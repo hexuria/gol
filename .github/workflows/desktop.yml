@@ -1,0 +1,22 @@
+name: desktop
+on:
+  push:
+    paths:
+      - .github/workflows/desktop.yml
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config g++ libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libvulkan-dev libxcb1-dev
+      - run: cargo build -p desktop
+      - run: |
+          git config user.name gol
+          git config user.email gol@users.noreply.github.com
+          git add Cargo.lock
+          git rm .github/workflows/desktop.yml
+          git commit -m "Record the gpui-kit desktop lock"
+          git push
