@@ -7,4 +7,6 @@ publish = false
 [dependencies]
 workflow-core = { path = "../workflow-core" }
 harness-core = { path = "../harness-core" }
+harness = { path = "../harness" }
+protocol = { path = "../protocol" }
 tokio = { version = "1", default-features = false }
