@@ -33,6 +33,11 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
                     "content": output,
                 }));
             }
+            EventPayload::UserMessage { text } if !text.is_empty() => {
+                out.push(json!({"type": "TEXT_MESSAGE_START", "messageId": id, "role": "user"}));
+                out.push(json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": id, "delta": text}));
+                out.push(json!({"type": "TEXT_MESSAGE_END", "messageId": id}));
+            }
             EventPayload::ModelResponded { message } if !message.text.is_empty() => {
                 let role = match message.role {
                     MessageRole::Assistant => "assistant",
@@ -40,7 +45,9 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
                     MessageRole::System => "system",
                 };
                 out.push(json!({"type": "TEXT_MESSAGE_START", "messageId": id, "role": role}));
-                out.push(json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": id, "delta": message.text}));
+                out.push(
+                    json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": id, "delta": message.text}),
+                );
                 out.push(json!({"type": "TEXT_MESSAGE_END", "messageId": id}));
             }
             EventPayload::RunCompleted { outcome } => {

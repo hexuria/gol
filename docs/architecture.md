@@ -8,6 +8,8 @@ The harness plane owns the loop. `reduce` is pure. The driver performs an effect
 
 The execution plane runs `Local`, `Reverse`, and `Box`. Reverse and box run on a worker thread with the echo tool. Memory is an in-memory map. The gateway turns one provider payload into `ModelMessage`. The harness does not read provider JSON.
 
+The coworker desktop picks the computer and the credential. Subscription model HTTP is made by the desktop against the local proxy. Platform gateway model HTTP is made by the server. The message record stays on the server either way. The agent container does not make the model call. The desktop is the gpuix app in `coworker/`, not the older gpui-kit binary.
+
 ## Crates
 
 | Crate | Owns |
@@ -15,7 +17,8 @@ The execution plane runs `Local`, `Reverse`, and `Box`. Reverse and box run on a
 | `protocol` | Ids, `RunSpec`, effects, events, `HarnessState`, `DispatchPhase`, `fold`, `reduce`, the authorizer |
 | `harness` | `Decider`, the driver, the echo tool, in-memory `Memory` |
 | `gateway` | `ModelGateway` and the OpenAI chat-completion adapter |
-| `server` | Axum routes and `RunStore` |
+| `server` | Axum routes and `RunStore`. Gateway mode is the only path that posts to the fixture proxy. |
+| `proxy` | Local fixture stand-in for Claude, Codex, Grok, and the platform gateway. No vendor HTTP. |
 
 `RunSpec` is built with a typestate builder. Agent, input, placement, and work model are required. The gateway client cannot send until provider and credential source are set.
 
