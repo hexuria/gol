@@ -1,0 +1,104 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index f341ebe..0a8b1a8 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -117,6 +117,7 @@ checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
+ dependencies = [
+  "cfg-if",
+  "const-random",
++ "getrandom 0.3.4",
+  "once_cell",
+  "version_check",
+  "zerocopy",
+@@ -5085,6 +5086,9 @@ name = "once_cell"
+ version = "1.21.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
++dependencies = [
++ "portable-atomic",
++]
+ 
+ [[package]]
+ name = "oo7"
+@@ -6232,6 +6236,34 @@ dependencies = [
+  "bytemuck",
+ ]
+ 
++[[package]]
++name = "rhai"
++version = "1.26.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0334639972c0ea5a3fd366aa36116754a11431b619fec3ed559b3f73bcbcebf5"
++dependencies = [
++ "ahash",
++ "bitflags 2.13.2",
++ "num-traits",
++ "once_cell",
++ "rhai_codegen",
++ "smallvec",
++ "smartstring",
++ "thin-vec",
++ "web-time",
++]
++
++[[package]]
++name = "rhai_codegen"
++version = "3.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3cd3a7535e50bf36857e7be7bec276d334e8c2dfa469c2201226fd01638ea5ca"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
+ [[package]]
+ name = "ring"
+ version = "0.17.14"
+@@ -6977,6 +7009,17 @@ version = "1.16.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
+ 
++[[package]]
++name = "smartstring"
++version = "1.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3fb72c633efbaa2dd666986505016c32c3044395ceaf881518399d2f4127ee29"
++dependencies = [
++ "autocfg",
++ "static_assertions",
++ "version_check",
++]
++
+ [[package]]
+ name = "smol"
+ version = "2.0.2"
+@@ -7438,6 +7481,12 @@ dependencies = [
+  "winapi-util",
+ ]
+ 
++[[package]]
++name = "thin-vec"
++version = "0.2.20"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4568d7e143ec86d2021c338bae2afa88699e84b8e0af523626654fe6f03a1748"
++
+ [[package]]
+ name = "thiserror"
+ version = "1.0.69"
+@@ -9399,6 +9448,15 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+ name = "workflow-core"
+ version = "0.1.0"
+ 
++[[package]]
++name = "workflow-rhai"
++version = "0.1.0"
++dependencies = [
++ "rhai",
++ "runtime-tokio",
++ "workflow-core",
++]
++
+ [[package]]
+ name = "writeable"
+ version = "0.6.4"
