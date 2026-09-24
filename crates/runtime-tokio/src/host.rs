@@ -3,8 +3,8 @@ use std::io::Read;
 use std::path::Path;
 
 use workflow_core::{
-    History, ToolSpec, WaitCondition, WorkflowCommand, WorkflowContext, WorkflowDriver,
-    WorkflowStep, spawn,
+    spawn, History, ToolSpec, WaitCondition, WorkflowCommand, WorkflowContext, WorkflowDriver,
+    WorkflowStep,
 };
 
 use crate::Journal;
@@ -15,16 +15,19 @@ pub fn replay(
     path: &Path,
     journal: &mut Journal,
     stand_in: &mut dyn FnMut() -> i64,
-) -> std::io::Result<WorkflowStep> {
+) -> std::io::Result<(WorkflowStep, Option<protocol::RunState>)> {
     let recorded = read_path(path)?;
     let history = history_from_committed(&recorded)?;
     let step = driver.evaluate(ctx, &history);
-    if let [WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" })] = step.commands.as_slice()
-    {
+    let harness = match step.commands.as_slice() {
+        [command] => on_command(*command),
+        _ => None,
+    };
+    if let [WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" })] = step.commands.as_slice() {
         let value = stand_in();
         journal.commit(&value.to_le_bytes())?;
     }
-    Ok(step)
+    Ok((step, harness))
 }
 
 fn read_path(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -102,7 +105,7 @@ fn join_all(
     Ok(())
 }
 
-fn on_command(command: WorkflowCommand) {
+fn on_command(command: WorkflowCommand) -> Option<protocol::RunState> {
     match command {
         WorkflowCommand::SpawnAgent => {
             let mut driver = harness::Driver::boot(
@@ -129,21 +132,23 @@ fn on_command(command: WorkflowCommand) {
                 &mut harness::InMemory::default(),
             )
             .unwrap();
+            Some(driver.state())
         }
-        WorkflowCommand::ExecuteTool(_) | WorkflowCommand::Complete | WorkflowCommand::Fail => {}
+        WorkflowCommand::ExecuteTool(_) | WorkflowCommand::Complete | WorkflowCommand::Fail => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{join_all, on_command, replay};
+    use super::{join_all, replay};
     use crate::Journal;
     use std::cell::{Cell, RefCell};
     use std::fs::{self, OpenOptions};
     use std::io::Read;
     use std::path::Path;
     use workflow_core::{
-        CounterBranch, JoinBranch, ToolSpec, WaitCondition, WorkflowCommand, WorkflowContext,
+        CounterBranch, History, JoinBranch, ToolSpec, WaitCondition, WorkflowCommand,
+        WorkflowContext, WorkflowDriver, WorkflowStep,
     };
 
     fn read_path(path: &Path) -> Vec<u8> {
@@ -169,7 +174,9 @@ mod tests {
         let driver = CounterBranch;
         let ctx = WorkflowContext;
 
-        let first = replay(&driver, &ctx, &path, &mut journal, &mut stand_in).unwrap();
+        let (first, first_harness) =
+            replay(&driver, &ctx, &path, &mut journal, &mut stand_in).unwrap();
+        assert!(first_harness.is_none());
         assert_eq!(calls.get(), 1);
         assert_eq!(
             first.commands,
@@ -178,7 +185,9 @@ mod tests {
         assert_eq!(first.wait, WaitCondition::None);
         assert_eq!(read_path(&path), 0i64.to_le_bytes());
 
-        let second = replay(&driver, &ctx, &path, &mut journal, &mut stand_in).unwrap();
+        let (second, second_harness) =
+            replay(&driver, &ctx, &path, &mut journal, &mut stand_in).unwrap();
+        assert!(second_harness.is_none());
         assert_eq!(calls.get(), 1);
         assert_eq!(second.commands, [WorkflowCommand::Complete]);
         assert_eq!(second.wait, WaitCondition::None);
@@ -254,14 +263,182 @@ mod tests {
 
     #[test]
     fn spawn_agent_calls_run_to_completion_once() {
-        let source = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/host.rs"),
+        let spec = protocol::RunSpec::builder()
+            .agent(protocol::AgentId::new(), "1")
+            .input("hello")
+            .placement(protocol::ExecutionPlacement::Local)
+            .work_model(protocol::WorkModel {
+                provider: protocol::ModelProvider::OpenAI,
+                model_name: "gpt-test".to_string(),
+                credential: protocol::CredentialSource::PlatformGateway,
+            })
+            .build();
+        let delegate = protocol::Effect::Delegate {
+            agent_id: protocol::AgentId::new(),
+            input: "child".to_string(),
+        };
+        assert_eq!(
+            protocol::authorize(&spec, &delegate, &[]),
+            protocol::PolicyDecision::Deny {
+                reason: "effect is not implemented in this slice".to_string(),
+            }
+        );
+        let mut denied = harness::Driver::boot(spec).unwrap();
+        let events_before = denied.events().len();
+        let harness_before = denied.state().harness.clone();
+        denied.perform(
+            &[delegate],
+            &[],
+            &harness::UnavailableModel,
+            &mut harness::InMemory::default(),
+        );
+        assert_eq!(denied.events().len(), events_before);
+        assert_eq!(denied.state().harness, harness_before);
+        assert!(denied
+            .events()
+            .iter()
+            .all(|event| event.envelope.parent_run_id.is_none()));
+
+        struct Fixed {
+            command: WorkflowCommand,
+        }
+
+        impl WorkflowDriver for Fixed {
+            fn evaluate(&self, _ctx: &WorkflowContext, _history: &History) -> WorkflowStep {
+                WorkflowStep {
+                    commands: vec![self.command],
+                    wait: WaitCondition::None,
+                }
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("gol-host-{}-spawn", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("log");
+        let mut journal = Journal::open(&path).unwrap();
+        let calls = Cell::new(0u32);
+        let mut stand_in = || {
+            calls.set(calls.get() + 1);
+            0i64
+        };
+        let (step, harness) = replay(
+            &Fixed {
+                command: WorkflowCommand::SpawnAgent,
+            },
+            &WorkflowContext,
+            &path,
+            &mut journal,
+            &mut stand_in,
         )
         .unwrap();
-        let host = source.split("#[cfg(test)]").next().unwrap();
-        assert_eq!(host.matches("harness::run_to_completion").count(), 1);
-        assert!(host.contains("WorkflowCommand::SpawnAgent"));
-        assert!(!host.contains("Delegate"));
-        on_command(WorkflowCommand::SpawnAgent);
+        assert_eq!(calls.get(), 0);
+        assert!(read_path(&path).is_empty());
+        assert_eq!(step.commands, [WorkflowCommand::SpawnAgent]);
+        assert_eq!(step.wait, WaitCondition::None);
+        let state = harness.unwrap();
+        assert_eq!(state.steps, 1);
+        assert_eq!(state.model_calls, 0);
+        assert_eq!(
+            state.harness,
+            protocol::HarnessState::Completed {
+                outcome: "done".to_string(),
+            }
+        );
+        assert_eq!(
+            state.dispatch,
+            protocol::DispatchPhase::Completed {
+                outcome: "done".to_string(),
+            }
+        );
+
+        for command in [
+            WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" }),
+            WorkflowCommand::ExecuteTool(ToolSpec { name: "other" }),
+            WorkflowCommand::Complete,
+            WorkflowCommand::Fail,
+        ] {
+            let case = dir.join(format!("{command:?}"));
+            let mut case_journal = Journal::open(&case).unwrap();
+            let case_calls = Cell::new(0u32);
+            let mut case_stand_in = || {
+                case_calls.set(case_calls.get() + 1);
+                0i64
+            };
+            let (step, harness) = replay(
+                &Fixed { command },
+                &WorkflowContext,
+                &case,
+                &mut case_journal,
+                &mut case_stand_in,
+            )
+            .unwrap();
+            assert_eq!(step.commands, [command]);
+            assert!(harness.is_none());
+            match command {
+                WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" }) => {
+                    assert_eq!(case_calls.get(), 1);
+                    assert_eq!(read_path(&case), 0i64.to_le_bytes());
+                }
+                WorkflowCommand::ExecuteTool(_)
+                | WorkflowCommand::Complete
+                | WorkflowCommand::Fail
+                | WorkflowCommand::SpawnAgent => {
+                    assert_eq!(case_calls.get(), 0);
+                    assert!(read_path(&case).is_empty());
+                }
+            }
+        }
+
+        let failed = dir.join("failed");
+        fs::write(&failed, 1i64.to_le_bytes()).unwrap();
+        let mut failed_journal = Journal::open(&failed).unwrap();
+        let fail_calls = Cell::new(0u32);
+        let mut fail_stand_in = || {
+            fail_calls.set(fail_calls.get() + 1);
+            0i64
+        };
+        let (step, harness) = replay(
+            &CounterBranch,
+            &WorkflowContext,
+            &failed,
+            &mut failed_journal,
+            &mut fail_stand_in,
+        )
+        .unwrap();
+        assert_eq!(step.commands, [WorkflowCommand::Fail]);
+        assert!(harness.is_none());
+        assert_eq!(fail_calls.get(), 0);
+        assert_eq!(read_path(&failed).len(), 8);
+
+        struct TwoSpawn;
+
+        impl WorkflowDriver for TwoSpawn {
+            fn evaluate(&self, _ctx: &WorkflowContext, _history: &History) -> WorkflowStep {
+                WorkflowStep {
+                    commands: vec![WorkflowCommand::SpawnAgent, WorkflowCommand::SpawnAgent],
+                    wait: WaitCondition::None,
+                }
+            }
+        }
+
+        let joined = dir.join("join");
+        let mut joined_journal = Journal::open(&joined).unwrap();
+        let join_calls = RefCell::new(Vec::new());
+        let mut join_stand_in = |sequence: u32| {
+            join_calls.borrow_mut().push(sequence);
+            0i64
+        };
+        let error = join_all(
+            &TwoSpawn,
+            &WorkflowContext,
+            &joined,
+            &mut joined_journal,
+            &mut join_stand_in,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "command");
+        assert!(join_calls.borrow().is_empty());
+        assert!(read_path(&joined).is_empty());
     }
 }
