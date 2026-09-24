@@ -20,6 +20,12 @@ pub fn replay(
     let history = history_from_committed(&recorded)?;
     let step = driver.evaluate(ctx, &history);
     let harness = match step.commands.as_slice() {
+        [WorkflowCommand::SpawnAgent] if recorded.is_empty() => {
+            let state = on_command(WorkflowCommand::SpawnAgent);
+            journal.commit(&0i64.to_le_bytes())?;
+            state
+        }
+        [WorkflowCommand::SpawnAgent] => None,
         [command] => on_command(*command),
         _ => None,
     };
@@ -332,7 +338,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(calls.get(), 0);
-        assert!(read_path(&path).is_empty());
+        assert_eq!(read_path(&path), 0i64.to_le_bytes());
         assert_eq!(step.commands, [WorkflowCommand::SpawnAgent]);
         assert_eq!(step.wait, WaitCondition::None);
         let state = harness.unwrap();
@@ -350,6 +356,22 @@ mod tests {
                 outcome: "done".to_string(),
             }
         );
+
+        let (again, again_harness) = replay(
+            &Fixed {
+                command: WorkflowCommand::SpawnAgent,
+            },
+            &WorkflowContext,
+            &path,
+            &mut journal,
+            &mut stand_in,
+        )
+        .unwrap();
+        assert!(again_harness.is_none(), "harness started twice");
+        assert_eq!(again.commands, [WorkflowCommand::SpawnAgent]);
+        assert_eq!(again.wait, WaitCondition::None);
+        assert_eq!(calls.get(), 0);
+        assert_eq!(read_path(&path), 0i64.to_le_bytes());
 
         for command in [
             WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" }),
