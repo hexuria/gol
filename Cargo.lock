@@ -9922,7 +9922,6 @@ name = "workflow-js"
 version = "0.1.0"
 dependencies = [
  "boa_engine",
- "runtime-tokio",
  "workflow-core",
 ]
 
@@ -9931,7 +9930,6 @@ name = "workflow-rhai"
 version = "0.1.0"
 dependencies = [
  "rhai",
- "runtime-tokio",
  "workflow-core",
 ]
 

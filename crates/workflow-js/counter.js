@@ -1,1 +1,1 @@
-evaluate();
+onCounter(tool("counter"), complete(), fail());

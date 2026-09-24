@@ -6,5 +6,4 @@ publish = false
 
 [dependencies]
 workflow-core = { path = "../workflow-core" }
-runtime-tokio = { path = "../runtime-tokio" }
 rhai = "1.26.1"
