@@ -152,6 +152,7 @@ pub fn reduce(state: HarnessState, event: &Event) -> (HarnessState, Effects) {
         | EventPayload::EffectDecided { .. }
         | EventPayload::EffectDenied { .. }
         | EventPayload::ModelResponded { .. }
+        | EventPayload::UserMessage { .. }
         | EventPayload::MemoryRead { .. }
         | EventPayload::MemoryWritten { .. } => (state, Vec::new()),
     }
