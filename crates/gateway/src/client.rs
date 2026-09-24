@@ -3,6 +3,9 @@ use std::marker::PhantomData;
 use protocol::{CredentialSource, ModelMessage, ModelProvider, ModelRequest};
 
 use crate::openai::{chat_body, parse_chat_completion};
+use crate::providers::{
+    anthropic_body, gemini_body, parse_anthropic, parse_gemini, parse_system_one, system_one_body,
+};
 use crate::{GatewayError, HttpTransport, UreqTransport};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -86,10 +89,98 @@ impl<T: HttpTransport> GatewayClient<Set, Set, T> {
         }
         match provider {
             ModelProvider::OpenAI => self.openai(request, &credential),
-            ModelProvider::Anthropic | ModelProvider::Gemini | ModelProvider::SystemOne => {
-                Err(GatewayError::UnsupportedProvider(provider))
-            }
+            ModelProvider::Anthropic => self.anthropic(request, &credential),
+            ModelProvider::Gemini => self.gemini(request, &credential),
+            ModelProvider::SystemOne => self.system_one(request, &credential),
         }
+    }
+
+    fn anthropic(
+        &self,
+        request: &ModelRequest,
+        credential: &CredentialSource,
+    ) -> Result<ModelMessage, GatewayError> {
+        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let body = anthropic_body(&request.model_name, &request.prompt);
+        let response = match credential {
+            CredentialSource::BringYourOwn { secret_ref } => {
+                let headers = [
+                    ("content-type", "application/json"),
+                    ("x-api-key", secret_ref.as_str()),
+                    ("anthropic-version", "2023-06-01"),
+                ];
+                self.transport.post_json(&url, &headers, &body)?
+            }
+            CredentialSource::PlatformGateway => {
+                let headers = [
+                    ("content-type", "application/json"),
+                    ("x-api-key", "platform"),
+                    ("anthropic-version", "2023-06-01"),
+                ];
+                self.transport.post_json(&url, &headers, &body)?
+            }
+        };
+        parse_anthropic(&response)
+    }
+
+    fn gemini(
+        &self,
+        request: &ModelRequest,
+        credential: &CredentialSource,
+    ) -> Result<ModelMessage, GatewayError> {
+        let url = format!(
+            "{}/v1beta/models/{}:generateContent",
+            self.base_url.trim_end_matches('/'),
+            request.model_name
+        );
+        let body = gemini_body(&request.prompt);
+        let response = match credential {
+            CredentialSource::BringYourOwn { secret_ref } => {
+                let headers = [
+                    ("content-type", "application/json"),
+                    ("x-goog-api-key", secret_ref.as_str()),
+                ];
+                self.transport.post_json(&url, &headers, &body)?
+            }
+            CredentialSource::PlatformGateway => {
+                let headers = [
+                    ("content-type", "application/json"),
+                    ("x-goog-api-key", "platform"),
+                ];
+                self.transport.post_json(&url, &headers, &body)?
+            }
+        };
+        parse_gemini(&response)
+    }
+
+    fn system_one(
+        &self,
+        request: &ModelRequest,
+        credential: &CredentialSource,
+    ) -> Result<ModelMessage, GatewayError> {
+        let url = format!(
+            "{}/v1/chat/completions",
+            self.base_url.trim_end_matches('/')
+        );
+        let body = system_one_body(&request.model_name, &request.prompt);
+        let response = match credential {
+            CredentialSource::BringYourOwn { secret_ref } => {
+                let bearer = format!("Bearer {secret_ref}");
+                let headers = [
+                    ("content-type", "application/json"),
+                    ("authorization", bearer.as_str()),
+                ];
+                self.transport.post_json(&url, &headers, &body)?
+            }
+            CredentialSource::PlatformGateway => {
+                let headers = [
+                    ("content-type", "application/json"),
+                    ("authorization", "Bearer platform"),
+                ];
+                self.transport.post_json(&url, &headers, &body)?
+            }
+        };
+        parse_system_one(&response)
     }
 
     fn openai(
@@ -148,20 +239,20 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_is_unsupported() {
+    fn provider_mismatch_does_not_call_http() {
         let client = GatewayClient::with_transport(PanicTransport)
             .provider(ModelProvider::Anthropic)
             .credential(CredentialSource::PlatformGateway);
         let error = client
             .send(&ModelRequest {
-                provider: ModelProvider::Anthropic,
-                model_name: "claude".to_string(),
+                provider: ModelProvider::OpenAI,
+                model_name: "gpt".to_string(),
                 prompt: "hi".to_string(),
             })
             .unwrap_err();
         assert!(matches!(
             error,
-            GatewayError::UnsupportedProvider(ModelProvider::Anthropic)
+            GatewayError::UnsupportedProvider(ModelProvider::OpenAI)
         ));
     }
 }
