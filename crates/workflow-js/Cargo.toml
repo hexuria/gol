@@ -1,0 +1,10 @@
+[package]
+name = "workflow-js"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+workflow-core = { path = "../workflow-core" }
+runtime-tokio = { path = "../runtime-tokio" }
+boa_engine = "0.22.0"
