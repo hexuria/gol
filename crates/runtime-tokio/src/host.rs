@@ -102,9 +102,41 @@ fn join_all(
     Ok(())
 }
 
+fn on_command(command: WorkflowCommand) {
+    match command {
+        WorkflowCommand::SpawnAgent => {
+            let mut driver = harness::Driver::boot(
+                protocol::RunSpec::builder()
+                    .agent(protocol::AgentId::new(), "1")
+                    .input("hello")
+                    .placement(protocol::ExecutionPlacement::Local)
+                    .work_model(protocol::WorkModel {
+                        provider: protocol::ModelProvider::OpenAI,
+                        model_name: "gpt-test".to_string(),
+                        credential: protocol::CredentialSource::PlatformGateway,
+                    })
+                    .build(),
+            )
+            .unwrap();
+            let mut decider = harness::ScriptedDecider::new([protocol::Effect::Complete {
+                outcome: "done".to_string(),
+            }]);
+            harness::run_to_completion(
+                &mut driver,
+                &mut decider,
+                &[],
+                &harness::UnavailableModel,
+                &mut harness::InMemory::default(),
+            )
+            .unwrap();
+        }
+        WorkflowCommand::ExecuteTool(_) | WorkflowCommand::Complete | WorkflowCommand::Fail => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{join_all, replay};
+    use super::{join_all, on_command, replay};
     use crate::Journal;
     use std::cell::{Cell, RefCell};
     use std::fs::{self, OpenOptions};
@@ -218,5 +250,18 @@ mod tests {
         assert_eq!(partial_calls.borrow().as_slice(), &[1]);
         assert_eq!(read_path(&partial), expected);
         assert_eq!(read_path(&partial).len(), 16);
+    }
+
+    #[test]
+    fn spawn_agent_calls_run_to_completion_once() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/host.rs"),
+        )
+        .unwrap();
+        let host = source.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(host.matches("harness::run_to_completion").count(), 1);
+        assert!(host.contains("WorkflowCommand::SpawnAgent"));
+        assert!(!host.contains("Delegate"));
+        on_command(WorkflowCommand::SpawnAgent);
     }
 }

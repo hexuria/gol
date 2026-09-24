@@ -3201,6 +3201,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-core"
+version = "0.1.0"
+dependencies = [
+ "workflow-core",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6261,6 +6268,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "runtime-tokio"
+version = "0.1.0"
+dependencies = [
+ "harness",
+ "harness-core",
+ "protocol",
+ "tokio",
+ "workflow-core",
 ]
 
 [[package]]
@@ -9376,6 +9394,10 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "workflow-core"
+version = "0.1.0"
 
 [[package]]
 name = "writeable"
