@@ -76,6 +76,9 @@ pub enum EventPayload {
     },
     RunCancelled,
     RunExpired,
+    UserMessage {
+        text: String,
+    },
     StepRetried,
     StepAdvanced,
     EffectDecided {
@@ -124,6 +127,7 @@ impl EventPayload {
             Self::RunFailed { .. } => "run.failed",
             Self::RunCancelled => "run.cancelled",
             Self::RunExpired => "run.expired",
+            Self::UserMessage { .. } => "message.user",
             Self::StepRetried => "step.retried",
             Self::StepAdvanced => "step.advanced",
             Self::EffectDecided { .. } => "effect.decided",
