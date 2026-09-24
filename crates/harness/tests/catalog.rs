@@ -2,8 +2,8 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use harness::{
-    load_catalog, run_to_completion, Decider, DeciderError, DecisionView, Driver, InMemory,
-    ScriptedDecider, UnavailableModel,
+    load_catalog, Decider, DeciderError, DecisionView, Driver, InMemory, ScriptedDecider,
+    UnavailableModel,
 };
 use protocol::{
     AgentId, Capability, CredentialSource, Effect, EventPayload, ExecutionPlacement, HarnessState,
@@ -53,7 +53,7 @@ fn declared_echo_runs_and_undeclared_tool_is_denied() {
     let dir = scratch();
     fs::write(dir.join("harness.toml"), "tools = [\"echo\"]\n").unwrap();
     let catalog = load_catalog(&dir).unwrap();
-    let mut driver = Driver::boot(spec(vec!["tool.echo"])).unwrap();
+    let mut driver = Driver::boot_with_catalog(spec(vec!["tool.echo"]), catalog).unwrap();
     let mut decider = ScriptedDecider::new([
         Effect::ToolCall {
             name: "echo".into(),
@@ -67,15 +67,9 @@ fn declared_echo_runs_and_undeclared_tool_is_denied() {
             outcome: "done".into(),
         },
     ]);
-    let tools = catalog.tools();
-    run_to_completion(
-        &mut driver,
-        &mut decider,
-        &tools,
-        &UnavailableModel,
-        &mut InMemory::default(),
-    )
-    .unwrap();
+    driver
+        .run_loaded(&mut decider, &UnavailableModel, &mut InMemory::default())
+        .unwrap();
     assert_eq!(tool_names(driver.events()), vec!["echo:hello".to_string()]);
     assert!(driver.events().iter().any(|event| matches!(
         &event.payload,
@@ -121,7 +115,7 @@ for line in sys.stdin:
     fs::write(dir.join("harness.toml"), toml).unwrap();
     let catalog = load_catalog(&dir).unwrap();
     assert_eq!(catalog.descriptors()[0].name, "ping");
-    let mut driver = Driver::boot(spec(vec!["mcp.local.ping"])).unwrap();
+    let mut driver = Driver::boot_with_catalog(spec(vec!["mcp.local.ping"]), catalog).unwrap();
     let mut decider = ScriptedDecider::new([
         Effect::ToolCall {
             name: "ping".into(),
@@ -131,15 +125,9 @@ for line in sys.stdin:
             outcome: "done".into(),
         },
     ]);
-    let tools = catalog.tools();
-    run_to_completion(
-        &mut driver,
-        &mut decider,
-        &tools,
-        &UnavailableModel,
-        &mut InMemory::default(),
-    )
-    .unwrap();
+    driver
+        .run_loaded(&mut decider, &UnavailableModel, &mut InMemory::default())
+        .unwrap();
     assert_eq!(tool_names(driver.events()), vec!["ping:pong:hi".to_string()]);
 }
 
@@ -171,12 +159,12 @@ fn skill_body_is_on_the_decision_view() {
     )
     .unwrap();
     let catalog = load_catalog(&dir).unwrap();
-    let mut driver = Driver::boot(spec(vec![])).unwrap();
+    let mut driver = Driver::boot_with_catalog(spec(vec![]), catalog).unwrap();
     let mut decider = SkillSeen {
         body: String::new(),
     };
     driver
-        .decide_with_skills(&mut decider, &[], &catalog.skills)
+        .run_loaded(&mut decider, &UnavailableModel, &mut InMemory::default())
         .unwrap();
     assert_eq!(decider.body, "note:remember the rust");
 }
