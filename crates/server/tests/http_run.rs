@@ -1,0 +1,148 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use protocol::{AgentId, Capability, EventPayload, HarnessState, Limits};
+use server::{router, AgentManifest, InMemoryStore, LocalEchoFactory};
+
+#[tokio::test]
+async fn post_run_reads_completed_and_events() {
+    let app = router(
+        Arc::new(InMemoryStore::default()),
+        Arc::new(LocalEchoFactory),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let agent_id = AgentId::new();
+    post_when_up(
+        &client,
+        &format!("{base}/v1/agents"),
+        &AgentManifest {
+            id: agent_id,
+            version: "1".to_string(),
+            instructions: "Echo the input, then finish.".to_string(),
+            tools: vec!["echo".to_string()],
+            required_capabilities: vec![Capability::new("tool.echo")],
+        },
+    )
+    .await;
+
+    let created = post_when_up(
+        &client,
+        &format!("{base}/v1/runs"),
+        &serde_json::json!({
+            "agent_id": agent_id,
+            "agent_version": "1",
+            "input": "hello",
+            "placement": "Local",
+            "work_model": {
+                "provider": "OpenAI",
+                "model_name": "gpt-test",
+                "credential": "PlatformGateway"
+            },
+            "capabilities": ["tool.echo"],
+            "limits": { "max_steps": 8, "max_model_calls": 4 }
+        }),
+    )
+    .await;
+    let created: protocol::RunState = created.json().await.expect("run json");
+    assert_eq!(
+        created.harness,
+        HarnessState::Completed {
+            outcome: "done".to_string()
+        }
+    );
+
+    let fetched = client
+        .get(format!("{base}/v1/runs/{}", created.run_id))
+        .send()
+        .await
+        .expect("get run")
+        .error_for_status()
+        .expect("get status")
+        .json::<protocol::RunState>()
+        .await
+        .expect("fetched json");
+    assert_eq!(fetched.harness, created.harness);
+
+    let events = client
+        .get(format!("{base}/v1/runs/{}/events", created.run_id))
+        .send()
+        .await
+        .expect("get events")
+        .error_for_status()
+        .expect("events status")
+        .json::<Vec<protocol::Event>>()
+        .await
+        .expect("events json");
+    assert!(events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::ToolResult { name, output }
+            if name == "echo" && output == "hello"
+    )));
+    assert!(events
+        .iter()
+        .any(|event| matches!(&event.payload, EventPayload::RunCompleted { outcome } if outcome == "done")));
+}
+
+#[tokio::test]
+async fn reverse_placement_does_not_run() {
+    let app = router(
+        Arc::new(InMemoryStore::default()),
+        Arc::new(LocalEchoFactory),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let client = reqwest::Client::new();
+    let response = post_when_up(
+        &client,
+        &format!("http://{addr}/v1/runs"),
+        &serde_json::json!({
+            "agent_id": AgentId::new(),
+            "agent_version": "1",
+            "input": "hello",
+            "placement": "Reverse",
+            "work_model": {
+                "provider": "OpenAI",
+                "model_name": "gpt-test",
+                "credential": "PlatformGateway"
+            },
+            "limits": Limits {
+                max_steps: 4,
+                max_model_calls: 1
+            }
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+async fn post_when_up(
+    client: &reqwest::Client,
+    url: &str,
+    body: &impl serde::Serialize,
+) -> reqwest::Response {
+    let mut last = None;
+    for _ in 0..20 {
+        match client.post(url).json(body).send().await {
+            Ok(response) => return response,
+            Err(error) => {
+                last = Some(error);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+    panic!("server did not accept {url}: {last:?}");
+}
