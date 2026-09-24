@@ -1,5 +1,6 @@
 import base64, io, pathlib, subprocess, tarfile
-raw = base64.b64decode(pathlib.Path(".github/catalog.b64").read_text().strip())
+b64 = "".join(pathlib.Path(f".github/b64part{i}").read_text().strip() for i in range(4))
+raw = base64.b64decode(b64)
 tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz").extractall(".")
 lock = pathlib.Path("Cargo.lock")
 text = lock.read_text()
@@ -38,6 +39,6 @@ for path, sha in expected.items():
 subprocess.check_call(["git", "config", "user.email", "actions@github.com"])
 subprocess.check_call(["git", "config", "user.name", "github-actions"])
 subprocess.check_call(["git", "add", "Cargo.lock", "crates/harness"])
-subprocess.check_call(["git", "rm", "-f", ".github/workflows/catalog.yml", ".github/apply_catalog.py", ".github/catalog.b64"])
+subprocess.check_call(["git", "rm", "-f", ".github/workflows/catalog.yml", ".github/apply_catalog.py", ".github/catalog.b64", ".github/b64part0", ".github/b64part1", ".github/b64part2", ".github/b64part3"])
 subprocess.check_call(["git", "commit", "-m", "feat(harness): load tools, MCP, and skills"])
 subprocess.check_call(["git", "push"])
