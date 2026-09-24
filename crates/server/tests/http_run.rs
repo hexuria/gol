@@ -123,6 +123,36 @@ async fn post_run_reads_completed_and_events() {
     assert!(events
         .iter()
         .any(|event| matches!(&event.payload, EventPayload::RunCompleted { outcome } if outcome == "done")));
+
+    let ag_ui = client
+        .get(format!("{base}/v1/runs/{}/ag-ui", created.run_id))
+        .send()
+        .await
+        .expect("ag-ui")
+        .error_for_status()
+        .expect("ag-ui status")
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .expect("ag-ui json");
+    assert_eq!(ag_ui.first().and_then(|event| event.get("type")), Some(&serde_json::json!("RUN_STARTED")));
+    assert!(ag_ui.iter().any(|event| event.get("type") == Some(&serde_json::json!("TOOL_CALL_RESULT"))));
+    assert_eq!(ag_ui.last().and_then(|event| event.get("type")), Some(&serde_json::json!("RUN_FINISHED")));
+
+    let ui = client
+        .get(format!("{base}/v1/runs/{}/ui", created.run_id))
+        .send()
+        .await
+        .expect("ui")
+        .error_for_status()
+        .expect("ui status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("ui json");
+    assert_eq!(ui.get("root").and_then(|value| value.as_str()), Some("screen"));
+    assert_eq!(
+        ui.pointer("/elements/outcome/props/text").and_then(|value| value.as_str()),
+        Some("done")
+    );
 }
 
 #[tokio::test]

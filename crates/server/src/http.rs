@@ -16,6 +16,7 @@ use serde::Deserialize;
 
 use crate::queue::RedisRunQueue;
 use crate::store::{AgentManifest, RunStore, StoredRun};
+use crate::surface::{ag_ui_events, json_render_spec};
 
 #[derive(Clone)]
 struct AppState {
@@ -52,6 +53,8 @@ pub fn router_with_queue(
         .route("/v1/runs", post(create_run))
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/events", get(get_events))
+        .route("/v1/runs/{id}/ag-ui", get(get_ag_ui))
+        .route("/v1/runs/{id}/ui", get(get_ui))
         .with_state(AppState {
             store,
             jev_base_url: jev_base_url.into(),
@@ -125,6 +128,40 @@ async fn get_events(
         .map_err(|error| ApiError::Decider(error.to_string()))?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(stored.events))
+}
+
+async fn get_ag_ui(
+    State(state): State<AppState>,
+    Path(id): Path<RunId>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = state.store.clone();
+    let stored = tokio::task::spawn_blocking(move || store.run(id))
+        .await
+        .map_err(|error| ApiError::Decider(error.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(serde_json::Value::Array(ag_ui_events(
+        stored.spec.run_id,
+        &stored.events,
+    ))))
+}
+
+async fn get_ui(
+    State(state): State<AppState>,
+    Path(id): Path<RunId>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = state.store.clone();
+    let stored = tokio::task::spawn_blocking(move || store.run(id))
+        .await
+        .map_err(|error| ApiError::Decider(error.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+    let folded = fold(&stored.spec, &stored.events);
+    let outcome = match &folded.harness {
+        protocol::HarnessState::Completed { outcome } => outcome.clone(),
+        protocol::HarnessState::Failed { message, .. } => message.clone(),
+        protocol::HarnessState::Cancelled => "cancelled".to_string(),
+        _ => "running".to_string(),
+    };
+    Ok(Json(json_render_spec(&stored.spec.input, &outcome)))
 }
 
 fn run_with_jev(jev_base_url: &str, spec: RunSpec) -> Result<Vec<Event>, RunStartError> {
