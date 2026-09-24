@@ -1,6 +1,9 @@
 use crate::driver::{History, WorkflowContext, WorkflowDriver};
 use crate::step::{ToolSpec, WaitCondition, WorkflowCommand, WorkflowStep};
 
+#[path = "id.rs"]
+pub mod id;
+
 pub struct CounterBranch;
 
 impl WorkflowDriver for CounterBranch {
@@ -51,5 +54,35 @@ mod tests {
             [WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" })]
         );
         assert_eq!(empty.wait, WaitCondition::None);
+
+        let run = super::id::WorkflowRunId("counter-branch");
+        let zero_id = super::id::effect_id(run, &recorded_zero, 0);
+        let zero_id_again = super::id::effect_id(run, &recorded_zero, 0);
+        assert_eq!(zero_id, zero_id_again);
+        assert_eq!(zero_id.path, super::id::Path::Zero);
+        assert_eq!(zero_id.workflow, super::id::WorkflowRunId("counter-branch"));
+        assert_eq!(zero_id.sequence, 0);
+
+        let one_id = super::id::effect_id(run, &recorded_one, 0);
+        let one_id_again = super::id::effect_id(run, &recorded_one, 0);
+        assert_eq!(one_id, one_id_again);
+        assert_eq!(one_id.path, super::id::Path::Nonzero);
+        assert_ne!(one_id, zero_id);
+
+        let recorded_two = History { counter: Some(2) };
+        let two_id = super::id::effect_id(run, &recorded_two, 0);
+        assert_eq!(two_id, one_id);
+
+        let unrecorded_id = super::id::effect_id(run, &unrecorded, 0);
+        assert_eq!(unrecorded_id.path, super::id::Path::Unrecorded);
+        assert_ne!(unrecorded_id, zero_id);
+        assert_ne!(unrecorded_id, one_id);
+
+        let zero_next = super::id::effect_id(run, &recorded_zero, 1);
+        assert_ne!(zero_id, zero_next);
+
+        let other_run = super::id::WorkflowRunId("other-run");
+        let other_id = super::id::effect_id(other_run, &recorded_zero, 0);
+        assert_ne!(zero_id, other_id);
     }
 }
