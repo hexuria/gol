@@ -14,12 +14,14 @@ use protocol::{
 };
 use serde::Deserialize;
 
+use crate::queue::RedisRunQueue;
 use crate::store::{AgentManifest, RunStore, StoredRun};
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<dyn RunStore>,
     jev_base_url: String,
+    redis_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,6 +39,14 @@ struct RunBody {
 }
 
 pub fn router(store: Arc<dyn RunStore>, jev_base_url: impl Into<String>) -> Router {
+    router_with_queue(store, jev_base_url, None)
+}
+
+pub fn router_with_queue(
+    store: Arc<dyn RunStore>,
+    jev_base_url: impl Into<String>,
+    redis_url: Option<String>,
+) -> Router {
     Router::new()
         .route("/v1/agents", post(create_agent))
         .route("/v1/runs", post(create_run))
@@ -45,15 +55,20 @@ pub fn router(store: Arc<dyn RunStore>, jev_base_url: impl Into<String>) -> Rout
         .with_state(AppState {
             store,
             jev_base_url: jev_base_url.into(),
+            redis_url,
         })
 }
 
 async fn create_agent(
     State(state): State<AppState>,
     Json(agent): Json<AgentManifest>,
-) -> Json<AgentManifest> {
-    state.store.put_agent(agent.clone());
-    Json(agent)
+) -> Result<Json<AgentManifest>, ApiError> {
+    let store = state.store.clone();
+    let saved = agent.clone();
+    tokio::task::spawn_blocking(move || store.put_agent(saved))
+        .await
+        .map_err(|error| ApiError::Decider(error.to_string()))?;
+    Ok(Json(agent))
 }
 
 async fn create_run(
@@ -74,7 +89,17 @@ async fn create_run(
         Err(error) => return Err(ApiError::Decider(error.to_string())),
     };
     let folded = fold(&spec, &events);
-    state.store.put_run(StoredRun { spec, events });
+    let run_id = spec.run_id;
+    let store = state.store.clone();
+    tokio::task::spawn_blocking(move || store.put_run(StoredRun { spec, events }))
+        .await
+        .map_err(|error| ApiError::Decider(error.to_string()))?;
+    if let Some(url) = state.redis_url.clone() {
+        tokio::task::spawn_blocking(move || RedisRunQueue::open(url).push(run_id))
+            .await
+            .map_err(|error| ApiError::Decider(error.to_string()))?
+            .map_err(ApiError::Decider)?;
+    }
     Ok(Json(folded))
 }
 
@@ -82,7 +107,11 @@ async fn get_run(
     State(state): State<AppState>,
     Path(id): Path<RunId>,
 ) -> Result<Json<RunState>, ApiError> {
-    let stored = state.store.run(id).ok_or(ApiError::NotFound)?;
+    let store = state.store.clone();
+    let stored = tokio::task::spawn_blocking(move || store.run(id))
+        .await
+        .map_err(|error| ApiError::Decider(error.to_string()))?
+        .ok_or(ApiError::NotFound)?;
     Ok(Json(fold(&stored.spec, &stored.events)))
 }
 
@@ -90,7 +119,11 @@ async fn get_events(
     State(state): State<AppState>,
     Path(id): Path<RunId>,
 ) -> Result<Json<Vec<Event>>, ApiError> {
-    let stored = state.store.run(id).ok_or(ApiError::NotFound)?;
+    let store = state.store.clone();
+    let stored = tokio::task::spawn_blocking(move || store.run(id))
+        .await
+        .map_err(|error| ApiError::Decider(error.to_string()))?
+        .ok_or(ApiError::NotFound)?;
     Ok(Json(stored.events))
 }
 
