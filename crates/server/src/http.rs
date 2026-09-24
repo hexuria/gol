@@ -9,11 +9,15 @@ use harness::{
     run_to_completion, BootError, Driver, EchoTool, InMemory, JevDecider, UnavailableModel,
 };
 use protocol::{
-    fold, AgentId, Capability, Event, ExecutionPlacement, Limits, RunId, RunSpec, RunState,
-    WorkModel,
+    fold, AgentId, Capability, Event, EventPayload, ExecutionPlacement, Limits, RunId, RunSpec,
+    RunState, WorkModel,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
+use crate::inference::{
+    accept_subscription_completion, computer_plan, open_turn, ComputerPlan, GatewayPoster,
+    HttpGatewayPoster, SharedPoster, TurnError, TurnOutcome,
+};
 use crate::queue::RedisRunQueue;
 use crate::store::{AgentManifest, RunStore, StoredRun};
 use crate::surface::{ag_ui_events, json_render_spec};
@@ -23,6 +27,7 @@ struct AppState {
     store: Arc<dyn RunStore>,
     jev_base_url: String,
     redis_url: Option<String>,
+    poster: SharedPoster,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +53,28 @@ pub fn router_with_queue(
     jev_base_url: impl Into<String>,
     redis_url: Option<String>,
 ) -> Router {
+    router_with_parts(
+        store,
+        jev_base_url,
+        redis_url,
+        Arc::new(HttpGatewayPoster::from_env()),
+    )
+}
+
+pub fn router_with_gateway(
+    store: Arc<dyn RunStore>,
+    jev_base_url: impl Into<String>,
+    poster: Arc<dyn GatewayPoster>,
+) -> Router {
+    router_with_parts(store, jev_base_url, None, poster)
+}
+
+fn router_with_parts(
+    store: Arc<dyn RunStore>,
+    jev_base_url: impl Into<String>,
+    redis_url: Option<String>,
+    poster: SharedPoster,
+) -> Router {
     Router::new()
         .route("/v1/agents", post(create_agent))
         .route("/v1/runs", post(create_run))
@@ -55,10 +82,16 @@ pub fn router_with_queue(
         .route("/v1/runs/{id}/events", get(get_events))
         .route("/v1/runs/{id}/ag-ui", get(get_ag_ui))
         .route("/v1/runs/{id}/ui", get(get_ui))
+        .route("/v1/coworker/turns", post(create_coworker_turn))
+        .route(
+            "/v1/coworker/turns/{id}/completion",
+            post(complete_coworker_turn),
+        )
         .with_state(AppState {
             store,
             jev_base_url: jev_base_url.into(),
             redis_url,
+            poster,
         })
 }
 
@@ -81,8 +114,19 @@ async fn create_run(
     let spec = spec_from_body(body);
     let jev_base_url = state.jev_base_url.clone();
     let spec_for_run = spec.clone();
-    let events = match tokio::task::spawn_blocking(move || run_with_jev(&jev_base_url, spec_for_run))
-        .await
+    let store_for_run = state.store.clone();
+    let events = match tokio::task::spawn_blocking(move || {
+        // The user message is on the record before the harness asks Jev.
+        let message = crate::inference::user_message_event(&spec_for_run);
+        store_for_run.put_run(StoredRun {
+            spec: spec_for_run.clone(),
+            events: vec![message.clone()],
+        });
+        let mut events = vec![message];
+        events.extend(run_with_jev(&jev_base_url, spec_for_run)?);
+        Ok(events)
+    })
+    .await
     {
         Ok(Ok(events)) => events,
         Ok(Err(RunStartError::Unsupported(placement))) => {
@@ -104,6 +148,92 @@ async fn create_run(
             .map_err(ApiError::Decider)?;
     }
     Ok(Json(folded))
+}
+
+async fn create_coworker_turn(
+    State(state): State<AppState>,
+    Json(body): Json<RunBody>,
+) -> Result<Json<TurnBody>, ApiError> {
+    let spec = spec_from_body(body);
+    let store = state.store.clone();
+    let poster = state.poster.clone();
+    let outcome =
+        tokio::task::spawn_blocking(move || open_turn(store.as_ref(), spec, poster.as_ref()))
+            .await
+            .map_err(|error| ApiError::Decider(error.to_string()))?
+            .map_err(ApiError::from)?;
+    Ok(Json(TurnBody::from_outcome(outcome)))
+}
+
+async fn complete_coworker_turn(
+    State(state): State<AppState>,
+    Path(id): Path<RunId>,
+    Json(body): Json<CompletionBody>,
+) -> Result<Json<TurnBody>, ApiError> {
+    let store = state.store.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        accept_subscription_completion(store.as_ref(), id, &body.text)
+    })
+    .await
+    .map_err(|error| ApiError::Decider(error.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(TurnBody::from_outcome(outcome)))
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletionBody {
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TurnBody {
+    run_id: RunId,
+    placement: ExecutionPlacement,
+    credential_mode: &'static str,
+    user_message: String,
+    completion: Option<String>,
+    computer: ComputerBody,
+}
+
+#[derive(Debug, Serialize)]
+struct ComputerBody {
+    image: String,
+    started_by: &'static str,
+    command: String,
+    started: bool,
+}
+
+impl TurnBody {
+    fn from_outcome(outcome: TurnOutcome) -> Self {
+        let user_message = outcome
+            .events
+            .iter()
+            .find_map(|event| match &event.payload {
+                EventPayload::UserMessage { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| outcome.spec.input.clone());
+        let computer = computer_plan(outcome.spec.placement);
+        Self {
+            run_id: outcome.spec.run_id,
+            placement: outcome.spec.placement,
+            credential_mode: outcome.credential_mode,
+            user_message,
+            completion: outcome.completion,
+            computer: ComputerBody::from_plan(computer),
+        }
+    }
+}
+
+impl ComputerBody {
+    fn from_plan(plan: ComputerPlan) -> Self {
+        Self {
+            image: plan.image,
+            started_by: plan.started_by,
+            command: plan.command,
+            started: plan.started,
+        }
+    }
 }
 
 async fn get_run(
@@ -218,6 +348,20 @@ enum ApiError {
     Unsupported(ExecutionPlacement),
     Decider(String),
     NotFound,
+    Proxy(String),
+    Conflict(&'static str),
+    BadRequest(&'static str),
+}
+
+impl From<TurnError> for ApiError {
+    fn from(error: TurnError) -> Self {
+        match error {
+            TurnError::Proxy(message) => Self::Proxy(message),
+            TurnError::NotFound => Self::NotFound,
+            TurnError::Conflict(message) => Self::Conflict(message),
+            TurnError::BadRequest(message) => Self::BadRequest(message),
+        }
+    }
 }
 
 impl axum::response::IntoResponse for ApiError {
@@ -239,6 +383,21 @@ impl axum::response::IntoResponse for ApiError {
             Self::NotFound => (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "run not found" })),
+            )
+                .into_response(),
+            Self::Proxy(message) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response(),
+            Self::Conflict(message) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response(),
+            Self::BadRequest(message) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": message })),
             )
                 .into_response(),
         }
