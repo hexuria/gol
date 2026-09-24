@@ -5653,6 +5653,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "proxy"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "pulp"
 version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6792,12 +6802,14 @@ dependencies = [
  "harness",
  "postgres",
  "protocol",
+ "proxy",
  "redis",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "typesafe-sdk",
+ "ureq",
  "uuid",
  "wiremock",
 ]
