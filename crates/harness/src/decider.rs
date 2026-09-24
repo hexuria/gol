@@ -2,11 +2,18 @@ use std::collections::VecDeque;
 
 use protocol::{Effect, Event, RunSpec, RunState, ToolDescriptor};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Skill {
+    pub name: String,
+    pub body: String,
+}
+
 pub struct DecisionView<'a> {
     pub spec: &'a RunSpec,
     pub state: &'a RunState,
     pub events: &'a [Event],
     pub tools: &'a [ToolDescriptor],
+    pub skills: &'a [Skill],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
