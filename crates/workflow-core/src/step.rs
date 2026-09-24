@@ -9,6 +9,7 @@ pub enum WorkflowCommand {
     ExecuteTool(ToolSpec),
     Complete,
     Fail,
+    SpawnAgent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

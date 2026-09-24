@@ -72,7 +72,9 @@ fn run(journal_path: &Path, effect_path: &Path, next_path: &Path) -> std::io::Re
                 append_one(next_path)?;
                 return Ok(());
             }
-            WorkflowCommand::ExecuteTool(_) | WorkflowCommand::Fail => {
+            WorkflowCommand::ExecuteTool(_)
+            | WorkflowCommand::Fail
+            | WorkflowCommand::SpawnAgent => {
                 return Err(input("command"));
             }
         }
