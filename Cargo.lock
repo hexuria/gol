@@ -1531,7 +1531,9 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "typesafe-sdk",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
