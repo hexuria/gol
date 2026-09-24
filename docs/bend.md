@@ -59,7 +59,7 @@ unshare -r -n -- env -i BEND_NO_TELEMETRY=1 bend counter.bend
 
 The process is its own group. On timeout or an output overrun, Rust sends `SIGKILL` to the group and reaps it. stdout is capped at 4KiB and stderr at 16KiB. The wait is 30 seconds. stdin is closed.
 
-`counter.bend` is executed only when it has exactly one line `def main() -> String:`. That is a guard, not a parser. A `String` result is normalized by the checker. An `IO` result would be compiled and run, which is why the guard refuses it before `bend` sees the file. The guard does not reject a Bend program that is pure but whose `main` line is spelled differently; those files fail closed.
+`counter.bend` runs only when its one real `def main` returns `String`. The guard follows Bend 2.0.27: space, tab, `\n`, and a bare `\r` are whitespace; a `#` comment runs to the next `\n`; a `"` string, escapes included, hides the text inside it, line breaks too. A `def main() -> String:` sitting inside a string is not the main. Any other real main is refused before `bend` starts, so an `IO` main cannot run. A `String` result is normalized by the checker. An `IO` result would be compiled and run.
 
 ## Formats across the boundary
 

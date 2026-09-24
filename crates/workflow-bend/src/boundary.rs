@@ -138,24 +138,240 @@ fn read_source(path: &Path) -> Result<String, FrontendError> {
 }
 
 fn assert_string_main(source: &str) -> Result<(), FrontendError> {
-    let mut found = 0;
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("def main") {
-            found += 1;
-            if line != "def main() -> String:" {
-                return Err(FrontendError::Encoding(
-                    "counter.bend main must return String; IO is not executed".to_string(),
-                ));
-            }
+    let mut scan = BendScan { src: source, i: 0 };
+    let mut mains = 0usize;
+    while scan.i < scan.src.len() {
+        scan.skip();
+        if scan.i >= scan.src.len() {
+            break;
         }
+        if scan.at_word("def") {
+            scan.i += 3;
+            if scan.def_name_is_main() {
+                mains += 1;
+                if !scan.main_returns_string()? {
+                    return Err(main_must_be_string());
+                }
+            }
+            continue;
+        }
+        if scan.at(b'"') {
+            scan.skip_string()?;
+            continue;
+        }
+        if scan.at(b'\'') {
+            scan.skip_char_lit()?;
+            continue;
+        }
+        scan.bump_char()?;
     }
-    if found != 1 {
+    if mains != 1 {
         return Err(FrontendError::Encoding(
             "counter.bend needs one def main() -> String:".to_string(),
         ));
     }
     Ok(())
+}
+
+fn main_must_be_string() -> FrontendError {
+    FrontendError::Encoding("counter.bend main must return String; IO is not executed".to_string())
+}
+
+// Bend 2.0.27 lexing for the main guard. Whitespace is space, tab, `\n`, and a
+// bare `\r`. A `#` comment runs to the next `\n` only. A `"` string, including
+// one that spans lines, hides its text. Escapes match the compiler.
+struct BendScan<'a> {
+    src: &'a str,
+    i: usize,
+}
+
+impl BendScan<'_> {
+    fn skip(&mut self) {
+        let bytes = self.src.as_bytes();
+        while self.i < bytes.len() {
+            match bytes[self.i] {
+                b' ' | b'\n' | b'\r' | b'\t' => self.i += 1,
+                b'#' => {
+                    self.i += 1;
+                    while self.i < bytes.len() && bytes[self.i] != b'\n' {
+                        self.i += 1;
+                    }
+                }
+                _ => return,
+            }
+        }
+    }
+
+    fn at(&self, byte: u8) -> bool {
+        self.src.as_bytes().get(self.i) == Some(&byte)
+    }
+
+    fn at_word(&self, word: &str) -> bool {
+        let rest = &self.src[self.i..];
+        rest.starts_with(word)
+            && !rest[word.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    }
+
+    fn take(&mut self, text: &str) -> bool {
+        if self.src[self.i..].starts_with(text) {
+            self.i += text.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn bump_char(&mut self) -> Result<(), FrontendError> {
+        let Some(ch) = self.src[self.i..].chars().next() else {
+            return Err(main_must_be_string());
+        };
+        self.i += ch.len_utf8();
+        Ok(())
+    }
+
+    fn read_name(&mut self) -> Option<String> {
+        let mut chars = self.src[self.i..].chars();
+        let head = chars.next()?;
+        if !head.is_ascii_alphabetic() && head != '_' {
+            return None;
+        }
+        let mut size = head.len_utf8();
+        for ch in chars {
+            if !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.') {
+                break;
+            }
+            size += ch.len_utf8();
+        }
+        let name = self.src[self.i..self.i + size].to_string();
+        self.i += size;
+        Some(name)
+    }
+
+    fn def_name_is_main(&mut self) -> bool {
+        self.skip();
+        self.read_name().as_deref() == Some("main")
+    }
+
+    fn main_returns_string(&mut self) -> Result<bool, FrontendError> {
+        self.skip();
+        if self.at(b'?') {
+            self.i += 1;
+        }
+        self.skip();
+        if !self.take("(") {
+            return Ok(false);
+        }
+        self.skip_balanced(b'(', b')')?;
+        self.skip();
+        if !self.take("->") {
+            return Ok(false);
+        }
+        self.skip();
+        if !self.at_word("String") {
+            return Ok(false);
+        }
+        self.i += "String".len();
+        self.skip();
+        Ok(self.take(":"))
+    }
+
+    fn skip_balanced(&mut self, open: u8, close: u8) -> Result<(), FrontendError> {
+        let mut depth = 1u32;
+        while depth > 0 {
+            self.skip();
+            if self.i >= self.src.len() {
+                return Err(main_must_be_string());
+            }
+            if self.at(b'"') {
+                self.skip_string()?;
+                continue;
+            }
+            if self.at(b'\'') {
+                self.skip_char_lit()?;
+                continue;
+            }
+            let byte = self.src.as_bytes()[self.i];
+            if byte == open {
+                depth += 1;
+                self.i += 1;
+                continue;
+            }
+            if byte == close {
+                depth -= 1;
+                self.i += 1;
+                continue;
+            }
+            self.bump_char()?;
+        }
+        Ok(())
+    }
+
+    fn skip_string(&mut self) -> Result<(), FrontendError> {
+        if !self.take("\"") {
+            return Err(main_must_be_string());
+        }
+        while !self.take("\"") {
+            if self.i >= self.src.len() {
+                return Err(main_must_be_string());
+            }
+            self.take_char_body()?;
+        }
+        Ok(())
+    }
+
+    fn skip_char_lit(&mut self) -> Result<(), FrontendError> {
+        if !self.take("'") {
+            return Err(main_must_be_string());
+        }
+        self.take_char_body()?;
+        if self.take("'") {
+            Ok(())
+        } else {
+            Err(main_must_be_string())
+        }
+    }
+
+    fn take_char_body(&mut self) -> Result<(), FrontendError> {
+        if self.i >= self.src.len() {
+            return Err(main_must_be_string());
+        }
+        if !self.at(b'\\') {
+            return self.bump_char();
+        }
+        self.i += 1;
+        if self.take_unicode_escape() {
+            return Ok(());
+        }
+        let Some(ch) = self.src[self.i..].chars().next() else {
+            return Err(main_must_be_string());
+        };
+        if matches!(ch, 'n' | 't' | 'r' | '0' | '\\' | '\'' | '"') {
+            self.i += ch.len_utf8();
+            Ok(())
+        } else {
+            Err(main_must_be_string())
+        }
+    }
+
+    fn take_unicode_escape(&mut self) -> bool {
+        let rest = &self.src.as_bytes()[self.i..];
+        let window = &rest[..rest.len().min(11)];
+        if window.len() < 4 || !window[0].eq_ignore_ascii_case(&b'u') || window[1] != b'{' {
+            return false;
+        }
+        let mut end = 2;
+        while end < window.len() && window[end].is_ascii_hexdigit() {
+            end += 1;
+        }
+        if end == 2 || end >= window.len() || window[end] != b'}' {
+            return false;
+        }
+        self.i += end + 1;
+        true
+    }
 }
 
 pub fn check_version(bend: &Path, dir: &Path) -> Result<(), FrontendError> {

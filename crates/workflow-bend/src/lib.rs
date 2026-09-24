@@ -234,6 +234,35 @@ mod tests {
     }
 
     #[test]
+    fn carriage_return_cannot_hide_an_io_main() {
+        let dir = scratch();
+        copy_experiment(&dir);
+        let marker = dir.join("owned");
+        let counter = fs::read_to_string(dir.join("counter.bend")).unwrap();
+        let head = counter.rsplit_once("def main() -> String:\n").unwrap().0;
+        let mut source = head.to_string();
+        source.push_str("def helper() -> String:\n  \"x\ndef main() -> String:\ny\"\r");
+        source.push_str(
+            "def main() -> IO(Unit):\n  do IO<Unit>:\n    file : File <- IO.try(File, File.open(\"",
+        );
+        source.push_str(&marker.display().to_string());
+        source.push_str("\", \"w\"))\n    wrote : File & Result<&1, &1, U32 & String, Unit> <- File.write(file, \"owned\")\n    IO.print(\"\\\"v1 on_counter execute complete fail\\\"\")\n");
+        assert!(source.contains('\r'));
+        assert!(
+            !source.lines().any(|line| line == "def main() -> IO(Unit):"),
+            "the IO main must stay hidden from a newline split"
+        );
+        fs::write(dir.join("counter.bend"), &source).unwrap();
+        let error = compile(&dir).unwrap_err();
+        assert!(
+            error.to_string().contains("main must return String"),
+            "{error}"
+        );
+        assert!(!marker.exists(), "compile ran the hidden IO main");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn io_main_is_not_executed() {
         let dir = scratch();
         copy_experiment(&dir);
