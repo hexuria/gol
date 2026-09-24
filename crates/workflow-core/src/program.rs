@@ -20,6 +20,30 @@ impl WorkflowDriver for CounterBranch {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Handle {
+    pub sequence: u32,
+    pub command: WorkflowCommand,
+}
+
+pub fn spawn(sequence: u32, command: WorkflowCommand) -> Handle {
+    Handle { sequence, command }
+}
+
+pub struct JoinBranch;
+
+impl WorkflowDriver for JoinBranch {
+    fn evaluate(&self, _ctx: &WorkflowContext, _history: &History) -> WorkflowStep {
+        WorkflowStep {
+            commands: vec![
+                WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" }),
+                WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" }),
+            ],
+            wait: WaitCondition::None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::CounterBranch;
