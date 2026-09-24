@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use protocol::{
@@ -128,19 +128,12 @@ fn box_command(name: &str) -> String {
 #[derive(Debug)]
 pub enum SandboxError {
     Host(String),
-    Work(String),
 }
 
 pub trait SandboxHost: Send + Sync {
-    /// Provision `name`, run `work` while that sandbox exists, then destroy it.
-    fn run(
-        &self,
-        name: &str,
-        work: &mut dyn FnMut() -> Result<Option<String>, String>,
-    ) -> Result<Option<String>, SandboxError>;
-
+    fn provision(&self, name: &str) -> Result<(), SandboxError>;
+    fn destroy(&self, name: &str) -> Result<(), SandboxError>;
     fn exists(&self, name: &str) -> bool;
-
     fn launches_docker(&self) -> bool;
 }
 
@@ -150,23 +143,8 @@ pub struct MemorySandbox {
     provisioned: Mutex<Vec<String>>,
 }
 
-struct LiveGuard<'a> {
-    host: &'a MemorySandbox,
-    name: String,
-}
-
-impl Drop for LiveGuard<'_> {
-    fn drop(&mut self) {
-        self.host.live.lock().expect("sandbox").remove(&self.name);
-    }
-}
-
 impl SandboxHost for MemorySandbox {
-    fn run(
-        &self,
-        name: &str,
-        work: &mut dyn FnMut() -> Result<Option<String>, String>,
-    ) -> Result<Option<String>, SandboxError> {
+    fn provision(&self, name: &str) -> Result<(), SandboxError> {
         if name.is_empty() || name == "gol-agent-box" {
             return Err(SandboxError::Host(format!("refusing sandbox name {name}")));
         }
@@ -182,13 +160,16 @@ impl SandboxHost for MemorySandbox {
             .lock()
             .expect("sandbox")
             .push(name.to_string());
-        let guard = LiveGuard {
-            host: self,
-            name: name.to_string(),
-        };
-        let result = work().map_err(SandboxError::Work);
-        drop(guard);
-        result
+        Ok(())
+    }
+
+    fn destroy(&self, name: &str) -> Result<(), SandboxError> {
+        let removed = self.live.lock().expect("sandbox").remove(name);
+        if removed {
+            Ok(())
+        } else {
+            Err(SandboxError::Host(format!("sandbox {name} is not running")))
+        }
     }
 
     fn exists(&self, name: &str) -> bool {
@@ -206,32 +187,42 @@ impl MemorySandbox {
     }
 }
 
-pub struct DockerSandbox;
-
-struct ContainerGuard {
-    name: String,
+pub struct DockerSandbox {
+    command: Arc<dyn Fn(&[String]) -> Result<(), String> + Send + Sync>,
 }
 
-impl Drop for ContainerGuard {
-    fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &self.name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+impl DockerSandbox {
+    pub fn new() -> Self {
+        Self::from_command(|args| docker(args))
+    }
+
+    pub fn from_command<F>(command: F) -> Self
+    where
+        F: Fn(&[String]) -> Result<(), String> + Send + Sync + 'static,
+    {
+        Self {
+            command: Arc::new(command),
+        }
+    }
+
+    fn command(&self, args: &[&str]) -> Result<(), SandboxError> {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        (self.command)(&owned).map_err(SandboxError::Host)
+    }
+}
+
+impl Default for DockerSandbox {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl SandboxHost for DockerSandbox {
-    fn run(
-        &self,
-        name: &str,
-        work: &mut dyn FnMut() -> Result<Option<String>, String>,
-    ) -> Result<Option<String>, SandboxError> {
+    fn provision(&self, name: &str) -> Result<(), SandboxError> {
         if name.is_empty() || name == "gol-agent-box" {
             return Err(SandboxError::Host(format!("refusing sandbox name {name}")));
         }
-        docker(&[
+        self.command(&[
             "create",
             "--name",
             name,
@@ -242,25 +233,21 @@ impl SandboxHost for DockerSandbox {
             "gol-agent:production",
             "-c",
             "true",
-        ])
-        .map_err(SandboxError::Host)?;
-        let guard = ContainerGuard {
-            name: name.to_string(),
-        };
-        let result = work().map_err(SandboxError::Work)?;
-        docker(&["start", "-a", name]).map_err(SandboxError::Host)?;
-        drop(guard);
-        Ok(result)
+        ])?;
+        if let Err(error) = self.command(&["start", "-a", name]) {
+            let _ = self.command(&["rm", "-f", name]);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn destroy(&self, name: &str) -> Result<(), SandboxError> {
+        self.command(&["rm", "-f", name])
     }
 
     fn exists(&self, name: &str) -> bool {
-        Command::new("docker")
-            .args(["inspect", "--type", "container", name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        self.command(&["inspect", "--type", "container", name])
+            .is_ok()
     }
 
     fn launches_docker(&self) -> bool {
@@ -268,7 +255,7 @@ impl SandboxHost for DockerSandbox {
     }
 }
 
-fn docker(args: &[&str]) -> Result<(), String> {
+fn docker(args: &[String]) -> Result<(), String> {
     let status = Command::new("docker")
         .args(args)
         .status()
@@ -282,7 +269,7 @@ fn docker(args: &[&str]) -> Result<(), String> {
 
 pub fn sandbox_from_env() -> Arc<dyn SandboxHost> {
     if std::env::var("GOL_START_BOX").ok().as_deref() == Some("1") {
-        Arc::new(DockerSandbox)
+        Arc::new(DockerSandbox::new())
     } else {
         Arc::new(MemorySandbox::default())
     }
@@ -297,6 +284,7 @@ pub struct TurnOutcome {
     pub computer: ComputerPlan,
 }
 
+#[derive(Debug)]
 pub enum TurnError {
     Proxy(String),
     Sandbox(String),
@@ -306,8 +294,9 @@ pub enum TurnError {
 }
 
 /// Record the user message, then post to the proxy only for the platform gateway.
-/// A Box turn provisions its sandbox before that work, and destroys it before
-/// the turn is completed.
+/// A Box sandbox is provisioned before that call. Gateway mode removes it only
+/// after `RunCompleted` is stored. Subscription mode leaves it until
+/// `accept_subscription_completion`. A failed remove rolls the completion back.
 pub fn open_turn(
     store: &dyn RunStore,
     spec: RunSpec,
@@ -330,41 +319,49 @@ pub fn open_turn(
         events: events.clone(),
     });
 
-    let mut work = || match &spec.work_model.credential {
-        CredentialSource::PlatformGateway => poster
-            .complete(&GatewayCall {
+    let box_turn = spec.placement == ExecutionPlacement::Box;
+    let name = box_container_name(spec.run_id);
+    if box_turn {
+        sandbox.provision(&name).map_err(sandbox_error)?;
+    }
+    let completion = match &spec.work_model.credential {
+        CredentialSource::PlatformGateway => {
+            match poster.complete(&GatewayCall {
                 run_id: spec.run_id,
                 input: spec.input.clone(),
                 model_name: spec.work_model.model_name.clone(),
                 placement: spec.placement,
-            })
-            .map(Some),
-        CredentialSource::BringYourOwn { .. } => Ok(None),
-    };
-    let (completion, computer) = if spec.placement == ExecutionPlacement::Box {
-        let name = box_container_name(spec.run_id);
-        let completion = match sandbox.run(&name, &mut work) {
-            Ok(completion) => completion,
-            Err(SandboxError::Work(message)) => return Err(TurnError::Proxy(message)),
-            Err(SandboxError::Host(message)) => return Err(TurnError::Sandbox(message)),
-        };
-        let computer = computer_for(spec.placement, spec.run_id, sandbox.launches_docker());
-        (completion, computer)
-    } else {
-        let completion = work().map_err(TurnError::Proxy)?;
-        let computer = computer_for(spec.placement, spec.run_id, false);
-        (completion, computer)
+            }) {
+                Ok(text) => Some(text),
+                Err(message) => {
+                    if box_turn {
+                        let _ = sandbox.destroy(&name);
+                    }
+                    return Err(TurnError::Proxy(message));
+                }
+            }
+        }
+        CredentialSource::BringYourOwn { .. } => None,
     };
     let credential_mode = match &spec.work_model.credential {
         CredentialSource::PlatformGateway => "gateway",
         CredentialSource::BringYourOwn { .. } => "subscription",
     };
+    let computer = computer_for(
+        spec.placement,
+        spec.run_id,
+        box_turn && sandbox.launches_docker(),
+    );
     if let Some(text) = completion.as_deref() {
+        let prior = events.clone();
         append_completion(&spec, &mut events, text);
         store.put_run(StoredRun {
             spec: spec.clone(),
             events: events.clone(),
         });
+        if box_turn {
+            release_after_complete(store, &spec, sandbox, &name, prior)?;
+        }
     }
     Ok(TurnOutcome {
         spec,
@@ -379,6 +376,7 @@ pub fn accept_subscription_completion(
     store: &dyn RunStore,
     run_id: RunId,
     text: &str,
+    sandbox: &dyn SandboxHost,
 ) -> Result<TurnOutcome, TurnError> {
     let text = text.trim();
     if text.is_empty() {
@@ -407,12 +405,23 @@ pub fn accept_subscription_completion(
     {
         return Err(TurnError::Conflict("user message is not recorded"));
     }
+    let box_turn = stored.spec.placement == ExecutionPlacement::Box;
+    let name = box_container_name(stored.spec.run_id);
+    if box_turn && !sandbox.exists(&name) {
+        return Err(TurnError::Sandbox(
+            "box sandbox is gone before the turn completed".to_string(),
+        ));
+    }
+    let prior = stored.events.clone();
     let mut events = stored.events;
     append_completion(&stored.spec, &mut events, text);
     store.put_run(StoredRun {
         spec: stored.spec.clone(),
         events: events.clone(),
     });
+    if box_turn {
+        release_after_complete(store, &stored.spec, sandbox, &name, prior)?;
+    }
     Ok(TurnOutcome {
         spec: stored.spec.clone(),
         events,
@@ -420,6 +429,28 @@ pub fn accept_subscription_completion(
         credential_mode: "subscription",
         computer: computer_plan(stored.spec.placement, stored.spec.run_id),
     })
+}
+
+fn release_after_complete(
+    store: &dyn RunStore,
+    spec: &RunSpec,
+    sandbox: &dyn SandboxHost,
+    name: &str,
+    prior: Vec<Event>,
+) -> Result<(), TurnError> {
+    if let Err(error) = sandbox.destroy(name) {
+        store.put_run(StoredRun {
+            spec: spec.clone(),
+            events: prior,
+        });
+        return Err(sandbox_error(error));
+    }
+    Ok(())
+}
+
+fn sandbox_error(error: SandboxError) -> TurnError {
+    let SandboxError::Host(message) = error;
+    TurnError::Sandbox(message)
 }
 
 pub fn user_message_event(spec: &RunSpec) -> Event {

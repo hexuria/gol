@@ -186,8 +186,9 @@ async fn complete_coworker_turn(
     Json(body): Json<CompletionBody>,
 ) -> Result<Json<TurnBody>, ApiError> {
     let store = state.store.clone();
+    let sandbox = state.sandbox.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        accept_subscription_completion(store.as_ref(), id, &body.text)
+        accept_subscription_completion(store.as_ref(), id, &body.text, sandbox.as_ref())
     })
     .await
     .map_err(|error| ApiError::Decider(error.to_string()))?

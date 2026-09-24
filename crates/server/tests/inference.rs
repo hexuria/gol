@@ -1,15 +1,19 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::Request;
 use axum::middleware::Next;
-use protocol::{AgentId, EventPayload, HarnessState};
+use protocol::{
+    AgentId, Capability, CredentialSource, EventPayload, ExecutionPlacement, HarnessState, Limits,
+    ModelProvider, RunSpec, WorkModel,
+};
 use proxy::GATEWAY_TEXT;
 use server::{
-    box_container_name, ensure_fixture_proxy, router_with_gateway, router_with_sandbox,
-    GatewayCall, GatewayPoster, HttpGatewayPoster, InMemoryStore, MemorySandbox, RunStore,
-    SandboxHost,
+    box_container_name, ensure_fixture_proxy, open_turn, router_with_gateway, router_with_sandbox,
+    DockerSandbox, GatewayCall, GatewayPoster, HttpGatewayPoster, InMemoryStore, MemorySandbox,
+    RunStore, SandboxError, SandboxHost, TurnError,
 };
 
 async fn proxy_server() -> (String, Arc<Mutex<Vec<String>>>) {
@@ -270,6 +274,204 @@ fn parse_run_id(body: &serde_json::Value) -> protocol::RunId {
         .expect("run id")
         .parse()
         .expect("run id uuid")
+}
+
+struct ReleaseAfterComplete {
+    inner: MemorySandbox,
+    store: Arc<InMemoryStore>,
+}
+
+impl SandboxHost for ReleaseAfterComplete {
+    fn provision(&self, name: &str) -> Result<(), SandboxError> {
+        self.inner.provision(name)
+    }
+
+    fn destroy(&self, name: &str) -> Result<(), SandboxError> {
+        let run_id = name
+            .strip_prefix("gol-box-")
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| SandboxError::Host(format!("sandbox {name} is not a box run")))?;
+        let stored = self
+            .store
+            .run(run_id)
+            .ok_or_else(|| SandboxError::Host(format!("sandbox {name} has no run")))?;
+        if !stored
+            .events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. }))
+        {
+            return Err(SandboxError::Host(
+                "sandbox removed before the turn completed".to_string(),
+            ));
+        }
+        self.inner.destroy(name)
+    }
+
+    fn exists(&self, name: &str) -> bool {
+        self.inner.exists(name)
+    }
+
+    fn launches_docker(&self) -> bool {
+        false
+    }
+}
+
+#[tokio::test]
+async fn subscription_box_keeps_the_sandbox_until_the_turn_completes() {
+    let store = Arc::new(InMemoryStore::default());
+    let sandbox = Arc::new(ReleaseAfterComplete {
+        inner: MemorySandbox::default(),
+        store: store.clone(),
+    });
+    let app = router_with_sandbox(
+        store,
+        "http://127.0.0.1:9",
+        Arc::new(OkPoster),
+        sandbox.clone(),
+    );
+    let base = listen(app).await;
+    let client = reqwest::Client::new();
+    let opened = post_when_up(
+        &client,
+        &format!("{base}/v1/coworker/turns"),
+        &turn_body("Box", subscription(), "hold the box"),
+    )
+    .await
+    .error_for_status()
+    .expect("open")
+    .json::<serde_json::Value>()
+    .await
+    .expect("json");
+    assert!(opened["completion"].is_null());
+    let name = opened["computer"]["name"]
+        .as_str()
+        .expect("name")
+        .to_string();
+    assert!(
+        sandbox.exists(&name),
+        "sandbox was gone before the desktop model call"
+    );
+    let run_id = opened["run_id"].as_str().expect("run id");
+    let events = events_of(&client, &base, run_id).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. })),
+        "subscription turn completed inside open_turn"
+    );
+
+    let completed = post_when_up(
+        &client,
+        &format!("{base}/v1/coworker/turns/{run_id}/completion"),
+        &serde_json::json!({ "text": "desktop model text" }),
+    )
+    .await
+    .error_for_status()
+    .expect("completion")
+    .json::<serde_json::Value>()
+    .await
+    .expect("json");
+    assert_eq!(completed["completion"], "desktop model text");
+    assert!(
+        !sandbox.exists(&name),
+        "sandbox still present after the turn completed"
+    );
+    let events = events_of(&client, &base, run_id).await;
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. })));
+}
+
+struct FailingRemove {
+    live: Mutex<HashSet<String>>,
+}
+
+impl FailingRemove {
+    fn call(&self, args: &[String]) -> Result<(), String> {
+        let name = docker_target(args);
+        match args.first().map(String::as_str) {
+            Some("create") => {
+                self.live.lock().expect("docker").insert(name);
+                Ok(())
+            }
+            Some("start") => {
+                if self.live.lock().expect("docker").contains(&name) {
+                    Ok(())
+                } else {
+                    Err(format!("container {name} was not created"))
+                }
+            }
+            Some("rm") => Err(format!("docker rm -f {name} failed")),
+            Some("inspect") => {
+                if self.live.lock().expect("docker").contains(&name) {
+                    Ok(())
+                } else {
+                    Err(format!("container {name} is gone"))
+                }
+            }
+            other => Err(format!("unexpected docker {other:?}")),
+        }
+    }
+}
+
+fn docker_target(args: &[String]) -> String {
+    if let Some(index) = args.iter().position(|arg| arg == "--name") {
+        return args.get(index + 1).cloned().unwrap_or_default();
+    }
+    args.last().cloned().unwrap_or_default()
+}
+
+#[test]
+fn a_failed_sandbox_destroy_does_not_complete_the_turn() {
+    let state = Arc::new(FailingRemove {
+        live: Mutex::new(HashSet::new()),
+    });
+    let command = state.clone();
+    let sandbox = DockerSandbox::from_command(move |args| command.call(args));
+    let store = InMemoryStore::default();
+    let spec = RunSpec::builder()
+        .agent(AgentId::new(), "1")
+        .input("ship the box")
+        .placement(ExecutionPlacement::Box)
+        .work_model(WorkModel {
+            provider: ModelProvider::Anthropic,
+            model_name: "claude-fixture".to_string(),
+            credential: CredentialSource::PlatformGateway,
+        })
+        .capabilities(vec![Capability::new("model.call")])
+        .limits(Limits {
+            max_steps: 8,
+            max_model_calls: 4,
+        })
+        .build();
+    let error =
+        open_turn(&store, spec.clone(), &OkPoster, &sandbox).expect_err("rm must fail the turn");
+    match error {
+        TurnError::Sandbox(message) => assert!(message.contains("rm"), "{message}"),
+        other => panic!("expected sandbox error, got {other:?}"),
+    }
+    let stored = store.run(spec.run_id).expect("run stored");
+    assert!(
+        !stored
+            .events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. })),
+        "failed destroy still marked the turn complete"
+    );
+    assert!(sandbox.exists(&box_container_name(spec.run_id)));
+}
+
+async fn events_of(client: &reqwest::Client, base: &str, run_id: &str) -> Vec<protocol::Event> {
+    client
+        .get(format!("{base}/v1/runs/{run_id}/events"))
+        .send()
+        .await
+        .expect("events")
+        .error_for_status()
+        .expect("events status")
+        .json()
+        .await
+        .expect("events json")
 }
 
 #[tokio::test]

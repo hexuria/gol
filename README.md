@@ -54,7 +54,7 @@ The desktop posts the user message to `POST /v1/coworker/turns` before any model
 | Gateway, Local | Server, `POST /v1/gateway/complete`. The desktop does not call the proxy. | Desktop starts `gol-agent:local` |
 | Gateway, Box | Server, same gateway path | Server starts `gol-agent:production` |
 
-The server posts to the proxy only for gateway mode. Set `GOL_PROXY_URL` and `GOL_GATEWAY_TOKEN` (default `gol-gateway-local`, a local stand-in, not a vendor token). A Box turn provisions a unique sandbox, runs the turn inside it, and destroys it before the turn is completed. `GOL_START_BOX=1` makes that sandbox a Docker container. Otherwise the server records the command and tracks the sandbox in process. The workspace mount stays `gol-workspace:/workspace`.
+The server posts to the proxy only for gateway mode. Set `GOL_PROXY_URL` and `GOL_GATEWAY_TOKEN` (default `gol-gateway-local`, a local stand-in, not a vendor token). A Box turn provisions `gol-box-<run id>` before the model call. Gateway mode removes it only after the turn is completed. Subscription mode leaves it up until the desktop posts the completion, then removes it. A failed remove does not leave the turn completed. `GOL_START_BOX=1` makes that sandbox a Docker container. Otherwise the server records the command and tracks the sandbox in process. The workspace mount stays `gol-workspace:/workspace`.
 
 ## Agent images
 
