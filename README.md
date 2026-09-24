@@ -50,11 +50,11 @@ The desktop posts the user message to `POST /v1/coworker/turns` before any model
 | Mode | Who calls the proxy | Who starts the computer |
 | --- | --- | --- |
 | Subscription, Local | Desktop, `POST /v1/messages` on the local proxy, then `POST /v1/coworker/turns/{id}/completion` | Desktop: `docker run --rm -d --name gol-agent-local -v gol-workspace:/workspace gol-agent:local` |
-| Subscription, Box | Desktop, same proxy call | Server: `docker run --rm -d --name gol-agent-box -v gol-workspace:/workspace gol-agent:production` |
+| Subscription, Box | Desktop, same proxy call | Server: unique `gol-box-$RUN_ID`, then remove it. `docker create --name gol-box-$RUN_ID -v gol-workspace:/workspace --entrypoint /bin/sh gol-agent:production -c true && docker start -a gol-box-$RUN_ID && docker rm -f gol-box-$RUN_ID` |
 | Gateway, Local | Server, `POST /v1/gateway/complete`. The desktop does not call the proxy. | Desktop starts `gol-agent:local` |
 | Gateway, Box | Server, same gateway path | Server starts `gol-agent:production` |
 
-The server posts to the proxy only for gateway mode. Set `GOL_PROXY_URL` and `GOL_GATEWAY_TOKEN` (default `gol-gateway-local`, a local stand-in, not a vendor token). `GOL_START_BOX=1` makes a Box turn run the production `docker run`. Otherwise the server records the command and does not start a container.
+The server posts to the proxy only for gateway mode. Set `GOL_PROXY_URL` and `GOL_GATEWAY_TOKEN` (default `gol-gateway-local`, a local stand-in, not a vendor token). A Box turn provisions a unique sandbox, runs the turn inside it, and destroys it before the turn is completed. `GOL_START_BOX=1` makes that sandbox a Docker container. Otherwise the server records the command and tracks the sandbox in process. The workspace mount stays `gol-workspace:/workspace`.
 
 ## Agent images
 

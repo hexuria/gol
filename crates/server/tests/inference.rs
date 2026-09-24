@@ -7,8 +7,9 @@ use axum::middleware::Next;
 use protocol::{AgentId, EventPayload, HarnessState};
 use proxy::GATEWAY_TEXT;
 use server::{
-    ensure_fixture_proxy, router_with_gateway, GatewayCall, GatewayPoster, HttpGatewayPoster,
-    InMemoryStore, RunStore,
+    box_container_name, ensure_fixture_proxy, router_with_gateway, router_with_sandbox,
+    GatewayCall, GatewayPoster, HttpGatewayPoster, InMemoryStore, MemorySandbox, RunStore,
+    SandboxHost,
 };
 
 async fn proxy_server() -> (String, Arc<Mutex<Vec<String>>>) {
@@ -144,6 +145,131 @@ async fn gateway_records_the_user_message_before_it_posts_to_the_proxy() {
         .as_str()
         .unwrap()
         .contains("gateway"));
+}
+
+struct BoxWatch {
+    store: Arc<InMemoryStore>,
+    sandbox: Arc<MemorySandbox>,
+    saw_live: Arc<AtomicBool>,
+}
+
+impl GatewayPoster for BoxWatch {
+    fn complete(&self, call: &GatewayCall) -> Result<String, String> {
+        let name = box_container_name(call.run_id);
+        assert!(
+            self.sandbox.exists(&name),
+            "open_turn finished the turn before the container existed"
+        );
+        assert_ne!(name, "gol-agent-box");
+        let stored = self.store.run(call.run_id).expect("user message stored");
+        assert!(
+            !stored
+                .events
+                .iter()
+                .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. })),
+            "turn completed before the sandbox existed"
+        );
+        self.saw_live.store(true, Ordering::SeqCst);
+        Ok("boxed".to_string())
+    }
+}
+
+struct OkPoster;
+
+impl GatewayPoster for OkPoster {
+    fn complete(&self, _call: &GatewayCall) -> Result<String, String> {
+        Ok("boxed".to_string())
+    }
+}
+
+#[tokio::test]
+async fn a_second_box_run_does_not_reuse_the_container_name() {
+    let sandbox = Arc::new(MemorySandbox::default());
+    let app = router_with_sandbox(
+        Arc::new(InMemoryStore::default()),
+        "http://127.0.0.1:9",
+        Arc::new(OkPoster),
+        sandbox.clone(),
+    );
+    let base = listen(app).await;
+    let client = reqwest::Client::new();
+    let mut names = Vec::new();
+    for input in ["first box", "second box"] {
+        let body = post_when_up(
+            &client,
+            &format!("{base}/v1/coworker/turns"),
+            &turn_body("Box", serde_json::json!("PlatformGateway"), input),
+        )
+        .await
+        .error_for_status()
+        .expect("status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("json");
+        let name = body["computer"]["name"].as_str().expect("name").to_string();
+        let command = body["computer"]["command"].as_str().expect("command");
+        assert_ne!(name, "gol-agent-box");
+        assert!(command.contains(&name));
+        assert!(command.contains("-v gol-workspace:/workspace"));
+        assert!(!command.contains("sleep"));
+        assert!(!command.split_whitespace().any(|arg| arg == "-d"));
+        names.push(name);
+    }
+    let provisioned = sandbox.provisioned();
+    assert_eq!(
+        provisioned, names,
+        "response names drifted from the sandbox"
+    );
+    assert_ne!(
+        provisioned[0], provisioned[1],
+        "second run reused {}",
+        provisioned[0]
+    );
+}
+
+#[tokio::test]
+async fn the_box_sandbox_is_gone_after_the_run() {
+    let store = Arc::new(InMemoryStore::default());
+    let sandbox = Arc::new(MemorySandbox::default());
+    let saw_live = Arc::new(AtomicBool::new(false));
+    let app = router_with_sandbox(
+        store.clone(),
+        "http://127.0.0.1:9",
+        Arc::new(BoxWatch {
+            store: store.clone(),
+            sandbox: sandbox.clone(),
+            saw_live: saw_live.clone(),
+        }),
+        sandbox.clone(),
+    );
+    let base = listen(app).await;
+    let body = post_when_up(
+        &reqwest::Client::new(),
+        &format!("{base}/v1/coworker/turns"),
+        &turn_body("Box", serde_json::json!("PlatformGateway"), "ship the box"),
+    )
+    .await
+    .error_for_status()
+    .expect("status")
+    .json::<serde_json::Value>()
+    .await
+    .expect("json");
+    let name = body["computer"]["name"].as_str().expect("name");
+    assert!(saw_live.load(Ordering::SeqCst));
+    assert_eq!(name, box_container_name(parse_run_id(&body)));
+    assert!(
+        !sandbox.exists(name),
+        "sandbox {name} was still present after the run"
+    );
+    assert_eq!(body["completion"], "boxed");
+}
+
+fn parse_run_id(body: &serde_json::Value) -> protocol::RunId {
+    body["run_id"]
+        .as_str()
+        .expect("run id")
+        .parse()
+        .expect("run id uuid")
 }
 
 #[tokio::test]
