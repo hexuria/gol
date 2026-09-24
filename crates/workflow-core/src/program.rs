@@ -4,19 +4,72 @@ use crate::step::{ToolSpec, WaitCondition, WorkflowCommand, WorkflowStep};
 #[path = "id.rs"]
 pub mod id;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowProgram {
+    pub root: Decision,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Tool(ToolName),
+    Complete,
+    Fail,
+    OnCounter {
+        missing: Box<Decision>,
+        zero: Box<Decision>,
+        other: Box<Decision>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolName {
+    Counter,
+}
+
+pub fn counter_program() -> WorkflowProgram {
+    WorkflowProgram {
+        root: Decision::OnCounter {
+            missing: Box::new(Decision::Tool(ToolName::Counter)),
+            zero: Box::new(Decision::Complete),
+            other: Box::new(Decision::Fail),
+        },
+    }
+}
+
+pub fn evaluate_program(program: &WorkflowProgram, history: &History) -> WorkflowStep {
+    WorkflowStep {
+        commands: vec![command(&program.root, history)],
+        wait: WaitCondition::None,
+    }
+}
+
+fn command(decision: &Decision, history: &History) -> WorkflowCommand {
+    match decision {
+        Decision::Tool(ToolName::Counter) => {
+            WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" })
+        }
+        Decision::Complete => WorkflowCommand::Complete,
+        Decision::Fail => WorkflowCommand::Fail,
+        Decision::OnCounter {
+            missing,
+            zero,
+            other,
+        } => {
+            let arm = match history.counter {
+                None => missing,
+                Some(0) => zero,
+                Some(_) => other,
+            };
+            command(arm, history)
+        }
+    }
+}
+
 pub struct CounterBranch;
 
 impl WorkflowDriver for CounterBranch {
     fn evaluate(&self, _ctx: &WorkflowContext, history: &History) -> WorkflowStep {
-        let command = match history.counter {
-            None => WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" }),
-            Some(0) => WorkflowCommand::Complete,
-            Some(_) => WorkflowCommand::Fail,
-        };
-        WorkflowStep {
-            commands: vec![command],
-            wait: WaitCondition::None,
-        }
+        evaluate_program(&counter_program(), history)
     }
 }
 

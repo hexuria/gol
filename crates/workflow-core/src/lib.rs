@@ -1,7 +1,10 @@
 mod driver;
-mod step;
 mod program;
+mod step;
 
 pub use driver::{History, WorkflowContext, WorkflowDriver};
-pub use program::{CounterBranch, Handle, JoinBranch, spawn};
+pub use program::{
+    counter_program, evaluate_program, spawn, CounterBranch, Decision, Handle, JoinBranch,
+    ToolName, WorkflowProgram,
+};
 pub use step::{ToolSpec, WaitCondition, WorkflowCommand, WorkflowStep};

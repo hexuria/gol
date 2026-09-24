@@ -1,9 +1,9 @@
 [package]
-name = "workflow-rhai"
+name = "workflow-js"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
 [dependencies]
 workflow-core = { path = "../workflow-core" }
-rhai = "1.26.1"
+boa_engine = "0.22.0"
