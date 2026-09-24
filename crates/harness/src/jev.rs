@@ -1,4 +1,4 @@
-use protocol::Effect;
+use protocol::{Effect, InvocationId};
 use typesafe_sdk::blocking::Client;
 use typesafe_sdk::Question;
 
@@ -42,6 +42,7 @@ impl Decider for JevDecider {
             "echo" => Ok(Effect::ToolCall {
                 name: "echo".to_string(),
                 input: view.spec.input.clone(),
+                invocation: InvocationId::new(),
             }),
             "model" => Ok(Effect::ModelCall {
                 prompt: view.spec.input.clone(),

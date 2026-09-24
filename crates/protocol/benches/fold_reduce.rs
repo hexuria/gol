@@ -3,7 +3,7 @@ use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, Criterion};
 use protocol::{
     Actor, AgentId, CredentialSource, Effect, Event, EventPayload, ExecutionPlacement,
-    HarnessState, Limits, ModelProvider, RunSpec, Timestamp, WorkModel,
+    HarnessState, InvocationId, Limits, ModelProvider, RunSpec, Timestamp, WorkModel,
 };
 
 fn spec() -> RunSpec {
@@ -37,6 +37,7 @@ fn event(spec: &RunSpec, payload: EventPayload) -> Event {
 }
 
 fn completed_log(spec: &RunSpec) -> Vec<Event> {
+    let invocation = InvocationId::new();
     vec![
         event(spec, EventPayload::RunStarted),
         event(
@@ -45,6 +46,7 @@ fn completed_log(spec: &RunSpec) -> Vec<Event> {
                 effect: Effect::ToolCall {
                     name: "echo".to_string(),
                     input: "hello".to_string(),
+                    invocation,
                 },
             },
         ),
@@ -52,6 +54,9 @@ fn completed_log(spec: &RunSpec) -> Vec<Event> {
             spec,
             EventPayload::ToolResult {
                 name: "echo".to_string(),
+                invocation,
+                step: 1,
+                attempt: 0,
                 output: "hello".to_string(),
             },
         ),
@@ -85,6 +90,7 @@ fn bench_reduce(c: &mut Criterion) {
             effect: Effect::ToolCall {
                 name: "echo".to_string(),
                 input: "hello".to_string(),
+                invocation: InvocationId::new(),
             },
         },
     );

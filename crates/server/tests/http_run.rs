@@ -117,7 +117,7 @@ async fn post_run_reads_completed_and_events() {
         .expect("events json");
     assert!(events.iter().any(|event| matches!(
         &event.payload,
-        EventPayload::ToolResult { name, output }
+        EventPayload::ToolResult { name, output, .. }
             if name == "echo" && output == "hello"
     )));
     assert!(events

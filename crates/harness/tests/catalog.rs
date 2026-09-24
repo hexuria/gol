@@ -7,7 +7,7 @@ use harness::{
 };
 use protocol::{
     AgentId, Capability, CredentialSource, Effect, EventPayload, ExecutionPlacement, HarnessState,
-    Limits, ModelProvider, RunSpec, WorkModel,
+    InvocationId, Limits, ModelProvider, RunSpec, WorkModel,
 };
 
 fn spec(capabilities: Vec<&str>) -> RunSpec {
@@ -42,7 +42,7 @@ fn tool_names(events: &[protocol::Event]) -> Vec<String> {
     events
         .iter()
         .filter_map(|event| match &event.payload {
-            EventPayload::ToolResult { name, output } => Some(format!("{name}:{output}")),
+            EventPayload::ToolResult { name, output, .. } => Some(format!("{name}:{output}")),
             _ => None,
         })
         .collect()
@@ -58,10 +58,12 @@ fn declared_echo_runs_and_undeclared_tool_is_denied() {
         Effect::ToolCall {
             name: "echo".into(),
             input: "hello".into(),
+            invocation: InvocationId::new(),
         },
         Effect::ToolCall {
             name: "other".into(),
             input: "nope".into(),
+            invocation: InvocationId::new(),
         },
         Effect::Complete {
             outcome: "done".into(),
@@ -120,6 +122,7 @@ for line in sys.stdin:
         Effect::ToolCall {
             name: "ping".into(),
             input: "hi".into(),
+            invocation: InvocationId::new(),
         },
         Effect::Complete {
             outcome: "done".into(),
@@ -128,7 +131,10 @@ for line in sys.stdin:
     driver
         .run_loaded(&mut decider, &UnavailableModel, &mut InMemory::default())
         .unwrap();
-    assert_eq!(tool_names(driver.events()), vec!["ping:pong:hi".to_string()]);
+    assert_eq!(
+        tool_names(driver.events()),
+        vec!["ping:pong:hi".to_string()]
+    );
 }
 
 struct SkillSeen {
@@ -153,11 +159,7 @@ fn skill_body_is_on_the_decision_view() {
     let dir = scratch();
     fs::create_dir(dir.join("skills")).unwrap();
     fs::write(dir.join("skills/note.md"), "remember the rust").unwrap();
-    fs::write(
-        dir.join("harness.toml"),
-        "skills = [\"skills/note.md\"]\n",
-    )
-    .unwrap();
+    fs::write(dir.join("harness.toml"), "skills = [\"skills/note.md\"]\n").unwrap();
     let catalog = load_catalog(&dir).unwrap();
     let mut driver = Driver::boot_with_catalog(spec(vec![]), catalog).unwrap();
     let mut decider = SkillSeen {

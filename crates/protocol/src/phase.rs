@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::ApprovalId;
+use crate::{ApprovalId, InvocationId};
 
 pub const MAX_STEPS: u32 = 3;
 pub const MAX_RETRIES: u32 = 2;
@@ -16,6 +16,8 @@ pub enum HarnessState {
     WaitingForTool {
         step: u32,
         attempt: u32,
+        name: String,
+        invocation: InvocationId,
     },
     Completed {
         outcome: String,

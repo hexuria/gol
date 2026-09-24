@@ -11,7 +11,7 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
     for event in events {
         let id = event.envelope.event_id.to_string();
         match &event.payload {
-            EventPayload::ToolResult { name, output } => {
+            EventPayload::ToolResult { name, output, .. } => {
                 out.push(json!({
                     "type": "TOOL_CALL_START",
                     "toolCallId": id,

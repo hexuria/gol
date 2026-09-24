@@ -43,7 +43,7 @@ fn allow_capability(spec: &RunSpec, name: &str) -> PolicyDecision {
 mod tests {
     use super::*;
     use crate::spec::sample_spec;
-    use crate::{Capability, Effect, ToolDescriptor, ToolId};
+    use crate::{Capability, Effect, InvocationId, ToolDescriptor, ToolId};
 
     fn echo() -> ToolDescriptor {
         ToolDescriptor {
@@ -63,6 +63,7 @@ mod tests {
         let effect = Effect::ToolCall {
             name: "echo".to_string(),
             input: "ping".to_string(),
+            invocation: InvocationId::new(),
         };
 
         assert_eq!(
