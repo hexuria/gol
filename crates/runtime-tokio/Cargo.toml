@@ -1,0 +1,10 @@
+[package]
+name = "runtime-tokio"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+workflow-core = { path = "../workflow-core" }
+harness-core = { path = "../harness-core" }
+tokio = { version = "1", default-features = false }
