@@ -5,20 +5,21 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use harness::{run_to_completion, BootError, Driver, EchoTool, InMemory, UnavailableModel};
+use harness::{
+    run_to_completion, BootError, Driver, EchoTool, InMemory, JevDecider, UnavailableModel,
+};
 use protocol::{
     fold, AgentId, Capability, Event, ExecutionPlacement, Limits, RunId, RunSpec, RunState,
     WorkModel,
 };
 use serde::Deserialize;
 
-use crate::local::LocalEchoFactory;
 use crate::store::{AgentManifest, RunStore, StoredRun};
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<dyn RunStore>,
-    echo: Arc<LocalEchoFactory>,
+    jev_base_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,13 +36,16 @@ struct RunBody {
     metadata: BTreeMap<String, String>,
 }
 
-pub fn router(store: Arc<dyn RunStore>, echo: Arc<LocalEchoFactory>) -> Router {
+pub fn router(store: Arc<dyn RunStore>, jev_base_url: impl Into<String>) -> Router {
     Router::new()
         .route("/v1/agents", post(create_agent))
         .route("/v1/runs", post(create_run))
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/events", get(get_events))
-        .with_state(AppState { store, echo })
+        .with_state(AppState {
+            store,
+            jev_base_url: jev_base_url.into(),
+        })
 }
 
 async fn create_agent(
@@ -57,23 +61,18 @@ async fn create_run(
     Json(body): Json<RunBody>,
 ) -> Result<Json<RunState>, ApiError> {
     let spec = spec_from_body(body);
-    let mut driver = match Driver::boot(spec.clone()) {
-        Ok(driver) => driver,
-        Err(BootError::UnsupportedPlacement(placement)) => {
+    let jev_base_url = state.jev_base_url.clone();
+    let spec_for_run = spec.clone();
+    let events = match tokio::task::spawn_blocking(move || run_with_jev(&jev_base_url, spec_for_run))
+        .await
+    {
+        Ok(Ok(events)) => events,
+        Ok(Err(RunStartError::Unsupported(placement))) => {
             return Err(ApiError::Unsupported(placement));
         }
+        Ok(Err(RunStartError::Decider(message))) => return Err(ApiError::Decider(message)),
+        Err(error) => return Err(ApiError::Decider(error.to_string())),
     };
-    let mut decider = state.echo.decider();
-    let echo = EchoTool;
-    run_to_completion(
-        &mut driver,
-        &mut decider,
-        &[&echo],
-        &UnavailableModel,
-        &mut InMemory::default(),
-    )
-    .map_err(|error| ApiError::Decider(error.message))?;
-    let events = driver.events().to_vec();
     let folded = fold(&spec, &events);
     state.store.put_run(StoredRun { spec, events });
     Ok(Json(folded))
@@ -93,6 +92,41 @@ async fn get_events(
 ) -> Result<Json<Vec<Event>>, ApiError> {
     let stored = state.store.run(id).ok_or(ApiError::NotFound)?;
     Ok(Json(stored.events))
+}
+
+fn run_with_jev(jev_base_url: &str, spec: RunSpec) -> Result<Vec<Event>, RunStartError> {
+    let mut driver = match Driver::boot(spec) {
+        Ok(driver) => driver,
+        Err(BootError::UnsupportedPlacement(placement)) => {
+            return Err(RunStartError::Unsupported(placement));
+        }
+    };
+    let client = jev_client(jev_base_url).map_err(RunStartError::Decider)?;
+    let mut decider = JevDecider::new(client);
+    let echo = EchoTool;
+    run_to_completion(
+        &mut driver,
+        &mut decider,
+        &[&echo],
+        &UnavailableModel,
+        &mut InMemory::default(),
+    )
+    .map_err(|error| RunStartError::Decider(error.message))?;
+    Ok(driver.events().to_vec())
+}
+
+fn jev_client(base_url: &str) -> Result<typesafe_sdk::blocking::Client, String> {
+    typesafe_sdk::blocking::Client::builder()
+        .api_key("gol")
+        .base_url(base_url)
+        .retry(typesafe_sdk::RetryPolicy::disabled())
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+enum RunStartError {
+    Unsupported(ExecutionPlacement),
+    Decider(String),
 }
 
 fn spec_from_body(body: RunBody) -> RunSpec {
