@@ -1,0 +1,47 @@
+name: lockdeps
+on:
+  push:
+    paths:
+      - .github/workflows/lockdeps.yml
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: record server deps in Cargo.lock
+        run: |
+          set -eu
+          python3 - << 'PY'
+          from pathlib import Path
+          path = Path("Cargo.lock")
+          text = path.read_text()
+          old = """name = \"server\"
+          version = \"0.1.0\"
+          dependencies = [
+           \"axum\",
+           \"harness\",
+           \"protocol\",
+           \"reqwest\",
+           \"serde\",
+           \"serde_json\",
+           \"tokio\",
+           \"uuid\",
+          ]
+          """
+          new = old.replace(
+              ' \"tokio\",\n \"uuid\",',
+              ' \"tokio\",\n \"typesafe-sdk\",\n \"uuid\",\n \"wiremock\",',
+          )
+          if old not in text:
+              raise SystemExit("server block not found")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          test "$(git hash-object Cargo.lock)" = "4eea4f51dd37035f9835e23dec30d7442778582b"
+          git config user.email "lockdeps@users.noreply.github.com"
+          git config user.name "lockdeps"
+          git add Cargo.lock
+          git rm -f .github/workflows/lockdeps.yml
+          git commit -m "Record server typesafe-sdk and wiremock in Cargo.lock"
+          git push
