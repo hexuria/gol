@@ -1,0 +1,21 @@
+name: agui
+on:
+  push:
+    paths:
+      - .github/workflows/agui.yml
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -c "from pathlib import Path; p=Path('.github/apply_agui.py'); p.write_text(p.read_text().replace(chr(92)+chr(34), chr(34)))"
+      - run: python3 .github/apply_agui.py
+      - run: |
+          git config user.name gol
+          git config user.email gol@users.noreply.github.com
+          git add crates/server/src/http.rs crates/server/tests/http_run.rs
+          git rm .github/apply_agui.py .github/workflows/agui.yml
+          git commit -m "feat(server): serve AG-UI events and a json-render spec"
+          git push
