@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use server::{router, InMemoryStore};
+use server::{router_with_gateway, HttpGatewayPoster, InMemoryStore};
 
 #[tokio::main]
 async fn main() {
@@ -10,7 +10,11 @@ async fn main() {
         .unwrap_or(43123);
     let jev_base_url = std::env::var("TYPESAFE_BASE_URL")
         .unwrap_or_else(|_| "https://api.typesafe.ai".to_string());
-    let app = router(Arc::new(InMemoryStore::default()), jev_base_url);
+    let app = router_with_gateway(
+        Arc::new(InMemoryStore::default()),
+        jev_base_url,
+        Arc::new(HttpGatewayPoster::from_env()),
+    );
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .expect("bind");

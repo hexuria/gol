@@ -1,0 +1,18 @@
+[package]
+name = "proxy"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "gol-proxy"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+
+[dev-dependencies]
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }

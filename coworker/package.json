@@ -1,0 +1,13 @@
+{
+  "name": "gol-coworker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun chat.tsx",
+    "test": "node --test turn.test.mjs"
+  },
+  "dependencies": {
+    "@gpuix/react": "0.10.0",
+    "react": "^19.2.4"
+  }
+}
