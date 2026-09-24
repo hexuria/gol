@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use protocol::{AgentId, Capability, Event, RunId, RunSpec};
+use protocol::{AgentId, ArtifactId, Capability, Event, RunId, RunSpec};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentManifest {
@@ -18,16 +18,27 @@ pub struct StoredRun {
     pub events: Vec<Event>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredArtifact {
+    pub id: ArtifactId,
+    pub run_id: RunId,
+    pub name: String,
+    pub body: Vec<u8>,
+}
+
 pub trait RunStore: Send + Sync {
     fn put_agent(&self, agent: AgentManifest);
     fn put_run(&self, run: StoredRun);
     fn run(&self, id: RunId) -> Option<StoredRun>;
+    fn put_artifact(&self, artifact: StoredArtifact);
+    fn artifact(&self, id: ArtifactId) -> Option<StoredArtifact>;
 }
 
 #[derive(Default)]
 pub struct InMemoryStore {
     agents: Mutex<HashMap<AgentId, AgentManifest>>,
     runs: Mutex<HashMap<RunId, StoredRun>>,
+    artifacts: Mutex<HashMap<ArtifactId, StoredArtifact>>,
 }
 
 impl RunStore for InMemoryStore {
@@ -47,5 +58,16 @@ impl RunStore for InMemoryStore {
 
     fn run(&self, id: RunId) -> Option<StoredRun> {
         self.runs.lock().expect("run store").get(&id).cloned()
+    }
+
+    fn put_artifact(&self, artifact: StoredArtifact) {
+        self.artifacts
+            .lock()
+            .expect("artifact store")
+            .insert(artifact.id, artifact);
+    }
+
+    fn artifact(&self, id: ArtifactId) -> Option<StoredArtifact> {
+        self.artifacts.lock().expect("artifact store").get(&id).cloned()
     }
 }
