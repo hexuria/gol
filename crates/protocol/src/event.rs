@@ -3,7 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, ApprovalId, Effect, EventId, FailureClass, MemoryScope, ModelMessage, RunId, StepId,
+    AgentId, ApprovalId, Effect, EventId, FailureClass, InvocationId, MemoryScope, ModelMessage,
+    RunId, StepId,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +94,9 @@ pub enum EventPayload {
     },
     ToolResult {
         name: String,
+        invocation: InvocationId,
+        step: u32,
+        attempt: u32,
         output: String,
     },
     ModelResponded {

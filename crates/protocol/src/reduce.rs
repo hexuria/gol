@@ -64,16 +64,33 @@ pub fn reduce(state: HarnessState, event: &Event) -> (HarnessState, Effects) {
             other => (other, Vec::new()),
         },
         EventPayload::EffectAuthorized { effect } => on_authorized(state, effect),
-        EventPayload::ToolResult { .. } => match state {
-            HarnessState::WaitingForTool { step, attempt } => (
-                HarnessState::Running {
-                    step,
-                    attempt,
-                    answered: true,
-                },
-                Vec::new(),
-            ),
-            other => (other, Vec::new()),
+        EventPayload::ToolResult {
+            name,
+            invocation,
+            step,
+            attempt,
+            ..
+        } => match &state {
+            HarnessState::WaitingForTool {
+                step: waiting_step,
+                attempt: waiting_attempt,
+                name: waiting_name,
+                invocation: waiting_invocation,
+            } if *step == *waiting_step
+                && *attempt == *waiting_attempt
+                && name == waiting_name
+                && invocation == waiting_invocation =>
+            {
+                (
+                    HarnessState::Running {
+                        step: *waiting_step,
+                        attempt: *waiting_attempt,
+                        answered: true,
+                    },
+                    Vec::new(),
+                )
+            }
+            _ => (state, Vec::new()),
         },
         EventPayload::StepRetried => match state {
             HarnessState::Running {
@@ -174,8 +191,15 @@ fn on_authorized(state: HarnessState, effect: &Effect) -> (HarnessState, Effects
     };
 
     match effect {
-        Effect::ToolCall { .. } if !answered && (1..=MAX_STEPS).contains(&step) => (
-            HarnessState::WaitingForTool { step, attempt },
+        Effect::ToolCall {
+            name, invocation, ..
+        } if !answered && (1..=MAX_STEPS).contains(&step) => (
+            HarnessState::WaitingForTool {
+                step,
+                attempt,
+                name: name.clone(),
+                invocation: *invocation,
+            },
             vec![effect.clone()],
         ),
         Effect::Complete { outcome } => (
@@ -195,8 +219,34 @@ fn on_authorized(state: HarnessState, effect: &Effect) -> (HarnessState, Effects
 mod tests {
     use super::*;
     use crate::spec::sample_spec;
-    use crate::{Actor, Event, FailureClass, Timestamp};
+    use crate::{Actor, Event, FailureClass, InvocationId, Timestamp};
     use proptest::prelude::*;
+    use uuid::Uuid;
+
+    fn invocation() -> InvocationId {
+        InvocationId::from_uuid(Uuid::from_u128(1))
+    }
+
+    fn other_invocation() -> InvocationId {
+        InvocationId::from_uuid(Uuid::from_u128(2))
+    }
+
+    fn echo_call(input: &str) -> Effect {
+        Effect::ToolCall {
+            name: "echo".to_string(),
+            input: input.to_string(),
+            invocation: invocation(),
+        }
+    }
+
+    fn echo_wait(step: u32, attempt: u32) -> HarnessState {
+        HarnessState::WaitingForTool {
+            step,
+            attempt,
+            name: "echo".to_string(),
+            invocation: invocation(),
+        }
+    }
 
     fn ev(payload: EventPayload) -> Event {
         let spec = sample_spec();
@@ -212,11 +262,24 @@ mod tests {
         )
     }
 
-    fn tool_result() -> Event {
+    fn tool_result_for(
+        name: &str,
+        invocation: InvocationId,
+        step: u32,
+        attempt: u32,
+        output: &str,
+    ) -> Event {
         ev(EventPayload::ToolResult {
-            name: "echo".to_string(),
-            output: "hello".to_string(),
+            name: name.to_string(),
+            invocation,
+            step,
+            attempt,
+            output: output.to_string(),
         })
+    }
+
+    fn tool_result() -> Event {
+        tool_result_for("echo", invocation(), 1, 0, "hello")
     }
 
     #[test]
@@ -226,32 +289,36 @@ mod tests {
             attempt: 0,
             answered: false,
         };
-        let effect = Effect::ToolCall {
-            name: "echo".to_string(),
-            input: "hello".to_string(),
-        };
+        let effect = echo_call("hello");
         let (next, effects) = reduce(
             running,
             &ev(EventPayload::EffectAuthorized {
                 effect: effect.clone(),
             }),
         );
-        assert_eq!(
-            next,
-            HarnessState::WaitingForTool {
-                step: 1,
-                attempt: 0
-            }
-        );
+        assert_eq!(next, echo_wait(1, 0));
         assert_eq!(effects, vec![effect]);
     }
 
     #[test]
+    fn mismatched_tool_result_leaves_the_wait() {
+        let waiting = echo_wait(1, 0);
+        let mismatches = [
+            tool_result_for("other", invocation(), 1, 0, "nope"),
+            tool_result_for("echo", other_invocation(), 1, 0, "nope"),
+            tool_result_for("echo", invocation(), 2, 0, "nope"),
+            tool_result_for("echo", invocation(), 1, 1, "nope"),
+        ];
+        for event in mismatches {
+            let (next, effects) = reduce(waiting.clone(), &event);
+            assert_eq!(next, waiting);
+            assert!(effects.is_empty());
+        }
+    }
+
+    #[test]
     fn duplicate_tool_result_stays_answered() {
-        let waiting = HarnessState::WaitingForTool {
-            step: 1,
-            attempt: 0,
-        };
+        let waiting = echo_wait(1, 0);
         let (answered, effects) = reduce(waiting, &tool_result());
         assert!(effects.is_empty());
         let (again, effects) = reduce(answered.clone(), &tool_result());
@@ -269,10 +336,7 @@ mod tests {
 
     #[test]
     fn late_tool_result_after_cancel_stays_cancelled() {
-        let waiting = HarnessState::WaitingForTool {
-            step: 1,
-            attempt: 0,
-        };
+        let waiting = echo_wait(1, 0);
         let (cancelled, _) = reduce(waiting, &ev(EventPayload::RunCancelled));
         assert_eq!(cancelled, HarnessState::Cancelled);
         let (next, effects) = reduce(cancelled, &tool_result());
@@ -289,10 +353,7 @@ mod tests {
 
     #[test]
     fn fail_while_waiting_clears_the_wait() {
-        let waiting = HarnessState::WaitingForTool {
-            step: 1,
-            attempt: 0,
-        };
+        let waiting = echo_wait(1, 0);
         let (next, effects) = reduce(
             waiting,
             &ev(EventPayload::RunFailed {
@@ -317,23 +378,14 @@ mod tests {
             attempt: 0,
             answered: false,
         };
-        let first = Effect::ToolCall {
-            name: "echo".to_string(),
-            input: "one".to_string(),
-        };
+        let first = echo_call("one");
         let (waiting, effects) = reduce(
             running,
             &ev(EventPayload::EffectAuthorized {
                 effect: first.clone(),
             }),
         );
-        assert_eq!(
-            waiting,
-            HarnessState::WaitingForTool {
-                step: 1,
-                attempt: 0
-            }
-        );
+        assert_eq!(waiting, echo_wait(1, 0));
         assert_eq!(effects, vec![first]);
 
         let (answered, effects) = reduce(waiting, &tool_result());
@@ -361,6 +413,7 @@ mod tests {
         let second = Effect::ToolCall {
             name: "echo".to_string(),
             input: "two".to_string(),
+            invocation: other_invocation(),
         };
         let (waiting, effects) = reduce(
             next,
@@ -373,7 +426,9 @@ mod tests {
             waiting,
             HarnessState::WaitingForTool {
                 step: 2,
-                attempt: 0
+                attempt: 0,
+                name: "echo".to_string(),
+                invocation: other_invocation(),
             }
         );
     }
@@ -447,8 +502,22 @@ mod tests {
             any::<String>().prop_map(|outcome| EventPayload::RunCompleted { outcome }),
             (failure_class(), any::<String>())
                 .prop_map(|(class, message)| { EventPayload::RunFailed { class, message } }),
-            (any::<String>(), any::<String>())
-                .prop_map(|(name, output)| EventPayload::ToolResult { name, output }),
+            (
+                any::<String>(),
+                any::<u128>(),
+                any::<u32>(),
+                any::<u32>(),
+                any::<String>(),
+            )
+                .prop_map(|(name, bits, step, attempt, output)| {
+                    EventPayload::ToolResult {
+                        name,
+                        invocation: InvocationId::from_uuid(Uuid::from_u128(bits)),
+                        step,
+                        attempt,
+                        output,
+                    }
+                }),
             any::<String>().prop_map(|outcome| EventPayload::EffectAuthorized {
                 effect: Effect::Complete { outcome },
             }),

@@ -1,5 +1,5 @@
 use harness::{Decider, DeciderError, DecisionView};
-use protocol::Effect;
+use protocol::{Effect, InvocationId};
 
 pub struct LocalEchoFactory;
 
@@ -13,6 +13,7 @@ impl Decider for LocalEchoDecider {
             Effect::ToolCall {
                 name: "echo".to_string(),
                 input: view.spec.input.clone(),
+                invocation: InvocationId::new(),
             }
         } else {
             Effect::Complete {

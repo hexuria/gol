@@ -30,10 +30,12 @@ fn script() -> ScriptedDecider {
         Effect::ToolCall {
             name: "other".to_string(),
             input: "nope".to_string(),
+            invocation: protocol::InvocationId::new(),
         },
         Effect::ToolCall {
             name: "echo".to_string(),
             input: "hello".to_string(),
+            invocation: protocol::InvocationId::new(),
         },
         Effect::Complete {
             outcome: "done".to_string(),
@@ -53,7 +55,7 @@ fn reverse_worker_runs_echo_off_the_caller_thread() {
     )));
     assert!(run.events.iter().any(|event| matches!(
         &event.payload,
-        EventPayload::ToolResult { name, output } if name == "echo" && output == "hello"
+        EventPayload::ToolResult { name, output, .. } if name == "echo" && output == "hello"
     )));
     let folded = protocol::fold(&spec, &run.events);
     assert!(matches!(folded.harness, HarnessState::Completed { .. }));
@@ -67,7 +69,7 @@ fn box_worker_runs_only_the_boxed_echo_tool() {
     assert_ne!(run.worker_thread, caller);
     assert!(run.events.iter().any(|event| matches!(
         &event.payload,
-        EventPayload::ToolResult { name, output } if name == "echo" && output == "hello"
+        EventPayload::ToolResult { name, output, .. } if name == "echo" && output == "hello"
     )));
     assert!(!run.events.iter().any(|event| matches!(
         &event.payload,

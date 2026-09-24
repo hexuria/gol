@@ -1,6 +1,4 @@
-use protocol::{
-    Actor, AgentId, Event, EventPayload, ModelMessage, MessageRole, RunId, Timestamp,
-};
+use protocol::{Actor, AgentId, Event, EventPayload, MessageRole, ModelMessage, RunId, Timestamp};
 use server::{ag_ui_events, json_render_spec};
 
 fn event(run_id: RunId, payload: EventPayload) -> Event {
@@ -26,6 +24,9 @@ fn ag_ui_maps_tool_result_and_completion() {
                 run_id,
                 EventPayload::ToolResult {
                     name: "echo".to_string(),
+                    invocation: protocol::InvocationId::new(),
+                    step: 1,
+                    attempt: 0,
                     output: "hello".to_string(),
                 },
             ),

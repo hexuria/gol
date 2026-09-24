@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentId, ApprovalId, ArtifactId};
+use crate::{AgentId, ApprovalId, ArtifactId, InvocationId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum MemoryScope {
@@ -22,6 +22,7 @@ pub enum Effect {
     ToolCall {
         name: String,
         input: String,
+        invocation: InvocationId,
     },
     MemoryRead {
         scope: MemoryScope,

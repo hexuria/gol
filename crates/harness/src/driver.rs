@@ -1,6 +1,6 @@
 use protocol::{
     authorize, fold, Actor, Effect, Event, EventPayload, ExecutionPlacement, FailureClass,
-    HarnessState, PolicyDecision, RunSpec, RunState, Timestamp, ToolDescriptor,
+    HarnessState, InvocationId, PolicyDecision, RunSpec, RunState, Timestamp, ToolDescriptor,
 };
 
 use crate::{
@@ -76,14 +76,28 @@ impl Driver {
     pub fn deliver_tool_result(
         &mut self,
         name: impl Into<String>,
+        invocation: InvocationId,
         output: impl Into<String>,
     ) -> bool {
-        if !matches!(self.state().harness, HarnessState::WaitingForTool { .. }) {
+        let name = name.into();
+        let HarnessState::WaitingForTool {
+            step,
+            attempt,
+            name: expected_name,
+            invocation: expected_invocation,
+        } = self.state().harness
+        else {
+            return false;
+        };
+        if name != expected_name || invocation != expected_invocation {
             return false;
         }
         self.push(
             EventPayload::ToolResult {
-                name: name.into(),
+                name,
+                invocation,
+                step,
+                attempt,
                 output: output.into(),
             },
             Actor::Tool,
@@ -189,8 +203,20 @@ impl Driver {
     ) {
         for effect in effects {
             match effect {
-                Effect::ToolCall { name, input } => {
-                    if !matches!(self.state().harness, HarnessState::WaitingForTool { .. }) {
+                Effect::ToolCall {
+                    name,
+                    input,
+                    invocation,
+                } => {
+                    let HarnessState::WaitingForTool {
+                        name: waiting_name,
+                        invocation: waiting_invocation,
+                        ..
+                    } = self.state().harness
+                    else {
+                        continue;
+                    };
+                    if waiting_name != *name || waiting_invocation != *invocation {
                         continue;
                     }
                     let Some(tool) = tools.iter().find(|tool| tool.descriptor().name == *name)
@@ -205,7 +231,7 @@ impl Driver {
                         return;
                     };
                     let output = tool.call(input);
-                    self.deliver_tool_result(name, output);
+                    self.deliver_tool_result(name, *invocation, output);
                 }
                 Effect::ModelCall { prompt } => {
                     let request = protocol::ModelRequest {
@@ -362,6 +388,7 @@ mod tests {
         Effect::ToolCall {
             name: "echo".to_string(),
             input: "hello".to_string(),
+            invocation: InvocationId::from_uuid(uuid::Uuid::from_u128(1)),
         }
     }
 
@@ -393,17 +420,17 @@ mod tests {
     #[test]
     fn two_authorized_tool_steps_both_execute() {
         let mut driver = Driver::boot(local_echo()).unwrap();
-        let mut decider = ScriptedDecider::new([
-            Effect::ToolCall {
-                name: "echo".to_string(),
-                input: "one".to_string(),
-            },
-            Effect::ToolCall {
-                name: "echo".to_string(),
-                input: "two".to_string(),
-            },
-            complete(),
-        ]);
+        let first = Effect::ToolCall {
+            name: "echo".to_string(),
+            input: "one".to_string(),
+            invocation: InvocationId::from_uuid(uuid::Uuid::from_u128(1)),
+        };
+        let second = Effect::ToolCall {
+            name: "echo".to_string(),
+            input: "two".to_string(),
+            invocation: InvocationId::from_uuid(uuid::Uuid::from_u128(2)),
+        };
+        let mut decider = ScriptedDecider::new([first, second.clone(), complete()]);
         let echo = EchoTool;
         let tools: [&dyn Tool; 1] = [&echo];
         run_to_completion(
@@ -422,10 +449,12 @@ mod tests {
                 EventPayload::ToolResult {
                     name: first_name,
                     output: first_output,
+                    ..
                 },
                 EventPayload::ToolResult {
                     name: second_name,
                     output: second_output,
+                    ..
                 },
             ) => {
                 assert_eq!(first_name, "echo");
@@ -470,7 +499,9 @@ mod tests {
             waiting.harness,
             HarnessState::WaitingForTool {
                 step: 2,
-                attempt: 0
+                attempt: 0,
+                name: "echo".to_string(),
+                invocation: InvocationId::from_uuid(uuid::Uuid::from_u128(2)),
             }
         );
         assert_eq!(
@@ -510,7 +541,7 @@ mod tests {
         );
         assert_eq!(tool_results(driver.events()).len(), 1);
         match &tool_results(driver.events())[0].payload {
-            EventPayload::ToolResult { name, output } => {
+            EventPayload::ToolResult { name, output, .. } => {
                 assert_eq!(name, "echo");
                 assert_eq!(output, "hello");
             }
@@ -549,6 +580,42 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_tool_result_leaves_the_original_call_outstanding() {
+        let invocation = InvocationId::from_uuid(uuid::Uuid::from_u128(1));
+        let call = Effect::ToolCall {
+            name: "echo".to_string(),
+            input: "hello".to_string(),
+            invocation,
+        };
+        let mut driver = Driver::boot(local_echo()).unwrap();
+        let mut decider = ScriptedDecider::new([call.clone()]);
+        let echo = EchoTool;
+        let effects = driver.decide(&mut decider, &[echo.descriptor()]).unwrap();
+        let outstanding = HarnessState::WaitingForTool {
+            step: 1,
+            attempt: 0,
+            name: "echo".to_string(),
+            invocation,
+        };
+        assert_eq!(effects, vec![call]);
+        assert_eq!(driver.state().harness, outstanding);
+        assert!(!driver.deliver_tool_result(
+            "other",
+            InvocationId::from_uuid(uuid::Uuid::from_u128(2)),
+            "nope",
+        ));
+        assert_eq!(driver.state().harness, outstanding);
+        assert!(tool_results(driver.events()).is_empty());
+        assert!(!driver.deliver_tool_result(
+            "echo",
+            InvocationId::from_uuid(uuid::Uuid::from_u128(2)),
+            "nope",
+        ));
+        assert_eq!(driver.state().harness, outstanding);
+        assert!(tool_results(driver.events()).is_empty());
+    }
+
+    #[test]
     fn duplicate_tool_result_is_not_appended() {
         let mut driver = Driver::boot(local_echo()).unwrap();
         let mut decider = ScriptedDecider::new([tool_call()]);
@@ -562,7 +629,11 @@ mod tests {
             &mut InMemory::default(),
         );
         assert_eq!(tool_results(driver.events()).len(), 1);
-        assert!(!driver.deliver_tool_result("echo", "again"));
+        assert!(!driver.deliver_tool_result(
+            "echo",
+            InvocationId::from_uuid(uuid::Uuid::from_u128(1)),
+            "again"
+        ));
         assert_eq!(tool_results(driver.events()).len(), 1);
         assert_eq!(
             driver.state().harness,
@@ -585,7 +656,11 @@ mod tests {
             HarnessState::WaitingForTool { .. }
         ));
         driver.cancel();
-        assert!(!driver.deliver_tool_result("echo", "late"));
+        assert!(!driver.deliver_tool_result(
+            "echo",
+            InvocationId::from_uuid(uuid::Uuid::from_u128(1)),
+            "late"
+        ));
         driver.perform(
             &effects,
             &[&echo],
