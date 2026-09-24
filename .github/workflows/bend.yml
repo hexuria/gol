@@ -1,0 +1,19 @@
+name: bend
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  bend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Install Bend 2.0.27
+        run: |
+          curl -fsSL https://bend-lang.com/install.sh | sh
+          echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
+          test "$(BEND_NO_TELEMETRY=1 "$HOME/.bend/bin/bend" version)" = "bend 2.0.27"
+      - name: Verify Bend
+        run: ./scripts/verify-bend.sh

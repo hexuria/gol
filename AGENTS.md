@@ -1686,3 +1686,17 @@ Tests are written before the behavior they describe.
 Provider HTTP tests use wiremock.
 
 Hot paths have Criterion benchmarks. The fold and the harness reducer are the first two. A benchmark is a regression signal. It is not a claim that the algorithm is optimal.
+
+---
+
+# 43. Bend Policy
+
+Bend is the language for verified pure workflow logic. It does not replace TLA+ or Lean, and it is not a place to rewrite the Rust harness.
+
+Run `bend guide` before a non-trivial Bend change. Current upstream docs win when an older Bend or HVM1 article disagrees.
+
+Laws live in `LAWS.bend`. Proofs live in `PROOF.bend`. Run the proofs before committing. `./scripts/verify-bend.sh` is the gate: syntax, types, laws, proofs, and Rust compatibility. A proof that fails means stop. Never weaken a law to make a proof pass. When a law fails, decide whether the implementation or the spec is wrong.
+
+Bend is for pure verified computation. Parallelize only independent computation. Effects stay in Rust. A passed proof is not a sandbox: Rust keeps the timeout, the kill, and the output limit.
+
+Benchmark a Bend claim against idiomatic Rust. Do not claim a speedup the boundary benchmark did not measure.

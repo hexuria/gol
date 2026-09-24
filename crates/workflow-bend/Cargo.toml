@@ -1,0 +1,19 @@
+[package]
+name = "workflow-bend"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+workflow-core = { path = "../workflow-core" }
+libc = "0.2"
+
+[dev-dependencies]
+criterion = "0.5"
+harness-core = { path = "../harness-core" }
+workflow-js = { path = "../workflow-js" }
+workflow-rhai = { path = "../workflow-rhai" }
+
+[[bench]]
+name = "boundary"
+harness = false

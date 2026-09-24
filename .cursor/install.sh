@@ -33,6 +33,12 @@ if ! command -v bun >/dev/null 2>&1 && [ ! -x "${BUN_INSTALL}/bin/bun" ]; then
 fi
 export PATH="${BUN_INSTALL}/bin:${PATH}"
 
+export BEND_NO_TELEMETRY=1
+if [ ! -x "${HOME}/.bend/bin/bend" ]; then
+  curl -fsSL https://bend-lang.com/install.sh | sh
+fi
+export PATH="${HOME}/.bend/bin:${PATH}"
+
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${root}"
 cargo fetch
