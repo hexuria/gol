@@ -30,6 +30,10 @@ impl LoadedCatalog {
     pub fn tools(&self) -> Vec<&dyn Tool> {
         self.tools.iter().map(|tool| tool.as_ref()).collect()
     }
+
+    pub fn into_parts(self) -> (Vec<Box<dyn Tool>>, Vec<Skill>) {
+        (self.tools, self.skills)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,7 +69,7 @@ pub fn load_catalog(dir: impl AsRef<Path>) -> Result<LoadedCatalog, LoadError> {
     }
 
     for server in &file.mcp {
-        let session = McpSession::spawn(server)?;
+        let session = McpSession::spawn(dir, server)?;
         let listed = session.lock().expect("mcp").list_tools()?;
         let shared = Arc::new(session);
         for listed_tool in listed {
@@ -108,14 +112,15 @@ struct McpSession {
 }
 
 impl McpSession {
-    fn spawn(server: &McpServer) -> Result<Mutex<Self>, LoadError> {
+    fn spawn(dir: &Path, server: &McpServer) -> Result<Mutex<Self>, LoadError> {
         let mut child = Command::new(&server.command)
             .args(&server.args)
+            .current_dir(dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|err| LoadError::Mcp(err.to_string()))?;
+            .map_err(|err| LoadError::Mcp(format!("{}: {err}", server.name)))?;
         let stdin = child.stdin.take().ok_or_else(|| LoadError::Mcp("no stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| LoadError::Mcp("no stdout".into()))?;
         let mut session = Self {
@@ -185,6 +190,9 @@ impl McpSession {
         });
         self.send(&message)?;
         let value = self.read_value()?;
+        if value.get("id").and_then(|item| item.as_i64()) != Some(id) {
+            return Err(LoadError::Mcp("malformed response".into()));
+        }
         if let Some(error) = value.get("error") {
             return Err(LoadError::Mcp(error.to_string()));
         }
