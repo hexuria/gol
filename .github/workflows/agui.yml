@@ -16,6 +16,6 @@ jobs:
           git config user.name gol
           git config user.email gol@users.noreply.github.com
           git add crates/server/src/http.rs crates/server/tests/http_run.rs
-          git rm .github/apply_agui.py .github/workflows/agui.yml
+          git rm -f .github/apply_agui.py .github/workflows/agui.yml
           git commit -m "feat(server): serve AG-UI events and a json-render spec"
           git push
