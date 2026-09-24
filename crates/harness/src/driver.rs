@@ -3,7 +3,9 @@ use protocol::{
     HarnessState, PolicyDecision, RunSpec, RunState, Timestamp, ToolDescriptor,
 };
 
-use crate::{Decider, DeciderError, DecisionView, Memory, ModelCompletion, Skill, Tool};
+use crate::{
+    Decider, DeciderError, DecisionView, LoadedCatalog, Memory, ModelCompletion, Skill, Tool,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BootError {
@@ -13,6 +15,8 @@ pub enum BootError {
 pub struct Driver {
     spec: RunSpec,
     events: Vec<Event>,
+    skills: Vec<Skill>,
+    loaded: Option<Vec<Box<dyn Tool>>>,
 }
 
 impl Driver {
@@ -23,9 +27,34 @@ impl Driver {
         let mut driver = Self {
             spec,
             events: Vec::new(),
+            skills: Vec::new(),
+            loaded: None,
         };
         driver.push(EventPayload::RunStarted, Actor::System);
         Ok(driver)
+    }
+
+    pub fn boot_with_catalog(spec: RunSpec, catalog: LoadedCatalog) -> Result<Self, BootError> {
+        let mut driver = Self::boot(spec)?;
+        let (tools, skills) = catalog.into_parts();
+        driver.loaded = Some(tools);
+        driver.skills = skills;
+        Ok(driver)
+    }
+
+    pub fn run_loaded(
+        &mut self,
+        decider: &mut dyn Decider,
+        models: &dyn ModelCompletion,
+        memory: &mut dyn Memory,
+    ) -> Result<(), DeciderError> {
+        let tools = self.loaded.take().unwrap_or_default();
+        let result = {
+            let refs: Vec<&dyn Tool> = tools.iter().map(|tool| tool.as_ref()).collect();
+            run_to_completion(self, decider, &refs, models, memory)
+        };
+        self.loaded = Some(tools);
+        result
     }
 
     pub fn events(&self) -> &[Event] {
@@ -67,7 +96,8 @@ impl Driver {
         decider: &mut dyn Decider,
         tools: &[ToolDescriptor],
     ) -> Result<Vec<Effect>, DeciderError> {
-        self.decide_with_skills(decider, tools, &[])
+        let skills = self.skills.clone();
+        self.decide_with_skills(decider, tools, &skills)
     }
 
     pub fn decide_with_skills(
