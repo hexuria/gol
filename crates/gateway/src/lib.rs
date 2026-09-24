@@ -1,6 +1,7 @@
 mod client;
 mod error;
 mod openai;
+mod providers;
 mod transport;
 
 pub use client::{GatewayClient, Missing, ModelGateway, Set};
