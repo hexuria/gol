@@ -6,5 +6,5 @@ publish = false
 
 [dependencies]
 protocol = { path = "../protocol" }
-serde_json = "=1.0.134"
+serde_json = "1"
 typesafe-sdk = { version = "0.1.2", features = ["blocking"] }
