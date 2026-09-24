@@ -259,6 +259,21 @@ impl Driver {
         }
     }
 
+    fn advance_answered_step(&mut self) {
+        let HarnessState::Running {
+            step,
+            answered: true,
+            ..
+        } = self.state().harness
+        else {
+            return;
+        };
+        if step >= protocol::MAX_STEPS {
+            return;
+        }
+        self.push(EventPayload::StepAdvanced, Actor::System);
+    }
+
     fn push(&mut self, payload: EventPayload, actor: Actor) {
         self.events.push(Event::record(
             self.spec.run_id,
@@ -293,6 +308,7 @@ pub fn run_to_completion(
             continue;
         }
         driver.perform(&effects, tools, models, memory);
+        driver.advance_answered_step();
     }
 }
 
@@ -372,6 +388,97 @@ mod tests {
         fn call(&self, _input: &str) -> String {
             panic!("tool executed");
         }
+    }
+
+    #[test]
+    fn two_authorized_tool_steps_both_execute() {
+        let mut driver = Driver::boot(local_echo()).unwrap();
+        let mut decider = ScriptedDecider::new([
+            Effect::ToolCall {
+                name: "echo".to_string(),
+                input: "one".to_string(),
+            },
+            Effect::ToolCall {
+                name: "echo".to_string(),
+                input: "two".to_string(),
+            },
+            complete(),
+        ]);
+        let echo = EchoTool;
+        let tools: [&dyn Tool; 1] = [&echo];
+        run_to_completion(
+            &mut driver,
+            &mut decider,
+            &tools,
+            &UnavailableModel,
+            &mut InMemory::default(),
+        )
+        .unwrap();
+
+        let results = tool_results(driver.events());
+        assert_eq!(results.len(), 2);
+        match (&results[0].payload, &results[1].payload) {
+            (
+                EventPayload::ToolResult {
+                    name: first_name,
+                    output: first_output,
+                },
+                EventPayload::ToolResult {
+                    name: second_name,
+                    output: second_output,
+                },
+            ) => {
+                assert_eq!(first_name, "echo");
+                assert_eq!(first_output, "one");
+                assert_eq!(second_name, "echo");
+                assert_eq!(second_output, "two");
+            }
+            _ => unreachable!(),
+        }
+
+        let events = driver.events();
+        let first_result = events
+            .iter()
+            .position(|event| matches!(event.payload, EventPayload::ToolResult { .. }))
+            .unwrap();
+        assert!(matches!(
+            events[first_result + 1].payload,
+            EventPayload::StepAdvanced
+        ));
+        let advanced = protocol::fold(&driver.spec, &events[..=first_result + 1]);
+        assert_eq!(
+            advanced.harness,
+            HarnessState::Running {
+                step: 2,
+                attempt: 0,
+                answered: false
+            }
+        );
+        let second_authorized = events
+            .iter()
+            .rposition(|event| {
+                matches!(
+                    &event.payload,
+                    EventPayload::EffectAuthorized {
+                        effect: Effect::ToolCall { .. }
+                    }
+                )
+            })
+            .unwrap();
+        let waiting = protocol::fold(&driver.spec, &events[..=second_authorized]);
+        assert_eq!(
+            waiting.harness,
+            HarnessState::WaitingForTool {
+                step: 2,
+                attempt: 0
+            }
+        );
+        assert_eq!(
+            driver.state().harness,
+            HarnessState::Completed {
+                outcome: "done".to_string()
+            }
+        );
     }
 
     #[test]

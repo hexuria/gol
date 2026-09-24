@@ -311,6 +311,74 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_then_step_advanced_opens_the_next_tool_call() {
+        let running = HarnessState::Running {
+            step: 1,
+            attempt: 0,
+            answered: false,
+        };
+        let first = Effect::ToolCall {
+            name: "echo".to_string(),
+            input: "one".to_string(),
+        };
+        let (waiting, effects) = reduce(
+            running,
+            &ev(EventPayload::EffectAuthorized {
+                effect: first.clone(),
+            }),
+        );
+        assert_eq!(
+            waiting,
+            HarnessState::WaitingForTool {
+                step: 1,
+                attempt: 0
+            }
+        );
+        assert_eq!(effects, vec![first]);
+
+        let (answered, effects) = reduce(waiting, &tool_result());
+        assert!(effects.is_empty());
+        assert_eq!(
+            answered,
+            HarnessState::Running {
+                step: 1,
+                attempt: 0,
+                answered: true
+            }
+        );
+
+        let (next, effects) = reduce(answered, &ev(EventPayload::StepAdvanced));
+        assert!(effects.is_empty());
+        assert_eq!(
+            next,
+            HarnessState::Running {
+                step: 2,
+                attempt: 0,
+                answered: false
+            }
+        );
+
+        let second = Effect::ToolCall {
+            name: "echo".to_string(),
+            input: "two".to_string(),
+        };
+        let (waiting, effects) = reduce(
+            next,
+            &ev(EventPayload::EffectAuthorized {
+                effect: second.clone(),
+            }),
+        );
+        assert_eq!(effects, vec![second]);
+        assert_eq!(
+            waiting,
+            HarnessState::WaitingForTool {
+                step: 2,
+                attempt: 0
+            }
+        );
+    }
+
+    #[test]
     fn retry_and_advance_stay_on_running() {
         let answered = HarnessState::Running {
             step: 1,
