@@ -1,0 +1,10 @@
+[package]
+name = "harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+protocol = { path = "../protocol" }
+serde_json = "=1.0.134"
+typesafe-sdk = { version = "0.1.2", features = ["blocking"] }
