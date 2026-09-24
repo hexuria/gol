@@ -2,14 +2,47 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use protocol::{AgentId, Capability, EventPayload, HarnessState, Limits};
-use server::{router, AgentManifest, InMemoryStore, LocalEchoFactory};
+use server::{router, AgentManifest, InMemoryStore};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn choice(effect: &str) -> serde_json::Value {
+    let mut probabilities = serde_json::json!({"echo": 0.0, "model": 0.0, "complete": 0.0});
+    probabilities[effect] = serde_json::json!(1.0);
+    serde_json::json!({
+        "model": "jev-latest",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+        "answers": {
+            "effect": {
+                "type": "choice",
+                "choice": effect,
+                "confidence": 1.0,
+                "probabilities": probabilities
+            }
+        }
+    })
+}
+
+async fn jev_mock() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice("echo")))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice("complete")))
+        .mount(&server)
+        .await;
+    server
+}
 
 #[tokio::test]
 async fn post_run_reads_completed_and_events() {
-    let app = router(
-        Arc::new(InMemoryStore::default()),
-        Arc::new(LocalEchoFactory),
-    );
+    let jev = jev_mock().await;
+    let app = router(Arc::new(InMemoryStore::default()), jev.uri());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -94,10 +127,7 @@ async fn post_run_reads_completed_and_events() {
 
 #[tokio::test]
 async fn reverse_placement_does_not_run() {
-    let app = router(
-        Arc::new(InMemoryStore::default()),
-        Arc::new(LocalEchoFactory),
-    );
+    let app = router(Arc::new(InMemoryStore::default()), "http://127.0.0.1:9");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -127,6 +157,46 @@ async fn reverse_placement_does_not_run() {
     )
     .await;
     assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn run_calls_jev_system_one() {
+    let jev = jev_mock().await;
+    let app = router(Arc::new(InMemoryStore::default()), jev.uri());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let client = reqwest::Client::new();
+    let response = post_when_up(
+        &client,
+        &format!("http://{addr}/v1/runs"),
+        &serde_json::json!({
+            "agent_id": AgentId::new(),
+            "agent_version": "1",
+            "input": "hello",
+            "placement": "Local",
+            "work_model": {
+                "provider": "OpenAI",
+                "model_name": "gpt-test",
+                "credential": "PlatformGateway"
+            },
+            "capabilities": ["tool.echo"],
+            "limits": { "max_steps": 8, "max_model_calls": 4 }
+        }),
+    )
+    .await;
+    assert!(response.status().is_success());
+    let requests = jev.received_requests().await.expect("requests");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.url.path() == "/v1/systemone"),
+        "server run did not call Jev"
+    );
 }
 
 async fn post_when_up(
