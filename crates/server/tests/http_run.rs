@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use protocol::{AgentId, Capability, EventPayload, HarnessState, Limits};
+use protocol::{AgentId, Capability, EventPayload, HarnessState};
 use server::{router, AgentManifest, InMemoryStore};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -126,37 +126,45 @@ async fn post_run_reads_completed_and_events() {
 }
 
 #[tokio::test]
-async fn reverse_placement_does_not_run() {
-    let app = router(Arc::new(InMemoryStore::default()), "http://127.0.0.1:9");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve");
-    });
-    let client = reqwest::Client::new();
-    let response = post_when_up(
-        &client,
-        &format!("http://{addr}/v1/runs"),
-        &serde_json::json!({
-            "agent_id": AgentId::new(),
-            "agent_version": "1",
-            "input": "hello",
-            "placement": "Reverse",
-            "work_model": {
-                "provider": "OpenAI",
-                "model_name": "gpt-test",
-                "credential": "PlatformGateway"
-            },
-            "limits": Limits {
-                max_steps: 4,
-                max_model_calls: 1
+async fn reverse_and_box_placements_complete() {
+    for placement in ["Reverse", "Box"] {
+        let jev = jev_mock().await;
+        let app = router(Arc::new(InMemoryStore::default()), jev.uri());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = reqwest::Client::new();
+        let response = post_when_up(
+            &client,
+            &format!("http://{addr}/v1/runs"),
+            &serde_json::json!({
+                "agent_id": AgentId::new(),
+                "agent_version": "1",
+                "input": "hello",
+                "placement": placement,
+                "work_model": {
+                    "provider": "OpenAI",
+                    "model_name": "gpt-test",
+                    "credential": "PlatformGateway"
+                },
+                "capabilities": ["tool.echo"],
+                "limits": { "max_steps": 8, "max_model_calls": 4 }
+            }),
+        )
+        .await;
+        assert!(response.status().is_success(), "{placement}");
+        let created: protocol::RunState = response.json().await.expect("run json");
+        assert_eq!(
+            created.harness,
+            HarnessState::Completed {
+                outcome: "done".to_string()
             }
-        }),
-    )
-    .await;
-    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        );
+    }
 }
 
 #[tokio::test]

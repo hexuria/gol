@@ -26,7 +26,7 @@ Cancellation is terminal. A later `ToolResult` stays `Cancelled`. A later `StepR
 
 `RunFailed` from `WaitingForTool` enters `Failed` in that same step. The wait does not survive the failure.
 
-`ExecutionPlacement::Reverse` and `ExecutionPlacement::Box` type-check on `RunSpec`. The execution boundary returns `ExecuteError::UnsupportedPlacement` and does not run the loop.
+`ExecutionPlacement::Reverse` and `ExecutionPlacement::Box` boot the same harness loop as `Local`. The execution crate runs each on its own worker thread.
 
 `RunQueued`, `RunScheduled`, `RunProvisioning`, `RunStarting`, `RunWaiting`, `RunRecovering`, `RunPaused`, and `RunAwaitingApproval` stay in the log and do not change `HarnessState`. `reduce_dispatch` is the only function that moves `DispatchPhase`.
 

@@ -6,7 +6,7 @@ The control plane accepts a run and records dispatch. Dispatch has its own reduc
 
 The harness plane owns the loop. `reduce` is pure. The driver performs an effect only after `reduce` emits it. The checked phases are `Idle`, `Running`, `WaitingForTool`, `Completed`, `Failed`, and `Cancelled`. `Running` stores the step, the attempt, and whether the current step has been answered. A tool result is an event.
 
-The execution plane is local and in-process. `Reverse` and `Box` type-check and stop at the execution boundary. One echo tool is registered. Memory is an in-memory map. The gateway turns one provider payload into `ModelMessage`. The harness does not read provider JSON.
+The execution plane runs `Local`, `Reverse`, and `Box`. Reverse and box run on a worker thread with the echo tool. Memory is an in-memory map. The gateway turns one provider payload into `ModelMessage`. The harness does not read provider JSON.
 
 ## Crates
 

@@ -20,7 +20,7 @@ The server listens on `http://127.0.0.1:43123`. Override the port with `GOL_PORT
 - `GET /v1/runs/{id}` returns the folded state.
 - `GET /v1/runs/{id}/events` returns the event log.
 
-`Reverse` and `Box` are valid placements on the spec. The server responds `422` and does not run the loop.
+`Reverse` and `Box` run the same loop as `Local`. The execution crate runs each placement on a worker thread.
 
 ## Formal model
 

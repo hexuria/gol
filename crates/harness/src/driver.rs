@@ -18,8 +18,7 @@ pub struct Driver {
 impl Driver {
     pub fn boot(spec: RunSpec) -> Result<Self, BootError> {
         match spec.placement {
-            ExecutionPlacement::Local => {}
-            placement => return Err(BootError::UnsupportedPlacement(placement)),
+            ExecutionPlacement::Local | ExecutionPlacement::Reverse | ExecutionPlacement::Box => {}
         }
         let mut driver = Self {
             spec,
@@ -460,16 +459,13 @@ mod tests {
     }
 
     #[test]
-    fn reverse_and_box_do_not_boot() {
-        let reverse = spec_with(ExecutionPlacement::Reverse, Vec::new());
-        let boxed = spec_with(ExecutionPlacement::Box, Vec::new());
-        assert_eq!(
-            Driver::boot(reverse).err(),
-            Some(BootError::UnsupportedPlacement(ExecutionPlacement::Reverse))
-        );
-        assert_eq!(
-            Driver::boot(boxed).err(),
-            Some(BootError::UnsupportedPlacement(ExecutionPlacement::Box))
-        );
+    fn reverse_and_box_boot_into_running() {
+        for placement in [ExecutionPlacement::Reverse, ExecutionPlacement::Box] {
+            let driver = Driver::boot(spec_with(placement, Vec::new())).unwrap();
+            assert!(matches!(
+                driver.state().harness,
+                HarnessState::Running { .. }
+            ));
+        }
     }
 }
