@@ -3,7 +3,7 @@ use protocol::{
     HarnessState, PolicyDecision, RunSpec, RunState, Timestamp, ToolDescriptor,
 };
 
-use crate::{Decider, DeciderError, DecisionView, Memory, ModelCompletion, Tool};
+use crate::{Decider, DeciderError, DecisionView, Memory, ModelCompletion, Skill, Tool};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BootError {
@@ -67,6 +67,15 @@ impl Driver {
         decider: &mut dyn Decider,
         tools: &[ToolDescriptor],
     ) -> Result<Vec<Effect>, DeciderError> {
+        self.decide_with_skills(decider, tools, &[])
+    }
+
+    pub fn decide_with_skills(
+        &mut self,
+        decider: &mut dyn Decider,
+        tools: &[ToolDescriptor],
+        skills: &[Skill],
+    ) -> Result<Vec<Effect>, DeciderError> {
         let state = self.state();
         if state.harness.is_terminal() {
             return Ok(Vec::new());
@@ -90,6 +99,7 @@ impl Driver {
                 state: &state,
                 events: &self.events,
                 tools,
+                skills,
             };
             decider.decide(&view)?
         };

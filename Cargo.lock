@@ -3194,7 +3194,9 @@ name = "harness"
 version = "0.1.0"
 dependencies = [
  "protocol",
+ "serde",
  "serde_json",
+ "toml 0.8.23",
  "typesafe-sdk",
 ]
 
