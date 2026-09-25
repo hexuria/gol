@@ -93,15 +93,14 @@ The installer checks the release archive sha256 and installs `bend 2.0.27`. `doc
 
 `formal/harness/Harness.tla` is the interleaving model. `formal/lean` is the single-turn proof. Findings are in `formal/harness/FINDINGS.md`.
 
-From `formal/harness`, with `Harness.cfg` in that directory:
+`./scripts/verify-tla.sh` runs TLC on every `formal/**/*.cfg` with `-workers auto -lncheck final -deadlock`. It reads the jar from `TLA_JAR`, then `~/.local/tla/tla2tools.jar`, then `/usr/share/java/tla2tools.jar`. `./scripts/verify-lean.sh` runs `lake build` in each Lean project.
 
 ```bash
-java -jar /path/to/tla2tools.jar -workers 2 -deadlock Harness.tla
+./scripts/verify-tla.sh
+./scripts/verify-lean.sh
 ```
 
-```bash
-cd formal/lean && lake build
-```
+`./scripts/verify-formal.sh` runs `verify-bend.sh`, `verify-tla.sh`, and `verify-lean.sh` in that order.
 
 ## Layout
 
