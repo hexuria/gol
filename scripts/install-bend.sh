@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Install the pinned Bend release into ~/.bend/bin. CI and .cursor/install.sh call this, so the pin
-# lives in one place. The upstream installer always serves the newest release; when that is not the
-# pin, print what it serves and stop instead of installing a different Bend.
+# lives in one place. bend-lang.com/install.sh always serves the newest release, with VER and one
+# SHA_<OS>_<ARCH> per archive. When it serves another release, point VER and SHA_LINUX_X64 back at
+# the pin; the installer's own sha256 check then verifies the pinned archive. Other platforms stop.
 set -euo pipefail
 
 pin="2.0.27"
-# sha256 of ~/.bend/bin/bend for the pin on linux-x64 (docs/bend.md).
+# linux-x64 release archive and installed binary for the pin (docs/bend.md).
+archive_sha256="58adc86af6605ed0c48f7d84e4c23028f78893ce4a867a20a4f004b11582687b"
 bin_sha256="38330ad07e228ba7a317836f484648cba93a1a3927357edccc65e3f2a0de253a"
 bin="${HOME}/.bend/bin/bend"
 export BEND_NO_TELEMETRY=1
@@ -20,10 +22,18 @@ if ! installed; then
   curl -fsSL -o "${script}" https://bend-lang.com/install.sh
   served="$(sed -n 's/^VER=["'\'']\{0,1\}\([^"'\'' ]*\).*/\1/p' "${script}" | head -n 1)"
   if [ "${served}" != "${pin}" ]; then
-    echo "bend-lang.com/install.sh serves VER=${served:-?}, the pin is ${pin}." >&2
-    echo "Version, URL, and checksum lines of the served installer:" >&2
-    grep -n -E 'VER|https?://|sha256|[0-9a-f]{64}' "${script}" >&2 || true
-    exit 1
+    if [ "$(uname -s)-$(uname -m)" != "Linux-x86_64" ]; then
+      echo "bend-lang.com/install.sh serves ${served:-?}; only linux-x64 has a recorded ${pin} sha256." >&2
+      exit 1
+    fi
+    sed -i -e "s/^VER=.*/VER=\"${pin}\"/" \
+      -e "s/^SHA_LINUX_X64=.*/SHA_LINUX_X64=\"${archive_sha256}\"/" "${script}"
+    if ! grep -qx "VER=\"${pin}\"" "${script}" \
+      || ! grep -qx "SHA_LINUX_X64=\"${archive_sha256}\"" "${script}"; then
+      echo "bend-lang.com/install.sh no longer sets VER and SHA_LINUX_X64; cannot pin ${pin}." >&2
+      grep -n -E 'VER|REPO|SHA_|https?://' "${script}" >&2 || true
+      exit 1
+    fi
   fi
   sh "${script}"
 fi
