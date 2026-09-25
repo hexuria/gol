@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -96,6 +96,7 @@ pub fn load_catalog(dir: impl AsRef<Path>) -> Result<LoadedCatalog, LoadError> {
         for declared in server.tools {
             let capability = format!("mcp.{}.{}", server.name, declared.name);
             tools.push(Box::new(McpTool {
+                id: ToolId::new(),
                 server: server.name.clone(),
                 name: declared.name,
                 description: declared.description,
@@ -107,8 +108,29 @@ pub fn load_catalog(dir: impl AsRef<Path>) -> Result<LoadedCatalog, LoadError> {
 
     let mut skills = Vec::new();
     for relative in &file.skills {
-        let path = dir.join(relative);
-        let body = fs::read_to_string(&path).map_err(|err| LoadError::Io(err.to_string()))?;
+        let rel = Path::new(relative);
+        if rel.is_absolute() {
+            return Err(LoadError::Io(format!("skill path is absolute: {relative}")));
+        }
+        if rel
+            .components()
+            .any(|component| component == Component::ParentDir)
+        {
+            return Err(LoadError::Io(format!("skill path contains ..: {relative}")));
+        }
+        let catalog_dir = dir
+            .canonicalize()
+            .map_err(|err| LoadError::Io(err.to_string()))?;
+        let canonical = dir
+            .join(rel)
+            .canonicalize()
+            .map_err(|err| LoadError::Io(err.to_string()))?;
+        if !canonical.starts_with(&catalog_dir) {
+            return Err(LoadError::Io(format!(
+                "skill path is outside the catalog: {relative}"
+            )));
+        }
+        let body = fs::read_to_string(&canonical).map_err(|err| LoadError::Io(err.to_string()))?;
         let name = PathBuf::from(relative)
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -264,6 +286,7 @@ impl Drop for McpSession {
 }
 
 struct McpTool {
+    id: ToolId,
     server: String,
     name: String,
     description: String,
@@ -274,7 +297,7 @@ struct McpTool {
 impl Tool for McpTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
-            id: ToolId::new(),
+            id: self.id,
             name: self.name.clone(),
             description: self.description.clone(),
             input_schema: "{\"type\":\"object\"}".to_string(),
@@ -283,12 +306,12 @@ impl Tool for McpTool {
         }
     }
 
-    fn call(&self, input: &str) -> String {
+    fn call(&self, input: &str) -> Result<String, String> {
         let _ = &self.server;
         self.session
             .lock()
             .expect("mcp")
             .call(&self.name, input)
-            .unwrap_or_else(|err| format!("mcp error: {err:?}"))
+            .map_err(|err| format!("{err:?}"))
     }
 }
