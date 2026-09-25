@@ -385,7 +385,7 @@ pub fn open_turn(
     if let Some(text) = completion.as_deref() {
         let prior = events.clone();
         append_completion(&spec, &mut events, text);
-        store.put_run(StoredRun {
+        store.replace_run(StoredRun {
             spec: spec.clone(),
             events: events.clone(),
         });
@@ -468,7 +468,7 @@ fn release_after_complete(
     prior: Vec<Event>,
 ) -> Result<(), TurnError> {
     if let Err(error) = sandbox.destroy(name) {
-        store.put_run(StoredRun {
+        store.replace_run(StoredRun {
             spec: spec.clone(),
             events: prior,
         });

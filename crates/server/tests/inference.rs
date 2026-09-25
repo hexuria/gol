@@ -765,6 +765,10 @@ impl RunStore for LateUserMessage {
         self.inner.put_run(run);
     }
 
+    fn replace_run(&self, run: StoredRun) {
+        self.inner.replace_run(run);
+    }
+
     fn append_events(&self, id: RunId, events: Vec<Event>) {
         self.inner.append_events(id, events);
     }
