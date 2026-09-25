@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Install the pinned Bend release into ~/.bend.
 #
-# bend-lang.com/install.sh installs the newest release. The repo pins 2.0.27
+# bend-lang.com/install.sh installs the newest release. The repo pins 2.0.28
 # (verify-bend.sh and workflow-bend's BEND_VERSION), so a new upstream release
 # broke every install that used it. This script fetches the pinned release
 # archive and refuses it unless its sha256 matches.
 set -euo pipefail
 
-version="2.0.27"
-sha256="58adc86af6605ed0c48f7d84e4c23028f78893ce4a867a20a4f004b11582687b"
+version="2.0.28"
+sha256="22bb6d5f6bce8ae2c5b340371fedddcbd90edc07a48b6e2b351a944c4558a3eb"
 url="https://github.com/bendlang/bend/releases/download/v${version}/bend-${version}-linux-x64.tar.gz"
 
 case "$(uname -s)-$(uname -m)" in
