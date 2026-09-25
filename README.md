@@ -90,17 +90,16 @@ export BEND_NO_TELEMETRY=1
 
 ## Formal model
 
-`formal/harness/Harness.tla` is the interleaving model. It composes `HarnessCore.tla` and `Dispatch.tla`, which TLC checks separately at full bounds. `formal/lean` is the single-turn proof. Findings are in `formal/harness/FINDINGS.md`.
+`formal/harness/Harness.tla` is the interleaving model. It composes `HarnessCore.tla` and `Dispatch.tla`, which TLC checks separately at full bounds. `formal/runlog/RunLog.tla` models the writers of a run's event log, and `formal/workflow/Replay.tla` the counter journal. Findings are in each directory's `FINDINGS.md`. The reducers themselves are checked in Rust: `crates/protocol/tests/reduce_bounded.rs` enumerates every bounded (state, event) pair of production `reduce` and `reduce_dispatch`.
 
-`./scripts/install-tla.sh` installs the pinned TLA+ tools, v1.7.4 (TLC 2.19), at `~/.local/tla/tla2tools.jar` and checks its sha256. `./scripts/verify-tla.sh` runs TLC on every `formal/**/*.cfg` with `-workers auto -lncheck final`. TLC checks deadlock unless a config says `CHECK_DEADLOCK FALSE`. The script reads the jar from `TLA_JAR`, then `~/.local/tla/tla2tools.jar`, then `/usr/share/java/tla2tools.jar`. `./scripts/verify-lean.sh` runs `lake build` in each Lean project.
+`./scripts/install-tla.sh` installs the pinned TLA+ tools, v1.7.4 (TLC 2.19), at `~/.local/tla/tla2tools.jar` and checks its sha256. `./scripts/verify-tla.sh` runs TLC on every `formal/**/*.cfg` with `-workers auto -lncheck final`. TLC checks deadlock unless a config says `CHECK_DEADLOCK FALSE`. The script reads the jar from `TLA_JAR`, then `~/.local/tla/tla2tools.jar`, then `/usr/share/java/tla2tools.jar`.
 
 ```bash
 ./scripts/install-tla.sh
 ./scripts/verify-tla.sh
-./scripts/verify-lean.sh
 ```
 
-`./scripts/verify-formal.sh` runs `verify-bend.sh`, `verify-tla.sh`, and `verify-lean.sh` in that order.
+`./scripts/verify-formal.sh` runs `verify-bend.sh`, then `verify-tla.sh`.
 
 ## Layout
 

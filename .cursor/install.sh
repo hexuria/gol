@@ -43,25 +43,6 @@ sudo ln -sfn "${HOME}/.bend/bin/bend" /usr/local/bin/bend
 # Same pinned jar as the formal job in .github/workflows/pr.yml.
 "$(cd "$(dirname "$0")/.." && pwd)/scripts/install-tla.sh"
 
-# Same elan command as the formal job. It does not name a Lean version.
-# lake reads formal/**/lean-toolchain when scripts/verify-formal.sh builds.
-if [ ! -x "${HOME}/.elan/bin/elan" ]; then
-  curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
-fi
-if [ -f "${HOME}/.elan/env" ]; then
-  # shellcheck disable=SC1091
-  source "${HOME}/.elan/env"
-fi
-if [ ! -x "${HOME}/.elan/bin/lake" ]; then
-  echo "lake was not installed by elan" >&2
-  exit 1
-fi
-sudo ln -sfn "${HOME}/.elan/bin/elan" /usr/local/bin/elan
-sudo ln -sfn "${HOME}/.elan/bin/lake" /usr/local/bin/lake
-if [ -x "${HOME}/.elan/bin/lean" ]; then
-  sudo ln -sfn "${HOME}/.elan/bin/lean" /usr/local/bin/lean
-fi
-
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${root}"
 cargo fetch

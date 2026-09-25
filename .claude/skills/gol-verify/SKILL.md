@@ -40,14 +40,14 @@ One owner per failure class. A new check on a property that already has an owner
 
 | Failure class | Code | Owner | Status |
 |---|---|---|---|
-| Wrong harness transition, lost validity, no progress | `protocol/src/{reduce,phase}.rs` | unit tests in `reduce.rs`; `reduce_bounded` | `formal/lean/Harness.lean` checked the same on a copy; PR B deletes it |
+| Wrong harness transition, lost validity, no progress | `protocol/src/{reduce,phase}.rs` | unit tests in `reduce.rs`; `reduce_bounded` | owned in Rust; the Lean copy was deleted once `reduce_bounded` covered its theorems |
 | Dispatch lifecycle | `reduce_dispatch` | `reduce_bounded` (terminal stuck, rank, every open phase has an exit) | `formal/harness/Dispatch.tla` states the same properties; this test is its Rust link |
 | Late tool result vs cancel | `reduce.rs` | unit tests of both orders | `protocol/tests/loom_cancel.rs` runs Loom around the pure reducer and checks no gol sync code |
 | Run never ends | `harness/src/driver.rs` budget | `harness/tests/budget.rs` | covers `EventuallyDone` for real runs |
 | Effect without authorization | `authorizer.rs`, `driver.rs` | unit tests | thin: 2 authorizer tests |
 | Concurrent run-log writers | `server/src/{store,postgres,inference,http}.rs` | `formal/runlog` + `server/tests/{inference,pg_redis}.rs` | linked: each counterexample is a Rust test |
 | Stores disagree | `store.rs` vs `postgres.rs` | tests on both stores | no shared contract suite yet |
-| Duplicate effect after a crash | `runtime-tokio/src/{journal,host}.rs` | `replay_proof.rs`; `formal/workflow/Replay.tla` for the design | `formal/replay/Replay.lean` restates `Replay.tla`; PR B deletes it |
+| Duplicate effect after a crash | `runtime-tokio/src/{journal,host}.rs` | `replay_proof.rs`; `formal/workflow/Replay.tla` for the design | the Lean restatement was deleted; its extra theorems map to `replay_proof.rs` and `program.rs` |
 | Frontends disagree | `workflow-*` | `histories_agree_across_rust_rhai_js_and_bend` | runs in more than one CI job |
 | Bend laws and encoding | `experiments/bend` | `verify-bend.sh`, workflow-bend tests | see gol-bend |
 | gol `unsafe` | `workflow-bend/src/boundary.rs` `kill_group` | `forbid(unsafe_code)` in every other crate; `timeout_kills_the_process_group` | compiler-enforced |

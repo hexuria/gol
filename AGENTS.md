@@ -26,7 +26,6 @@ cargo test --workspace            # pg_redis needs Postgres 16 and Redis 7 on 12
 ./scripts/check-architecture.sh   # also runs scripts/verify-plan.sh --self-test
 cargo deny check
 ./scripts/verify-tla.sh           # after ./scripts/install-tla.sh
-./scripts/verify-lean.sh          # needs elan
 ./scripts/verify-bend.sh          # after ./scripts/install-bend.sh
 ./scripts/verify-plan.sh          # what this change must verify
 ```
