@@ -5,7 +5,8 @@
 #   scripts/verify-plan.sh --self-test
 #
 # VERIFY_PLAN_TABLE_REF=<ref> reads the table from that commit instead of the working tree, so a
-# change cannot relax the rules it is judged by (CI passes the base commit).
+# change cannot relax the rules it is judged by. A ref whose AGENTS.md has no table falls back to the
+# working tree. --self-test always reads the working tree, where a new row and its case land together.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -53,10 +54,28 @@ def ticks(text):
     return re.findall(r"`([^`]+)`", text)
 
 
+def split_outside_ticks(text, sep):
+    """Split on `sep` outside backticks, so a regex may contain it."""
+    parts, current, quoted = [], [], False
+    for c in text:
+        if c == "`":
+            quoted = not quoted
+        if c == sep and not quoted:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(c)
+    parts.append("".join(current))
+    return parts
+
+
 def parse_rule(cell):
-    """Clauses are separated by `;`: always | paths: | lines: | lines±: | lines [±] in `glob`: | claim."""
+    """Clauses are separated by `;`: always | claim | paths: | lines[±-] [in `glob`]:.
+
+    `lines:` matches added lines, `lines-:` removed lines, `lines±:` both.
+    """
     rule = {"always": False, "claim": False, "paths": [], "lines": []}
-    for clause in [c.strip() for c in cell.split(";") if c.strip()]:
+    for clause in [c.strip() for c in split_outside_ticks(cell, ";") if c.strip()]:
         if clause == "always":
             rule["always"] = True
         elif clause.startswith("claim"):
@@ -64,12 +83,13 @@ def parse_rule(cell):
         elif clause.startswith("paths:"):
             rule["paths"] += [glob_regex(g) for g in ticks(clause[len("paths:"):])]
         else:
-            m = re.match(r"lines(±)?(?: in `([^`]+)`)?:(.*)$", clause)
+            m = re.match(r"lines([±-])?(?: in `([^`]+)`)?:(.*)$", clause)
             if not m:
                 raise SystemExit(f"verify-plan: cannot read clause: {clause}")
             scope = glob_regex(m.group(2) or DEFAULT_LINE_SCOPE)
+            side = {None: "added", "-": "removed", "±": "both"}[m.group(1)]
             for pattern in ticks(m.group(3)):
-                rule["lines"].append((re.compile(pattern), scope, bool(m.group(1))))
+                rule["lines"].append((re.compile(pattern), scope, side))
     return rule
 
 
@@ -78,9 +98,12 @@ def load_table(text):
         raise SystemExit("verify-plan: AGENTS.md has no verify-plan table")
     rows = []
     for line in text.split(BEGIN, 1)[1].split(END, 1)[0].splitlines():
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) != 3 or not re.fullmatch(r"T\d+", cells[0]):
+        # GFM escapes a pipe inside a cell as \|; split only on unescaped pipes.
+        cells = [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
+        if not re.fullmatch(r"T\d+", cells[0]):
             continue
+        if len(cells) != 3:
+            raise SystemExit(f"verify-plan: row {cells[0]} has {len(cells)} cells, not 3: {line.strip()}")
         rows.append((cells[0], parse_rule(cells[1]), cells[2]))
     if not rows:
         raise SystemExit("verify-plan: the verify-plan table is empty")
@@ -98,10 +121,9 @@ def fired(rows, changes):
             if any(p.match(path) for p in rule["paths"]):
                 hit = True
                 break
-            for pattern, scope, both in rule["lines"]:
-                if scope.match(path) and any(
-                    pattern.search(l) for l in (added + removed if both else added)
-                ):
+            for pattern, scope, side in rule["lines"]:
+                lines = {"added": added, "removed": removed, "both": added + removed}[side]
+                if scope.match(path) and any(pattern.search(l) for l in lines):
                     hit = True
                     break
         if hit:
@@ -110,33 +132,51 @@ def fired(rows, changes):
 
 
 def git(*args):
-    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
+    out = subprocess.run(["git", *args], check=True, capture_output=True).stdout
+    return out.decode("utf-8", errors="replace")
+
+
+def hunk_lines(merge_base, path):
+    """Added and removed lines of one file. Headers end at the first @@, so a
+    content line that starts with -- or ++ is still content."""
+    added, removed, in_hunk = [], [], False
+    for line in git("diff", "--no-renames", "-U0", merge_base, "--", f":(literal){path}").splitlines():
+        if line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk and line.startswith("+"):
+            added.append(line[1:])
+        elif in_hunk and line.startswith("-"):
+            removed.append(line[1:])
+    return added, removed
 
 
 def diff_changes(base):
+    """{path: (added_lines, removed_lines)} for the working tree against merge-base(base, HEAD).
+    Paths come from -z listings, so spaces, " b/" and non-ASCII names stay intact; content that
+    is not UTF-8 is decoded with replacement."""
     merge_base = git("merge-base", base, "HEAD").strip()
     changes = {}
-    path = None
-    for line in git("diff", "--no-renames", "-U0", merge_base).splitlines():
-        if line.startswith("diff --git "):
-            path = line.split(" b/", 1)[1]
-            changes.setdefault(path, ([], []))
-        elif line.startswith("+++ ") or line.startswith("--- "):
-            continue
-        elif path and line.startswith("+"):
-            changes[path][0].append(line[1:])
-        elif path and line.startswith("-"):
-            changes[path][1].append(line[1:])
-    for new in git("ls-files", "--others", "--exclude-standard").splitlines():
-        with open(new, errors="replace") as handle:
-            changes[new] = (handle.read().splitlines(), [])
+    for path in filter(None, git("diff", "--no-renames", "--name-only", "-z", merge_base).split("\0")):
+        changes[path] = hunk_lines(merge_base, path)
+    for new in filter(None, git("ls-files", "--others", "--exclude-standard", "-z").split("\0")):
+        lines = []
+        if os.path.isfile(new):
+            with open(new, "rb") as handle:
+                lines = handle.read().decode("utf-8", errors="replace").splitlines()
+        changes[new] = (lines, [])
     return changes
 
 
-def table_text():
+def table_text(for_self_test=False):
     ref = os.environ.get("VERIFY_PLAN_TABLE_REF")
-    if ref:
-        return git("show", f"{ref}:AGENTS.md")
+    if ref and not for_self_test:
+        try:
+            text = git("show", f"{ref}:AGENTS.md")
+        except subprocess.CalledProcessError:
+            text = ""
+        if BEGIN in text and END in text:
+            return text
+        print(f"verify-plan: {ref}:AGENTS.md has no table; using the working tree", file=sys.stderr)
     with open("AGENTS.md") as handle:
         return handle.read()
 
@@ -159,6 +199,22 @@ SELF_TEST = [
     ("change a TLA+ model", {"formal/runlog/RunLog.tla": (["Next == Done"], [])}, {"T0", "T10"}),
     ("a benchmark", {"crates/protocol/benches/fold_reduce.rs": (["c.bench_function(\"fold\", |b| b.iter(f));"], [])}, {"T0", "T11"}),
     ("a rhai frontend construct", {"crates/workflow-rhai/src/lib.rs": (["    Decision::Wait => \"wait\","], [])}, {"T0", "T5"}),
+    ("a sql update in memory", {"crates/memory/src/lib.rs": (['    "UPDATE memories SET value = $1 WHERE key = $2"'], [])}, {"T0", "T3"}),
+    ("a sql delete in memory", {"crates/memory/src/lib.rs": (['    "DELETE FROM memories WHERE key = $1"'], [])}, {"T0", "T3"}),
+    ("a redis producer", {"crates/execution/src/queue.rs": (['    let _: () = conn.lpush("runs", id)?;', '    cmd("XADD").arg("s")'], [])}, {"T0", "T3"}),
+    ("remove a sql comment line", {"crates/memory/src/lib.rs": ([], ["-- on conflict do nothing"])}, {"T0", "T3"}),
+    ("delete a bounded test", {"crates/protocol/tests/reduce_bounded.rs": ([], ["#[test]", "fn dispatch_reduce_matches_the_table_on_every_pair() {"])}, {"T0", "T12"}),
+    ("add a test", {"crates/protocol/tests/probe.rs": (["#[test]", "fn probe() {}"], [])}, {"T0"}),
+    ("fewer proptest cases", {"crates/protocol/src/reduce.rs": (["    #![proptest_config(ProptestConfig { cases: 4, ..ProptestConfig::default() })]"], [])}, {"T0", "T1", "T12"}),
+    ("tests off for a crate", {"crates/memory/Cargo.toml": (["test = false"], [])}, {"T0", "T12"}),
+    ("toolchain pin", {"rust-toolchain.toml": (['channel = "1.80"'], [])}, {"T0", "T12"}),
+    ("ci scope", {"scripts/ci-scope.sh": (["docs_only='^.*$'"], [])}, {"T0", "T12"}),
+]
+
+TABLE_PARSE_CASES = [
+    ("escaped pipe in a regex", "| T1 | lines: `a\\|b` | x |", {"crates/x/src/y.rs": (["b"], [])}, True),
+    ("semicolon in a regex", "| T1 | lines: `a;b` | x |", {"crates/x/src/y.rs": (["a;b"], [])}, True),
+    ("removed-only clause ignores additions", "| T1 | lines-: `gone` | x |", {"crates/x/src/y.rs": (["gone"], [])}, False),
 ]
 
 
@@ -175,16 +231,70 @@ def self_test(rows):
         if missing:
             failed += 1
             print(f"self-test names rows the table lacks: {sorted(missing)}", file=sys.stderr)
+    for label, row, changes, fires in TABLE_PARSE_CASES:
+        got = bool(fired(load_table(f"{BEGIN}\n{row}\n{END}"), changes))
+        if got != fires:
+            failed += 1
+            print(f"self-test {label}: expected fired={fires}, got {got}", file=sys.stderr)
+    try:
+        load_table(f"{BEGIN}\n| T1 | lines: `a|b` | x |\n{END}")
+        failed += 1
+        print("self-test: a row with an unescaped pipe was not rejected", file=sys.stderr)
+    except SystemExit:
+        pass
+    failed += diff_self_test()
     if failed:
         sys.exit(1)
-    print(f"verify-plan self-test ok ({len(SELF_TEST)} cases)")
+    print(f"verify-plan self-test ok ({len(SELF_TEST) + len(TABLE_PARSE_CASES) + 2} cases)")
+
+
+def diff_self_test():
+    """diff_changes on a scratch repo with awkward paths and bytes."""
+    import tempfile
+    here = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        os.chdir(tmp)
+        try:
+            def run(*args):
+                subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                               check=True, capture_output=True)
+            run("init", "-q", "-b", "main")
+            os.makedirs("docs/x b/formal")
+            with open("docs/x b/formal/M.tla", "w") as f:
+                f.write("a\n")
+            with open("café.rs", "w") as f:
+                f.write("a\n")
+            with open("bytes.rs", "wb") as f:
+                f.write(b"a\n")
+            run("add", "-A")
+            run("commit", "-q", "-m", "base")
+            with open("docs/x b/formal/M.tla", "w") as f:
+                f.write("b\n")
+            with open("café.rs", "w") as f:
+                f.write("-- on conflict\n")
+            with open("bytes.rs", "wb") as f:
+                f.write(b"\xff\xfe spawn(\n")
+            os.symlink("missing", "dangling")
+            changes = diff_changes("HEAD")
+        finally:
+            os.chdir(here)
+    want = {
+        "docs/x b/formal/M.tla": (["b"], ["a"]),
+        "café.rs": (["-- on conflict"], ["a"]),
+        "bytes.rs": (["\ufffd\ufffd spawn("], ["a"]),
+        "dangling": ([], []),
+    }
+    if changes != want:
+        print(f"self-test diff parsing: expected {want}, got {changes}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def main(argv):
-    rows = load_table(table_text())
     if argv[:1] == ["--self-test"]:
-        self_test(rows)
+        self_test(load_table(table_text(for_self_test=True)))
         return
+    rows = load_table(table_text())
     base = argv[0] if argv else "origin/main"
     changes = diff_changes(base)
     hits = fired(rows, changes)

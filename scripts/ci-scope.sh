@@ -8,8 +8,9 @@
 # and HEAD^1 is the base.
 set -uo pipefail
 
-# Paths that no build, test, or check reads.
-docs_only='^(README\.md|AGENTS\.md|docs/.*)$'
+# Paths that no build, test, or check reads. AGENTS.md is not one: the architecture job
+# runs the verify-plan self-test against its trigger table.
+docs_only='^(README\.md|docs/.*)$'
 
 code=true
 if [ "${EVENT:-}" = pull_request ] && git rev-parse --verify --quiet HEAD^1 >/dev/null; then
