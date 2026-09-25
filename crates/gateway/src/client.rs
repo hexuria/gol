@@ -66,6 +66,9 @@ impl<P, C, T> GatewayClient<P, C, T> {
 impl<C, T> GatewayClient<Missing, C, T> {
     pub fn provider(mut self, provider: ModelProvider) -> GatewayClient<Set, C, T> {
         self.provider = Some(provider);
+        if provider != ModelProvider::OpenAI {
+            self.base_url = String::new();
+        }
         self.retag()
     }
 }
@@ -103,10 +106,9 @@ impl<T: HttpTransport> GatewayClient<Set, Set, T> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let body = anthropic_body(&request.model_name, &request.prompt);
         let response = match credential {
-            CredentialSource::BringYourOwn { secret_ref } => {
+            CredentialSource::BringYourOwn { .. } => {
                 let headers = [
                     ("content-type", "application/json"),
-                    ("x-api-key", secret_ref.as_str()),
                     ("anthropic-version", "2023-06-01"),
                 ];
                 self.transport.post_json(&url, &headers, &body)?
@@ -135,11 +137,8 @@ impl<T: HttpTransport> GatewayClient<Set, Set, T> {
         );
         let body = gemini_body(&request.prompt);
         let response = match credential {
-            CredentialSource::BringYourOwn { secret_ref } => {
-                let headers = [
-                    ("content-type", "application/json"),
-                    ("x-goog-api-key", secret_ref.as_str()),
-                ];
+            CredentialSource::BringYourOwn { .. } => {
+                let headers = [("content-type", "application/json")];
                 self.transport.post_json(&url, &headers, &body)?
             }
             CredentialSource::PlatformGateway => {
@@ -164,12 +163,8 @@ impl<T: HttpTransport> GatewayClient<Set, Set, T> {
         );
         let body = system_one_body(&request.model_name, &request.prompt);
         let response = match credential {
-            CredentialSource::BringYourOwn { secret_ref } => {
-                let bearer = format!("Bearer {secret_ref}");
-                let headers = [
-                    ("content-type", "application/json"),
-                    ("authorization", bearer.as_str()),
-                ];
+            CredentialSource::BringYourOwn { .. } => {
+                let headers = [("content-type", "application/json")];
                 self.transport.post_json(&url, &headers, &body)?
             }
             CredentialSource::PlatformGateway => {
@@ -194,11 +189,8 @@ impl<T: HttpTransport> GatewayClient<Set, Set, T> {
         );
         let body = chat_body(&request.model_name, &request.prompt);
         let response = match credential {
-            CredentialSource::BringYourOwn { secret_ref } => {
-                let headers = [
-                    ("content-type", "application/json"),
-                    ("x-secret-ref", secret_ref.as_str()),
-                ];
+            CredentialSource::BringYourOwn { .. } => {
+                let headers = [("content-type", "application/json")];
                 self.transport.post_json(&url, &headers, &body)?
             }
             CredentialSource::PlatformGateway => {
@@ -222,6 +214,8 @@ impl<T: HttpTransport> ModelGateway for GatewayClient<Set, Set, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use serde_json::Value;
 
@@ -236,6 +230,64 @@ mod tests {
         ) -> Result<Value, GatewayError> {
             panic!("http was called");
         }
+    }
+
+    struct RecordedPost {
+        url: String,
+        headers: Vec<(String, String)>,
+    }
+
+    struct RecordingTransport {
+        posts: Arc<Mutex<Vec<RecordedPost>>>,
+    }
+
+    impl HttpTransport for RecordingTransport {
+        fn post_json(
+            &self,
+            url: &str,
+            headers: &[(&str, &str)],
+            _body: &Value,
+        ) -> Result<Value, GatewayError> {
+            self.posts.lock().expect("recording").push(RecordedPost {
+                url: url.to_string(),
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect(),
+            });
+            Ok(serde_json::json!({
+                "content": [{ "text": "ok" }],
+                "candidates": [{ "content": { "parts": [{ "text": "ok" }] } }],
+                "choices": [{ "message": { "role": "assistant", "content": "ok" } }]
+            }))
+        }
+    }
+
+    fn send_recorded(
+        provider: ModelProvider,
+        credential: CredentialSource,
+        base_url_first: Option<&str>,
+    ) -> RecordedPost {
+        let posts = Arc::new(Mutex::new(Vec::new()));
+        let client = GatewayClient::with_transport(RecordingTransport {
+            posts: Arc::clone(&posts),
+        });
+        let client = match base_url_first {
+            Some(base_url) => client.base_url(base_url),
+            None => client,
+        };
+        client
+            .provider(provider)
+            .credential(credential)
+            .send(&ModelRequest {
+                provider,
+                model_name: "model".to_string(),
+                prompt: "hi".to_string(),
+            })
+            .expect("recorded send");
+        let mut posts = posts.lock().expect("recording");
+        assert_eq!(posts.len(), 1, "{provider:?} posted once");
+        posts.pop().expect("one post")
     }
 
     #[test]
@@ -254,5 +306,82 @@ mod tests {
             error,
             GatewayError::UnsupportedProvider(ModelProvider::OpenAI)
         ));
+    }
+
+    #[test]
+    fn bring_your_own_header_omits_secret_ref() {
+        let secret_ref = "jev-secret-ref";
+        for provider in [
+            ModelProvider::OpenAI,
+            ModelProvider::Anthropic,
+            ModelProvider::Gemini,
+            ModelProvider::SystemOne,
+        ] {
+            let post = send_recorded(
+                provider,
+                CredentialSource::BringYourOwn {
+                    secret_ref: secret_ref.to_string(),
+                },
+                None,
+            );
+            for (name, value) in &post.headers {
+                assert!(
+                    !value.contains(secret_ref),
+                    "{provider:?} header {name} contained {secret_ref}: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_drops_openai_host_for_other_providers() {
+        let cases = [
+            (ModelProvider::Anthropic, "/v1/messages"),
+            (
+                ModelProvider::Gemini,
+                "/v1beta/models/model:generateContent",
+            ),
+            (ModelProvider::SystemOne, "/v1/chat/completions"),
+        ];
+        for (provider, suffix) in cases {
+            let post = send_recorded(provider, CredentialSource::PlatformGateway, None);
+            assert!(
+                !post.url.contains("https://api.openai.com"),
+                "{provider:?} kept the OpenAI host: {}",
+                post.url
+            );
+            assert!(
+                post.url.ends_with(suffix),
+                "{provider:?} url {} does not end with {suffix}",
+                post.url
+            );
+        }
+    }
+
+    #[test]
+    fn base_url_before_provider_does_not_keep_the_mock() {
+        let mock = "http://127.0.0.1:9";
+        let cases = [
+            (ModelProvider::Anthropic, "/v1/messages"),
+            (
+                ModelProvider::Gemini,
+                "/v1beta/models/model:generateContent",
+            ),
+            (ModelProvider::SystemOne, "/v1/chat/completions"),
+        ];
+        for (provider, path) in cases {
+            let post = send_recorded(provider, CredentialSource::PlatformGateway, Some(mock));
+            assert_eq!(post.url, path, "{provider:?} kept {mock}");
+        }
+    }
+
+    #[test]
+    fn openai_default_host_stays_api_openai_com() {
+        let post = send_recorded(
+            ModelProvider::OpenAI,
+            CredentialSource::PlatformGateway,
+            None,
+        );
+        assert_eq!(post.url, "https://api.openai.com/v1/chat/completions");
     }
 }
