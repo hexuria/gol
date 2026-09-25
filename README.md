@@ -81,13 +81,13 @@ The desktop chooses Local (start the local image with Docker) or Box (the server
 Bend 2.0.27 is the pure counter workflow. Rust still owns effects. Install the pinned release, then verify syntax, types, laws, proofs, and the Rust adapter:
 
 ```bash
-curl -fsSL https://bend-lang.com/install.sh | sh
+./scripts/install-bend.sh
 export PATH="$HOME/.bend/bin:$PATH"
 export BEND_NO_TELEMETRY=1
 ./scripts/verify-bend.sh
 ```
 
-The installer checks the release archive sha256 and installs `bend 2.0.27`. `docs/bend.md` is the boundary model. `experiments/bend/LAWS.bend` states the counter laws. `experiments/bend/PROOF.bend` proves them. `cargo test -p workflow-bend` compiles that program into `WorkflowProgram`. `cargo bench -p workflow-bend --bench boundary` measures the process boundary against `counter_program`.
+`scripts/install-bend.sh` downloads the 2.0.27 release archive, checks its pinned sha256, and installs it under `~/.bend`. The upstream `bend-lang.com/install.sh` installs the newest release, which fails the 2.0.27 pin. `docs/bend.md` is the boundary model. `experiments/bend/LAWS.bend` states the counter laws. `experiments/bend/PROOF.bend` proves them. `cargo test -p workflow-bend` compiles that program into `WorkflowProgram`. `cargo bench -p workflow-bend --bench boundary` measures the process boundary against `counter_program`.
 
 ## Formal model
 

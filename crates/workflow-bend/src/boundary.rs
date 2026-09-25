@@ -56,8 +56,7 @@ pub fn bend_program() -> Result<PathBuf, FrontendError> {
         }
     }
     Err(FrontendError::Setup(
-        "bend 2.0.27 is not installed; curl -fsSL https://bend-lang.com/install.sh | sh"
-            .to_string(),
+        "bend 2.0.27 is not installed; run ./scripts/install-bend.sh".to_string(),
     ))
 }
 
