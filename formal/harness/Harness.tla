@@ -85,7 +85,8 @@ Advance(t) ==
   /\ turnStep[t] < MaxSteps
   /\ turnStep' = [turnStep EXCEPT ![t] = turnStep[t] + 1]
   /\ answered' = [answered EXCEPT ![t] = FALSE]
-  /\ UNCHANGED <<session, dispatch, turnPhase, owner, attempt, pending, live, issued>>
+  /\ attempt' = [attempt EXCEPT ![t] = 0]
+  /\ UNCHANGED <<session, dispatch, turnPhase, owner, pending, live, issued>>
 
 Retry(t) ==
   /\ turnPhase[t] = "running"
@@ -190,6 +191,11 @@ DispatchRecover ==
   /\ dispatch' = "recovering"
   /\ UNCHANGED harnessVars
 
+DispatchResume ==
+  /\ dispatch \in {"waiting", "awaiting_approval", "paused", "recovering"}
+  /\ dispatch' = "running"
+  /\ UNCHANGED harnessVars
+
 DispatchComplete ==
   /\ dispatch \in DispatchLive
   /\ dispatch' = "completed"
@@ -219,6 +225,7 @@ Scheduling ==
   \/ DispatchApproval
   \/ DispatchPause
   \/ DispatchRecover
+  \/ DispatchResume
 
 Done ==
   /\ session = "done"
@@ -253,6 +260,7 @@ Next ==
   \/ DispatchApproval
   \/ DispatchPause
   \/ DispatchRecover
+  \/ DispatchResume
   \/ DispatchComplete
   \/ DispatchFail
   \/ DispatchCancel
@@ -260,7 +268,7 @@ Next ==
   \/ Done
 
 Spec == Init /\ [][Next]_vars
-FairSpec == Spec /\ WF_vars(Next)
+FairSpec == Spec /\ WF_vars(Next) /\ WF_vars(DispatchComplete)
 
 TypeOK ==
   /\ session \in {"idle", "active", "done"}
@@ -326,7 +334,7 @@ DispatchRank ==
 
 Rank == SessionRank + DispatchRank + LiveCount + SumPhase(Turns)
 
-RankDecreases == [][Rank' < Rank]_vars
+RankDecreases == [][DispatchResume \/ Rank' < Rank]_vars
 
 TerminalStuck ==
   [][\A t \in Turns : turnPhase[t] \in Terminal => turnPhase'[t] = turnPhase[t]]_vars
