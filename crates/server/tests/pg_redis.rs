@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use protocol::{
     Actor, AgentId, ArtifactId, Capability, CredentialSource, DispatchPhase, Event, EventPayload,
-    ExecutionPlacement, HarnessState, Limits, ModelProvider, RunId, RunSpec, Timestamp, WorkModel,
+    EventSource, ExecutionPlacement, HarnessState, Limits, MessageRole, ModelMessage,
+    ModelProvider, RunId, RunSpec, Timestamp, WorkModel,
 };
 use server::{
     router_with_queue, AgentManifest, PostgresStore, RedisRunQueue, RunStore, StoredArtifact,
@@ -198,6 +199,192 @@ async fn create_run_writes_postgres_and_enqueues_redis() {
             .any(|request| request.url.path() == "/v1/systemone"),
         "queued create_run called Jev"
     );
+}
+
+fn record(spec: &RunSpec, actor: Actor, at: i64, payload: EventPayload) -> Event {
+    Event::record(
+        EventSource::new(
+            spec.run_id,
+            spec.agent_id,
+            &spec.agent_version,
+            actor,
+            Timestamp::unix_millis(at),
+        ),
+        payload,
+    )
+}
+
+fn reconnect(id: RunId) -> StoredRun {
+    PostgresStore::connect(POSTGRES_URL)
+        .expect("reconnect")
+        .run(id)
+        .expect("run")
+}
+
+fn user_message(spec: &RunSpec, at: i64) -> Event {
+    record(
+        spec,
+        Actor::System,
+        at,
+        EventPayload::UserMessage {
+            text: "hello".to_string(),
+        },
+    )
+}
+
+fn completion_pair(spec: &RunSpec, text: &str, at: i64) -> (Event, Event) {
+    (
+        record(
+            spec,
+            Actor::Gateway,
+            at,
+            EventPayload::ModelResponded {
+                message: ModelMessage {
+                    role: MessageRole::Assistant,
+                    text: text.to_string(),
+                },
+            },
+        ),
+        record(
+            spec,
+            Actor::System,
+            at + 1,
+            EventPayload::RunCompleted {
+                outcome: text.to_string(),
+            },
+        ),
+    )
+}
+
+#[test]
+fn second_put_stores_the_no_redis_log() {
+    let spec = spec();
+    let run_id = spec.run_id;
+    let user = user_message(&spec, 1);
+    let started = record(&spec, Actor::System, 2, EventPayload::RunStarted);
+    let second = vec![user.clone(), started];
+    {
+        let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+        store.put_run(StoredRun {
+            spec: spec.clone(),
+            events: vec![user],
+        });
+        store.replace_run(StoredRun {
+            spec,
+            events: second.clone(),
+        });
+    }
+    let loaded = reconnect(run_id);
+    assert_eq!(loaded.events, second);
+    assert_eq!(
+        loaded
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event.payload,
+                EventPayload::UserMessage { ref text } if text == "hello"
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn second_put_stores_the_gateway_completion() {
+    let spec = spec();
+    let run_id = spec.run_id;
+    let created = record(&spec, Actor::System, 1, EventPayload::RunCreated);
+    let started = record(&spec, Actor::System, 2, EventPayload::RunStarted);
+    let user = user_message(&spec, 3);
+    let (responded, completed) = completion_pair(&spec, "gateway text", 4);
+    let first = vec![created, started, user];
+    let mut second = first.clone();
+    second.push(responded);
+    second.push(completed);
+    {
+        let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+        store.put_run(StoredRun {
+            spec: spec.clone(),
+            events: first,
+        });
+        store.replace_run(StoredRun {
+            spec,
+            events: second.clone(),
+        });
+    }
+    let loaded = reconnect(run_id);
+    assert_eq!(loaded.events, second);
+    assert_eq!(loaded.events.len(), 5);
+    assert_eq!(
+        loaded
+            .events
+            .iter()
+            .filter(|event| matches!(event.payload, EventPayload::RunCreated))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn failed_destroy_put_restores_prior() {
+    let spec = spec();
+    let run_id = spec.run_id;
+    let created = record(&spec, Actor::System, 1, EventPayload::RunCreated);
+    let started = record(&spec, Actor::System, 2, EventPayload::RunStarted);
+    let user = user_message(&spec, 3);
+    let (responded, completed) = completion_pair(&spec, "gateway text", 4);
+    let prefix = vec![created, started, user];
+    let mut stored = prefix.clone();
+    stored.push(responded);
+    stored.push(completed);
+    {
+        let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+        store.put_run(StoredRun {
+            spec: spec.clone(),
+            events: stored,
+        });
+        store.replace_run(StoredRun {
+            spec,
+            events: prefix.clone(),
+        });
+    }
+    let loaded = reconnect(run_id);
+    assert_eq!(loaded.events, prefix);
+    assert!(!loaded
+        .events
+        .iter()
+        .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. })));
+}
+
+#[test]
+fn append_then_prior_put_restores_the_subscription_log() {
+    let spec = spec();
+    let run_id = spec.run_id;
+    let user = user_message(&spec, 1);
+    let prefix = vec![user];
+    let (responded, completed) = completion_pair(&spec, "subscription text", 2);
+    let appended = vec![responded, completed];
+    {
+        let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+        store.put_run(StoredRun {
+            spec: spec.clone(),
+            events: prefix.clone(),
+        });
+        store.append_events(run_id, appended.clone());
+    }
+    let mid = reconnect(run_id);
+    let mut with_completion = prefix.clone();
+    with_completion.extend(appended);
+    assert_eq!(mid.events, with_completion);
+    {
+        let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+        store.replace_run(StoredRun {
+            spec,
+            events: prefix.clone(),
+        });
+    }
+    let loaded = reconnect(run_id);
+    assert_eq!(loaded.events, prefix);
 }
 
 fn choice(effect: &str) -> serde_json::Value {
