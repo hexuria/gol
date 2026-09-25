@@ -145,7 +145,7 @@ fn read_committed(path: &Path) -> std::io::Result<Vec<u8>> {
 
 fn read_stdin() -> std::io::Result<()> {
     let mut byte = [0u8; 1];
-    std::io::stdin().read(&mut byte)?;
+    std::io::stdin().read_exact(&mut byte)?;
     Ok(())
 }
 

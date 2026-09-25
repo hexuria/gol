@@ -94,6 +94,12 @@ impl RunSpec {
     }
 }
 
+impl Default for RunSpecBuilder<Missing, Missing, Missing, Missing> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RunSpecBuilder<Missing, Missing, Missing, Missing> {
     pub fn new() -> Self {
         Self {

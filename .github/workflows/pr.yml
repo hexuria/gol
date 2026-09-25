@@ -1,0 +1,204 @@
+name: pr
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install desktop build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libvulkan-dev clang g++
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: clippy
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gol
+          POSTGRES_PASSWORD: gol
+          POSTGRES_DB: gol
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gol -d gol"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install desktop build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libvulkan-dev clang g++
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Install Bend 2.0.27
+        run: |
+          curl -fsSL https://bend-lang.com/install.sh | sh
+          echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
+          test "$(BEND_NO_TELEMETRY=1 "$HOME/.bend/bin/bend" version)" = "bend 2.0.27"
+      - name: Allow user namespaces for unshare
+        run: |
+          # ubuntu-latest sets apparmor_restrict_unprivileged_userns=1, which
+          # makes `unshare -r -n` fail with: unshare: write failed /proc/self/uid_map.
+          # Lift that restriction when the host allows it. If uid_map still cannot
+          # be written, keep a network namespace when `unshare -n` works.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -f /etc/apparmor.d/unprivileged_userns ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/unprivileged_userns || true
+          fi
+          if unshare -r -n -- true; then
+            exit 0
+          fi
+          if unshare -n -- true; then
+            exit 0
+          fi
+          echo "unshare cannot create a network namespace" >&2
+          exit 1
+      - name: cargo test --workspace
+        run: cargo test --workspace
+      - name: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets
+
+  differential:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Install Bend 2.0.27
+        run: |
+          curl -fsSL https://bend-lang.com/install.sh | sh
+          echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
+          test "$(BEND_NO_TELEMETRY=1 "$HOME/.bend/bin/bend" version)" = "bend 2.0.27"
+      - name: Allow user namespaces for unshare
+        run: |
+          # ubuntu-latest sets apparmor_restrict_unprivileged_userns=1, which
+          # makes `unshare -r -n` fail with: unshare: write failed /proc/self/uid_map.
+          # Lift that restriction when the host allows it. If uid_map still cannot
+          # be written, keep a network namespace when `unshare -n` works.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -f /etc/apparmor.d/unprivileged_userns ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/unprivileged_userns || true
+          fi
+          if unshare -r -n -- true; then
+            exit 0
+          fi
+          if unshare -n -- true; then
+            exit 0
+          fi
+          echo "unshare cannot create a network namespace" >&2
+          exit 1
+      - name: Workflow histories agree on WorkflowStep
+        run: |
+          log="$(mktemp)"
+          cargo test -p workflow-bend tests::histories_agree_across_rust_rhai_js_and_bend -- --exact | tee "$log"
+          if ! grep -q 'test tests::histories_agree_across_rust_rhai_js_and_bend \.\.\. ok' "$log"; then
+            echo "tests::histories_agree_across_rust_rhai_js_and_bend did not run" >&2
+            exit 1
+          fi
+
+  formal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Install Bend 2.0.27
+        run: |
+          curl -fsSL https://bend-lang.com/install.sh | sh
+          echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
+          test "$(BEND_NO_TELEMETRY=1 "$HOME/.bend/bin/bend" version)" = "bend 2.0.27"
+      - name: Allow user namespaces for unshare
+        run: |
+          # ubuntu-latest sets apparmor_restrict_unprivileged_userns=1, which
+          # makes `unshare -r -n` fail with: unshare: write failed /proc/self/uid_map.
+          # Lift that restriction when the host allows it. If uid_map still cannot
+          # be written, keep a network namespace when `unshare -n` works.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -f /etc/apparmor.d/unprivileged_userns ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/unprivileged_userns || true
+          fi
+          if unshare -r -n -- true; then
+            exit 0
+          fi
+          if unshare -n -- true; then
+            exit 0
+          fi
+          echo "unshare cannot create a network namespace" >&2
+          exit 1
+      - name: Install TLA+ tools
+        run: |
+          mkdir -p "$HOME/.local/tla"
+          curl -fsSL -o "$HOME/.local/tla/tla2tools.jar" \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+      - name: Install Lean
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: ./scripts/verify-formal.sh
+        run: ./scripts/verify-formal.sh
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Install cargo-deny and cargo-audit
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/cargo-deny.tgz \
+            https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
+          tar -xzf /tmp/cargo-deny.tgz -C /tmp
+          install -m 755 /tmp/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny "$HOME/.local/bin/cargo-deny"
+          curl -fsSL -o /tmp/cargo-audit.tgz \
+            https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz
+          tar -xzf /tmp/cargo-audit.tgz -C /tmp
+          install -m 755 /tmp/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2/cargo-audit "$HOME/.local/bin/cargo-audit"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: cargo deny check
+        run: cargo deny check
+      - name: cargo audit
+        run: cargo audit
+
+  architecture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Architecture guard
+        run: ./scripts/check-architecture.sh

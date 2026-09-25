@@ -12,7 +12,9 @@ impl Render for Desk {
             .p_4()
             .gap_2()
             .child("gol")
-            .child("Control decides what may run. Execution decides where. The harness decides how.")
+            .child(
+                "Control decides what may run. Execution decides where. The harness decides how.",
+            )
             .child(Button::new("local").primary().label("Local"))
             .child(Button::new("reverse").label("Reverse"))
             .child(Button::new("box").label("Box"))

@@ -219,7 +219,7 @@ fn on_authorized(state: HarnessState, effect: &Effect) -> (HarnessState, Effects
 mod tests {
     use super::*;
     use crate::spec::sample_spec;
-    use crate::{Actor, Event, FailureClass, InvocationId, Timestamp};
+    use crate::{Actor, Event, EventSource, FailureClass, InvocationId, Timestamp};
     use proptest::prelude::*;
     use uuid::Uuid;
 
@@ -251,13 +251,13 @@ mod tests {
     fn ev(payload: EventPayload) -> Event {
         let spec = sample_spec();
         Event::record(
-            spec.run_id,
-            spec.agent_id,
-            &spec.agent_version,
-            None,
-            Actor::System,
-            None,
-            Timestamp::unix_millis(0),
+            EventSource::new(
+                spec.run_id,
+                spec.agent_id,
+                &spec.agent_version,
+                Actor::System,
+                Timestamp::unix_millis(0),
+            ),
             payload,
         )
     }

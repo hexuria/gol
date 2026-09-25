@@ -5,8 +5,8 @@ use protocol::{
     ExecutionPlacement, Limits, ModelProvider, RunId, RunSpec, Timestamp, WorkModel,
 };
 use server::{
-    router_with_queue, AgentManifest, PostgresStore, RedisRunQueue, RunStore,
-    StoredArtifact, StoredRun,
+    router_with_queue, AgentManifest, PostgresStore, RedisRunQueue, RunStore, StoredArtifact,
+    StoredRun,
 };
 
 const POSTGRES_URL: &str = "postgres://gol:gol@127.0.0.1/gol";
@@ -44,13 +44,13 @@ fn postgres_round_trips_event_and_artifact_on_a_new_connection() {
             required_capabilities: vec![Capability::new("tool.echo")],
         });
         let event = Event::record(
-            run_id,
-            run.agent_id,
-            "1",
-            None,
-            Actor::System,
-            None,
-            Timestamp::unix_millis(1),
+            protocol::EventSource::new(
+                run_id,
+                run.agent_id,
+                "1",
+                Actor::System,
+                Timestamp::unix_millis(1),
+            ),
             EventPayload::RunCreated,
         );
         store.put_run(StoredRun {
@@ -69,7 +69,10 @@ fn postgres_round_trips_event_and_artifact_on_a_new_connection() {
     assert_eq!(loaded.spec.input, "hello");
     assert!(matches!(
         loaded.events.as_slice(),
-        [Event { payload: EventPayload::RunCreated, .. }]
+        [Event {
+            payload: EventPayload::RunCreated,
+            ..
+        }]
     ));
     let artifact = store.artifact(artifact_id).expect("artifact");
     assert_eq!(artifact.body, b"saved");
@@ -105,9 +108,10 @@ async fn create_run_writes_postgres_and_enqueues_redis() {
         .mount(&jev)
         .await;
 
-    let store = tokio::task::spawn_blocking(|| PostgresStore::connect(POSTGRES_URL).expect("connect"))
-        .await
-        .expect("connect thread");
+    let store =
+        tokio::task::spawn_blocking(|| PostgresStore::connect(POSTGRES_URL).expect("connect"))
+            .await
+            .expect("connect thread");
     let app = router_with_queue(Arc::new(store), jev.uri(), Some(REDIS_URL.to_string()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

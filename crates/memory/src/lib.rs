@@ -8,19 +8,32 @@ pub struct PostgresMemory {
     client: Mutex<postgres::Client>,
 }
 
+const SCHEMA: &str = "
+create table if not exists memories (
+    scope text not null,
+    key text not null,
+    value text not null,
+    primary key (scope, key)
+);
+";
+
+fn ensure_schema(client: &mut postgres::Client) -> Result<(), postgres::Error> {
+    client.batch_execute("begin")?;
+    if let Err(err) = client.query_one("select pg_advisory_xact_lock(872347)", &[]) {
+        let _ = client.batch_execute("rollback");
+        return Err(err);
+    }
+    if let Err(err) = client.batch_execute(SCHEMA) {
+        let _ = client.batch_execute("rollback");
+        return Err(err);
+    }
+    client.batch_execute("commit")
+}
+
 impl PostgresMemory {
     pub fn connect(url: &str) -> Result<Self, postgres::Error> {
         let mut client = postgres::Client::connect(url, NoTls)?;
-        client.batch_execute(
-            "
-            create table if not exists memories (
-                scope text not null,
-                key text not null,
-                value text not null,
-                primary key (scope, key)
-            );
-            ",
-        )?;
+        ensure_schema(&mut client)?;
         Ok(Self {
             client: Mutex::new(client),
         })

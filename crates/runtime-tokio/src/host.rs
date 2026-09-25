@@ -61,7 +61,7 @@ fn history_from_committed(bytes: &[u8]) -> std::io::Result<History> {
     }
 }
 
-fn join_all(
+pub fn join_all(
     driver: &impl WorkflowDriver,
     ctx: &WorkflowContext,
     path: &Path,

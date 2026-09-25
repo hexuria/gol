@@ -56,8 +56,10 @@ struct McpServer {
 
 pub fn load_catalog(dir: impl AsRef<Path>) -> Result<LoadedCatalog, LoadError> {
     let dir = dir.as_ref();
-    let raw = fs::read_to_string(dir.join("harness.toml")).map_err(|err| LoadError::Io(err.to_string()))?;
-    let file: CatalogFile = toml::from_str(&raw).map_err(|err| LoadError::Parse(err.to_string()))?;
+    let raw = fs::read_to_string(dir.join("harness.toml"))
+        .map_err(|err| LoadError::Io(err.to_string()))?;
+    let file: CatalogFile =
+        toml::from_str(&raw).map_err(|err| LoadError::Parse(err.to_string()))?;
 
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
     for name in &file.tools {
@@ -121,8 +123,14 @@ impl McpSession {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|err| LoadError::Mcp(format!("{}: {err}", server.name)))?;
-        let stdin = child.stdin.take().ok_or_else(|| LoadError::Mcp("no stdin".into()))?;
-        let stdout = child.stdout.take().ok_or_else(|| LoadError::Mcp("no stdout".into()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| LoadError::Mcp("no stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| LoadError::Mcp("no stdout".into()))?;
         let mut session = Self {
             child,
             stdin,
@@ -179,7 +187,11 @@ impl McpSession {
         Ok(text.to_string())
     }
 
-    fn request(&mut self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, LoadError> {
+    fn request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, LoadError> {
         let id = self.next_id;
         self.next_id += 1;
         let message = serde_json::json!({
@@ -213,7 +225,9 @@ impl McpSession {
 
     fn send(&mut self, message: &serde_json::Value) -> Result<(), LoadError> {
         writeln!(self.stdin, "{message}").map_err(|err| LoadError::Mcp(err.to_string()))?;
-        self.stdin.flush().map_err(|err| LoadError::Mcp(err.to_string()))
+        self.stdin
+            .flush()
+            .map_err(|err| LoadError::Mcp(err.to_string()))
     }
 
     fn read_value(&mut self) -> Result<serde_json::Value, LoadError> {

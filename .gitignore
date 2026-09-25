@@ -1,3 +1,5 @@
 /target
 formal/lean/.lake
+formal/replay/.lake
+formal/harness/states
 coworker/node_modules

@@ -10,28 +10,41 @@ pub struct PostgresStore {
     client: Mutex<postgres::Client>,
 }
 
+const SCHEMA: &str = "
+create table if not exists agents (
+    id uuid primary key,
+    manifest jsonb not null
+);
+create table if not exists runs (
+    id uuid primary key,
+    spec jsonb not null,
+    events jsonb not null
+);
+create table if not exists artifacts (
+    id uuid primary key,
+    run_id uuid not null,
+    name text not null,
+    body bytea not null
+);
+";
+
+fn ensure_schema(client: &mut postgres::Client) -> Result<(), postgres::Error> {
+    client.batch_execute("begin")?;
+    if let Err(err) = client.query_one("select pg_advisory_xact_lock(872346)", &[]) {
+        let _ = client.batch_execute("rollback");
+        return Err(err);
+    }
+    if let Err(err) = client.batch_execute(SCHEMA) {
+        let _ = client.batch_execute("rollback");
+        return Err(err);
+    }
+    client.batch_execute("commit")
+}
+
 impl PostgresStore {
     pub fn connect(url: &str) -> Result<Self, postgres::Error> {
         let mut client = postgres::Client::connect(url, NoTls)?;
-        client.batch_execute(
-            "
-            create table if not exists agents (
-                id uuid primary key,
-                manifest jsonb not null
-            );
-            create table if not exists runs (
-                id uuid primary key,
-                spec jsonb not null,
-                events jsonb not null
-            );
-            create table if not exists artifacts (
-                id uuid primary key,
-                run_id uuid not null,
-                name text not null,
-                body bytea not null
-            );
-            ",
-        )?;
+        ensure_schema(&mut client)?;
         Ok(Self {
             client: Mutex::new(client),
         })
@@ -71,7 +84,10 @@ impl RunStore for PostgresStore {
             .client
             .lock()
             .expect("postgres")
-            .query_opt("select spec, events from runs where id = $1", &[&id.as_uuid()])
+            .query_opt(
+                "select spec, events from runs where id = $1",
+                &[&id.as_uuid()],
+            )
             .expect("select run")?;
         let spec = serde_json::from_value(row.get::<_, Value>(0)).expect("spec");
         let events = serde_json::from_value(row.get::<_, Value>(1)).expect("events");
@@ -120,7 +136,10 @@ impl PostgresStore {
             .client
             .lock()
             .expect("postgres")
-            .query_opt("select manifest from agents where id = $1", &[&id.as_uuid()])
+            .query_opt(
+                "select manifest from agents where id = $1",
+                &[&id.as_uuid()],
+            )
             .expect("select agent")?;
         Some(serde_json::from_value(row.get::<_, Value>(0)).expect("agent"))
     }

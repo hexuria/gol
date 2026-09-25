@@ -12,7 +12,7 @@ mod tool;
 
 pub use authorizer::authorize;
 pub use effect::{Effect, MemoryScope};
-pub use event::{Actor, Event, EventEnvelope, EventPayload, Timestamp};
+pub use event::{Actor, Event, EventEnvelope, EventPayload, EventSource, Timestamp};
 pub use fold::{fold, RunState};
 pub use id::{AgentId, ApprovalId, ArtifactId, EventId, InvocationId, RunId, StepId, ToolId};
 pub use model::{MessageRole, ModelMessage, ModelRequest};

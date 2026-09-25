@@ -302,13 +302,13 @@ impl Driver {
 
     fn push(&mut self, payload: EventPayload, actor: Actor) {
         self.events.push(Event::record(
-            self.spec.run_id,
-            self.spec.agent_id,
-            &self.spec.agent_version,
-            None,
-            actor,
-            None,
-            Timestamp::now(),
+            protocol::EventSource::new(
+                self.spec.run_id,
+                self.spec.agent_id,
+                &self.spec.agent_version,
+                actor,
+                Timestamp::now(),
+            ),
             payload,
         ));
     }
