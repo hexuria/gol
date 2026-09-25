@@ -294,7 +294,7 @@ impl Driver {
         else {
             return;
         };
-        if step >= protocol::MAX_STEPS {
+        if step >= self.spec.limits.max_steps {
             return;
         }
         self.push(EventPayload::StepAdvanced, Actor::System);
@@ -343,11 +343,11 @@ fn effects_of_last(spec: &RunSpec, events: &[Event]) -> Vec<Effect> {
         return Vec::new();
     };
     let prior = fold(spec, &events[..events.len() - 1]);
-    reduce_effects(prior.harness, last)
+    reduce_effects(prior.harness, last, spec)
 }
 
-fn reduce_effects(state: HarnessState, event: &Event) -> Vec<Effect> {
-    protocol::reduce(state, event).1
+fn reduce_effects(state: HarnessState, event: &Event, spec: &RunSpec) -> Vec<Effect> {
+    protocol::reduce(state, event, spec).1
 }
 
 #[cfg(test)]
