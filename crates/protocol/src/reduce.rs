@@ -1,5 +1,5 @@
 use crate::{
-    DispatchPhase, Effect, Event, EventPayload, FailureClass, HarnessState, MAX_RETRIES, MAX_STEPS,
+    DispatchPhase, Effect, Event, EventPayload, FailureClass, HarnessState, RunSpec, MAX_RETRIES,
 };
 
 pub type Effects = Vec<Effect>;
@@ -27,6 +27,13 @@ pub fn reduce_dispatch(state: DispatchPhase, event: &Event) -> DispatchPhase {
         (DispatchPhase::Running, EventPayload::RunPaused) => DispatchPhase::Paused,
         (DispatchPhase::Running, EventPayload::RunRecovering) => DispatchPhase::Recovering,
         (
+            DispatchPhase::Waiting { .. }
+            | DispatchPhase::AwaitingApproval { .. }
+            | DispatchPhase::Paused
+            | DispatchPhase::Recovering,
+            EventPayload::RunResumed,
+        ) => DispatchPhase::Running,
+        (
             DispatchPhase::Running
             | DispatchPhase::Waiting { .. }
             | DispatchPhase::AwaitingApproval { .. }
@@ -46,7 +53,7 @@ pub fn reduce_dispatch(state: DispatchPhase, event: &Event) -> DispatchPhase {
     }
 }
 
-pub fn reduce(state: HarnessState, event: &Event) -> (HarnessState, Effects) {
+pub fn reduce(state: HarnessState, event: &Event, spec: &RunSpec) -> (HarnessState, Effects) {
     if state.is_terminal() {
         return (state, Vec::new());
     }
@@ -63,7 +70,7 @@ pub fn reduce(state: HarnessState, event: &Event) -> (HarnessState, Effects) {
             ),
             other => (other, Vec::new()),
         },
-        EventPayload::EffectAuthorized { effect } => on_authorized(state, effect),
+        EventPayload::EffectAuthorized { effect } => on_authorized(state, effect, spec),
         EventPayload::ToolResult {
             name,
             invocation,
@@ -110,12 +117,12 @@ pub fn reduce(state: HarnessState, event: &Event) -> (HarnessState, Effects) {
         EventPayload::StepAdvanced => match state {
             HarnessState::Running {
                 step,
-                attempt,
                 answered: true,
-            } if step < MAX_STEPS => (
+                ..
+            } if step < spec.limits.max_steps => (
                 HarnessState::Running {
                     step: step + 1,
-                    attempt,
+                    attempt: 0,
                     answered: false,
                 },
                 Vec::new(),
@@ -166,6 +173,7 @@ pub fn reduce(state: HarnessState, event: &Event) -> (HarnessState, Effects) {
         | EventPayload::RunAwaitingApproval { .. }
         | EventPayload::RunPaused
         | EventPayload::RunRecovering
+        | EventPayload::RunResumed
         | EventPayload::EffectDecided { .. }
         | EventPayload::EffectDenied { .. }
         | EventPayload::ModelResponded { .. }
@@ -175,7 +183,7 @@ pub fn reduce(state: HarnessState, event: &Event) -> (HarnessState, Effects) {
     }
 }
 
-fn on_authorized(state: HarnessState, effect: &Effect) -> (HarnessState, Effects) {
+fn on_authorized(state: HarnessState, effect: &Effect, spec: &RunSpec) -> (HarnessState, Effects) {
     let HarnessState::Running {
         step,
         attempt,
@@ -193,7 +201,7 @@ fn on_authorized(state: HarnessState, effect: &Effect) -> (HarnessState, Effects
     match effect {
         Effect::ToolCall {
             name, invocation, ..
-        } if !answered && (1..=MAX_STEPS).contains(&step) => (
+        } if !answered && (1..=spec.limits.max_steps).contains(&step) => (
             HarnessState::WaitingForTool {
                 step,
                 attempt,
@@ -219,7 +227,10 @@ fn on_authorized(state: HarnessState, effect: &Effect) -> (HarnessState, Effects
 mod tests {
     use super::*;
     use crate::spec::sample_spec;
-    use crate::{Actor, Event, EventSource, FailureClass, InvocationId, Timestamp};
+    use crate::{
+        Actor, AgentId, Capability, CredentialSource, Event, EventSource, ExecutionPlacement,
+        FailureClass, InvocationId, Limits, ModelProvider, RunSpec, Timestamp, WorkModel,
+    };
     use proptest::prelude::*;
     use uuid::Uuid;
 
@@ -295,6 +306,7 @@ mod tests {
             &ev(EventPayload::EffectAuthorized {
                 effect: effect.clone(),
             }),
+            &sample_spec(),
         );
         assert_eq!(next, echo_wait(1, 0));
         assert_eq!(effects, vec![effect]);
@@ -310,7 +322,7 @@ mod tests {
             tool_result_for("echo", invocation(), 1, 1, "nope"),
         ];
         for event in mismatches {
-            let (next, effects) = reduce(waiting.clone(), &event);
+            let (next, effects) = reduce(waiting.clone(), &event, &sample_spec());
             assert_eq!(next, waiting);
             assert!(effects.is_empty());
         }
@@ -319,9 +331,9 @@ mod tests {
     #[test]
     fn duplicate_tool_result_stays_answered() {
         let waiting = echo_wait(1, 0);
-        let (answered, effects) = reduce(waiting, &tool_result());
+        let (answered, effects) = reduce(waiting, &tool_result(), &sample_spec());
         assert!(effects.is_empty());
-        let (again, effects) = reduce(answered.clone(), &tool_result());
+        let (again, effects) = reduce(answered.clone(), &tool_result(), &sample_spec());
         assert_eq!(again, answered);
         assert!(effects.is_empty());
         assert_eq!(
@@ -337,16 +349,20 @@ mod tests {
     #[test]
     fn late_tool_result_after_cancel_stays_cancelled() {
         let waiting = echo_wait(1, 0);
-        let (cancelled, _) = reduce(waiting, &ev(EventPayload::RunCancelled));
+        let (cancelled, _) = reduce(waiting, &ev(EventPayload::RunCancelled), &sample_spec());
         assert_eq!(cancelled, HarnessState::Cancelled);
-        let (next, effects) = reduce(cancelled, &tool_result());
+        let (next, effects) = reduce(cancelled, &tool_result(), &sample_spec());
         assert_eq!(next, HarnessState::Cancelled);
         assert!(effects.is_empty());
     }
 
     #[test]
     fn retry_after_cancel_stays_cancelled() {
-        let (next, effects) = reduce(HarnessState::Cancelled, &ev(EventPayload::StepRetried));
+        let (next, effects) = reduce(
+            HarnessState::Cancelled,
+            &ev(EventPayload::StepRetried),
+            &sample_spec(),
+        );
         assert_eq!(next, HarnessState::Cancelled);
         assert!(effects.is_empty());
     }
@@ -360,6 +376,7 @@ mod tests {
                 class: FailureClass::Tool,
                 message: "worker gone".to_string(),
             }),
+            &sample_spec(),
         );
         assert_eq!(
             next,
@@ -384,11 +401,12 @@ mod tests {
             &ev(EventPayload::EffectAuthorized {
                 effect: first.clone(),
             }),
+            &sample_spec(),
         );
         assert_eq!(waiting, echo_wait(1, 0));
         assert_eq!(effects, vec![first]);
 
-        let (answered, effects) = reduce(waiting, &tool_result());
+        let (answered, effects) = reduce(waiting, &tool_result(), &sample_spec());
         assert!(effects.is_empty());
         assert_eq!(
             answered,
@@ -399,7 +417,7 @@ mod tests {
             }
         );
 
-        let (next, effects) = reduce(answered, &ev(EventPayload::StepAdvanced));
+        let (next, effects) = reduce(answered, &ev(EventPayload::StepAdvanced), &sample_spec());
         assert!(effects.is_empty());
         assert_eq!(
             next,
@@ -420,6 +438,7 @@ mod tests {
             &ev(EventPayload::EffectAuthorized {
                 effect: second.clone(),
             }),
+            &sample_spec(),
         );
         assert_eq!(effects, vec![second]);
         assert_eq!(
@@ -440,7 +459,7 @@ mod tests {
             attempt: 0,
             answered: true,
         };
-        let (retried, _) = reduce(answered, &ev(EventPayload::StepRetried));
+        let (retried, _) = reduce(answered, &ev(EventPayload::StepRetried), &sample_spec());
         assert_eq!(
             retried,
             HarnessState::Running {
@@ -454,15 +473,89 @@ mod tests {
             attempt: 1,
             answered: true,
         };
-        let (advanced, _) = reduce(answered, &ev(EventPayload::StepAdvanced));
+        let (advanced, _) = reduce(answered, &ev(EventPayload::StepAdvanced), &sample_spec());
         assert_eq!(
             advanced,
             HarnessState::Running {
                 step: 2,
-                attempt: 1,
+                attempt: 0,
                 answered: false
             }
         );
+    }
+
+    #[test]
+    fn step_advanced_stops_at_the_spec_limit() {
+        let spec = RunSpec::builder()
+            .agent(AgentId::new(), "3")
+            .input("ship")
+            .placement(ExecutionPlacement::Box)
+            .work_model(WorkModel {
+                provider: ModelProvider::SystemOne,
+                model_name: "jev-latest".to_string(),
+                credential: CredentialSource::BringYourOwn {
+                    secret_ref: "jev".to_string(),
+                },
+            })
+            .capabilities(vec![Capability::new("tool.echo")])
+            .limits(Limits {
+                max_steps: 2,
+                max_model_calls: 1,
+            })
+            .build();
+
+        let at_limit = HarnessState::Running {
+            step: 2,
+            attempt: 1,
+            answered: true,
+        };
+        let (stopped, effects) = reduce(at_limit.clone(), &ev(EventPayload::StepAdvanced), &spec);
+        assert_eq!(stopped, at_limit);
+        assert!(effects.is_empty());
+
+        let answered = HarnessState::Running {
+            step: 1,
+            attempt: 1,
+            answered: true,
+        };
+        let (advanced, effects) = reduce(answered, &ev(EventPayload::StepAdvanced), &spec);
+        assert!(effects.is_empty());
+        assert_eq!(
+            advanced,
+            HarnessState::Running {
+                step: 2,
+                attempt: 0,
+                answered: false
+            }
+        );
+
+        let effect = echo_call("hello");
+        let (waiting, effects) = reduce(
+            HarnessState::Running {
+                step: 2,
+                attempt: 0,
+                answered: false,
+            },
+            &ev(EventPayload::EffectAuthorized {
+                effect: effect.clone(),
+            }),
+            &spec,
+        );
+        assert_eq!(effects, vec![effect.clone()]);
+        assert_eq!(waiting, echo_wait(2, 0));
+
+        let past = HarnessState::Running {
+            step: 3,
+            attempt: 0,
+            answered: false,
+        };
+        let (stays, effects) = reduce(
+            past.clone(),
+            &ev(EventPayload::EffectAuthorized { effect }),
+            &spec,
+        );
+        assert_eq!(stays, past);
+        assert!(effects.is_empty());
     }
 
     fn failure_class() -> impl Strategy<Value = FailureClass> {
@@ -527,7 +620,7 @@ mod tests {
     proptest! {
         #[test]
         fn terminal_state_is_stuck(state in terminal_state(), payload in payload()) {
-            let (next, effects) = reduce(state.clone(), &ev(payload));
+            let (next, effects) = reduce(state.clone(), &ev(payload), &sample_spec());
             prop_assert_eq!(next, state);
             prop_assert!(effects.is_empty());
         }
