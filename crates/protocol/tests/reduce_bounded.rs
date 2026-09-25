@@ -4,7 +4,9 @@
 //! validity is preserved, a lexicographic rank strictly drops on every change,
 //! terminal states absorb every event, and a pair outside the transition table
 //! leaves the state unchanged. Here the subject is `protocol::reduce` and
-//! `protocol::reduce_dispatch` themselves.
+//! `protocol::reduce_dispatch` themselves. Each reducer is checked against a
+//! total table: the exact next state and, for the harness, the exact effects
+//! of every pair.
 //!
 //! The alphabets come from matches with no `_` arm (`payload_index`,
 //! `effect_index`, `phase_index`, `class_index`), so adding a variant to
@@ -495,6 +497,33 @@ fn expected_next(state: &HarnessState, payload: &EventPayload) -> HarnessState {
     }
 }
 
+/// The exact effects of every pair. An authorized model call or memory
+/// access passes through from any running step; an authorized tool call only
+/// from an unanswered step inside the budget. Nothing else emits.
+fn expected_effects(state: &HarnessState, payload: &EventPayload, max_steps: u32) -> Vec<Effect> {
+    let (HarnessState::Running { step, answered, .. }, EventPayload::EffectAuthorized { effect }) =
+        (state, payload)
+    else {
+        return Vec::new();
+    };
+    let emits = match effect {
+        Effect::ToolCall { .. } => !answered && (1..=max_steps).contains(step),
+        Effect::ModelCall { .. } | Effect::MemoryRead { .. } | Effect::MemoryWrite { .. } => true,
+        Effect::Execute { .. }
+        | Effect::Delegate { .. }
+        | Effect::AskUser { .. }
+        | Effect::RequestApproval { .. }
+        | Effect::Wait { .. }
+        | Effect::PublishArtifact { .. }
+        | Effect::Complete { .. } => false,
+    };
+    if emits {
+        vec![effect.clone()]
+    } else {
+        Vec::new()
+    }
+}
+
 #[test]
 fn harness_reduce_keeps_validity_rank_and_table_on_every_bounded_pair() {
     let mut checked = 0usize;
@@ -536,12 +565,12 @@ fn harness_reduce_keeps_validity_rank_and_table_on_every_bounded_pair() {
                     assert!(effects.is_empty(), "terminal state emitted: {}", at());
                 }
 
-                match payload {
-                    EventPayload::EffectAuthorized { effect } if !effects.is_empty() => {
-                        assert_eq!(effects, vec![effect.clone()], "emitted: {}", at());
-                    }
-                    _ => assert!(effects.is_empty(), "unauthorized effect: {}", at()),
-                }
+                assert_eq!(
+                    effects,
+                    expected_effects(&state, payload, max_steps),
+                    "wrong effects: {}",
+                    at()
+                );
                 if effects
                     .iter()
                     .any(|effect| matches!(effect, Effect::ToolCall { .. }))
@@ -636,24 +665,90 @@ fn dispatch_rank(phase: &DispatchPhase) -> u32 {
     }
 }
 
+/// The transition table of `formal/harness/Dispatch.tla`, one arm per action,
+/// as a total function: every pair outside an action is the identity.
+fn dispatch_expected(phase: &DispatchPhase, payload: &EventPayload) -> DispatchPhase {
+    use DispatchPhase as D;
+    use EventPayload as P;
+    let live = matches!(
+        phase,
+        D::Running | D::Waiting { .. } | D::AwaitingApproval { .. } | D::Paused | D::Recovering
+    );
+    match (phase, payload) {
+        _ if phase.is_terminal() => phase.clone(),
+        // DispatchQueue, DispatchSchedule, DispatchProvision, DispatchPrepare
+        (D::Created, P::RunQueued) => D::Queued,
+        (D::Queued, P::RunScheduled) => D::Scheduled,
+        (D::Scheduled, P::RunProvisioning) => D::Provisioning,
+        (D::Provisioning, P::RunStarting) => D::Starting,
+        // DispatchRun, DispatchLocalRun
+        (D::Starting | D::Created, P::RunStarted) => D::Running,
+        // DispatchWait, DispatchApproval, DispatchPause, DispatchRecover
+        (D::Running, P::RunWaiting { reason }) => D::Waiting {
+            reason: reason.clone(),
+        },
+        (D::Running, P::RunAwaitingApproval { approval_id }) => D::AwaitingApproval {
+            approval_id: *approval_id,
+        },
+        (D::Running, P::RunPaused) => D::Paused,
+        (D::Running, P::RunRecovering) => D::Recovering,
+        // DispatchResume
+        (
+            D::Waiting { .. } | D::AwaitingApproval { .. } | D::Paused | D::Recovering,
+            P::RunResumed,
+        ) => D::Running,
+        // DispatchComplete: live phases only
+        (_, P::RunCompleted { outcome }) if live => D::Completed {
+            outcome: outcome.clone(),
+        },
+        // DispatchFail, DispatchCancel, DispatchExpire: every open phase
+        (_, P::RunFailed { class, message }) => D::Failed {
+            class: *class,
+            message: message.clone(),
+        },
+        (_, P::RunCancelled) => D::Cancelled,
+        (_, P::RunExpired) => D::Expired,
+        _ => phase.clone(),
+    }
+}
+
+/// `DispatchResume`: a paused live phase returns to running. It is the only
+/// change that may raise the rank (`RankDecreases` in `Dispatch.tla`).
+fn is_resume(phase: &DispatchPhase, next: &DispatchPhase) -> bool {
+    matches!(
+        phase,
+        DispatchPhase::Waiting { .. }
+            | DispatchPhase::AwaitingApproval { .. }
+            | DispatchPhase::Paused
+            | DispatchPhase::Recovering
+    ) && *next == DispatchPhase::Running
+}
+
 /// The properties `formal/harness/Dispatch.cfg` checks, on production
-/// `reduce_dispatch`: terminal phases stay put, every change lowers the rank
-/// except `RunResumed`, and every open phase has an exit.
+/// `reduce_dispatch`: the exact next phase of every pair, terminal phases stay
+/// put, every change except `DispatchResume` lowers the rank, and every open
+/// phase has an exit.
 #[test]
-fn dispatch_reduce_keeps_terminal_rank_and_exits_on_every_pair() {
+fn dispatch_reduce_matches_the_table_on_every_pair() {
     let payloads = payloads(3);
     for phase in dispatch_phases() {
         let mut exits = 0;
         for payload in &payloads {
             let next = reduce_dispatch(phase.clone(), &event(payload.clone()));
             let at = || format!("{phase:?} + {payload:?} -> {next:?}");
+            assert_eq!(
+                next,
+                dispatch_expected(&phase, payload),
+                "wrong next phase: {}",
+                at()
+            );
             if phase.is_terminal() {
                 assert_eq!(next, phase, "terminal phase moved: {}", at());
                 continue;
             }
             if next != phase {
                 exits += 1;
-                if !matches!(payload, EventPayload::RunResumed) {
+                if !is_resume(&phase, &next) {
                     assert!(
                         dispatch_rank(&next) < dispatch_rank(&phase),
                         "rank did not drop: {}",

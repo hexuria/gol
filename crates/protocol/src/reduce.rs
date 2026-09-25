@@ -360,6 +360,14 @@ mod tests {
     fn tool_result_then_cancel_ends_cancelled() {
         let waiting = echo_wait(1, 0);
         let (answered, effects) = reduce(waiting, &tool_result(), &sample_spec());
+        assert_eq!(
+            answered,
+            HarnessState::Running {
+                step: 1,
+                attempt: 0,
+                answered: true,
+            }
+        );
         assert!(effects.is_empty());
         let (next, effects) = reduce(answered, &ev(EventPayload::RunCancelled), &sample_spec());
         assert_eq!(next, HarnessState::Cancelled);

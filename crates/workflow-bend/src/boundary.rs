@@ -537,7 +537,10 @@ fn join_reader(handle: thread::JoinHandle<Capped>) -> Result<Capped, FrontendErr
 fn kill_group(child: &mut Child) {
     let pid = child.id() as i32;
     // SAFETY: kill(2) takes two integers and touches no memory of this process.
-    // The child was spawned in its own process group, so -pid names that group.
+    // The child was spawned with process_group(0), so its pgid equals its pid and
+    // -pid names that group. The pid fits in i32 (Linux caps pids at 2^22) and is
+    // never 0 or 1. The child is not reaped until the wait below, so its pid and
+    // pgid cannot have been reused by another process.
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }

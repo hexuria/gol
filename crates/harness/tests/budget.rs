@@ -117,4 +117,6 @@ fn a_run_one_decision_over_its_budget_fails() {
             ..
         }
     ));
+    assert_eq!(budget_failures(&driver), 1);
+    assert_eq!(driver.state().steps, 1);
 }
