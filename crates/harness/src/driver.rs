@@ -230,8 +230,21 @@ impl Driver {
                         );
                         return;
                     };
-                    let output = tool.call(input);
-                    self.deliver_tool_result(name, *invocation, output);
+                    match tool.call(input) {
+                        Ok(output) => {
+                            self.deliver_tool_result(name, *invocation, output);
+                        }
+                        Err(message) => {
+                            self.push(
+                                EventPayload::RunFailed {
+                                    class: FailureClass::Tool,
+                                    message,
+                                },
+                                Actor::System,
+                            );
+                            return;
+                        }
+                    }
                 }
                 Effect::ModelCall { prompt } => {
                     let request = protocol::ModelRequest {
@@ -412,7 +425,7 @@ mod tests {
             EchoTool::descriptor()
         }
 
-        fn call(&self, _input: &str) -> String {
+        fn call(&self, _input: &str) -> Result<String, String> {
             panic!("tool executed");
         }
     }

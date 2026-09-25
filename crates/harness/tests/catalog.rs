@@ -6,12 +6,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use harness::{
-    load_catalog, Decider, DeciderError, DecisionView, Driver, InMemory, ScriptedDecider,
-    UnavailableModel,
+    load_catalog, Decider, DeciderError, DecisionView, Driver, EchoTool, InMemory, LoadedCatalog,
+    ScriptedDecider, Tool, UnavailableModel,
 };
 use protocol::{
-    AgentId, Capability, CredentialSource, Effect, EventPayload, ExecutionPlacement, HarnessState,
-    InvocationId, Limits, ModelProvider, RunSpec, WorkModel,
+    AgentId, Capability, CredentialSource, Effect, EventPayload, ExecutionPlacement, FailureClass,
+    HarnessState, InvocationId, Limits, ModelProvider, RunSpec, WorkModel,
 };
 
 fn spec(capabilities: Vec<&str>) -> RunSpec {
@@ -242,4 +242,227 @@ fn skill_body_is_on_the_decision_view() {
         .run_loaded(&mut decider, &UnavailableModel, &mut InMemory::default())
         .unwrap();
     assert_eq!(decider.body, "note:remember the rust");
+}
+
+fn run_call(catalog: LoadedCatalog, capability: &str, name: &str, input: &str) -> Driver {
+    let mut driver = Driver::boot_with_catalog(spec(vec![capability]), catalog).unwrap();
+    let mut decider = ScriptedDecider::new([
+        Effect::ToolCall {
+            name: name.into(),
+            input: input.into(),
+            invocation: InvocationId::new(),
+        },
+        Effect::Complete {
+            outcome: "done".into(),
+        },
+    ]);
+    driver
+        .run_loaded(&mut decider, &UnavailableModel, &mut InMemory::default())
+        .unwrap();
+    driver
+}
+
+fn assert_tool_failure(driver: &Driver) {
+    assert!(
+        driver
+            .events()
+            .iter()
+            .all(|event| !matches!(event.payload, EventPayload::ToolResult { .. })),
+        "tool error was recorded as a tool result"
+    );
+    assert!(
+        matches!(
+            driver.state().harness,
+            HarnessState::Failed {
+                class: FailureClass::Tool,
+                ..
+            }
+        ),
+        "expected a tool failure, got {:?}",
+        driver.state().harness
+    );
+    assert!(!matches!(
+        driver.state().harness,
+        HarnessState::Completed { .. }
+    ));
+}
+
+fn mcp_script(call_arm: &str) -> String {
+    format!(
+        r#"import json, sys
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    msg = json.loads(line)
+    if "id" not in msg:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        send({{"jsonrpc":"2.0","id":msg["id"],"result":{{"protocolVersion":"2024-11-05","capabilities":{{}},"serverInfo":{{"name":"fake","version":"0"}}}}}})
+    elif method == "tools/call":
+        {call_arm}
+    else:
+        send({{"jsonrpc":"2.0","id":msg["id"],"error":{{"code":-32601,"message":"no"}}}})
+"#
+    )
+}
+
+fn write_mcp_catalog(dir: &Path, command: &str, args: &[&str], tools: &[(&str, &str)]) {
+    let mut toml = format!("[[mcp]]\nname = \"local\"\ncommand = \"{command}\"\n");
+    if !args.is_empty() {
+        let listed = args
+            .iter()
+            .map(|arg| format!("\"{arg}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        toml.push_str(&format!("args = [{listed}]\n"));
+    }
+    for (name, description) in tools {
+        toml.push_str(&format!(
+            "\n[[mcp.tools]]\nname = \"{name}\"\ndescription = \"{description}\"\n"
+        ));
+    }
+    fs::write(dir.join("harness.toml"), toml).unwrap();
+}
+
+#[test]
+fn mcp_jsonrpc_error_is_not_a_tool_result() {
+    let dir = scratch();
+    let script = dir.join("mcp.py");
+    fs::write(
+        &script,
+        mcp_script(
+            "send({\"jsonrpc\":\"2.0\",\"id\":msg[\"id\"],\"error\":{\"code\":-32000,\"message\":\"boom\"}})",
+        ),
+    )
+    .unwrap();
+    write_mcp_catalog(
+        &dir,
+        "python3",
+        &[script.to_str().unwrap()],
+        &[("ping", "p")],
+    );
+    let catalog = load_catalog(&dir).unwrap();
+    let driver = run_call(catalog, "mcp.local.ping", "ping", "hi");
+    assert_tool_failure(&driver);
+}
+
+#[test]
+fn mcp_spawn_failure_is_not_a_tool_result() {
+    let dir = scratch();
+    let missing = dir.join("missing-mcp-command");
+    write_mcp_catalog(&dir, missing.to_str().unwrap(), &[], &[("ping", "p")]);
+    let catalog = load_catalog(&dir).unwrap();
+    let driver = run_call(catalog, "mcp.local.ping", "ping", "hi");
+    assert_tool_failure(&driver);
+}
+
+#[test]
+fn echo_mcp_error_text_is_a_tool_result() {
+    let dir = scratch();
+    fs::write(dir.join("harness.toml"), "tools = [\"echo\"]\n").unwrap();
+    let catalog = load_catalog(&dir).unwrap();
+    let input = "mcp error: Mcp(\"x\")";
+    let driver = run_call(catalog, "tool.echo", "echo", input);
+    assert_eq!(tool_names(driver.events()), vec![format!("echo:{input}")]);
+    assert!(matches!(
+        driver.state().harness,
+        HarnessState::Completed { .. }
+    ));
+}
+
+fn sibling(dir: &Path, suffix: &str) -> std::path::PathBuf {
+    let name = dir.file_name().unwrap().to_str().unwrap();
+    dir.with_file_name(format!("{name}-{suffix}"))
+}
+
+#[test]
+fn skill_dotdot_outside_is_rejected() {
+    let dir = scratch();
+    let leaked = sibling(&dir, "leaked.md");
+    fs::write(&leaked, "leaked").unwrap();
+    let rel = format!("../{}", leaked.file_name().unwrap().to_str().unwrap());
+    fs::write(dir.join("harness.toml"), format!("skills = [\"{rel}\"]\n")).unwrap();
+    assert!(load_catalog(&dir).is_err());
+}
+
+#[test]
+fn skill_symlink_outside_is_rejected() {
+    let dir = scratch();
+    fs::create_dir(dir.join("skills")).unwrap();
+    let outside = sibling(&dir, "outside");
+    fs::create_dir(&outside).unwrap();
+    let secret = outside.join("secret.md");
+    fs::write(&secret, "outside secret body").unwrap();
+    std::os::unix::fs::symlink(&secret, dir.join("skills/link.md")).unwrap();
+    fs::write(dir.join("harness.toml"), "skills = [\"skills/link.md\"]\n").unwrap();
+    match load_catalog(&dir) {
+        Err(_) => {}
+        Ok(catalog) => {
+            assert!(
+                catalog
+                    .skills
+                    .iter()
+                    .all(|skill| skill.body != "outside secret body"),
+                "loaded the outside file"
+            );
+            panic!("symlink skill was accepted");
+        }
+    }
+}
+
+#[test]
+fn skill_absolute_is_rejected() {
+    let dir = scratch();
+    fs::create_dir(dir.join("skills")).unwrap();
+    let inside = dir.join("skills/note.md");
+    fs::write(&inside, "remember the rust").unwrap();
+    let outside = sibling(&dir, "other.md");
+    fs::write(&outside, "nope").unwrap();
+    for absolute in [inside, outside] {
+        fs::write(
+            dir.join("harness.toml"),
+            format!("skills = [\"{}\"]\n", absolute.display()),
+        )
+        .unwrap();
+        assert!(
+            load_catalog(&dir).is_err(),
+            "accepted absolute skill path {}",
+            absolute.display()
+        );
+    }
+}
+
+#[test]
+fn skill_dotdot_back_inside_is_rejected() {
+    let dir = scratch();
+    fs::create_dir(dir.join("skills")).unwrap();
+    fs::write(dir.join("skills/note.md"), "remember the rust").unwrap();
+    fs::write(
+        dir.join("harness.toml"),
+        "skills = [\"skills/../skills/note.md\"]\n",
+    )
+    .unwrap();
+    assert!(load_catalog(&dir).is_err());
+}
+
+#[test]
+fn echo_descriptor_id_is_stable() {
+    let first = EchoTool::descriptor();
+    let second = EchoTool::descriptor();
+    assert_eq!(first.id, second.id);
+    assert_eq!(Tool::descriptor(&EchoTool).id, first.id);
+}
+
+#[test]
+fn mcp_descriptor_id_is_stable() {
+    let dir = scratch();
+    write_mcp_catalog(&dir, "python3", &[], &[("ping", "p"), ("pong", "q")]);
+    let catalog = load_catalog(&dir).unwrap();
+    let first = catalog.descriptors();
+    let second = catalog.descriptors();
+    assert_eq!(first[0].id, second[0].id);
+    assert_eq!(first[1].id, second[1].id);
+    assert_ne!(first[0].id, first[1].id);
 }
