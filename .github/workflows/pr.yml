@@ -77,9 +77,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Bend 2.0.27
         run: |
-          curl -fsSL https://bend-lang.com/install.sh | sh
+          ./scripts/install-bend.sh
           echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
-          test "$(BEND_NO_TELEMETRY=1 "$HOME/.bend/bin/bend" version)" = "bend 2.0.27"
       - name: Allow user namespaces for unshare
         run: |
           # ubuntu-latest sets apparmor_restrict_unprivileged_userns=1, which
@@ -116,9 +115,8 @@ jobs:
           shared-key: workflow-bend
       - name: Install Bend 2.0.27
         run: |
-          curl -fsSL https://bend-lang.com/install.sh | sh
+          ./scripts/install-bend.sh
           echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
-          test "$(BEND_NO_TELEMETRY=1 "$HOME/.bend/bin/bend" version)" = "bend 2.0.27"
       - name: Allow user namespaces for unshare
         run: |
           # ubuntu-latest sets apparmor_restrict_unprivileged_userns=1, which
