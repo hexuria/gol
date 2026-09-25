@@ -444,11 +444,10 @@ pub fn accept_subscription_completion(
     }
     let prior = stored.events.clone();
     let mut events = stored.events;
-    append_completion(&stored.spec, &mut events, text);
-    store.put_run(StoredRun {
-        spec: stored.spec.clone(),
-        events: events.clone(),
-    });
+    let mut appended = Vec::new();
+    append_completion(&stored.spec, &mut appended, text);
+    store.append_events(stored.spec.run_id, appended.clone());
+    events.extend(appended);
     if box_turn {
         release_after_complete(store, &stored.spec, sandbox, &name, prior)?;
     }
