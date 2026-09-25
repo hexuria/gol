@@ -40,7 +40,8 @@ if ((${#configs[@]})); then
     echo "TLC ${base}"
     # -workers auto uses every core. -lncheck final checks liveness once, on the complete
     # state graph, instead of pausing the search for a partial check every few minutes.
-    # Invariants and [][A]_v properties are still checked on every transition.
-    java -XX:+UseParallelGC -jar "${jar}" -workers auto -lncheck final -config "${cfg}" -deadlock "${tla}"
+    # Invariants and [][A]_v properties are still checked on every transition. TLC also
+    # checks deadlock; a config that must allow one says CHECK_DEADLOCK FALSE.
+    java -XX:+UseParallelGC -jar "${jar}" -workers auto -lncheck final -config "${cfg}" "${tla}"
   done
 fi

@@ -93,9 +93,10 @@ export BEND_NO_TELEMETRY=1
 
 `formal/harness/Harness.tla` is the interleaving model. `formal/lean` is the single-turn proof. Findings are in `formal/harness/FINDINGS.md`.
 
-`./scripts/verify-tla.sh` runs TLC on every `formal/**/*.cfg` with `-workers auto -lncheck final -deadlock`. It reads the jar from `TLA_JAR`, then `~/.local/tla/tla2tools.jar`, then `/usr/share/java/tla2tools.jar`. `./scripts/verify-lean.sh` runs `lake build` in each Lean project.
+`./scripts/install-tla.sh` installs the pinned TLA+ tools, v1.7.4 (TLC 2.19), at `~/.local/tla/tla2tools.jar` and checks its sha256. `./scripts/verify-tla.sh` runs TLC on every `formal/**/*.cfg` with `-workers auto -lncheck final`. TLC checks deadlock unless a config says `CHECK_DEADLOCK FALSE`. The script reads the jar from `TLA_JAR`, then `~/.local/tla/tla2tools.jar`, then `/usr/share/java/tla2tools.jar`. `./scripts/verify-lean.sh` runs `lake build` in each Lean project.
 
 ```bash
+./scripts/install-tla.sh
 ./scripts/verify-tla.sh
 ./scripts/verify-lean.sh
 ```

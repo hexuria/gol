@@ -40,15 +40,8 @@ export BEND_NO_TELEMETRY=1
 export PATH="${HOME}/.bend/bin:${PATH}"
 sudo ln -sfn "${HOME}/.bend/bin/bend" /usr/local/bin/bend
 
-# Same jar URL as the formal job in .github/workflows/pr.yml.
-tla_jar="${HOME}/.local/tla/tla2tools.jar"
-if [ ! -f "${tla_jar}" ] || ! unzip -t "${tla_jar}" >/dev/null 2>&1; then
-  mkdir -p "${HOME}/.local/tla"
-  tmp_jar="${tla_jar}.partial"
-  curl -fsSL -o "${tmp_jar}" \
-    https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
-  mv -f "${tmp_jar}" "${tla_jar}"
-fi
+# Same pinned jar as the formal job in .github/workflows/pr.yml.
+"$(cd "$(dirname "$0")/.." && pwd)/scripts/install-tla.sh"
 
 # Same elan command as the formal job. It does not name a Lean version.
 # lake reads formal/**/lean-toolchain when scripts/verify-formal.sh builds.
