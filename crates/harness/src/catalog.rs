@@ -52,6 +52,15 @@ struct McpServer {
     command: String,
     #[serde(default)]
     args: Vec<String>,
+    #[serde(default)]
+    tools: Vec<McpToolDecl>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpToolDecl {
+    name: String,
+    #[serde(default)]
+    description: String,
 }
 
 pub fn load_catalog(dir: impl AsRef<Path>) -> Result<LoadedCatalog, LoadError> {
@@ -70,16 +79,26 @@ pub fn load_catalog(dir: impl AsRef<Path>) -> Result<LoadedCatalog, LoadError> {
         }
     }
 
-    for server in &file.mcp {
-        let session = McpSession::spawn(dir, server)?;
-        let listed = session.lock().expect("mcp").list_tools()?;
-        let shared = Arc::new(session);
-        for listed_tool in listed {
-            let capability = format!("mcp.{}.{}", server.name, listed_tool.name);
+    for server in file.mcp {
+        if server.tools.is_empty() {
+            return Err(LoadError::Mcp(format!(
+                "{}: declare tools in the catalog; loading does not start {}",
+                server.name, server.command
+            )));
+        }
+        let shared = Arc::new(Mutex::new(PendingMcp {
+            dir: dir.to_path_buf(),
+            server_name: server.name.clone(),
+            command: server.command,
+            args: server.args,
+            live: None,
+        }));
+        for declared in server.tools {
+            let capability = format!("mcp.{}.{}", server.name, declared.name);
             tools.push(Box::new(McpTool {
                 server: server.name.clone(),
-                name: listed_tool.name,
-                description: listed_tool.description,
+                name: declared.name,
+                description: declared.description,
                 capability,
                 session: Arc::clone(&shared),
             }));
@@ -101,9 +120,26 @@ pub fn load_catalog(dir: impl AsRef<Path>) -> Result<LoadedCatalog, LoadError> {
     Ok(LoadedCatalog { tools, skills })
 }
 
-struct ListedTool {
-    name: String,
-    description: String,
+struct PendingMcp {
+    dir: PathBuf,
+    server_name: String,
+    command: String,
+    args: Vec<String>,
+    live: Option<McpSession>,
+}
+
+impl PendingMcp {
+    fn call(&mut self, name: &str, input: &str) -> Result<String, LoadError> {
+        if self.live.is_none() {
+            self.live = Some(McpSession::spawn(
+                &self.dir,
+                &self.server_name,
+                &self.command,
+                &self.args,
+            )?);
+        }
+        self.live.as_mut().expect("mcp session").call(name, input)
+    }
 }
 
 struct McpSession {
@@ -114,15 +150,15 @@ struct McpSession {
 }
 
 impl McpSession {
-    fn spawn(dir: &Path, server: &McpServer) -> Result<Mutex<Self>, LoadError> {
-        let mut child = Command::new(&server.command)
-            .args(&server.args)
+    fn spawn(dir: &Path, name: &str, command: &str, args: &[String]) -> Result<Self, LoadError> {
+        let mut child = Command::new(command)
+            .args(args)
             .current_dir(dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|err| LoadError::Mcp(format!("{}: {err}", server.name)))?;
+            .map_err(|err| LoadError::Mcp(format!("{name}: {err}")))?;
         let stdin = child
             .stdin
             .take()
@@ -146,30 +182,7 @@ impl McpSession {
             }),
         )?;
         session.notify("notifications/initialized", serde_json::json!({}))?;
-        Ok(Mutex::new(session))
-    }
-
-    fn list_tools(&mut self) -> Result<Vec<ListedTool>, LoadError> {
-        let result = self.request("tools/list", serde_json::json!({}))?;
-        let tools = result
-            .get("tools")
-            .and_then(|value| value.as_array())
-            .ok_or_else(|| LoadError::Mcp("tools/list missing tools".into()))?;
-        let mut listed = Vec::new();
-        for tool in tools {
-            let name = tool
-                .get("name")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| LoadError::Mcp("tool missing name".into()))?
-                .to_string();
-            let description = tool
-                .get("description")
-                .and_then(|value| value.as_str())
-                .unwrap_or("")
-                .to_string();
-            listed.push(ListedTool { name, description });
-        }
-        Ok(listed)
+        Ok(session)
     }
 
     fn call(&mut self, name: &str, input: &str) -> Result<String, LoadError> {
@@ -255,7 +268,7 @@ struct McpTool {
     name: String,
     description: String,
     capability: String,
-    session: Arc<Mutex<McpSession>>,
+    session: Arc<Mutex<PendingMcp>>,
 }
 
 impl Tool for McpTool {

@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use harness::{
@@ -111,7 +112,7 @@ for line in sys.stdin:
     )
     .unwrap();
     let toml = format!(
-        "[[mcp]]\nname = \"local\"\ncommand = \"python3\"\nargs = [\"{}\"]\n",
+        "[[mcp]]\nname = \"local\"\ncommand = \"python3\"\nargs = [\"{}\"]\n\n[[mcp.tools]]\nname = \"ping\"\ndescription = \"p\"\n",
         script.display()
     );
     fs::write(dir.join("harness.toml"), toml).unwrap();
@@ -152,6 +153,35 @@ impl Decider for SkillSeen {
             outcome: "done".into(),
         })
     }
+}
+
+#[test]
+fn reading_the_catalog_does_not_spawn_the_configured_command() {
+    let dir = scratch();
+    let marker = dir.join("spawned");
+    let command = dir.join("spawn-marker");
+    fs::write(
+        &command,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+    let toml = format!(
+        "[[mcp]]\nname = \"local\"\ncommand = \"{}\"\n\n[[mcp.tools]]\nname = \"ping\"\ndescription = \"p\"\n",
+        command.display()
+    );
+    fs::write(dir.join("harness.toml"), toml).unwrap();
+
+    let loaded = load_catalog(&dir);
+    assert!(
+        !marker.exists(),
+        "reading the catalog spawned the configured command"
+    );
+    let catalog = loaded.expect("reading the catalog must not execute the mcp command");
+    assert_eq!(catalog.descriptors()[0].name, "ping");
+    assert!(!marker.exists());
+    drop(catalog);
+    assert!(!marker.exists());
 }
 
 #[test]
