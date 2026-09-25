@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Local fixture proxy. It answers Claude Messages, Codex Responses, Grok
 //! cli-chat-proxy Responses, and the gol platform gateway. It does not call
 //! Anthropic, OpenAI, xAI, or any other vendor.

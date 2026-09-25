@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use std::thread::ThreadId;
 
 use harness::{

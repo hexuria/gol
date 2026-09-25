@@ -532,8 +532,12 @@ fn join_reader(handle: thread::JoinHandle<Capped>) -> Result<Capped, FrontendErr
         .map_err(|_| FrontendError::Setup("bend output reader stopped".to_string()))
 }
 
+// The only unsafe code in the workspace. Every other crate root forbids it.
+#[allow(unsafe_code)]
 fn kill_group(child: &mut Child) {
     let pid = child.id() as i32;
+    // SAFETY: kill(2) takes two integers and touches no memory of this process.
+    // The child was spawned in its own process group, so -pid names that group.
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }

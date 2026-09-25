@@ -357,6 +357,16 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_then_cancel_ends_cancelled() {
+        let waiting = echo_wait(1, 0);
+        let (answered, effects) = reduce(waiting, &tool_result(), &sample_spec());
+        assert!(effects.is_empty());
+        let (next, effects) = reduce(answered, &ev(EventPayload::RunCancelled), &sample_spec());
+        assert_eq!(next, HarnessState::Cancelled);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
     fn retry_after_cancel_stays_cancelled() {
         let (next, effects) = reduce(
             HarnessState::Cancelled,

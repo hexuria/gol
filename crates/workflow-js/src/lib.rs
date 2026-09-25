@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use boa_engine::{
     js_string, Context, JsError, JsNativeError, JsResult, JsValue, NativeFunction, Source,
 };

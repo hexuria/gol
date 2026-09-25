@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 mod boundary;
 
 use std::path::Path;

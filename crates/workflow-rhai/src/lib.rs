@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use rhai::{Engine, EvalAltResult, OptimizationLevel, Position};
 use std::cell::RefCell;
 use std::rc::Rc;

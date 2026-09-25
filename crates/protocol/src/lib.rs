@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 mod authorizer;
 mod effect;
 mod event;

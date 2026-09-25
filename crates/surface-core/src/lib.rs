@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use crux_core::{App, Command, Effect};
 use protocol::ExecutionPlacement;
 
