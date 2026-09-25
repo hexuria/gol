@@ -30,7 +30,7 @@ pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
             _ => {}
         }
         dispatch = reduce_dispatch(dispatch, event);
-        let (next, _) = reduce(harness, event);
+        let (next, _) = reduce(harness, event, spec);
         harness = next;
     }
 
@@ -47,7 +47,9 @@ pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
 mod tests {
     use super::*;
     use crate::spec::sample_spec;
-    use crate::{Actor, ApprovalId, Event, EventSource, FailureClass, Timestamp};
+    use crate::{
+        Actor, ApprovalId, Effect, Event, EventSource, FailureClass, InvocationId, Timestamp,
+    };
 
     fn ev(spec: &RunSpec, payload: EventPayload) -> Event {
         Event::record(
@@ -309,5 +311,115 @@ mod tests {
         );
         assert_eq!(recovering.harness, started.harness);
         assert_eq!(recovering.dispatch, DispatchPhase::Recovering);
+    }
+
+    #[test]
+    fn run_resumed_returns_each_side_phase_to_running() {
+        let spec = sample_spec();
+        let running = HarnessState::Running {
+            step: 1,
+            attempt: 0,
+            answered: false,
+        };
+        assert_eq!(EventPayload::RunResumed.event_type(), "run.resumed");
+
+        let from_waiting = fold(
+            &spec,
+            &[
+                ev(&spec, EventPayload::RunStarted),
+                ev(
+                    &spec,
+                    EventPayload::RunWaiting {
+                        reason: "tool".to_string(),
+                    },
+                ),
+                ev(&spec, EventPayload::RunResumed),
+            ],
+        );
+        assert_eq!(from_waiting.dispatch, DispatchPhase::Running);
+        assert_eq!(from_waiting.harness, running);
+
+        let approval_id = ApprovalId::new();
+        let from_approval = fold(
+            &spec,
+            &[
+                ev(&spec, EventPayload::RunStarted),
+                ev(&spec, EventPayload::RunAwaitingApproval { approval_id }),
+                ev(&spec, EventPayload::RunResumed),
+            ],
+        );
+        assert_eq!(from_approval.dispatch, DispatchPhase::Running);
+        assert_eq!(from_approval.harness, running);
+
+        let from_paused = fold(
+            &spec,
+            &[
+                ev(&spec, EventPayload::RunStarted),
+                ev(&spec, EventPayload::RunPaused),
+                ev(&spec, EventPayload::RunResumed),
+            ],
+        );
+        assert_eq!(from_paused.dispatch, DispatchPhase::Running);
+        assert_eq!(from_paused.harness, running);
+
+        let from_recovering = fold(
+            &spec,
+            &[
+                ev(&spec, EventPayload::RunStarted),
+                ev(&spec, EventPayload::RunRecovering),
+                ev(&spec, EventPayload::RunResumed),
+            ],
+        );
+        assert_eq!(from_recovering.dispatch, DispatchPhase::Running);
+        assert_eq!(from_recovering.harness, running);
+
+        let resumed_only = fold(
+            &spec,
+            &[
+                ev(&spec, EventPayload::RunStarted),
+                ev(&spec, EventPayload::RunResumed),
+            ],
+        );
+        assert_eq!(resumed_only.dispatch, DispatchPhase::Running);
+        assert_eq!(resumed_only.harness, running);
+
+        let created = fold(&spec, &[ev(&spec, EventPayload::RunResumed)]);
+        assert_eq!(created.dispatch, DispatchPhase::Created);
+        assert_eq!(created.harness, HarnessState::Idle);
+
+        let invocation = InvocationId::from_uuid(uuid::Uuid::from_u128(1));
+        let outstanding = fold(
+            &spec,
+            &[
+                ev(&spec, EventPayload::RunStarted),
+                ev(
+                    &spec,
+                    EventPayload::EffectAuthorized {
+                        effect: Effect::ToolCall {
+                            name: "echo".to_string(),
+                            input: "hello".to_string(),
+                            invocation,
+                        },
+                    },
+                ),
+                ev(
+                    &spec,
+                    EventPayload::RunWaiting {
+                        reason: "tool".to_string(),
+                    },
+                ),
+                ev(&spec, EventPayload::RunResumed),
+            ],
+        );
+        assert_eq!(outstanding.dispatch, DispatchPhase::Running);
+        assert_eq!(
+            outstanding.harness,
+            HarnessState::WaitingForTool {
+                step: 1,
+                attempt: 0,
+                name: "echo".to_string(),
+                invocation,
+            }
+        );
     }
 }
