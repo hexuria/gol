@@ -69,7 +69,13 @@ async fn post_when_up(
 ) -> reqwest::Response {
     let mut last = None;
     for _ in 0..30 {
-        match client.post(url).json(body).send().await {
+        match client
+            .post(url)
+            .header("authorization", "Bearer gol-gateway-local")
+            .json(body)
+            .send()
+            .await
+        {
             Ok(response) => return response,
             Err(error) => {
                 last = Some(error);
@@ -585,6 +591,7 @@ fn two_box_runs_do_not_share_a_workspace_volume() {
 async fn events_of(client: &reqwest::Client, base: &str, run_id: &str) -> Vec<protocol::Event> {
     client
         .get(format!("{base}/v1/runs/{run_id}/events"))
+        .header("authorization", "Bearer gol-gateway-local")
         .send()
         .await
         .expect("events")
@@ -632,6 +639,7 @@ async fn four_modes_only_let_the_server_post_in_gateway_mode() {
         let run_id = created["run_id"].as_str().expect("run id");
         let events: Vec<protocol::Event> = client
             .get(format!("{base}/v1/runs/{run_id}/events"))
+            .header("authorization", "Bearer gol-gateway-local")
             .send()
             .await
             .expect("events")
@@ -663,6 +671,7 @@ async fn four_modes_only_let_the_server_post_in_gateway_mode() {
             ));
             let rejected = client
                 .post(format!("{base}/v1/coworker/turns/{run_id}/completion"))
+                .header("authorization", "Bearer gol-gateway-local")
                 .json(&serde_json::json!({"text": "desktop tried"}))
                 .send()
                 .await
@@ -677,6 +686,7 @@ async fn four_modes_only_let_the_server_post_in_gateway_mode() {
             assert!(created["completion"].is_null());
             let accepted = client
                 .post(format!("{base}/v1/coworker/turns/{run_id}/completion"))
+                .header("authorization", "Bearer gol-gateway-local")
                 .json(&serde_json::json!({"text": "fixture assistant text"}))
                 .send()
                 .await
@@ -690,6 +700,7 @@ async fn four_modes_only_let_the_server_post_in_gateway_mode() {
             assert!(paths.lock().expect("paths").is_empty());
             let after: Vec<protocol::Event> = client
                 .get(format!("{base}/v1/runs/{run_id}/events"))
+                .header("authorization", "Bearer gol-gateway-local")
                 .send()
                 .await
                 .expect("events")
