@@ -1,4 +1,6 @@
-use protocol::{Effect, Event, EventPayload, MessageRole, RunId};
+use std::collections::HashMap;
+
+use protocol::{Effect, Event, EventPayload, InvocationId, MessageRole, RunId};
 use serde_json::{json, Value};
 
 pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
@@ -8,6 +10,19 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
         "threadId": run,
         "runId": run,
     })];
+    // One pass: the authorized input for each tool invocation.
+    let inputs: HashMap<InvocationId, &str> = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::EffectAuthorized {
+                effect:
+                    Effect::ToolCall {
+                        input, invocation, ..
+                    },
+            } => Some((*invocation, input.as_str())),
+            _ => None,
+        })
+        .collect();
     for event in events {
         let id = event.envelope.event_id.to_string();
         match &event.payload {
@@ -17,30 +32,17 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
                 invocation,
                 ..
             } => {
-                let delta = events.iter().find_map(|prior| match &prior.payload {
-                    EventPayload::EffectAuthorized {
-                        effect:
-                            Effect::ToolCall {
-                                input,
-                                invocation: authorized,
-                                ..
-                            },
-                    } if authorized == invocation => Some(input.clone()),
-                    _ => None,
-                });
+                let delta = inputs.get(invocation).copied().unwrap_or("");
                 out.push(json!({
                     "type": "TOOL_CALL_START",
                     "toolCallId": id,
                     "toolCallName": name,
                 }));
-                let mut args = json!({
+                out.push(json!({
                     "type": "TOOL_CALL_ARGS",
                     "toolCallId": id,
-                });
-                if let Some(input) = delta {
-                    args["delta"] = json!(input);
-                }
-                out.push(args);
+                    "delta": delta,
+                }));
                 out.push(json!({
                     "type": "TOOL_CALL_END",
                     "toolCallId": id,

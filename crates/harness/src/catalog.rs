@@ -15,6 +15,19 @@ pub enum LoadError {
     Parse(String),
     Mcp(String),
     UnknownTool(String),
+    /// Two catalog tools share a name. Effects, the authorizer, and dispatch
+    /// name a tool by its name, so one name must mean one tool.
+    DuplicateTool(String),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(message) | Self::Parse(message) | Self::Mcp(message) => f.write_str(message),
+            Self::UnknownTool(name) => write!(f, "unknown tool: {name}"),
+            Self::DuplicateTool(name) => write!(f, "two catalog tools are named {name}"),
+        }
+    }
 }
 
 pub struct LoadedCatalog {
@@ -106,6 +119,17 @@ pub fn load_catalog(dir: impl AsRef<Path>) -> Result<LoadedCatalog, LoadError> {
         }
     }
 
+    let mut names = std::collections::HashSet::new();
+    for tool in &tools {
+        let name = tool.descriptor().name;
+        if !names.insert(name.clone()) {
+            return Err(LoadError::DuplicateTool(name));
+        }
+    }
+
+    let catalog_dir = dir
+        .canonicalize()
+        .map_err(|err| LoadError::Io(err.to_string()))?;
     let mut skills = Vec::new();
     for relative in &file.skills {
         let rel = Path::new(relative);
@@ -118,9 +142,6 @@ pub fn load_catalog(dir: impl AsRef<Path>) -> Result<LoadedCatalog, LoadError> {
         {
             return Err(LoadError::Io(format!("skill path contains ..: {relative}")));
         }
-        let catalog_dir = dir
-            .canonicalize()
-            .map_err(|err| LoadError::Io(err.to_string()))?;
         let canonical = dir
             .join(rel)
             .canonicalize()
@@ -180,7 +201,7 @@ impl McpSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|err| LoadError::Mcp(format!("{name}: {err}")))?;
+            .map_err(|err| LoadError::Mcp(format!("spawn {command} for {name}: {err}")))?;
         let stdin = child
             .stdin
             .take()
@@ -219,6 +240,10 @@ impl McpSession {
             .pointer("/content/0/text")
             .and_then(|value| value.as_str())
             .ok_or_else(|| LoadError::Mcp("tools/call missing text".into()))?;
+        // MCP reports a failed tool as a result with isError; it is not an answer.
+        if result.get("isError").and_then(|value| value.as_bool()) == Some(true) {
+            return Err(LoadError::Mcp(text.to_string()));
+        }
         Ok(text.to_string())
     }
 
@@ -241,7 +266,14 @@ impl McpSession {
             return Err(LoadError::Mcp("malformed response".into()));
         }
         if let Some(error) = value.get("error") {
-            return Err(LoadError::Mcp(error.to_string()));
+            let message = error
+                .get("message")
+                .and_then(|message| message.as_str())
+                .map_or_else(|| error.to_string(), str::to_string);
+            return Err(LoadError::Mcp(match error.get("code") {
+                Some(code) => format!("{message} (code {code})"),
+                None => message,
+            }));
         }
         value
             .get("result")
@@ -307,11 +339,10 @@ impl Tool for McpTool {
     }
 
     fn call(&self, input: &str) -> Result<String, String> {
-        let _ = &self.server;
         self.session
             .lock()
             .expect("mcp")
             .call(&self.name, input)
-            .map_err(|err| format!("{err:?}"))
+            .map_err(|err| format!("mcp {}.{}: {err}", self.server, self.name))
     }
 }

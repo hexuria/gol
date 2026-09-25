@@ -174,7 +174,8 @@ fn ag_ui_args_delta_is_the_authorized_input() {
         .iter()
         .find(|event| event["type"] == "TOOL_CALL_ARGS")
         .expect("args");
-    assert!(orphan_args.get("delta").is_none());
+    // AG-UI requires delta to be a string. With no authorization in the slice it is empty.
+    assert_eq!(orphan_args["delta"], "");
     assert!(!json_has_string(orphan_args, "pong:hi"));
     assert_eq!(
         orphan

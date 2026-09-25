@@ -6,8 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use harness::{
-    load_catalog, Decider, DeciderError, DecisionView, Driver, EchoTool, InMemory, LoadedCatalog,
-    ScriptedDecider, Tool, UnavailableModel,
+    load_catalog, Decider, DeciderError, DecisionView, Driver, EchoTool, InMemory, LoadError,
+    LoadedCatalog, ScriptedDecider, Tool, UnavailableModel,
 };
 use protocol::{
     AgentId, Capability, CredentialSource, Effect, EventPayload, ExecutionPlacement, FailureClass,
@@ -346,6 +346,78 @@ fn mcp_jsonrpc_error_is_not_a_tool_result() {
     let catalog = load_catalog(&dir).unwrap();
     let driver = run_call(catalog, "mcp.local.ping", "ping", "hi");
     assert_tool_failure(&driver);
+}
+
+fn failure_message(driver: &Driver) -> String {
+    match &driver.state().harness {
+        HarnessState::Failed { message, .. } => message.clone(),
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn mcp_jsonrpc_error_names_the_server_and_tool() {
+    let dir = scratch();
+    let script = dir.join("mcp.py");
+    fs::write(
+        &script,
+        mcp_script(
+            "send({\"jsonrpc\":\"2.0\",\"id\":msg[\"id\"],\"error\":{\"code\":-32602,\"message\":\"bad input\"}})",
+        ),
+    )
+    .unwrap();
+    write_mcp_catalog(
+        &dir,
+        "python3",
+        &[script.to_str().unwrap()],
+        &[("ping", "p")],
+    );
+    let catalog = load_catalog(&dir).unwrap();
+    let driver = run_call(catalog, "mcp.local.ping", "ping", "hi");
+    assert_tool_failure(&driver);
+    assert_eq!(
+        failure_message(&driver),
+        "mcp local.ping: bad input (code -32602)"
+    );
+}
+
+#[test]
+fn mcp_is_error_result_is_not_a_tool_result() {
+    let dir = scratch();
+    let script = dir.join("mcp.py");
+    fs::write(
+        &script,
+        mcp_script(
+            "send({\"jsonrpc\":\"2.0\",\"id\":msg[\"id\"],\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"boom\"}],\"isError\":True}})",
+        ),
+    )
+    .unwrap();
+    write_mcp_catalog(
+        &dir,
+        "python3",
+        &[script.to_str().unwrap()],
+        &[("ping", "p")],
+    );
+    let catalog = load_catalog(&dir).unwrap();
+    let driver = run_call(catalog, "mcp.local.ping", "ping", "hi");
+    assert_tool_failure(&driver);
+    assert_eq!(failure_message(&driver), "mcp local.ping: boom");
+}
+
+#[test]
+fn two_mcp_servers_cannot_declare_one_tool_name() {
+    let dir = scratch();
+    fs::write(
+        dir.join("harness.toml"),
+        "[[mcp]]\nname = \"a\"\ncommand = \"true\"\n\n[[mcp.tools]]\nname = \"ping\"\n\n\
+         [[mcp]]\nname = \"b\"\ncommand = \"true\"\n\n[[mcp.tools]]\nname = \"ping\"\n",
+    )
+    .unwrap();
+    match load_catalog(&dir) {
+        Err(LoadError::DuplicateTool(name)) => assert_eq!(name, "ping"),
+        Err(other) => panic!("expected DuplicateTool, got {other:?}"),
+        Ok(_) => panic!("two tools named ping were loaded"),
+    }
 }
 
 #[test]
