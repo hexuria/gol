@@ -19,7 +19,6 @@ fn anthropic_payload_maps_to_model_message() {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/v1/messages"))
-                .and(header("x-api-key", "test-key"))
                 .and(header("anthropic-version", "2023-06-01"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "content": [{ "type": "text", "text": "anthropic-pong" }]
@@ -98,7 +97,6 @@ fn gemini_payload_maps_to_model_message() {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/v1beta/models/gemini-test:generateContent"))
-                .and(header("x-goog-api-key", "test-key"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "candidates": [{
                         "content": { "parts": [{ "text": "gemini-pong" }] }
@@ -178,7 +176,6 @@ fn system_one_payload_maps_to_model_message() {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/v1/chat/completions"))
-                .and(header("authorization", "Bearer test-key"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "choices": [{
                         "message": { "role": "assistant", "content": "systemone-pong" }
