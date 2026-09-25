@@ -6,14 +6,16 @@ use axum::body::Body;
 use axum::http::Request;
 use axum::middleware::Next;
 use protocol::{
-    AgentId, Capability, CredentialSource, EventPayload, ExecutionPlacement, HarnessState, Limits,
-    ModelProvider, RunSpec, WorkModel,
+    Actor, AgentId, ArtifactId, Capability, CredentialSource, DispatchPhase, Event, EventPayload,
+    EventSource, ExecutionPlacement, HarnessState, Limits, MessageRole, ModelProvider, RunId,
+    RunSpec, Timestamp, WorkModel,
 };
 use proxy::GATEWAY_TEXT;
 use server::{
-    box_container_name, box_workspace_volume, computer_plan, ensure_fixture_proxy, open_turn,
-    router_with_gateway, router_with_sandbox, DockerSandbox, GatewayCall, GatewayPoster,
-    HttpGatewayPoster, InMemoryStore, MemorySandbox, RunStore, SandboxHost, TurnError,
+    accept_subscription_completion, box_container_name, box_workspace_volume, computer_plan,
+    ensure_fixture_proxy, open_turn, router_with_gateway, router_with_sandbox, AgentManifest,
+    DockerSandbox, GatewayCall, GatewayPoster, HttpGatewayPoster, InMemoryStore, MemorySandbox,
+    RunStore, SandboxHost, StoredArtifact, StoredRun, TurnError,
 };
 
 async fn proxy_server() -> (String, Arc<Mutex<Vec<String>>>) {
@@ -728,6 +730,179 @@ async fn four_modes_only_let_the_server_post_in_gateway_mode() {
         assert!(!command.to_ascii_lowercase().contains("bearer"));
         assert!(!command.contains("api."));
     }
+}
+
+const LATE_USER_MESSAGE: &str = "note arrived after the snapshot";
+
+struct LateUserMessage {
+    inner: InMemoryStore,
+    pending: AtomicBool,
+}
+
+impl LateUserMessage {
+    fn new(inner: InMemoryStore) -> Self {
+        Self {
+            inner,
+            pending: AtomicBool::new(true),
+        }
+    }
+}
+
+struct SilentPoster;
+
+impl GatewayPoster for SilentPoster {
+    fn complete(&self, _call: &GatewayCall) -> Result<String, String> {
+        Err("subscription must not post".to_string())
+    }
+}
+
+impl RunStore for LateUserMessage {
+    fn put_agent(&self, agent: AgentManifest) {
+        self.inner.put_agent(agent);
+    }
+
+    fn put_run(&self, run: StoredRun) {
+        self.inner.put_run(run);
+    }
+
+    fn append_events(&self, id: RunId, events: Vec<Event>) {
+        self.inner.append_events(id, events);
+    }
+
+    fn run(&self, id: RunId) -> Option<StoredRun> {
+        let snapshot = self.inner.run(id)?;
+        if self.pending.swap(false, Ordering::SeqCst) {
+            let mut events = snapshot.events.clone();
+            events.push(Event::record(
+                EventSource::new(
+                    snapshot.spec.run_id,
+                    snapshot.spec.agent_id,
+                    &snapshot.spec.agent_version,
+                    Actor::System,
+                    Timestamp::now(),
+                ),
+                EventPayload::UserMessage {
+                    text: LATE_USER_MESSAGE.to_string(),
+                },
+            ));
+            self.inner.put_run(StoredRun {
+                spec: snapshot.spec.clone(),
+                events,
+            });
+        }
+        Some(snapshot)
+    }
+
+    fn put_artifact(&self, artifact: StoredArtifact) {
+        self.inner.put_artifact(artifact);
+    }
+
+    fn artifact(&self, id: ArtifactId) -> Option<StoredArtifact> {
+        self.inner.artifact(id)
+    }
+}
+
+#[test]
+fn an_event_stored_after_run_returns_stays_ahead_of_the_completion() {
+    let spec = RunSpec::builder()
+        .agent(AgentId::new(), "1")
+        .input("hello from the desktop")
+        .placement(ExecutionPlacement::Local)
+        .work_model(WorkModel {
+            provider: ModelProvider::Anthropic,
+            model_name: "claude-fixture".to_string(),
+            credential: CredentialSource::BringYourOwn {
+                secret_ref: "desktop-subscription".to_string(),
+            },
+        })
+        .build();
+    assert_ne!(LATE_USER_MESSAGE, spec.input);
+    let inner = InMemoryStore::default();
+    let opened = open_turn(
+        &inner,
+        spec.clone(),
+        &SilentPoster,
+        &MemorySandbox::default(),
+    )
+    .expect("open");
+    assert!(opened.completion.is_none());
+    assert_eq!(opened.credential_mode, "subscription");
+    let prefix_ids: Vec<_> = opened
+        .events
+        .iter()
+        .map(|event| event.envelope.event_id)
+        .collect();
+    assert_eq!(prefix_ids.len(), 3);
+    let store = LateUserMessage::new(inner);
+    let outcome = accept_subscription_completion(
+        &store,
+        spec.run_id,
+        "  fixture assistant text  ",
+        &MemorySandbox::default(),
+    )
+    .expect("completion");
+    assert_eq!(
+        outcome.completion.as_deref(),
+        Some("fixture assistant text")
+    );
+    assert_eq!(outcome.credential_mode, "subscription");
+    assert_eq!(outcome.events.len(), 5);
+    assert_eq!(outcome.events[0].envelope.event_id, prefix_ids[0]);
+    assert_eq!(outcome.events[1].envelope.event_id, prefix_ids[1]);
+    assert_eq!(outcome.events[2].envelope.event_id, prefix_ids[2]);
+    assert!(
+        !outcome.events.iter().any(|event| {
+            matches!(&event.payload, EventPayload::UserMessage { text } if text == LATE_USER_MESSAGE)
+        }),
+        "the returned log is the loaded prefix plus the two completion events"
+    );
+
+    let stored = store.run(spec.run_id).expect("stored run");
+    assert_eq!(stored.spec, spec);
+    let events = &stored.events;
+    assert_eq!(events.len(), 6);
+    assert_eq!(events[0].envelope.event_id, prefix_ids[0]);
+    assert!(matches!(events[0].payload, EventPayload::RunCreated));
+    assert_eq!(events[1].envelope.event_id, prefix_ids[1]);
+    assert!(matches!(events[1].payload, EventPayload::RunStarted));
+    assert_eq!(events[2].envelope.event_id, prefix_ids[2]);
+    assert!(matches!(
+        &events[2].payload,
+        EventPayload::UserMessage { text } if text == &spec.input
+    ));
+    assert!(matches!(
+        &events[3].payload,
+        EventPayload::UserMessage { text } if text == LATE_USER_MESSAGE
+    ));
+    assert!(matches!(
+        &events[4].payload,
+        EventPayload::ModelResponded { message }
+            if message.role == MessageRole::Assistant && message.text == "fixture assistant text"
+    ));
+    assert!(matches!(
+        &events[5].payload,
+        EventPayload::RunCompleted { outcome } if outcome == "fixture assistant text"
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.payload, EventPayload::RunCreated))
+            .count(),
+        1
+    );
+    let folded = protocol::fold(&stored.spec, events);
+    assert_eq!(
+        folded.harness,
+        HarnessState::Completed {
+            outcome: "fixture assistant text".to_string(),
+        }
+    );
+    assert_eq!(
+        folded.dispatch,
+        DispatchPhase::Completed {
+            outcome: "fixture assistant text".to_string(),
+        }
+    );
 }
 
 fn fold_harness(events: &[protocol::Event]) -> HarnessState {
