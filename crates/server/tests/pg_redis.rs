@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use protocol::{
-    Actor, AgentId, ArtifactId, Capability, CredentialSource, Event, EventPayload,
-    ExecutionPlacement, Limits, ModelProvider, RunId, RunSpec, Timestamp, WorkModel,
+    Actor, AgentId, ArtifactId, Capability, CredentialSource, DispatchPhase, Event, EventPayload,
+    ExecutionPlacement, HarnessState, Limits, ModelProvider, RunId, RunSpec, Timestamp, WorkModel,
 };
 use server::{
     router_with_queue, AgentManifest, PostgresStore, RedisRunQueue, RunStore, StoredArtifact,
@@ -125,6 +125,7 @@ async fn create_run_writes_postgres_and_enqueues_redis() {
     let agent_id = AgentId::new();
     let agent = client
         .post(format!("http://{addr}/v1/agents"))
+        .header("authorization", "Bearer gol-gateway-local")
         .json(&AgentManifest {
             id: agent_id,
             version: "1".to_string(),
@@ -139,6 +140,7 @@ async fn create_run_writes_postgres_and_enqueues_redis() {
 
     let created = client
         .post(format!("http://{addr}/v1/runs"))
+        .header("authorization", "Bearer gol-gateway-local")
         .json(&serde_json::json!({
             "agent_id": agent_id,
             "agent_version": "1",
@@ -154,12 +156,16 @@ async fn create_run_writes_postgres_and_enqueues_redis() {
         }))
         .send()
         .await
-        .expect("run")
-        .error_for_status()
-        .expect("run status")
+        .expect("run");
+    assert_eq!(created.status(), reqwest::StatusCode::OK);
+    let created = created
         .json::<protocol::RunState>()
         .await
         .expect("run json");
+    assert_eq!(created.harness, HarnessState::Idle);
+    assert_eq!(created.dispatch, DispatchPhase::Created);
+    assert_eq!(created.steps, 0);
+    assert_eq!(created.model_calls, 0);
 
     let run_id = created.run_id;
     let stored = tokio::task::spawn_blocking(move || {
@@ -170,13 +176,28 @@ async fn create_run_writes_postgres_and_enqueues_redis() {
     .await
     .expect("reconnect thread")
     .expect("stored run");
-    assert!(stored.events.iter().any(|event| matches!(
-        &event.payload,
-        EventPayload::RunCompleted { outcome } if outcome == "done"
-    )));
+    assert!(matches!(
+        stored.events.as_slice(),
+        [Event {
+            payload: EventPayload::UserMessage { text },
+            ..
+        }] if text == "hello"
+    ));
+    assert!(!stored
+        .events
+        .iter()
+        .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. })));
 
     let queued = queue.pop().expect("queue").expect("run id");
     assert_eq!(queued, created.run_id);
+
+    let requests = jev.received_requests().await.expect("requests");
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path() == "/v1/systemone"),
+        "queued create_run called Jev"
+    );
 }
 
 fn choice(effect: &str) -> serde_json::Value {

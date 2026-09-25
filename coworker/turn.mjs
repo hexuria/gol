@@ -48,19 +48,24 @@ export async function sendTurn({
       ? "PlatformGateway"
       : { BringYourOwn: { secret_ref: "desktop-subscription" } };
 
-  const recorded = await postJson(fetchImpl, `${serverUrl}/v1/coworker/turns`, {
-    agent_id: agentId,
-    agent_version: "1",
-    input: message,
-    placement,
-    work_model: {
-      provider: "Anthropic",
-      model_name: "claude-fixture",
-      credential: credentialBody,
+  const recorded = await postJson(
+    fetchImpl,
+    `${serverUrl}/v1/coworker/turns`,
+    {
+      agent_id: agentId,
+      agent_version: "1",
+      input: message,
+      placement,
+      work_model: {
+        provider: "Anthropic",
+        model_name: "claude-fixture",
+        credential: credentialBody,
+      },
+      capabilities: ["model.call"],
+      limits: { max_steps: 8, max_model_calls: 4 },
     },
-    capabilities: ["model.call"],
-    limits: { max_steps: 8, max_model_calls: 4 },
-  });
+    { authorization: "Bearer gol-gateway-local" },
+  );
 
   if (credential === "gateway") {
     const assistant = recorded.completion;
@@ -100,6 +105,7 @@ export async function sendTurn({
     fetchImpl,
     `${serverUrl}/v1/coworker/turns/${recorded.run_id}/completion`,
     { text: assistant },
+    { authorization: "Bearer gol-gateway-local" },
   );
   return {
     runId: recorded.run_id,
