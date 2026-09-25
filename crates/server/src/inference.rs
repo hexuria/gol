@@ -7,7 +7,7 @@ use protocol::{
     ModelMessage, RunId, RunSpec, Timestamp,
 };
 
-use crate::store::{RunStore, StoredRun};
+use crate::store::{is_terminal, Append, RunStore, StoredRun};
 
 #[derive(Clone, Debug)]
 pub struct GatewayCall {
@@ -383,15 +383,15 @@ pub fn open_turn(
         box_turn && sandbox.launches_docker(),
     );
     if let Some(text) = completion.as_deref() {
-        let prior = events.clone();
-        append_completion(&spec, &mut events, text);
-        store.replace_run(StoredRun {
-            spec: spec.clone(),
-            events: events.clone(),
-        });
+        // The sandbox goes before the completion is recorded, so a failed destroy
+        // leaves an open turn and nothing to take back (formal/runlog/RunLog.tla).
         if box_turn {
-            release_after_complete(store, &spec, sandbox, &name, prior)?;
+            sandbox.destroy(&name).map_err(sandbox_error)?;
         }
+        let mut appended = Vec::new();
+        append_completion(&spec, &mut appended, text);
+        record_completion(store, spec.run_id, appended.clone())?;
+        events.extend(appended);
     }
     Ok(TurnOutcome {
         spec,
@@ -424,7 +424,7 @@ pub fn accept_subscription_completion(
     if stored
         .events
         .iter()
-        .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. }))
+        .any(|event| is_terminal(&event.payload))
     {
         return Err(TurnError::Conflict("turn already completed"));
     }
@@ -442,15 +442,14 @@ pub fn accept_subscription_completion(
             "box sandbox is gone before the turn completed".to_string(),
         ));
     }
-    let prior = stored.events.clone();
+    if box_turn {
+        sandbox.destroy(&name).map_err(sandbox_error)?;
+    }
     let mut events = stored.events;
     let mut appended = Vec::new();
     append_completion(&stored.spec, &mut appended, text);
-    store.append_events(stored.spec.run_id, appended.clone());
+    record_completion(store, stored.spec.run_id, appended.clone())?;
     events.extend(appended);
-    if box_turn {
-        release_after_complete(store, &stored.spec, sandbox, &name, prior)?;
-    }
     Ok(TurnOutcome {
         spec: stored.spec.clone(),
         events,
@@ -460,21 +459,18 @@ pub fn accept_subscription_completion(
     })
 }
 
-fn release_after_complete(
+/// Append the completion events. Two completions racing on one run get one
+/// `Appended`; the store refuses the other because the log is already terminal.
+fn record_completion(
     store: &dyn RunStore,
-    spec: &RunSpec,
-    sandbox: &dyn SandboxHost,
-    name: &str,
-    prior: Vec<Event>,
+    run_id: RunId,
+    events: Vec<Event>,
 ) -> Result<(), TurnError> {
-    if let Err(error) = sandbox.destroy(name) {
-        store.replace_run(StoredRun {
-            spec: spec.clone(),
-            events: prior,
-        });
-        return Err(sandbox_error(error));
+    match store.append_events(run_id, events) {
+        Append::Appended => Ok(()),
+        Append::Terminal => Err(TurnError::Conflict("turn already completed")),
+        Append::Missing => Err(TurnError::NotFound),
     }
-    Ok(())
 }
 
 fn sandbox_error(error: SandboxError) -> TurnError {

@@ -14,8 +14,8 @@ use proxy::GATEWAY_TEXT;
 use server::{
     accept_subscription_completion, box_container_name, box_workspace_volume, computer_plan,
     ensure_fixture_proxy, open_turn, router_with_gateway, router_with_sandbox, AgentManifest,
-    DockerSandbox, GatewayCall, GatewayPoster, HttpGatewayPoster, InMemoryStore, MemorySandbox,
-    RunStore, SandboxHost, StoredArtifact, StoredRun, TurnError,
+    Append, DockerSandbox, GatewayCall, GatewayPoster, HttpGatewayPoster, InMemoryStore,
+    MemorySandbox, RunStore, SandboxHost, StoredArtifact, StoredRun, TurnError,
 };
 
 async fn proxy_server() -> (String, Arc<Mutex<Vec<String>>>) {
@@ -734,17 +734,27 @@ async fn four_modes_only_let_the_server_post_in_gateway_mode() {
 
 const LATE_USER_MESSAGE: &str = "note arrived after the snapshot";
 
-struct LateUserMessage {
+/// Another writer stores `payload` right after the first `run` snapshot is taken.
+struct WriteAfterSnapshot {
     inner: InMemoryStore,
-    pending: AtomicBool,
+    pending: Mutex<Option<EventPayload>>,
 }
 
-impl LateUserMessage {
-    fn new(inner: InMemoryStore) -> Self {
+impl WriteAfterSnapshot {
+    fn new(inner: InMemoryStore, payload: EventPayload) -> Self {
         Self {
             inner,
-            pending: AtomicBool::new(true),
+            pending: Mutex::new(Some(payload)),
         }
+    }
+
+    fn late_user_message(inner: InMemoryStore) -> Self {
+        Self::new(
+            inner,
+            EventPayload::UserMessage {
+                text: LATE_USER_MESSAGE.to_string(),
+            },
+        )
     }
 }
 
@@ -756,7 +766,7 @@ impl GatewayPoster for SilentPoster {
     }
 }
 
-impl RunStore for LateUserMessage {
+impl RunStore for WriteAfterSnapshot {
     fn put_agent(&self, agent: AgentManifest) {
         self.inner.put_agent(agent);
     }
@@ -765,19 +775,14 @@ impl RunStore for LateUserMessage {
         self.inner.put_run(run);
     }
 
-    fn replace_run(&self, run: StoredRun) {
-        self.inner.replace_run(run);
-    }
-
-    fn append_events(&self, id: RunId, events: Vec<Event>) {
-        self.inner.append_events(id, events);
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Append {
+        self.inner.append_events(id, events)
     }
 
     fn run(&self, id: RunId) -> Option<StoredRun> {
         let snapshot = self.inner.run(id)?;
-        if self.pending.swap(false, Ordering::SeqCst) {
-            let mut events = snapshot.events.clone();
-            events.push(Event::record(
+        if let Some(payload) = self.pending.lock().expect("pending").take() {
+            let late = Event::record(
                 EventSource::new(
                     snapshot.spec.run_id,
                     snapshot.spec.agent_id,
@@ -785,14 +790,9 @@ impl RunStore for LateUserMessage {
                     Actor::System,
                     Timestamp::now(),
                 ),
-                EventPayload::UserMessage {
-                    text: LATE_USER_MESSAGE.to_string(),
-                },
-            ));
-            self.inner.put_run(StoredRun {
-                spec: snapshot.spec.clone(),
-                events,
-            });
+                payload,
+            );
+            assert_eq!(self.inner.append_events(id, vec![late]), Append::Appended);
         }
         Some(snapshot)
     }
@@ -837,7 +837,7 @@ fn an_event_stored_after_run_returns_stays_ahead_of_the_completion() {
         .map(|event| event.envelope.event_id)
         .collect();
     assert_eq!(prefix_ids.len(), 3);
-    let store = LateUserMessage::new(inner);
+    let store = WriteAfterSnapshot::late_user_message(inner);
     let outcome = accept_subscription_completion(
         &store,
         spec.run_id,
@@ -957,4 +957,163 @@ fn images_share_one_contract_and_name_both_placements() {
         assert!(!lower.contains("sk-"));
         assert!(!lower.contains("authorization"));
     }
+}
+
+fn subscription_spec(placement: ExecutionPlacement) -> RunSpec {
+    RunSpec::builder()
+        .agent(AgentId::new(), "1")
+        .input("hello from the desktop")
+        .placement(placement)
+        .work_model(WorkModel {
+            provider: ModelProvider::Anthropic,
+            model_name: "claude-fixture".to_string(),
+            credential: CredentialSource::BringYourOwn {
+                secret_ref: "desktop-subscription".to_string(),
+            },
+        })
+        .build()
+}
+
+fn completions(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::RunCompleted { outcome } => Some(outcome.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+// formal/runlog AckedDurable: the old rollback wrote the pre-completion snapshot back
+// over the row and dropped a user message another writer had stored in between.
+#[test]
+fn a_failed_destroy_keeps_a_message_stored_during_the_turn() {
+    let state = Arc::new(FailingRemove {
+        live: Mutex::new(HashSet::new()),
+    });
+    let command = state.clone();
+    let sandbox = DockerSandbox::from_command(move |args| command.call(args));
+    let spec = subscription_spec(ExecutionPlacement::Box);
+    let inner = InMemoryStore::default();
+    open_turn(&inner, spec.clone(), &SilentPoster, &sandbox).expect("open");
+    let store = WriteAfterSnapshot::late_user_message(inner);
+
+    let error = accept_subscription_completion(&store, spec.run_id, "done", &sandbox)
+        .expect_err("rm must fail the completion");
+
+    assert!(matches!(error, TurnError::Sandbox(_)), "{error:?}");
+    let events = store.run(spec.run_id).expect("run").events;
+    assert_eq!(events.len(), 4);
+    assert!(matches!(
+        &events[3].payload,
+        EventPayload::UserMessage { text } if text == LATE_USER_MESSAGE
+    ));
+    assert_eq!(completions(&events), Vec::<String>::new());
+    assert!(sandbox.exists(&box_container_name(spec.run_id)));
+}
+
+// formal/runlog AtMostOneTerminal: two completions that both read an open turn
+// each appended a RunCompleted.
+#[test]
+fn a_completion_racing_another_completion_is_a_conflict() {
+    let spec = subscription_spec(ExecutionPlacement::Local);
+    let inner = InMemoryStore::default();
+    open_turn(
+        &inner,
+        spec.clone(),
+        &SilentPoster,
+        &MemorySandbox::default(),
+    )
+    .expect("open");
+    let store = WriteAfterSnapshot::new(
+        inner,
+        EventPayload::RunCompleted {
+            outcome: "the other writer".to_string(),
+        },
+    );
+
+    let error = accept_subscription_completion(
+        &store,
+        spec.run_id,
+        "this writer",
+        &MemorySandbox::default(),
+    )
+    .expect_err("the second completion is refused");
+
+    assert!(
+        matches!(error, TurnError::Conflict("turn already completed")),
+        "{error:?}"
+    );
+    let events = store.run(spec.run_id).expect("run").events;
+    assert_eq!(completions(&events), vec!["the other writer".to_string()]);
+    assert_eq!(events.len(), 4);
+}
+
+// formal/runlog NothingAfterTerminal and AckedDurable at the store boundary.
+#[test]
+fn the_store_log_grows_and_ends_at_the_first_terminal_event() {
+    let spec = subscription_spec(ExecutionPlacement::Local);
+    let store = InMemoryStore::default();
+    let at = |payload| {
+        Event::record(
+            EventSource::new(
+                spec.run_id,
+                spec.agent_id,
+                &spec.agent_version,
+                Actor::System,
+                Timestamp::now(),
+            ),
+            payload,
+        )
+    };
+    let message = at(EventPayload::UserMessage {
+        text: "first".to_string(),
+    });
+    let late = at(EventPayload::UserMessage {
+        text: "late".to_string(),
+    });
+    let done = at(EventPayload::RunCompleted {
+        outcome: "done".to_string(),
+    });
+
+    assert_eq!(
+        store.append_events(spec.run_id, vec![message.clone()]),
+        Append::Missing
+    );
+    store.put_run(StoredRun {
+        spec: spec.clone(),
+        events: vec![message.clone()],
+    });
+    assert_eq!(
+        store.append_events(spec.run_id, vec![late.clone()]),
+        Append::Appended
+    );
+    store.put_run(StoredRun {
+        spec: spec.clone(),
+        events: vec![message.clone()],
+    });
+    assert_eq!(
+        store.append_events(spec.run_id, vec![done.clone()]),
+        Append::Appended
+    );
+    assert_eq!(
+        store.append_events(spec.run_id, vec![at(EventPayload::RunCancelled)]),
+        Append::Terminal
+    );
+
+    let ids: Vec<_> = store
+        .run(spec.run_id)
+        .expect("run")
+        .events
+        .iter()
+        .map(|event| event.envelope.event_id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            message.envelope.event_id,
+            late.envelope.event_id,
+            done.envelope.event_id
+        ]
+    );
 }

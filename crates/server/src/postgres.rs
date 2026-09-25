@@ -4,7 +4,7 @@ use postgres::NoTls;
 use protocol::{AgentId, ArtifactId, Event, RunId};
 use serde_json::Value;
 
-use crate::store::{AgentManifest, RunStore, StoredArtifact, StoredRun};
+use crate::store::{AgentManifest, Append, RunStore, StoredArtifact, StoredRun};
 
 pub struct PostgresStore {
     client: Mutex<postgres::Client>,
@@ -73,36 +73,39 @@ impl RunStore for PostgresStore {
             .expect("postgres")
             .execute(
                 "insert into runs (id, spec, events) values ($1, $2, $3)
-                 on conflict (id) do update set spec = excluded.spec",
+                 on conflict (id) do nothing",
                 &[&run.spec.run_id.as_uuid(), &spec, &events],
             )
             .expect("insert run");
     }
 
-    fn replace_run(&self, run: StoredRun) {
-        let spec = serde_json::to_value(&run.spec).expect("spec json");
-        let events = serde_json::to_value(&run.events).expect("events json");
-        self.client
-            .lock()
-            .expect("postgres")
-            .execute(
-                "insert into runs (id, spec, events) values ($1, $2, $3)
-                 on conflict (id) do update set spec = excluded.spec, events = excluded.events",
-                &[&run.spec.run_id.as_uuid(), &spec, &events],
-            )
-            .expect("replace run");
-    }
-
-    fn append_events(&self, id: RunId, events: Vec<Event>) {
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Append {
         let events = serde_json::to_value(&events).expect("events json");
-        self.client
-            .lock()
-            .expect("postgres")
+        let mut client = self.client.lock().expect("postgres");
+        // One statement: the terminal check and the append see the same row.
+        // The payloads of store::is_terminal. Unit variants serialize as a string
+        // ("RunCancelled"), the others as {"RunCompleted": ..}; `?|` matches both.
+        let appended = client
             .execute(
-                "update runs set events = events || $2::jsonb where id = $1",
+                "update runs set events = events || $2::jsonb
+                 where id = $1 and not exists (
+                     select 1 from jsonb_array_elements(events) as event
+                     where event->'payload' ?| array['RunCompleted', 'RunFailed', 'RunCancelled', 'RunExpired'])",
                 &[&id.as_uuid(), &events],
             )
             .expect("append events");
+        if appended == 1 {
+            return Append::Appended;
+        }
+        let exists = client
+            .query_opt("select 1 from runs where id = $1", &[&id.as_uuid()])
+            .expect("select run")
+            .is_some();
+        if exists {
+            Append::Terminal
+        } else {
+            Append::Missing
+        }
     }
 
     fn run(&self, id: RunId) -> Option<StoredRun> {

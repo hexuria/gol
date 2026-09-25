@@ -189,32 +189,32 @@ async fn create_run(
     let jev_base_url = state.jev_base_url.clone();
     let spec_for_run = spec.clone();
     let store_for_run = state.store.clone();
-    let events = match tokio::task::spawn_blocking(move || {
+    let stored = match tokio::task::spawn_blocking(move || {
         // The user message is on the record before the harness asks Jev.
         let message = crate::inference::user_message_event(&spec_for_run);
+        let run_id = spec_for_run.run_id;
         store_for_run.put_run(StoredRun {
             spec: spec_for_run.clone(),
-            events: vec![message.clone()],
+            events: vec![message],
         });
-        let mut events = vec![message];
-        events.extend(run_with_jev(&jev_base_url, spec_for_run)?);
-        Ok(events)
+        let events = run_with_jev(&jev_base_url, spec_for_run)?;
+        // Append, never overwrite: anything stored while Jev ran stays. When the
+        // run is already terminal the store keeps its log and refuses these.
+        store_for_run.append_events(run_id, events);
+        store_for_run
+            .run(run_id)
+            .ok_or_else(|| RunStartError::Decider("run is not stored".to_string()))
     })
     .await
     {
-        Ok(Ok(events)) => events,
+        Ok(Ok(stored)) => stored,
         Ok(Err(RunStartError::Unsupported(placement))) => {
             return Err(ApiError::Unsupported(placement));
         }
         Ok(Err(RunStartError::Decider(message))) => return Err(ApiError::Decider(message)),
         Err(error) => return Err(ApiError::Decider(error.to_string())),
     };
-    let folded = fold(&spec, &events);
-    let store = state.store.clone();
-    tokio::task::spawn_blocking(move || store.replace_run(StoredRun { spec, events }))
-        .await
-        .map_err(|error| ApiError::Decider(error.to_string()))?;
-    Ok(Json(folded))
+    Ok(Json(fold(&stored.spec, &stored.events)))
 }
 
 async fn create_coworker_turn(

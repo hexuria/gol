@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use protocol::{AgentId, ArtifactId, Capability, Event, EventPayload, HarnessState, RunId};
 use server::{
-    router, router_with_queue, AgentManifest, InMemoryStore, RunStore, StoredArtifact, StoredRun,
+    router, router_with_queue, AgentManifest, Append, InMemoryStore, RunStore, StoredArtifact,
+    StoredRun,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -443,12 +444,8 @@ impl RunStore for WatchedMemory {
         self.inner.put_run(run);
     }
 
-    fn replace_run(&self, run: StoredRun) {
-        self.inner.replace_run(run);
-    }
-
-    fn append_events(&self, id: RunId, events: Vec<Event>) {
-        self.inner.append_events(id, events);
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Append {
+        self.inner.append_events(id, events)
     }
 
     fn run(&self, id: RunId) -> Option<StoredRun> {

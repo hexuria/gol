@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use protocol::{
     Actor, AgentId, ArtifactId, Capability, CredentialSource, DispatchPhase, Event, EventPayload,
-    EventSource, ExecutionPlacement, HarnessState, Limits, MessageRole, ModelMessage,
+    EventSource, ExecutionPlacement, FailureClass, HarnessState, Limits, MessageRole, ModelMessage,
     ModelProvider, RunId, RunSpec, Timestamp, WorkModel,
 };
 use server::{
-    router_with_queue, AgentManifest, PostgresStore, RedisRunQueue, RunStore, StoredArtifact,
-    StoredRun,
+    router_with_queue, AgentManifest, Append, PostgresStore, RedisRunQueue, RunStore,
+    StoredArtifact, StoredRun,
 };
 
 const POSTGRES_URL: &str = "postgres://gol:gol@127.0.0.1/gol";
@@ -257,40 +257,27 @@ fn completion_pair(spec: &RunSpec, text: &str, at: i64) -> (Event, Event) {
 }
 
 #[test]
-fn second_put_stores_the_no_redis_log() {
+fn a_second_put_keeps_the_first_run() {
     let spec = spec();
     let run_id = spec.run_id;
     let user = user_message(&spec, 1);
     let started = record(&spec, Actor::System, 2, EventPayload::RunStarted);
-    let second = vec![user.clone(), started];
     {
         let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
         store.put_run(StoredRun {
             spec: spec.clone(),
-            events: vec![user],
+            events: vec![user.clone()],
         });
-        store.replace_run(StoredRun {
+        store.put_run(StoredRun {
             spec,
-            events: second.clone(),
+            events: vec![user.clone(), started],
         });
     }
-    let loaded = reconnect(run_id);
-    assert_eq!(loaded.events, second);
-    assert_eq!(
-        loaded
-            .events
-            .iter()
-            .filter(|event| matches!(
-                event.payload,
-                EventPayload::UserMessage { ref text } if text == "hello"
-            ))
-            .count(),
-        1
-    );
+    assert_eq!(reconnect(run_id).events, vec![user]);
 }
 
 #[test]
-fn second_put_stores_the_gateway_completion() {
+fn append_extends_the_stored_log() {
     let spec = spec();
     let run_id = spec.run_id;
     let created = record(&spec, Actor::System, 1, EventPayload::RunCreated);
@@ -298,93 +285,82 @@ fn second_put_stores_the_gateway_completion() {
     let user = user_message(&spec, 3);
     let (responded, completed) = completion_pair(&spec, "gateway text", 4);
     let first = vec![created, started, user];
-    let mut second = first.clone();
-    second.push(responded);
-    second.push(completed);
-    {
+    let appended = {
         let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
         store.put_run(StoredRun {
-            spec: spec.clone(),
-            events: first,
-        });
-        store.replace_run(StoredRun {
             spec,
-            events: second.clone(),
+            events: first.clone(),
         });
-    }
-    let loaded = reconnect(run_id);
-    assert_eq!(loaded.events, second);
-    assert_eq!(loaded.events.len(), 5);
-    assert_eq!(
-        loaded
-            .events
-            .iter()
-            .filter(|event| matches!(event.payload, EventPayload::RunCreated))
-            .count(),
-        1
-    );
+        store.append_events(run_id, vec![responded.clone(), completed.clone()])
+    };
+    assert_eq!(appended, Append::Appended);
+    let mut expected = first;
+    expected.push(responded);
+    expected.push(completed);
+    assert_eq!(reconnect(run_id).events, expected);
 }
 
 #[test]
-fn failed_destroy_put_restores_prior() {
-    let spec = spec();
-    let run_id = spec.run_id;
-    let created = record(&spec, Actor::System, 1, EventPayload::RunCreated);
-    let started = record(&spec, Actor::System, 2, EventPayload::RunStarted);
-    let user = user_message(&spec, 3);
-    let (responded, completed) = completion_pair(&spec, "gateway text", 4);
-    let prefix = vec![created, started, user];
-    let mut stored = prefix.clone();
-    stored.push(responded);
-    stored.push(completed);
-    {
-        let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
-        store.put_run(StoredRun {
-            spec: spec.clone(),
-            events: stored,
-        });
-        store.replace_run(StoredRun {
-            spec,
-            events: prefix.clone(),
-        });
-    }
-    let loaded = reconnect(run_id);
-    assert_eq!(loaded.events, prefix);
-    assert!(!loaded
-        .events
-        .iter()
-        .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. })));
-}
-
-#[test]
-fn append_then_prior_put_restores_the_subscription_log() {
+fn a_terminal_log_refuses_every_append() {
     let spec = spec();
     let run_id = spec.run_id;
     let user = user_message(&spec, 1);
-    let prefix = vec![user];
-    let (responded, completed) = completion_pair(&spec, "subscription text", 2);
-    let appended = vec![responded, completed];
-    {
+    let (responded, completed) = completion_pair(&spec, "first", 2);
+    let (again_responded, again_completed) = completion_pair(&spec, "second", 4);
+    let late = user_message(&spec, 6);
+    let outcomes = {
         let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
         store.put_run(StoredRun {
-            spec: spec.clone(),
-            events: prefix.clone(),
-        });
-        store.append_events(run_id, appended.clone());
-    }
-    let mid = reconnect(run_id);
-    let mut with_completion = prefix.clone();
-    with_completion.extend(appended);
-    assert_eq!(mid.events, with_completion);
-    {
-        let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
-        store.replace_run(StoredRun {
             spec,
-            events: prefix.clone(),
+            events: vec![user.clone()],
         });
+        [
+            store.append_events(run_id, vec![responded.clone(), completed.clone()]),
+            store.append_events(run_id, vec![again_responded, again_completed]),
+            store.append_events(run_id, vec![late]),
+        ]
+    };
+    assert_eq!(
+        outcomes,
+        [Append::Appended, Append::Terminal, Append::Terminal]
+    );
+    assert_eq!(reconnect(run_id).events, vec![user, responded, completed]);
+}
+
+#[test]
+fn every_terminal_payload_closes_the_log() {
+    for terminal in [
+        EventPayload::RunCancelled,
+        EventPayload::RunExpired,
+        EventPayload::RunFailed {
+            class: FailureClass::Tool,
+            message: "boom".to_string(),
+        },
+    ] {
+        let spec = spec();
+        let run_id = spec.run_id;
+        let ended = record(&spec, Actor::System, 1, terminal);
+        let late = user_message(&spec, 2);
+        let outcome = {
+            let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+            store.put_run(StoredRun {
+                spec,
+                events: vec![ended.clone()],
+            });
+            store.append_events(run_id, vec![late])
+        };
+        assert_eq!(outcome, Append::Terminal, "{:?}", ended.payload);
+        assert_eq!(reconnect(run_id).events, vec![ended]);
     }
-    let loaded = reconnect(run_id);
-    assert_eq!(loaded.events, prefix);
+}
+
+#[test]
+fn append_to_a_missing_run_is_refused() {
+    let spec = spec();
+    let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    let outcome = store.append_events(spec.run_id, vec![user_message(&spec, 1)]);
+    assert_eq!(outcome, Append::Missing);
+    assert!(store.run(spec.run_id).is_none());
 }
 
 fn choice(effect: &str) -> serde_json::Value {
