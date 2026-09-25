@@ -15,5 +15,17 @@ jobs:
           curl -fsSL https://bend-lang.com/install.sh | sh
           echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
           test "$(BEND_NO_TELEMETRY=1 "$HOME/.bend/bin/bend" version)" = "bend 2.0.27"
+      - name: Allow user namespaces for unshare
+        run: |
+          # verify-bend.sh runs `unshare -r -n` so bend has no network.
+          # ubuntu-latest sets apparmor_restrict_unprivileged_userns=1, which
+          # makes that fail with: unshare: write failed /proc/self/uid_map.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -f /etc/apparmor.d/unprivileged_userns ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/unprivileged_userns || true
+          fi
+          unshare -r -n -- true
       - name: Verify Bend
         run: ./scripts/verify-bend.sh
