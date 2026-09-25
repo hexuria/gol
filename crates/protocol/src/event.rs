@@ -68,6 +68,7 @@ pub enum EventPayload {
     },
     RunPaused,
     RunRecovering,
+    RunResumed,
     RunCompleted {
         outcome: String,
     },
@@ -127,6 +128,7 @@ impl EventPayload {
             Self::RunAwaitingApproval { .. } => "run.awaiting_approval",
             Self::RunPaused => "run.paused",
             Self::RunRecovering => "run.recovering",
+            Self::RunResumed => "run.resumed",
             Self::RunCompleted { .. } => "run.completed",
             Self::RunFailed { .. } => "run.failed",
             Self::RunCancelled => "run.cancelled",

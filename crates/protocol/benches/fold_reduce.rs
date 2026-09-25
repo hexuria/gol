@@ -99,6 +99,7 @@ fn bench_reduce(c: &mut Criterion) {
             black_box(protocol::reduce(
                 black_box(state.clone()),
                 black_box(&event),
+                black_box(&spec),
             ))
         })
     });
