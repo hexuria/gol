@@ -75,7 +75,7 @@ jobs:
           sudo apt-get install -y pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libvulkan-dev clang g++
       - uses: dtolnay/rust-toolchain@1.98.1
       - uses: Swatinem/rust-cache@v2
-      - name: Install Bend 2.0.27
+      - name: Install Bend 2.0.28
         run: |
           ./scripts/install-bend.sh
           echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
@@ -113,7 +113,7 @@ jobs:
         with:
           # The bend job in bend.yml builds the same workflow-bend test binary.
           shared-key: workflow-bend
-      - name: Install Bend 2.0.27
+      - name: Install Bend 2.0.28
         run: |
           ./scripts/install-bend.sh
           echo "$HOME/.bend/bin" >> "$GITHUB_PATH"

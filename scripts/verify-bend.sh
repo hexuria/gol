@@ -13,7 +13,7 @@ elif command -v bend >/dev/null 2>&1; then
 elif [ -x "${HOME}/.bend/bin/bend" ]; then
   bend_bin="${HOME}/.bend/bin/bend"
 else
-  echo "bend 2.0.27 is not installed." >&2
+  echo "bend 2.0.28 is not installed." >&2
   echo "run ./scripts/install-bend.sh" >&2
   exit 1
 fi
@@ -36,8 +36,8 @@ else
 fi
 
 version="$(/usr/bin/unshare "${unshare_net[@]}" -- env -i BEND_NO_TELEMETRY=1 "${bend_bin}" version)"
-if [ "${version}" != "bend 2.0.27" ]; then
-  echo "expected bend 2.0.27, found: ${version}" >&2
+if [ "${version}" != "bend 2.0.28" ]; then
+  echo "expected bend 2.0.28, found: ${version}" >&2
   exit 1
 fi
 

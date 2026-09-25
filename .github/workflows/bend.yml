@@ -24,7 +24,7 @@ jobs:
         with:
           # The differential job in pr.yml builds the same workflow-bend test binary.
           shared-key: workflow-bend
-      - name: Install Bend 2.0.27
+      - name: Install Bend 2.0.28
         run: |
           ./scripts/install-bend.sh
           echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
