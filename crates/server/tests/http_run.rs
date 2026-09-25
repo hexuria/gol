@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use protocol::{AgentId, ArtifactId, Capability, EventPayload, HarnessState, RunId};
+use protocol::{AgentId, ArtifactId, Capability, Event, EventPayload, HarnessState, RunId};
 use server::{
     router, router_with_queue, AgentManifest, InMemoryStore, RunStore, StoredArtifact, StoredRun,
 };
@@ -441,6 +441,10 @@ impl RunStore for WatchedMemory {
     fn put_run(&self, run: StoredRun) {
         self.ids.lock().expect("ids").push(run.spec.run_id);
         self.inner.put_run(run);
+    }
+
+    fn append_events(&self, id: RunId, events: Vec<Event>) {
+        self.inner.append_events(id, events);
     }
 
     fn run(&self, id: RunId) -> Option<StoredRun> {
