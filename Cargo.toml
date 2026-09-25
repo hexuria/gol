@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/harness", "crates/gateway", "crates/execution", "crates/memory", "crates/server", "crates/desktop", "crates/proxy", "crates/workflow-core", "crates/harness-core", "crates/runtime-tokio", "crates/workflow-rhai", "crates/workflow-js", "crates/workflow-bend"]
+members = ["crates/protocol", "crates/harness", "crates/gateway", "crates/execution", "crates/memory", "crates/server", "crates/proxy", "crates/workflow-core", "crates/harness-core", "crates/runtime-tokio", "crates/workflow-rhai", "crates/workflow-js", "crates/workflow-bend"]
