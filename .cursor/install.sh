@@ -35,26 +35,13 @@ fi
 export PATH="${BUN_INSTALL}/bin:${PATH}"
 
 export BEND_NO_TELEMETRY=1
-if [ ! -x "${HOME}/.bend/bin/bend" ] || [ "$(BEND_NO_TELEMETRY=1 "${HOME}/.bend/bin/bend" version)" != "bend 2.0.27" ]; then
-  curl -fsSL https://bend-lang.com/install.sh | sh
-fi
+# Pinned release with a sha256 check. The upstream installer takes the newest release.
+"$(cd "$(dirname "$0")/.." && pwd)/scripts/install-bend.sh"
 export PATH="${HOME}/.bend/bin:${PATH}"
-bend_version="$(BEND_NO_TELEMETRY=1 "${HOME}/.bend/bin/bend" version)"
-if [ "${bend_version}" != "bend 2.0.27" ]; then
-  echo "expected bend 2.0.27, found: ${bend_version}" >&2
-  exit 1
-fi
 sudo ln -sfn "${HOME}/.bend/bin/bend" /usr/local/bin/bend
 
-# Same jar URL as the formal job in .github/workflows/pr.yml.
-tla_jar="${HOME}/.local/tla/tla2tools.jar"
-if [ ! -f "${tla_jar}" ] || ! unzip -t "${tla_jar}" >/dev/null 2>&1; then
-  mkdir -p "${HOME}/.local/tla"
-  tmp_jar="${tla_jar}.partial"
-  curl -fsSL -o "${tmp_jar}" \
-    https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
-  mv -f "${tmp_jar}" "${tla_jar}"
-fi
+# Same pinned jar as the formal job in .github/workflows/pr.yml.
+"$(cd "$(dirname "$0")/.." && pwd)/scripts/install-tla.sh"
 
 # Same elan command as the formal job. It does not name a Lean version.
 # lake reads formal/**/lean-toolchain when scripts/verify-formal.sh builds.

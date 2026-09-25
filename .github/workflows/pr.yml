@@ -77,9 +77,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Bend 2.0.27
         run: |
-          curl -fsSL https://bend-lang.com/install.sh | sh
+          ./scripts/install-bend.sh
           echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
-          test "$(BEND_NO_TELEMETRY=1 "$HOME/.bend/bin/bend" version)" = "bend 2.0.27"
       - name: Allow user namespaces for unshare
         run: |
           # ubuntu-latest sets apparmor_restrict_unprivileged_userns=1, which
@@ -116,9 +115,8 @@ jobs:
           shared-key: workflow-bend
       - name: Install Bend 2.0.27
         run: |
-          curl -fsSL https://bend-lang.com/install.sh | sh
+          ./scripts/install-bend.sh
           echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
-          test "$(BEND_NO_TELEMETRY=1 "$HOME/.bend/bin/bend" version)" = "bend 2.0.27"
       - name: Allow user namespaces for unshare
         run: |
           # ubuntu-latest sets apparmor_restrict_unprivileged_userns=1, which
@@ -154,19 +152,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Install TLA+ tools
+        with:
+          # A pull_request checkout is a merge commit. Its first parent is the base.
+          fetch-depth: 2
+      - name: Did this change touch the formal inputs?
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
-          mkdir -p "$HOME/.local/tla"
-          curl -fsSL -o "$HOME/.local/tla/tla2tools.jar" \
-            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          # TLC and lake read only these paths, and the TLC jar is pinned. A pull
+          # request that leaves them unchanged gets the result main already has.
+          # Pushes to main always check.
+          inputs=(formal scripts/install-tla.sh scripts/verify-tla.sh scripts/verify-lean.sh .github/workflows/pr.yml)
+          if [ "$EVENT" = pull_request ] \
+            && git rev-parse --verify --quiet HEAD^1 >/dev/null \
+            && git diff --quiet HEAD^1 HEAD -- "${inputs[@]}"; then
+            echo "No formal input changed against the base. TLC and lake are skipped."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install TLA+ tools
+        if: steps.scope.outputs.run == 'true'
+        run: ./scripts/install-tla.sh
       - name: Install Lean
+        if: steps.scope.outputs.run == 'true'
         run: |
           curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       # Lean takes seconds and TLC takes minutes, so a Lean failure shows up first.
       - name: ./scripts/verify-lean.sh
+        if: steps.scope.outputs.run == 'true'
         run: ./scripts/verify-lean.sh
       - name: ./scripts/verify-tla.sh
+        if: steps.scope.outputs.run == 'true'
         run: ./scripts/verify-tla.sh
 
   supply-chain:

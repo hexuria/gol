@@ -14,7 +14,7 @@ elif [ -x "${HOME}/.bend/bin/bend" ]; then
   bend_bin="${HOME}/.bend/bin/bend"
 else
   echo "bend 2.0.27 is not installed." >&2
-  echo "curl -fsSL https://bend-lang.com/install.sh | sh" >&2
+  echo "run ./scripts/install-bend.sh" >&2
   exit 1
 fi
 

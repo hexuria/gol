@@ -32,7 +32,7 @@ TLC properties:
 - `DispatchTerminalStuck`. `completed`, `failed`, `cancelled`, and `expired` stay put.
 - `SchedulingPreserves`. Queue, schedule, provision, prepare, wait, approval, pause, recover, and resume leave the harness variables unchanged.
 - `RankDecreases`. A state-changing step lowers `Rank`, except `DispatchResume`, which returns dispatch to `running` and is exempt.
-- `EventuallyDone`. `FairSpec` is `Spec /\ WF_vars(Next) /\ WF_vars(DispatchComplete)`. The TLC run recorded below used the earlier `FairSpec` and does not cover this formula.
+- `EventuallyDone`. `FairSpec` is `Spec /\ WF_vars(Next) /\ WF_vars(DispatchComplete)`. The 2026-09-23 run recorded below used the earlier `FairSpec` and does not cover this formula. The 2026-09-25 run does.
 
 Lean theorems:
 
@@ -49,9 +49,9 @@ Command, from `formal/harness`:
 java -XX:+UseParallelGC -jar /tmp/tla/tla2tools.jar -workers 2 -deadlock Harness.tla
 ```
 
-TLC2 Version 2026.09.23.154203. Deadlock checking was on. Result:
+TLC2 Version 2026.09.23.154203. `-deadlock` turns deadlock checking off, so these runs did not check deadlock. Result:
 
-Uriah chose the full dispatch lifecycle. TLC was re-run on that machine before the Rust reducer changed. Deadlock checking was on. Result at 2026-09-23 23:26:24:
+Uriah chose the full dispatch lifecycle. TLC was re-run on that machine before the Rust reducer changed, with the same command. Result at 2026-09-23 23:26:24:
 
 ```text
 Model checking completed. No error has been found.
@@ -73,7 +73,7 @@ Answers at those bounds:
 - Retry after cancel is disabled. `Retry` requires `running`.
 - Two results do not satisfy one call. `RequestTool` records `<<step, attempt>>` in `issued` and refuses that pair a second time. `ReceiveResult` requires `answered = FALSE`. A later result is `IgnoreStale`.
 - Complete and cancel can both be enabled from `running`. The first one to occur wins. `TerminalStuck` keeps that phase.
-- `running`, `waiting`, and `running` cannot cycle. Unanswered `running` ranks `base + 30`, `waiting` ranks `base + 20`, and answered `running` ranks `base + 10`. `Retry` drops `base` by raising attempt. `Advance` raises the step and sets `attempt` to 0. TLC accepted the earlier strict `RankDecreases` and `EventuallyDone` on 2026-09-23. The current `RankDecreases` exempts `DispatchResume`. That formula was not re-checked.
+- `running`, `waiting`, and `running` cannot cycle. Unanswered `running` ranks `base + 30`, `waiting` ranks `base + 20`, and answered `running` ranks `base + 10`. `Retry` drops `base` by raising attempt. `Advance` raises the step and sets `attempt` to 0. TLC accepted the earlier strict `RankDecreases` and `EventuallyDone` on 2026-09-23. The current `RankDecreases` exempts `DispatchResume`. The 2026-09-23 run did not re-check that formula. The 2026-09-25 run does.
 - A worker cannot disappear while the owner still holds the step. `WorkerCrash` clears `live`, sets `owner` to 0, fails that worker's active turns, and clears `pending` in one action.
 - The same `<<step, attempt>>` is not issued twice. The same step index can run again only after `Retry`, which uses the next attempt. `Advance` is the only action that increments the step, and only from answered `running` with `step < MaxSteps`.
 - A session cannot complete while a turn is active. `CompleteSession` requires every turn to be outside `Active`. TLC accepted `NoActiveWhenDone`.
@@ -85,6 +85,28 @@ Retry from `cancelled` that writes `running` again violates `TerminalStuck`. Tra
 `ReceiveResult` from `cancelled` that writes `running` violates `TerminalStuck`. Trace: `StartSession`, `StartTurn(1)`, `Cancel(1)`, `ReceiveResult(1)` returns to `running`. 107 states generated, depth 5, 2026-09-23 22:49:43. The checked `ReceiveResult` requires `waiting`.
 
 `WorkerCrash` that only clears `live` violates `SingleOwner`. Trace: `StartSession`, `StartTurn(1)` with `owner = 1`, `WorkerCrash(1)` leaves phase `running` and `owner = 1` while `live[1] = FALSE`. 23 states generated, depth 4, 2026-09-23 22:42:06. The checked action releases the owner and fails the turn together.
+
+Re-run on 2026-09-25 with deadlock checking on. Command, from `formal/harness`, as `scripts/verify-tla.sh` runs it:
+
+```text
+java -XX:+UseParallelGC -jar ~/.local/tla/tla2tools.jar -workers auto -lncheck final -config Harness.cfg Harness.tla
+```
+
+TLC2 Version 2.19 of 08 August 2024, from tla2tools v1.7.4, which `scripts/install-tla.sh` pins. 4 workers. The command has no `-deadlock`, so TLC checked deadlock. `-lncheck final` checks `EventuallyDone` once, on the complete graph. The run covers the current `FairSpec`, `RankDecreases` with the `DispatchResume` exemption, and every invariant and property in `Harness.cfg`. Result:
+
+```text
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 1.2E-4
+  based on the actual fingerprints:  val = 7.0E-6
+153963902 states generated, 16441278 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 65.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 12 and the 95th percentile is 5).
+Finished in 17min 04s at (2026-09-25 20:02:55)
+```
+
+The nightly TLC2 Version 2026.09.25.020137 found the same 16,441,278 distinct states and depth 65 with `-deadlock`. `formal/workflow/Replay.cfg` also passes with deadlock checking on: 9 states generated, 5 distinct states found, depth 3. No state in either model is a deadlock. `Done`, `IgnoreStale`, and `Stop` are the stutter steps at the ends.
 
 ## Lean Findings
 
@@ -127,7 +149,7 @@ Rust `HarnessState` keeps the six checked phases.
 - `Failed { class, message }`
 - `Cancelled`
 
-`DispatchPhase` is not a projection of `HarnessState`. `reduce_dispatch` is its own pure function. `fold` applies both reducers to each event. TLC interleaves the two machines. The 2026-09-23 run checked the earlier formulas. `DispatchResume` and the current `FairSpec` were not part of that run.
+`DispatchPhase` is not a projection of `HarnessState`. `reduce_dispatch` is its own pure function. `fold` applies both reducers to each event. TLC interleaves the two machines. The 2026-09-23 run checked the earlier formulas. `DispatchResume` and the current `FairSpec` were not part of that run. The 2026-09-25 run covers both.
 
 Dispatch variants:
 
