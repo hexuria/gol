@@ -91,6 +91,15 @@ pub fn box_container_name(run_id: RunId) -> String {
     format!("gol-box-{run_id}")
 }
 
+/// Ephemeral workspace for one run. The shared volume `gol-workspace` is not mounted.
+pub fn box_workspace_volume(run_id: impl std::fmt::Display) -> String {
+    format!("gol-workspace-{run_id}")
+}
+
+fn workspace_mount(run_id: impl std::fmt::Display) -> String {
+    format!("{}:/workspace", box_workspace_volume(run_id))
+}
+
 pub fn computer_plan(placement: ExecutionPlacement, run_id: RunId) -> ComputerPlan {
     computer_for(placement, run_id, false)
 }
@@ -102,26 +111,32 @@ fn computer_for(placement: ExecutionPlacement, run_id: RunId, started: bool) -> 
             ComputerPlan {
                 image: "gol-agent:production".to_string(),
                 started_by: "server",
-                command: box_command(&name),
+                command: box_command(&name, run_id),
                 started,
                 name,
             }
         }
-        ExecutionPlacement::Local | ExecutionPlacement::Reverse => ComputerPlan {
-            image: "gol-agent:local".to_string(),
-            started_by: "desktop",
-            command: "docker run --rm -d --name gol-agent-local -v gol-workspace:/workspace gol-agent:local".to_string(),
-            started: false,
-            name: "gol-agent-local".to_string(),
-        },
+        ExecutionPlacement::Local | ExecutionPlacement::Reverse => {
+            let mount = workspace_mount(run_id);
+            ComputerPlan {
+                image: "gol-agent:local".to_string(),
+                started_by: "desktop",
+                command: format!(
+                    "docker run --rm -d --name gol-agent-local -v {mount} gol-agent:local"
+                ),
+                started: false,
+                name: "gol-agent-local".to_string(),
+            }
+        }
     }
 }
 
 /// Create, run a finite command, and remove. The image entrypoint is not used:
 /// `sleep infinity` would keep the container after `--rm` has nothing to reap.
-fn box_command(name: &str) -> String {
+fn box_command(name: &str, run_id: RunId) -> String {
+    let mount = workspace_mount(run_id);
     format!(
-        "docker create --name {name} -v gol-workspace:/workspace --entrypoint /bin/sh gol-agent:production -c true && docker start -a {name} && docker rm -f {name}"
+        "docker create --name {name} -v {mount} --entrypoint /bin/sh gol-agent:production -c true && docker start -a {name} && docker rm -f {name}"
     )
 }
 
@@ -222,12 +237,14 @@ impl SandboxHost for DockerSandbox {
         if name.is_empty() || name == "gol-agent-box" {
             return Err(SandboxError::Host(format!("refusing sandbox name {name}")));
         }
+        let run_id = name.strip_prefix("gol-box-").unwrap_or(name);
+        let mount = workspace_mount(run_id);
         self.command(&[
             "create",
             "--name",
             name,
             "-v",
-            "gol-workspace:/workspace",
+            &mount,
             "--entrypoint",
             "/bin/sh",
             "gol-agent:production",

@@ -6,11 +6,11 @@ const VENDOR_HOSTS = ["anthropic.com", "openai.com", "chatgpt.com", "x.ai", "gro
 export const FIXTURE_KEY = "gol-desktop-fixture";
 
 export function localImageCommand() {
-  return "docker run --rm -d --name gol-agent-local -v gol-workspace:/workspace gol-agent:local";
+  return "docker run --rm -d --name gol-agent-local -v gol-workspace-$RUN_ID:/workspace gol-agent:local";
 }
 
 export function productionImageCommand() {
-  return "docker create --name gol-box-$RUN_ID -v gol-workspace:/workspace --entrypoint /bin/sh gol-agent:production -c true && docker start -a gol-box-$RUN_ID && docker rm -f gol-box-$RUN_ID";
+  return "docker create --name gol-box-$RUN_ID -v gol-workspace-$RUN_ID:/workspace --entrypoint /bin/sh gol-agent:production -c true && docker start -a gol-box-$RUN_ID && docker rm -f gol-box-$RUN_ID";
 }
 
 export function assertFixtureProxy(url) {
