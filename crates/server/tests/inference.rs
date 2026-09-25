@@ -720,8 +720,22 @@ async fn four_modes_only_let_the_server_post_in_gateway_mode() {
 }
 
 fn fold_harness(events: &[protocol::Event]) -> HarnessState {
+    let spec = RunSpec::builder()
+        .agent(AgentId::new(), "1")
+        .input("hello")
+        .placement(ExecutionPlacement::Local)
+        .work_model(WorkModel {
+            provider: ModelProvider::OpenAI,
+            model_name: "gpt-test".to_string(),
+            credential: CredentialSource::PlatformGateway,
+        })
+        .limits(Limits {
+            max_steps: 8,
+            max_model_calls: 4,
+        })
+        .build();
     events.iter().fold(HarnessState::Idle, |state, event| {
-        protocol::reduce(state, event).0
+        protocol::reduce(state, event, &spec).0
     })
 }
 
