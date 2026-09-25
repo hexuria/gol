@@ -26,8 +26,9 @@ jobs:
           shared-key: workflow-bend
       - name: Install Bend 2.0.27
         run: |
-          ./scripts/install-bend.sh
+          curl -fsSL https://bend-lang.com/install.sh | sh
           echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
+          test "$(BEND_NO_TELEMETRY=1 "$HOME/.bend/bin/bend" version)" = "bend 2.0.27"
       - name: Allow user namespaces for unshare
         run: |
           # verify-bend.sh runs `unshare -r -n` so bend has no network.

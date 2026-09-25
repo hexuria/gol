@@ -35,8 +35,15 @@ fi
 export PATH="${BUN_INSTALL}/bin:${PATH}"
 
 export BEND_NO_TELEMETRY=1
-"$(cd "$(dirname "$0")/.." && pwd)/scripts/install-bend.sh"
+if [ ! -x "${HOME}/.bend/bin/bend" ] || [ "$(BEND_NO_TELEMETRY=1 "${HOME}/.bend/bin/bend" version)" != "bend 2.0.27" ]; then
+  curl -fsSL https://bend-lang.com/install.sh | sh
+fi
 export PATH="${HOME}/.bend/bin:${PATH}"
+bend_version="$(BEND_NO_TELEMETRY=1 "${HOME}/.bend/bin/bend" version)"
+if [ "${bend_version}" != "bend 2.0.27" ]; then
+  echo "expected bend 2.0.27, found: ${bend_version}" >&2
+  exit 1
+fi
 sudo ln -sfn "${HOME}/.bend/bin/bend" /usr/local/bin/bend
 
 # Same jar URL as the formal job in .github/workflows/pr.yml.
