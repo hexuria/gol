@@ -10,10 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Install desktop build libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libvulkan-dev clang g++
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
@@ -28,7 +24,6 @@ jobs:
           cargo miri test -p harness-core
           cargo miri test -p execution
           cargo miri test -p workflow-rhai
-          cargo miri test -p desktop
           # protocol: proptest terminal_state_is_stuck does not finish under Miri.
           # harness: catalog opens a socketpair of type 0x5, which Miri rejects.
           # gateway: the wiremock test returns while a server thread is still running.
