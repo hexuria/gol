@@ -75,3 +75,6 @@ if failed:
     sys.exit(1)
 print("architecture guard ok")
 PY
+
+# The verification planner reads its trigger table from AGENTS.md; keep both in step.
+"${root}/scripts/verify-plan.sh" --self-test
