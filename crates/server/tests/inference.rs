@@ -11,9 +11,9 @@ use protocol::{
 };
 use proxy::GATEWAY_TEXT;
 use server::{
-    box_container_name, ensure_fixture_proxy, open_turn, router_with_gateway, router_with_sandbox,
-    DockerSandbox, GatewayCall, GatewayPoster, HttpGatewayPoster, InMemoryStore, MemorySandbox,
-    RunStore, SandboxHost, TurnError,
+    box_container_name, box_workspace_volume, computer_plan, ensure_fixture_proxy, open_turn,
+    router_with_gateway, router_with_sandbox, DockerSandbox, GatewayCall, GatewayPoster,
+    HttpGatewayPoster, InMemoryStore, MemorySandbox, RunStore, SandboxHost, TurnError,
 };
 
 async fn proxy_server() -> (String, Arc<Mutex<Vec<String>>>) {
@@ -212,9 +212,16 @@ async fn a_second_box_run_does_not_reuse_the_container_name() {
         .expect("json");
         let name = body["computer"]["name"].as_str().expect("name").to_string();
         let command = body["computer"]["command"].as_str().expect("command");
+        let run_id = body["run_id"].as_str().expect("run id");
         assert_ne!(name, "gol-agent-box");
         assert!(command.contains(&name));
-        assert!(command.contains("-v gol-workspace:/workspace"));
+        let mount = format!("-v gol-workspace-{run_id}:/workspace");
+        assert!(command.contains(&mount), "{command}");
+        assert_eq!(
+            box_workspace_volume(run_id),
+            format!("gol-workspace-{run_id}")
+        );
+        assert!(!command.contains("-v gol-workspace:/workspace"));
         assert!(!command.contains("sleep"));
         assert!(!command.split_whitespace().any(|arg| arg == "-d"));
         names.push(name);
@@ -434,6 +441,13 @@ impl FailingRemove {
     }
 }
 
+fn workspace_mount_arg(args: &[String]) -> String {
+    args.windows(2)
+        .find(|pair| pair[0] == "-v")
+        .map(|pair| pair[1].clone())
+        .expect("docker create is missing a workspace mount")
+}
+
 fn docker_target(args: &[String]) -> String {
     if let Some(index) = args.iter().position(|arg| arg == "--name") {
         return args.get(index + 1).cloned().unwrap_or_default();
@@ -479,6 +493,93 @@ fn a_failed_sandbox_destroy_does_not_complete_the_turn() {
         "failed destroy still marked the turn complete"
     );
     assert!(sandbox.exists(&box_container_name(spec.run_id)));
+}
+
+fn box_gateway_spec(input: &str) -> RunSpec {
+    RunSpec::builder()
+        .agent(AgentId::new(), "1")
+        .input(input)
+        .placement(ExecutionPlacement::Box)
+        .work_model(WorkModel {
+            provider: ModelProvider::Anthropic,
+            model_name: "claude-fixture".to_string(),
+            credential: CredentialSource::PlatformGateway,
+        })
+        .capabilities(vec![Capability::new("model.call")])
+        .limits(Limits {
+            max_steps: 8,
+            max_model_calls: 4,
+        })
+        .build()
+}
+
+#[test]
+fn two_box_runs_do_not_share_a_workspace_volume() {
+    let mounts = Arc::new(Mutex::new(Vec::new()));
+    let record = mounts.clone();
+    let sandbox = DockerSandbox::from_command(move |args| {
+        if args.first().map(String::as_str) == Some("create") {
+            record
+                .lock()
+                .expect("mounts")
+                .push(workspace_mount_arg(args));
+        }
+        Ok(())
+    });
+
+    let mut expected = Vec::new();
+    for input in ["first box", "second box"] {
+        let spec = box_gateway_spec(input);
+        let outcome =
+            open_turn(&InMemoryStore::default(), spec.clone(), &OkPoster, &sandbox).expect("turn");
+        let volume = format!("gol-workspace-{}", spec.run_id);
+        let mount = format!("{volume}:/workspace");
+        assert_eq!(box_workspace_volume(spec.run_id), volume);
+        assert!(
+            outcome.computer.command.contains(&format!("-v {mount}")),
+            "{}",
+            outcome.computer.command
+        );
+        assert!(
+            !outcome
+                .computer
+                .command
+                .contains("-v gol-workspace:/workspace"),
+            "shared workspace mounted: {}",
+            outcome.computer.command
+        );
+        expected.push(mount);
+    }
+
+    let mounts = mounts.lock().expect("mounts");
+    assert_eq!(mounts.len(), 2, "each run must mount a workspace");
+    assert_ne!(
+        mounts[0], mounts[1],
+        "two runs shared workspace volume {}",
+        mounts[0]
+    );
+    assert_eq!(&mounts[0], &expected[0]);
+    assert_eq!(&mounts[1], &expected[1]);
+    assert_ne!(mounts[0], "gol-workspace:/workspace");
+    assert_ne!(mounts[1], "gol-workspace:/workspace");
+
+    let local_a = protocol::RunId::new();
+    let local_b = protocol::RunId::new();
+    let local_mounts = [local_a, local_b].map(|run_id| {
+        let command = computer_plan(ExecutionPlacement::Local, run_id).command;
+        let mount = format!("gol-workspace-{run_id}:/workspace");
+        assert!(command.contains(&format!("-v {mount}")), "{command}");
+        assert!(
+            !command.contains("-v gol-workspace:/workspace"),
+            "{command}"
+        );
+        mount
+    });
+    assert_ne!(
+        local_mounts[0], local_mounts[1],
+        "two local runs shared workspace volume {}",
+        local_mounts[0]
+    );
 }
 
 async fn events_of(client: &reqwest::Client, base: &str, run_id: &str) -> Vec<protocol::Event> {
