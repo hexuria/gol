@@ -41,8 +41,8 @@ One owner per failure class. A new check on a property that already has an owner
 | Failure class | Code | Owner | Status |
 |---|---|---|---|
 | Wrong harness transition, lost validity, no progress | `protocol/src/{reduce,phase}.rs` | unit tests in `reduce.rs`; `reduce_bounded` | owned in Rust; the Lean copy was deleted once `reduce_bounded` covered its theorems |
-| Dispatch lifecycle | `reduce_dispatch` | `reduce_bounded` (terminal stuck, rank, every open phase has an exit) | `formal/harness/Dispatch.tla` states the same properties; this test is its Rust link |
-| Late tool result vs cancel | `reduce.rs` | unit tests of both orders | `protocol/tests/loom_cancel.rs` runs Loom around the pure reducer and checks no gol sync code |
+| Dispatch lifecycle | `reduce_dispatch` | `reduce_bounded` (the exact next phase of every pair, terminal stuck, rank, every open phase has an exit) | `formal/harness/Dispatch.tla` states the same properties; this test is its Rust link |
+| Late tool result vs cancel | `reduce.rs` | unit tests of both orders | `protocol/tests/loom_cancel.rs` runs Loom around the pure reducer, which AGENTS.md "Do not" excludes; it checks no gol sync code, and retiring it is the owner's call |
 | Run never ends | `harness/src/driver.rs` budget | `harness/tests/budget.rs` | covers `EventuallyDone` for real runs |
 | Effect without authorization | `authorizer.rs`, `driver.rs` | unit tests | thin: 2 authorizer tests |
 | Concurrent run-log writers | `server/src/{store,postgres,inference,http}.rs` | `formal/runlog` + `server/tests/{inference,pg_redis}.rs` | linked: each counterexample is a Rust test |
@@ -84,6 +84,8 @@ A model result is evidence about Rust only through a Rust test that runs in CI.
 
 `crates/protocol/tests/reduce_bounded.rs` enumerates, for `max_steps` ∈ {0, 1, 2, 3, 9}, every valid `HarnessState`, all 25 `EventPayload` kinds (every `FailureClass`, every `Effect` inside `EffectDecided`/`EffectAuthorized`/`EffectDenied`, and matching and mismatching tool results), and all 14 `DispatchPhase`s. The alphabets come from matches with no `_` arm, so a new variant stops the file from compiling until it is enumerated.
 
-It asserts: validity is preserved; a change happens exactly where the transition table allows it, to exactly the expected next state; a lexicographic rank strictly drops on every change; terminal states absorb every event and emit nothing; the only effect emitted is the authorized one, and a tool call only from an unanswered running step; dispatch stays terminal, lowers its rank on every change except `RunResumed`, and every open phase has an exit.
+It asserts: validity is preserved; a change happens exactly where the transition table allows it, to exactly the expected next state; a lexicographic rank strictly drops on every change; terminal states absorb every event and emit nothing; the effects equal a total `expected_effects` (an authorized model call or memory access from any running step, a tool call only from an unanswered step inside the budget, nothing else); dispatch equals the `Dispatch.tla` action table on every pair, stays terminal, lowers its rank on every change except `DispatchResume` (a paused live phase back to running), and every open phase has an exit.
+
+Data fields take one value each, so a reducer that copies the wrong payload field is caught by the unit tests in `reduce.rs`, not here.
 
 `max_steps = 0` is enumerated with today's behavior: `RunStarted` enters `Running { step: 1 }`, no tool call is accepted, and the driver fails the run with `Budget` before its first decision.

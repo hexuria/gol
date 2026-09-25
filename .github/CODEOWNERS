@@ -4,6 +4,11 @@
 /CLAUDE.md                  @codeitlikemiley
 /.claude/                   @codeitlikemiley
 /formal/                    @codeitlikemiley
-/scripts/verify-plan.sh     @codeitlikemiley
+/scripts/verify-*.sh        @codeitlikemiley
+/scripts/check-architecture.sh @codeitlikemiley
+/scripts/ci-scope.sh        @codeitlikemiley
 /.github/                   @codeitlikemiley
 /deny.toml                  @codeitlikemiley
+/.cargo/                    @codeitlikemiley
+/rust-toolchain*            @codeitlikemiley
+proptest-regressions/       @codeitlikemiley

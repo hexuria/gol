@@ -76,5 +76,29 @@ if failed:
 print("architecture guard ok")
 PY
 
+# Every crate root forbids unsafe code. workflow-bend denies it and allows it on kill_group alone.
+unsafe_failed=0
+while IFS= read -r crate_root; do
+  if [[ "${crate_root}" == crates/workflow-bend/src/lib.rs ]]; then
+    want='#![deny(unsafe_code)]'
+  else
+    want='#![forbid(unsafe_code)]'
+  fi
+  if ! grep -qxF "${want}" "${root}/${crate_root}"; then
+    echo "${crate_root} lacks ${want}" >&2
+    unsafe_failed=1
+  fi
+done < <(cd "${root}" && ls crates/*/src/lib.rs crates/*/src/main.rs crates/*/src/bin/*.rs 2>/dev/null)
+allows="$(cd "${root}" && grep -rln 'allow(unsafe_code)' crates --include='*.rs' || true)"
+if [[ "${allows}" != crates/workflow-bend/src/boundary.rs ]] \
+  || [[ "$(grep -c 'allow(unsafe_code)' "${root}/crates/workflow-bend/src/boundary.rs")" != 1 ]]; then
+  echo "allow(unsafe_code) must appear once, on kill_group in crates/workflow-bend/src/boundary.rs; found in: ${allows:-nowhere}" >&2
+  unsafe_failed=1
+fi
+if [[ "${unsafe_failed}" != 0 ]]; then
+  exit 1
+fi
+echo "unsafe guard ok"
+
 # The verification planner reads its trigger table from AGENTS.md; keep both in step.
 "${root}/scripts/verify-plan.sh" --self-test
