@@ -15,37 +15,24 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ github.token }}
-      - name: Publish locked Cargo.lock commit
+      - name: Assemble Cargo.lock and drop temporary slices
         run: |
-          set +e
-          {
-            echo "begin $(date -u +%H:%M:%S)"
-            curl -sI --max-time 20 https://origin.cursor.com/git/uriah/tmp-92948c862c60569f.git/info/refs?service=git-upload-pack
-            echo CURL_EXIT:$?
-            git ls-remote https://origin.cursor.com/git/uriah/tmp-92948c862c60569f.git refs/heads/gol/surface-core-dbee
-            echo LS_EXIT:$?
-            git fetch --no-tags https://origin.cursor.com/git/uriah/tmp-92948c862c60569f.git refs/heads/gol/surface-core-dbee
-            echo FETCH_EXIT:$?
-            git rev-parse FETCH_HEAD
-            echo REV_EXIT:$?
-          } > /tmp/sync-fetch.log 2>&1
-          if grep -q '^FETCH_EXIT:0$' /tmp/sync-fetch.log && [ "$(git rev-parse FETCH_HEAD)" = "d7acf818e20417b0aa0813a3dfcd837086cc385b" ]; then
-            if git push --force origin FETCH_HEAD:refs/heads/gol/surface-core-dbee; then
-              exit 0
-            fi
-            echo PUSH_FORCE_FAILED >> /tmp/sync-fetch.log
-            git checkout FETCH_HEAD -- Cargo.lock
-            git rm -f .github/workflows/sync-lockfile.yml
-            rm -f sync-fetch.log
-            git config user.email "cursoragent@cursor.com"
-            git config user.name "Cursor Agent"
-            git commit -m "Lock surface-core and crux_core 0.20.0."
-            git push origin HEAD:refs/heads/gol/surface-core-dbee
-            exit $?
-          fi
-          cp /tmp/sync-fetch.log sync-fetch.log
-          git add sync-fetch.log
+          set -euo pipefail
+          python3 - << 'PY'
+          from pathlib import Path
+          parts = sorted(Path(".lockparts").glob("p-*"))
+          names = [p.name for p in parts]
+          expected = [f"p-{i:02d}" for i in range(33)]
+          if names != expected:
+              raise SystemExit(f"slice names {names} != {expected}")
+          data = b"".join(p.read_bytes() for p in parts)
+          Path("Cargo.lock").write_bytes(data)
+          PY
+          test "$(git hash-object Cargo.lock)" = "923d628ea9c72a8065e83269cf8c0aeed0e2b058"
+          git add Cargo.lock
+          git rm -r .lockparts
+          git rm -f sync-fetch.log .github/workflows/sync-lockfile.yml
           git config user.email "cursoragent@cursor.com"
           git config user.name "Cursor Agent"
-          git commit -m "Record lockfile fetch error."
+          git commit -m "Lock surface-core and crux_core 0.20.0."
           git push origin HEAD:refs/heads/gol/surface-core-dbee
