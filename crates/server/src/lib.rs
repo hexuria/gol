@@ -15,5 +15,7 @@ pub use inference::{
 pub use local::LocalEchoFactory;
 pub use postgres::PostgresStore;
 pub use queue::RedisRunQueue;
-pub use store::{AgentManifest, InMemoryStore, RunStore, StoredArtifact, StoredRun};
+pub use store::{
+    is_terminal, AgentManifest, Append, InMemoryStore, RunStore, StoredArtifact, StoredRun,
+};
 pub use surface::{ag_ui_events, json_render_spec};

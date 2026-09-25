@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use protocol::{AgentId, ArtifactId, Capability, Event, RunId, RunSpec};
+use protocol::{AgentId, ArtifactId, Capability, Event, EventPayload, RunId, RunSpec};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentManifest {
@@ -26,14 +26,38 @@ pub struct StoredArtifact {
     pub body: Vec<u8>,
 }
 
+/// What `RunStore::append_events` did. The log only grows, and it ends at the
+/// first terminal event (formal/runlog/RunLog.tla).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Append {
+    Appended,
+    /// The stored log already holds a terminal event (see `is_terminal`).
+    /// Nothing was written.
+    Terminal,
+    /// No run is stored under that id. Nothing was written.
+    Missing,
+}
+
+/// The payloads that end a run: `DispatchPhase::is_terminal` after the reducer.
+pub fn is_terminal(payload: &EventPayload) -> bool {
+    matches!(
+        payload,
+        EventPayload::RunCompleted { .. }
+            | EventPayload::RunFailed { .. }
+            | EventPayload::RunCancelled
+            | EventPayload::RunExpired
+    )
+}
+
 pub trait RunStore: Send + Sync {
     fn put_agent(&self, agent: AgentManifest);
+    /// Store a new run. A run already stored under that id keeps its spec and
+    /// events, so a redelivered put cannot drop anything appended since.
     fn put_run(&self, run: StoredRun);
-    /// Write `run` over the row for its id. The stored events become `run.events`.
-    fn replace_run(&self, run: StoredRun);
-    /// Append `events` onto the run already stored. `spec` and the events
-    /// already stored stay as they are. A missing run is left missing.
-    fn append_events(&self, id: RunId, events: Vec<Event>);
+    /// Append `events` onto the stored run in one atomic step, unless the
+    /// stored log is already terminal or the run is missing. `spec` and the
+    /// events already stored never change.
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Append;
     fn run(&self, id: RunId) -> Option<StoredRun>;
     fn put_artifact(&self, artifact: StoredArtifact);
     fn artifact(&self, id: ArtifactId) -> Option<StoredArtifact>;
@@ -58,21 +82,24 @@ impl RunStore for InMemoryStore {
         self.runs
             .lock()
             .expect("run store")
-            .insert(run.spec.run_id, run);
+            .entry(run.spec.run_id)
+            .or_insert(run);
     }
 
-    fn replace_run(&self, run: StoredRun) {
-        self.runs
-            .lock()
-            .expect("run store")
-            .insert(run.spec.run_id, run);
-    }
-
-    fn append_events(&self, id: RunId, events: Vec<Event>) {
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Append {
         let mut runs = self.runs.lock().expect("run store");
-        if let Some(stored) = runs.get_mut(&id) {
-            stored.events.extend(events);
+        let Some(stored) = runs.get_mut(&id) else {
+            return Append::Missing;
+        };
+        if stored
+            .events
+            .iter()
+            .any(|event| is_terminal(&event.payload))
+        {
+            return Append::Terminal;
         }
+        stored.events.extend(events);
+        Append::Appended
     }
 
     fn run(&self, id: RunId) -> Option<StoredRun> {
