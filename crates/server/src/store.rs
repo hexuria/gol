@@ -29,6 +29,8 @@ pub struct StoredArtifact {
 pub trait RunStore: Send + Sync {
     fn put_agent(&self, agent: AgentManifest);
     fn put_run(&self, run: StoredRun);
+    /// Write `run` over the row for its id. The stored events become `run.events`.
+    fn replace_run(&self, run: StoredRun);
     /// Append `events` onto the run already stored. `spec` and the events
     /// already stored stay as they are. A missing run is left missing.
     fn append_events(&self, id: RunId, events: Vec<Event>);
@@ -53,6 +55,13 @@ impl RunStore for InMemoryStore {
     }
 
     fn put_run(&self, run: StoredRun) {
+        self.runs
+            .lock()
+            .expect("run store")
+            .insert(run.spec.run_id, run);
+    }
+
+    fn replace_run(&self, run: StoredRun) {
         self.runs
             .lock()
             .expect("run store")

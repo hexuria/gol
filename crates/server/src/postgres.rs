@@ -73,10 +73,24 @@ impl RunStore for PostgresStore {
             .expect("postgres")
             .execute(
                 "insert into runs (id, spec, events) values ($1, $2, $3)
-                 on conflict (id) do update set spec = excluded.spec, events = excluded.events",
+                 on conflict (id) do update set spec = excluded.spec",
                 &[&run.spec.run_id.as_uuid(), &spec, &events],
             )
             .expect("insert run");
+    }
+
+    fn replace_run(&self, run: StoredRun) {
+        let spec = serde_json::to_value(&run.spec).expect("spec json");
+        let events = serde_json::to_value(&run.events).expect("events json");
+        self.client
+            .lock()
+            .expect("postgres")
+            .execute(
+                "insert into runs (id, spec, events) values ($1, $2, $3)
+                 on conflict (id) do update set spec = excluded.spec, events = excluded.events",
+                &[&run.spec.run_id.as_uuid(), &spec, &events],
+            )
+            .expect("replace run");
     }
 
     fn append_events(&self, id: RunId, events: Vec<Event>) {
