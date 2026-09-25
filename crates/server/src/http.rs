@@ -15,8 +15,8 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::inference::{
-    accept_subscription_completion, computer_plan, open_turn, ComputerPlan, GatewayPoster,
-    HttpGatewayPoster, SharedPoster, TurnError, TurnOutcome,
+    accept_subscription_completion, open_turn, sandbox_from_env, ComputerPlan, GatewayPoster,
+    HttpGatewayPoster, SandboxHost, SharedPoster, TurnError, TurnOutcome,
 };
 use crate::queue::RedisRunQueue;
 use crate::store::{AgentManifest, RunStore, StoredRun};
@@ -28,6 +28,7 @@ struct AppState {
     jev_base_url: String,
     redis_url: Option<String>,
     poster: SharedPoster,
+    sandbox: Arc<dyn SandboxHost>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +59,7 @@ pub fn router_with_queue(
         jev_base_url,
         redis_url,
         Arc::new(HttpGatewayPoster::from_env()),
+        sandbox_from_env(),
     )
 }
 
@@ -66,7 +68,16 @@ pub fn router_with_gateway(
     jev_base_url: impl Into<String>,
     poster: Arc<dyn GatewayPoster>,
 ) -> Router {
-    router_with_parts(store, jev_base_url, None, poster)
+    router_with_sandbox(store, jev_base_url, poster, sandbox_from_env())
+}
+
+pub fn router_with_sandbox(
+    store: Arc<dyn RunStore>,
+    jev_base_url: impl Into<String>,
+    poster: Arc<dyn GatewayPoster>,
+    sandbox: Arc<dyn SandboxHost>,
+) -> Router {
+    router_with_parts(store, jev_base_url, None, poster, sandbox)
 }
 
 fn router_with_parts(
@@ -74,6 +85,7 @@ fn router_with_parts(
     jev_base_url: impl Into<String>,
     redis_url: Option<String>,
     poster: SharedPoster,
+    sandbox: Arc<dyn SandboxHost>,
 ) -> Router {
     Router::new()
         .route("/v1/agents", post(create_agent))
@@ -92,6 +104,7 @@ fn router_with_parts(
             jev_base_url: jev_base_url.into(),
             redis_url,
             poster,
+            sandbox,
         })
 }
 
@@ -157,11 +170,13 @@ async fn create_coworker_turn(
     let spec = spec_from_body(body);
     let store = state.store.clone();
     let poster = state.poster.clone();
-    let outcome =
-        tokio::task::spawn_blocking(move || open_turn(store.as_ref(), spec, poster.as_ref()))
-            .await
-            .map_err(|error| ApiError::Decider(error.to_string()))?
-            .map_err(ApiError::from)?;
+    let sandbox = state.sandbox.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        open_turn(store.as_ref(), spec, poster.as_ref(), sandbox.as_ref())
+    })
+    .await
+    .map_err(|error| ApiError::Decider(error.to_string()))?
+    .map_err(ApiError::from)?;
     Ok(Json(TurnBody::from_outcome(outcome)))
 }
 
@@ -171,8 +186,9 @@ async fn complete_coworker_turn(
     Json(body): Json<CompletionBody>,
 ) -> Result<Json<TurnBody>, ApiError> {
     let store = state.store.clone();
+    let sandbox = state.sandbox.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        accept_subscription_completion(store.as_ref(), id, &body.text)
+        accept_subscription_completion(store.as_ref(), id, &body.text, sandbox.as_ref())
     })
     .await
     .map_err(|error| ApiError::Decider(error.to_string()))?
@@ -201,6 +217,7 @@ struct ComputerBody {
     started_by: &'static str,
     command: String,
     started: bool,
+    name: String,
 }
 
 impl TurnBody {
@@ -213,14 +230,13 @@ impl TurnBody {
                 _ => None,
             })
             .unwrap_or_else(|| outcome.spec.input.clone());
-        let computer = computer_plan(outcome.spec.placement);
         Self {
             run_id: outcome.spec.run_id,
             placement: outcome.spec.placement,
             credential_mode: outcome.credential_mode,
             user_message,
             completion: outcome.completion,
-            computer: ComputerBody::from_plan(computer),
+            computer: ComputerBody::from_plan(outcome.computer),
         }
     }
 }
@@ -232,6 +248,7 @@ impl ComputerBody {
             started_by: plan.started_by,
             command: plan.command,
             started: plan.started,
+            name: plan.name,
         }
     }
 }
@@ -349,6 +366,7 @@ enum ApiError {
     Decider(String),
     NotFound,
     Proxy(String),
+    Sandbox(String),
     Conflict(&'static str),
     BadRequest(&'static str),
 }
@@ -357,6 +375,7 @@ impl From<TurnError> for ApiError {
     fn from(error: TurnError) -> Self {
         match error {
             TurnError::Proxy(message) => Self::Proxy(message),
+            TurnError::Sandbox(message) => Self::Sandbox(message),
             TurnError::NotFound => Self::NotFound,
             TurnError::Conflict(message) => Self::Conflict(message),
             TurnError::BadRequest(message) => Self::BadRequest(message),
@@ -386,6 +405,11 @@ impl axum::response::IntoResponse for ApiError {
             )
                 .into_response(),
             Self::Proxy(message) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response(),
+            Self::Sandbox(message) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({ "error": message })),
             )

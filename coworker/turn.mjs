@@ -10,7 +10,7 @@ export function localImageCommand() {
 }
 
 export function productionImageCommand() {
-  return "docker run --rm -d --name gol-agent-box -v gol-workspace:/workspace gol-agent:production";
+  return "docker create --name gol-box-$RUN_ID -v gol-workspace:/workspace --entrypoint /bin/sh gol-agent:production -c true && docker start -a gol-box-$RUN_ID && docker rm -f gol-box-$RUN_ID";
 }
 
 export function assertFixtureProxy(url) {
