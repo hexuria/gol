@@ -2,7 +2,7 @@ use protocol::{Capability, ToolDescriptor, ToolId};
 
 pub trait Tool {
     fn descriptor(&self) -> ToolDescriptor;
-    fn call(&self, input: &str) -> String;
+    fn call(&self, input: &str) -> Result<String, String>;
 }
 
 pub struct EchoTool;
@@ -10,7 +10,9 @@ pub struct EchoTool;
 impl EchoTool {
     pub fn descriptor() -> ToolDescriptor {
         ToolDescriptor {
-            id: ToolId::new(),
+            id: ToolId::from_uuid(uuid::Uuid::from_u128(
+                0x3b1c_9c0a_4e2d_4b7a_9c11_8a0e_5d2f_6b41,
+            )),
             name: "echo".to_string(),
             description: "Returns the input text.".to_string(),
             input_schema: "{\"type\":\"string\"}".to_string(),
@@ -25,7 +27,7 @@ impl Tool for EchoTool {
         Self::descriptor()
     }
 
-    fn call(&self, input: &str) -> String {
-        input.to_string()
+    fn call(&self, input: &str) -> Result<String, String> {
+        Ok(input.to_string())
     }
 }
