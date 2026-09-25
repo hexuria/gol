@@ -47,7 +47,7 @@ One owner per failure class. A new check on a property that already has an owner
 | Effect without authorization | `authorizer.rs`, `driver.rs` | unit tests | thin: 2 authorizer tests |
 | Concurrent run-log writers | `server/src/{store,postgres,inference,http}.rs` | `formal/runlog` + `server/tests/{inference,pg_redis}.rs` | linked: each counterexample is a Rust test |
 | Stores disagree | `store.rs` vs `postgres.rs` | tests on both stores | no shared contract suite yet |
-| Duplicate effect after a crash | `runtime-tokio/src/{journal,host}.rs` | `replay_proof.rs`; `formal/workflow/Replay.tla` for the design | the Lean restatement was deleted; its extra theorems map to `replay_proof.rs` and `program.rs` |
+| Duplicate effect after a crash | `runtime-tokio/src/{journal,host}.rs` | `replay_proof.rs`; `formal/workflow/Replay.tla` for the design | the Lean restatement was deleted; `formal/harness/FINDINGS.md` "Lean (retired)" maps each theorem to its Rust test |
 | Frontends disagree | `workflow-*` | `histories_agree_across_rust_rhai_js_and_bend` | runs in more than one CI job |
 | Bend laws and encoding | `experiments/bend` | `verify-bend.sh`, workflow-bend tests | see gol-bend |
 | gol `unsafe` | `workflow-bend/src/boundary.rs` `kill_group` | `forbid(unsafe_code)` in every other crate; `timeout_kills_the_process_group` | compiler-enforced |

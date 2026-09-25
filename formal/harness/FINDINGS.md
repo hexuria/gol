@@ -180,6 +180,16 @@ Bounds are `MaxTurns`, `MaxSteps`, `MaxWorkers`, `MaxRetries`, `MaxTools`. The w
 
 The Rust test covers more than the copy did: `max_steps` ∈ {0, 1, 2, 3, 9}, invocation matching, `RunExpired`, and every effect kind.
 
+`formal/replay/Replay.lean` restated `formal/workflow/Replay.tla` for the counter journal. `Replay.tla` stays as the design model; the Rust owners are:
+
+| Lean theorem | Rust owner |
+|---|---|
+| `journaled_result_forces_branch` | `branch_on_recorded_counter` in `crates/workflow-core/src/program.rs`: no record executes the counter, 0 completes, nonzero fails, no wait |
+| `branch_changes_id` | `branch_on_recorded_counter`: each recorded path gets its own effect id at sequence 0 |
+| `held_is_not_a_hit` | `held_bytes_are_not_a_hit_before_ok` in `crates/runtime-tokio/src/journal.rs` |
+| `journaled_id_not_executed_again`, `hit_sticks`, `hit_disables_perform` | `kill_after_commit_skips_the_counter` in `crates/runtime-tokio/tests/replay_proof.rs`: after the rerun the effect count stays 1 and the log keeps the committed zero |
+| `crash_reenables_perform` | `kill_before_commit_leaves_the_next_unstarted`: a kill before commit leaves no record, so the rerun performs the effect again |
+
 ## Simplification
 
 The diagram in slice 1 started with `Idle`, `Planning`, `Running`, `WaitingForTool`, `Retrying`, `Cancelled`, `Failed`, and `Completed`, plus `ToolResult` drawn as a return edge.
