@@ -1,5 +1,9 @@
 use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use harness::{
     load_catalog, Decider, DeciderError, DecisionView, Driver, InMemory, ScriptedDecider,
@@ -36,6 +40,44 @@ fn scratch() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("gol-catalog-{nanos}"));
     fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+fn command_is_running(command: &Path) -> bool {
+    let needle = command.as_os_str().as_bytes();
+    let entries = fs::read_dir("/proc").expect("catalog spawn check requires /proc");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.as_bytes().iter().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if cmdline.split(|byte| *byte == 0).any(|arg| arg == needle) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `Command::spawn` returns before the shell reaches `touch`, and dropping a
+/// session kills that child. Watch the process itself for `window` before
+/// accepting that the command never started.
+fn assert_command_not_started(command: &Path, marker: &Path, window: Duration) {
+    let deadline = Instant::now() + window;
+    loop {
+        let running = command_is_running(command);
+        let marked = marker.exists();
+        if running || marked {
+            panic!(
+                "reading the catalog spawned the configured command (running={running}, marker={marked})"
+            );
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn tool_names(events: &[protocol::Event]) -> Vec<String> {
@@ -111,7 +153,7 @@ for line in sys.stdin:
     )
     .unwrap();
     let toml = format!(
-        "[[mcp]]\nname = \"local\"\ncommand = \"python3\"\nargs = [\"{}\"]\n",
+        "[[mcp]]\nname = \"local\"\ncommand = \"python3\"\nargs = [\"{}\"]\n\n[[mcp.tools]]\nname = \"ping\"\ndescription = \"p\"\n",
         script.display()
     );
     fs::write(dir.join("harness.toml"), toml).unwrap();
@@ -152,6 +194,37 @@ impl Decider for SkillSeen {
             outcome: "done".into(),
         })
     }
+}
+
+#[test]
+fn reading_the_catalog_does_not_spawn_the_configured_command() {
+    let dir = scratch();
+    let marker = dir.join("spawned");
+    let command = dir.join("spawn-marker");
+    fs::write(
+        &command,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nprintf '\\n'\nread ignored\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+    let toml = format!(
+        "[[mcp]]\nname = \"local\"\ncommand = \"{}\"\n\n[[mcp.tools]]\nname = \"ping\"\ndescription = \"p\"\n",
+        command.display()
+    );
+    fs::write(dir.join("harness.toml"), toml).unwrap();
+
+    let loaded = load_catalog(&dir);
+    let catalog = loaded.expect("reading the catalog must not execute the mcp command");
+    assert_eq!(catalog.descriptors()[0].name, "ping");
+    assert_command_not_started(&command, &marker, Duration::from_millis(200));
+    drop(catalog);
+    assert!(
+        !command_is_running(&command),
+        "reading the catalog spawned the configured command"
+    );
 }
 
 #[test]
