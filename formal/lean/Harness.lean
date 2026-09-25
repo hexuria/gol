@@ -60,7 +60,7 @@ def apply (s : State) (e : Ev) : State :=
   | .toolResult => { s with phase := .running, pending := false, answered := true }
   | .duplicateResult => s
   | .retry => { s with attempt := s.attempt + 1, answered := false }
-  | .advance => { s with step := s.step + 1, answered := false }
+  | .advance => { s with step := s.step + 1, attempt := 0, answered := false }
   | .cancel => { s with phase := .cancelled, pending := false }
   | .complete => { s with phase := .completed, pending := false }
   | .fail => { s with phase := .failed, pending := false }
