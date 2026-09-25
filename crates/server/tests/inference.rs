@@ -13,7 +13,7 @@ use proxy::GATEWAY_TEXT;
 use server::{
     box_container_name, ensure_fixture_proxy, open_turn, router_with_gateway, router_with_sandbox,
     DockerSandbox, GatewayCall, GatewayPoster, HttpGatewayPoster, InMemoryStore, MemorySandbox,
-    RunStore, SandboxError, SandboxHost, TurnError,
+    RunStore, SandboxHost, TurnError,
 };
 
 async fn proxy_server() -> (String, Arc<Mutex<Vec<String>>>) {
@@ -276,53 +276,38 @@ fn parse_run_id(body: &serde_json::Value) -> protocol::RunId {
         .expect("run id uuid")
 }
 
-struct ReleaseAfterComplete {
-    inner: MemorySandbox,
-    store: Arc<InMemoryStore>,
-}
-
-impl SandboxHost for ReleaseAfterComplete {
-    fn provision(&self, name: &str) -> Result<(), SandboxError> {
-        self.inner.provision(name)
-    }
-
-    fn destroy(&self, name: &str) -> Result<(), SandboxError> {
-        let run_id = name
-            .strip_prefix("gol-box-")
-            .and_then(|value| value.parse().ok())
-            .ok_or_else(|| SandboxError::Host(format!("sandbox {name} is not a box run")))?;
-        let stored = self
-            .store
-            .run(run_id)
-            .ok_or_else(|| SandboxError::Host(format!("sandbox {name} has no run")))?;
-        if !stored
-            .events
-            .iter()
-            .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. }))
-        {
-            return Err(SandboxError::Host(
-                "sandbox removed before the turn completed".to_string(),
-            ));
-        }
-        self.inner.destroy(name)
-    }
-
-    fn exists(&self, name: &str) -> bool {
-        self.inner.exists(name)
-    }
-
-    fn launches_docker(&self) -> bool {
-        false
-    }
-}
-
 #[tokio::test]
 async fn subscription_box_keeps_the_sandbox_until_the_turn_completes() {
     let store = Arc::new(InMemoryStore::default());
-    let sandbox = Arc::new(ReleaseAfterComplete {
-        inner: MemorySandbox::default(),
-        store: store.clone(),
-    });
+    let sandbox = Arc::new(MemorySandbox::default());
+    let box_name = Arc::new(Mutex::new(None::<String>));
+    let model_called = Arc::new(AtomicBool::new(false));
+    let alive_during_model_call = Arc::new(AtomicBool::new(false));
+    let expected = box_name.clone();
+    let during = sandbox.clone();
+    let called = model_called.clone();
+    let alive = alive_during_model_call.clone();
+    let proxy = proxy::router().layer(axum::middleware::from_fn(
+        move |request: Request<Body>, next: Next| {
+            let expected = expected.clone();
+            let during = during.clone();
+            let called = called.clone();
+            let alive = alive.clone();
+            async move {
+                if request.uri().path() == "/v1/messages" {
+                    let name = expected
+                        .lock()
+                        .expect("box name")
+                        .clone()
+                        .expect("model call before the box name is known");
+                    called.store(true, Ordering::SeqCst);
+                    alive.store(during.exists(&name), Ordering::SeqCst);
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    let proxy_url = listen(proxy).await;
     let app = router_with_sandbox(
         store,
         "http://127.0.0.1:9",
@@ -347,10 +332,6 @@ async fn subscription_box_keeps_the_sandbox_until_the_turn_completes() {
         .as_str()
         .expect("name")
         .to_string();
-    assert!(
-        sandbox.exists(&name),
-        "sandbox was gone before the desktop model call"
-    );
     let run_id = opened["run_id"].as_str().expect("run id");
     let events = events_of(&client, &base, run_id).await;
     assert!(
@@ -359,11 +340,23 @@ async fn subscription_box_keeps_the_sandbox_until_the_turn_completes() {
             .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. })),
         "subscription turn completed inside open_turn"
     );
+    *box_name.lock().expect("box name") = Some(name.clone());
+
+    let model = post_model(&client, &format!("{proxy_url}/v1/messages?beta=true")).await;
+    model.error_for_status().expect("model status");
+    assert!(
+        model_called.load(Ordering::SeqCst),
+        "desktop model call did not run"
+    );
+    assert!(
+        alive_during_model_call.load(Ordering::SeqCst),
+        "sandbox {name} was gone during the desktop model call"
+    );
 
     let completed = post_when_up(
         &client,
         &format!("{base}/v1/coworker/turns/{run_id}/completion"),
-        &serde_json::json!({ "text": "desktop model text" }),
+        &serde_json::json!({ "text": proxy::CLAUDE_TEXT }),
     )
     .await
     .error_for_status()
@@ -371,7 +364,7 @@ async fn subscription_box_keeps_the_sandbox_until_the_turn_completes() {
     .json::<serde_json::Value>()
     .await
     .expect("json");
-    assert_eq!(completed["completion"], "desktop model text");
+    assert_eq!(completed["completion"], proxy::CLAUDE_TEXT);
     assert!(
         !sandbox.exists(&name),
         "sandbox still present after the turn completed"
@@ -380,6 +373,33 @@ async fn subscription_box_keeps_the_sandbox_until_the_turn_completes() {
     assert!(events
         .iter()
         .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. })));
+}
+
+async fn post_model(client: &reqwest::Client, url: &str) -> reqwest::Response {
+    let body = serde_json::json!({
+        "model": "claude-fixture",
+        "max_tokens": 64,
+        "stream": false,
+        "messages": [{ "role": "user", "content": "hold the box" }],
+    });
+    let mut last = None;
+    for _ in 0..30 {
+        match client
+            .post(url)
+            .header("x-api-key", "gol-desktop-fixture")
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) => return response,
+            Err(error) => {
+                last = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    panic!("model call {url} failed: {last:?}");
 }
 
 struct FailingRemove {
