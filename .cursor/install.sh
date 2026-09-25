@@ -35,6 +35,7 @@ fi
 export PATH="${BUN_INSTALL}/bin:${PATH}"
 
 export BEND_NO_TELEMETRY=1
+# Pinned release with a sha256 check. The upstream installer takes the newest release.
 "$(cd "$(dirname "$0")/.." && pwd)/scripts/install-bend.sh"
 export PATH="${HOME}/.bend/bin:${PATH}"
 sudo ln -sfn "${HOME}/.bend/bin/bend" /usr/local/bin/bend
