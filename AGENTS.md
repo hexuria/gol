@@ -1700,3 +1700,13 @@ Laws live in `LAWS.bend`. Proofs live in `PROOF.bend`. Run the proofs before com
 Bend is for pure verified computation. Parallelize only independent computation. Effects stay in Rust. A passed proof is not a sandbox: Rust keeps the timeout, the kill, and the output limit.
 
 Benchmark a Bend claim against idiomatic Rust. Do not claim a speedup the boundary benchmark did not measure.
+
+---
+
+# 44. Lock Files
+
+`Cargo.lock` and `coworker/bun.lock` are committed. The workspace ships binaries, CI builds what the lock names, and `cargo deny` audits those exact versions.
+
+Only the package manager writes a lock file: `cargo update -p <crate>`, `cargo generate-lockfile`, or `bun install`. The result is pushed with git as one ordinary commit next to the manifest change that caused it.
+
+Never split a lock file into pieces, write it by hand, or have a workflow rebuild it. No workflow commits or pushes to a branch. An agent that cannot push a large file from a git checkout does not change dependencies.
