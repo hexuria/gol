@@ -38,13 +38,13 @@ Each invariant was checked on its own against `Design = "old"`. Each one fails. 
 - `NothingAfterTerminal`: a late user message is appended after Jev's terminal event.
 - `CompletedHasNoSandbox`: the completion is appended while the sandbox is still up. A reader can see it, and it can then be taken back.
 
-`Design = "new"`, from `formal/runlog`:
+`Design = "new"`, from `formal/runlog`, as `scripts/verify-tla.sh` runs it:
 
 ```text
-java -XX:+UseParallelGC -jar tla2tools.jar -workers auto -lncheck final -config RunLog.cfg -deadlock RunLog.tla
+java -XX:+UseParallelGC -jar ~/.local/tla/tla2tools.jar -workers auto -lncheck final -config RunLog.cfg RunLog.tla
 ```
 
-TLC2 2026.09.25. Every invariant and property passed: 1,461 states generated, 616 distinct. With `Completers = {"c1", "c2", "c3"}`: 15,136 generated, 5,316 distinct, no error.
+TLC2 Version 2.19 of 08 August 2024, from tla2tools v1.7.4, which `scripts/install-tla.sh` pins. The command has no `-deadlock`, so TLC checked deadlock. Every invariant and property passed, and no state is a deadlock: 1,461 states generated, 616 distinct, depth 10. With `Completers = {"c1", "c2", "c3"}`: 15,136 generated, 5,316 distinct, depth 13, no error. `Done` is the only stuttering step, so deadlock checking is not masked.
 
 The checks are not vacuous: an invariant saying `c1` never lands in the log is violated, and so is one saying a late message is never refused.
 
