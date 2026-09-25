@@ -1,0 +1,31 @@
+name: sync-lockfile
+on:
+  push:
+    branches:
+      - gol/surface-core-dbee
+    paths:
+      - .github/workflows/sync-lockfile.yml
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+      - name: Publish locked Cargo.lock commit
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://origin.cursor.com/git/uriah/tmp-92948c862c60569f.git refs/heads/gol/surface-core-dbee
+          test "$(git rev-parse FETCH_HEAD)" = "d7acf818e20417b0aa0813a3dfcd837086cc385b"
+          if git push --force origin FETCH_HEAD:refs/heads/gol/surface-core-dbee; then
+            exit 0
+          fi
+          git checkout FETCH_HEAD -- Cargo.lock
+          git rm -f .github/workflows/sync-lockfile.yml
+          git config user.email "cursoragent@cursor.com"
+          git config user.name "Cursor Agent"
+          git commit -m "Lock surface-core and crux_core 0.20.0."
+          git push origin HEAD:refs/heads/gol/surface-core-dbee
