@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ApprovalId, InvocationId};
 
-pub const MAX_STEPS: u32 = 3;
 pub const MAX_RETRIES: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

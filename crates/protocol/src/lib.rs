@@ -16,7 +16,7 @@ pub use event::{Actor, Event, EventEnvelope, EventPayload, EventSource, Timestam
 pub use fold::{fold, RunState};
 pub use id::{AgentId, ApprovalId, ArtifactId, EventId, InvocationId, RunId, StepId, ToolId};
 pub use model::{MessageRole, ModelMessage, ModelRequest};
-pub use phase::{DispatchPhase, FailureClass, HarnessState, MAX_RETRIES, MAX_STEPS};
+pub use phase::{DispatchPhase, FailureClass, HarnessState, MAX_RETRIES};
 pub use policy::PolicyDecision;
 pub use reduce::{reduce, reduce_dispatch, Effects};
 pub use spec::{

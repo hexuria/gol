@@ -5,8 +5,8 @@ use std::sync::Arc;
 use loom::sync::Mutex;
 use loom::thread;
 use protocol::{
-    reduce, Actor, AgentId, Event, EventPayload, EventSource, HarnessState, InvocationId, RunId,
-    Timestamp,
+    reduce, Actor, AgentId, CredentialSource, Event, EventPayload, EventSource, ExecutionPlacement,
+    HarnessState, InvocationId, ModelProvider, RunId, RunSpec, Timestamp, WorkModel,
 };
 use uuid::Uuid;
 
@@ -46,9 +46,22 @@ fn tool_result() -> Event {
     )
 }
 
-fn apply(state: &Mutex<HarnessState>, event: &Event) {
+fn run_spec() -> RunSpec {
+    RunSpec::builder()
+        .agent(AgentId::new(), "1")
+        .input("hello")
+        .placement(ExecutionPlacement::Local)
+        .work_model(WorkModel {
+            provider: ModelProvider::OpenAI,
+            model_name: "gpt-test".to_string(),
+            credential: CredentialSource::PlatformGateway,
+        })
+        .build()
+}
+
+fn apply(state: &Mutex<HarnessState>, event: &Event, spec: &RunSpec) {
     let mut guard = state.lock().unwrap();
-    let (next, effects) = reduce(guard.clone(), event);
+    let (next, effects) = reduce(guard.clone(), event, spec);
     assert!(effects.is_empty());
     *guard = next;
 }
@@ -56,11 +69,16 @@ fn apply(state: &Mutex<HarnessState>, event: &Event) {
 #[test]
 fn late_tool_result_races_cancel() {
     loom::model(|| {
+        let spec = run_spec();
         let state = Arc::new(Mutex::new(waiting()));
         let cancel_state = Arc::clone(&state);
         let result_state = Arc::clone(&state);
-        let cancel_thread = thread::spawn(move || apply(&cancel_state, &cancel_event()));
-        let result_thread = thread::spawn(move || apply(&result_state, &tool_result()));
+        let cancel_spec = spec.clone();
+        let result_spec = spec;
+        let cancel_thread =
+            thread::spawn(move || apply(&cancel_state, &cancel_event(), &cancel_spec));
+        let result_thread =
+            thread::spawn(move || apply(&result_state, &tool_result(), &result_spec));
         cancel_thread.join().unwrap();
         result_thread.join().unwrap();
         assert_eq!(*state.lock().unwrap(), HarnessState::Cancelled);
