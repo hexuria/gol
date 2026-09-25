@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use postgres::NoTls;
-use protocol::{AgentId, ArtifactId, RunId};
+use protocol::{AgentId, ArtifactId, Event, RunId};
 use serde_json::Value;
 
 use crate::store::{AgentManifest, RunStore, StoredArtifact, StoredRun};
@@ -77,6 +77,18 @@ impl RunStore for PostgresStore {
                 &[&run.spec.run_id.as_uuid(), &spec, &events],
             )
             .expect("insert run");
+    }
+
+    fn append_events(&self, id: RunId, events: Vec<Event>) {
+        let events = serde_json::to_value(&events).expect("events json");
+        self.client
+            .lock()
+            .expect("postgres")
+            .execute(
+                "update runs set events = events || $2::jsonb where id = $1",
+                &[&id.as_uuid(), &events],
+            )
+            .expect("append events");
     }
 
     fn run(&self, id: RunId) -> Option<StoredRun> {
