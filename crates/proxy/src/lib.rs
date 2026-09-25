@@ -158,7 +158,9 @@ async fn parts(request: Request) -> (HeaderMap, Value) {
 }
 
 fn claude_authorized(headers: &HeaderMap) -> bool {
-    header_value(headers, "authorization").is_some() || header_value(headers, "x-api-key").is_some()
+    const FIXTURE: &str = "gol-desktop-fixture";
+    header_value(headers, "x-api-key").as_deref() == Some(FIXTURE)
+        || bearer(headers).as_deref() == Some(FIXTURE)
 }
 
 fn bearer(headers: &HeaderMap) -> Option<String> {
