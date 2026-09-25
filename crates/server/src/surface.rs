@@ -1,4 +1,4 @@
-use protocol::{Event, EventPayload, MessageRole, RunId};
+use protocol::{Effect, Event, EventPayload, MessageRole, RunId};
 use serde_json::{json, Value};
 
 pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
@@ -11,17 +11,36 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
     for event in events {
         let id = event.envelope.event_id.to_string();
         match &event.payload {
-            EventPayload::ToolResult { name, output, .. } => {
+            EventPayload::ToolResult {
+                name,
+                output,
+                invocation,
+                ..
+            } => {
+                let delta = events.iter().find_map(|prior| match &prior.payload {
+                    EventPayload::EffectAuthorized {
+                        effect:
+                            Effect::ToolCall {
+                                input,
+                                invocation: authorized,
+                                ..
+                            },
+                    } if authorized == invocation => Some(input.clone()),
+                    _ => None,
+                });
                 out.push(json!({
                     "type": "TOOL_CALL_START",
                     "toolCallId": id,
                     "toolCallName": name,
                 }));
-                out.push(json!({
+                let mut args = json!({
                     "type": "TOOL_CALL_ARGS",
                     "toolCallId": id,
-                    "delta": output,
-                }));
+                });
+                if let Some(input) = delta {
+                    args["delta"] = json!(input);
+                }
+                out.push(args);
                 out.push(json!({
                     "type": "TOOL_CALL_END",
                     "toolCallId": id,

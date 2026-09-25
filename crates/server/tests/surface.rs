@@ -1,6 +1,8 @@
 use protocol::{
-    Actor, AgentId, Event, EventPayload, EventSource, MessageRole, ModelMessage, RunId, Timestamp,
+    Actor, AgentId, Effect, Event, EventPayload, EventSource, InvocationId, MessageRole,
+    ModelMessage, RunId, Timestamp,
 };
+use serde_json::Value;
 use server::{ag_ui_events, json_render_spec};
 
 fn event(run_id: RunId, payload: EventPayload) -> Event {
@@ -69,6 +71,117 @@ fn ag_ui_maps_tool_result_and_completion() {
             "TEXT_MESSAGE_END",
             "RUN_FINISHED",
         ]
+    );
+}
+
+fn json_has_string(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::String(text) => text == needle,
+        Value::Array(items) => items.iter().any(|item| json_has_string(item, needle)),
+        Value::Object(map) => map.values().any(|item| json_has_string(item, needle)),
+        _ => false,
+    }
+}
+
+#[test]
+fn ag_ui_args_delta_is_the_authorized_input() {
+    let run_id = RunId::new();
+    let first = InvocationId::new();
+    let second = InvocationId::new();
+    let events = ag_ui_events(
+        run_id,
+        &[
+            event(
+                run_id,
+                EventPayload::EffectAuthorized {
+                    effect: Effect::ToolCall {
+                        name: "ping".to_string(),
+                        input: "hi".to_string(),
+                        invocation: first,
+                    },
+                },
+            ),
+            event(
+                run_id,
+                EventPayload::ToolResult {
+                    name: "ping".to_string(),
+                    invocation: first,
+                    step: 1,
+                    attempt: 0,
+                    output: "pong:hi".to_string(),
+                },
+            ),
+            event(
+                run_id,
+                EventPayload::EffectAuthorized {
+                    effect: Effect::ToolCall {
+                        name: "ping".to_string(),
+                        input: "be".to_string(),
+                        invocation: second,
+                    },
+                },
+            ),
+            event(
+                run_id,
+                EventPayload::ToolResult {
+                    name: "ping".to_string(),
+                    invocation: second,
+                    step: 1,
+                    attempt: 0,
+                    output: "pong:be".to_string(),
+                },
+            ),
+        ],
+    );
+    let args: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "TOOL_CALL_ARGS")
+        .collect();
+    let results: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "TOOL_CALL_RESULT")
+        .collect();
+    assert_eq!(args.len(), 2);
+    assert_eq!(args[0]["delta"], "hi");
+    assert_eq!(args[1]["delta"], "be");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["content"], "pong:hi");
+    assert_eq!(results[1]["content"], "pong:be");
+    for args_event in &args {
+        assert!(!json_has_string(args_event, "pong:hi"));
+        assert!(!json_has_string(args_event, "pong:be"));
+    }
+    for event in &events {
+        let delta = event.get("delta").and_then(Value::as_str);
+        assert_ne!(delta, Some("pong:hi"));
+        assert_ne!(delta, Some("pong:be"));
+    }
+
+    let orphan = ag_ui_events(
+        run_id,
+        &[event(
+            run_id,
+            EventPayload::ToolResult {
+                name: "ping".to_string(),
+                invocation: InvocationId::new(),
+                step: 1,
+                attempt: 0,
+                output: "pong:hi".to_string(),
+            },
+        )],
+    );
+    let orphan_args = orphan
+        .iter()
+        .find(|event| event["type"] == "TOOL_CALL_ARGS")
+        .expect("args");
+    assert!(orphan_args.get("delta").is_none());
+    assert!(!json_has_string(orphan_args, "pong:hi"));
+    assert_eq!(
+        orphan
+            .iter()
+            .find(|event| event["type"] == "TOOL_CALL_RESULT")
+            .expect("result")["content"],
+        "pong:hi"
     );
 }
 
