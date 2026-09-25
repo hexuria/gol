@@ -2,7 +2,7 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use protocol::{
-    Actor, AgentId, CredentialSource, Effect, Event, EventPayload, ExecutionPlacement,
+    Actor, AgentId, CredentialSource, Effect, Event, EventPayload, EventSource, ExecutionPlacement,
     HarnessState, InvocationId, Limits, ModelProvider, RunSpec, Timestamp, WorkModel,
 };
 
@@ -25,13 +25,13 @@ fn spec() -> RunSpec {
 
 fn event(spec: &RunSpec, payload: EventPayload) -> Event {
     Event::record(
-        spec.run_id,
-        spec.agent_id,
-        &spec.agent_version,
-        None,
-        Actor::System,
-        None,
-        Timestamp::unix_millis(0),
+        EventSource::new(
+            spec.run_id,
+            spec.agent_id,
+            &spec.agent_version,
+            Actor::System,
+            Timestamp::unix_millis(0),
+        ),
         payload,
     )
 }

@@ -1,0 +1,48 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install desktop build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libvulkan-dev clang g++
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Miri
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+          # execution reads the realtime clock. Isolation rejects that, and the tests pass without it.
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: |
+          cargo miri setup
+          cargo miri test -p workflow-core
+          cargo miri test -p harness-core
+          cargo miri test -p execution
+          cargo miri test -p workflow-rhai
+          cargo miri test -p desktop
+          # protocol: proptest terminal_state_is_stuck does not finish under Miri.
+          # harness: catalog opens a socketpair of type 0x5, which Miri rejects.
+          # gateway: the wiremock test returns while a server thread is still running.
+          # memory: tokio-postgres setsockopt SOL_SOCKET option 0x9, which Miri rejects.
+          # server: reqwest setsockopt SOL_SOCKET option 0x9, which Miri rejects.
+          # proxy: reqwest setsockopt SOL_SOCKET option 0x9, which Miri rejects.
+          # runtime-tokio: replay_proof calls posix_spawn, which Miri cannot execute.
+          # workflow-js: boa_engine trips stacked-borrows UB inside Context::default.
+          # workflow-bend: staging sources calls copy_file_range (syscall 326), which Miri cannot execute.
+
+  loom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Late tool result against cancel
+        run: RUSTFLAGS="--cfg loom" cargo test -p protocol --test loom_cancel -- --test-threads=1

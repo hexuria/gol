@@ -3,8 +3,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use protocol::{
-    Actor, CredentialSource, Event, EventPayload, ExecutionPlacement, MessageRole, ModelMessage,
-    RunId, RunSpec, Timestamp,
+    Actor, CredentialSource, Event, EventPayload, EventSource, ExecutionPlacement, MessageRole,
+    ModelMessage, RunId, RunSpec, Timestamp,
 };
 
 use crate::store::{RunStore, StoredRun};
@@ -472,13 +472,13 @@ fn sandbox_error(error: SandboxError) -> TurnError {
 
 pub fn user_message_event(spec: &RunSpec) -> Event {
     Event::record(
-        spec.run_id,
-        spec.agent_id,
-        &spec.agent_version,
-        None,
-        Actor::System,
-        None,
-        Timestamp::now(),
+        EventSource::new(
+            spec.run_id,
+            spec.agent_id,
+            &spec.agent_version,
+            Actor::System,
+            Timestamp::now(),
+        ),
         EventPayload::UserMessage {
             text: spec.input.clone(),
         },
@@ -509,13 +509,13 @@ fn append_completion(spec: &RunSpec, events: &mut Vec<Event>, text: &str) {
 
 fn push(spec: &RunSpec, events: &mut Vec<Event>, actor: Actor, payload: EventPayload) {
     events.push(Event::record(
-        spec.run_id,
-        spec.agent_id,
-        &spec.agent_version,
-        None,
-        actor,
-        None,
-        Timestamp::now(),
+        EventSource::new(
+            spec.run_id,
+            spec.agent_id,
+            &spec.agent_version,
+            actor,
+            Timestamp::now(),
+        ),
         payload,
     ));
 }

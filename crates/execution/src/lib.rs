@@ -1,7 +1,7 @@
 use std::thread::ThreadId;
 
 use harness::{
-    run_to_completion, DeciderError, EchoTool, InMemory, ScriptedDecider, UnavailableModel, Driver,
+    run_to_completion, DeciderError, Driver, EchoTool, InMemory, ScriptedDecider, UnavailableModel,
 };
 use protocol::{Event, ExecutionPlacement, RunSpec};
 
@@ -17,10 +17,7 @@ pub struct PlacedRun {
     pub worker_thread: ThreadId,
 }
 
-pub fn run_reverse(
-    spec: RunSpec,
-    decider: ScriptedDecider,
-) -> Result<PlacedRun, ExecError> {
+pub fn run_reverse(spec: RunSpec, decider: ScriptedDecider) -> Result<PlacedRun, ExecError> {
     run_on_worker(spec, ExecutionPlacement::Reverse, decider)
 }
 

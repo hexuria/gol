@@ -68,6 +68,10 @@ impl RunStore for InMemoryStore {
     }
 
     fn artifact(&self, id: ArtifactId) -> Option<StoredArtifact> {
-        self.artifacts.lock().expect("artifact store").get(&id).cloned()
+        self.artifacts
+            .lock()
+            .expect("artifact store")
+            .get(&id)
+            .cloned()
     }
 }

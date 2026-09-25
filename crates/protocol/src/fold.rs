@@ -47,17 +47,17 @@ pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
 mod tests {
     use super::*;
     use crate::spec::sample_spec;
-    use crate::{Actor, ApprovalId, Event, FailureClass, Timestamp};
+    use crate::{Actor, ApprovalId, Event, EventSource, FailureClass, Timestamp};
 
     fn ev(spec: &RunSpec, payload: EventPayload) -> Event {
         Event::record(
-            spec.run_id,
-            spec.agent_id,
-            &spec.agent_version,
-            None,
-            Actor::System,
-            None,
-            Timestamp::unix_millis(0),
+            EventSource::new(
+                spec.run_id,
+                spec.agent_id,
+                &spec.agent_version,
+                Actor::System,
+                Timestamp::unix_millis(0),
+            ),
             payload,
         )
     }

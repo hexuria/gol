@@ -151,29 +151,50 @@ pub struct Event {
     pub payload: EventPayload,
 }
 
-impl Event {
-    pub fn record(
+pub struct EventSource<'a> {
+    pub run_id: RunId,
+    pub agent_id: AgentId,
+    pub agent_version: &'a str,
+    pub step_id: Option<StepId>,
+    pub actor: Actor,
+    pub caused_by: Option<EventId>,
+    pub at: Timestamp,
+}
+
+impl<'a> EventSource<'a> {
+    pub fn new(
         run_id: RunId,
         agent_id: AgentId,
-        agent_version: &str,
-        step_id: Option<StepId>,
+        agent_version: &'a str,
         actor: Actor,
-        caused_by: Option<EventId>,
         at: Timestamp,
-        payload: EventPayload,
     ) -> Self {
+        Self {
+            run_id,
+            agent_id,
+            agent_version,
+            step_id: None,
+            actor,
+            caused_by: None,
+            at,
+        }
+    }
+}
+
+impl Event {
+    pub fn record(source: EventSource<'_>, payload: EventPayload) -> Self {
         Self {
             envelope: EventEnvelope {
                 event_id: EventId::new(),
                 event_type: payload.event_type().to_string(),
-                run_id,
-                step_id,
+                run_id: source.run_id,
+                step_id: source.step_id,
                 parent_run_id: None,
-                agent_id,
-                agent_version: agent_version.to_string(),
-                at,
-                actor,
-                caused_by,
+                agent_id: source.agent_id,
+                agent_version: source.agent_version.to_string(),
+                at: source.at,
+                actor: source.actor,
+                caused_by: source.caused_by,
             },
             payload,
         }

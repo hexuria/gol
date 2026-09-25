@@ -1,15 +1,17 @@
-use protocol::{Actor, AgentId, Event, EventPayload, MessageRole, ModelMessage, RunId, Timestamp};
+use protocol::{
+    Actor, AgentId, Event, EventPayload, EventSource, MessageRole, ModelMessage, RunId, Timestamp,
+};
 use server::{ag_ui_events, json_render_spec};
 
 fn event(run_id: RunId, payload: EventPayload) -> Event {
     Event::record(
-        run_id,
-        AgentId::new(),
-        "1",
-        None,
-        Actor::Agent,
-        None,
-        Timestamp::unix_millis(1),
+        EventSource::new(
+            run_id,
+            AgentId::new(),
+            "1",
+            Actor::Agent,
+            Timestamp::unix_millis(1),
+        ),
         payload,
     )
 }
