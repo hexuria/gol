@@ -7,10 +7,9 @@ gol is a composable agent runtime. This slice runs one local agent loop. The har
 ```bash
 cargo test
 cargo run -p server
-cargo build -p desktop
 ```
 
-`cargo build -p desktop` produces `gol-desktop` with gpui-kit. On Linux it needs `pkg-config`, `libxkbcommon-dev`, `libxkbcommon-x11-dev`, `libwayland-dev`, `libfontconfig1-dev`, `libvulkan-dev`, and `g++`. The toolchain is Rust 1.98.1.
+The toolchain is Rust 1.98.1.
 
 The server listens on `http://127.0.0.1:43123`. Override the port with `GOL_PORT`.
 
