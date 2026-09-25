@@ -30,9 +30,9 @@ TLC properties:
 
 - `TerminalStuck`. A terminal harness phase stays that phase.
 - `DispatchTerminalStuck`. `completed`, `failed`, `cancelled`, and `expired` stay put.
-- `SchedulingPreserves`. Queue, schedule, provision, prepare, wait, approval, pause, and recover leave the harness variables unchanged.
-- `RankDecreases`. Every state-changing step lowers `Rank`.
-- `EventuallyDone`, under `WF_vars(Next)`.
+- `SchedulingPreserves`. Queue, schedule, provision, prepare, wait, approval, pause, recover, and resume leave the harness variables unchanged.
+- `RankDecreases`. A state-changing step lowers `Rank`, except `DispatchResume`, which returns dispatch to `running` and is exempt.
+- `EventuallyDone`. `FairSpec` is `Spec /\ WF_vars(Next) /\ WF_vars(DispatchComplete)`. The TLC run recorded below used the earlier `FairSpec` and does not cover this formula.
 
 Lean theorems:
 
@@ -73,7 +73,7 @@ Answers at those bounds:
 - Retry after cancel is disabled. `Retry` requires `running`.
 - Two results do not satisfy one call. `RequestTool` records `<<step, attempt>>` in `issued` and refuses that pair a second time. `ReceiveResult` requires `answered = FALSE`. A later result is `IgnoreStale`.
 - Complete and cancel can both be enabled from `running`. The first one to occur wins. `TerminalStuck` keeps that phase.
-- `running`, `waiting`, and `running` cannot cycle. Unanswered `running` ranks `base + 30`, `waiting` ranks `base + 20`, and answered `running` ranks `base + 10`. `Retry` and `Advance` drop `base` by raising attempt or step. TLC accepted `RankDecreases` and `EventuallyDone`.
+- `running`, `waiting`, and `running` cannot cycle. Unanswered `running` ranks `base + 30`, `waiting` ranks `base + 20`, and answered `running` ranks `base + 10`. `Retry` drops `base` by raising attempt. `Advance` raises the step and sets `attempt` to 0. TLC accepted the earlier strict `RankDecreases` and `EventuallyDone` on 2026-09-23. The current `RankDecreases` exempts `DispatchResume`. That formula was not re-checked.
 - A worker cannot disappear while the owner still holds the step. `WorkerCrash` clears `live`, sets `owner` to 0, fails that worker's active turns, and clears `pending` in one action.
 - The same `<<step, attempt>>` is not issued twice. The same step index can run again only after `Retry`, which uses the next attempt. `Advance` is the only action that increments the step, and only from answered `running` with `step < MaxSteps`.
 - A session cannot complete while a turn is active. `CompleteSession` requires every turn to be outside `Active`. TLC accepted `NoActiveWhenDone`.
@@ -127,20 +127,20 @@ Rust `HarnessState` keeps the six checked phases.
 - `Failed { class, message }`
 - `Cancelled`
 
-`DispatchPhase` is not a projection of `HarnessState`. `reduce_dispatch` is its own pure function. `fold` applies both reducers to each event. TLC interleaves the two machines. The safety properties above hold for that interleaving.
+`DispatchPhase` is not a projection of `HarnessState`. `reduce_dispatch` is its own pure function. `fold` applies both reducers to each event. TLC interleaves the two machines. The 2026-09-23 run checked the earlier formulas. `DispatchResume` and the current `FairSpec` were not part of that run.
 
 Dispatch variants:
 
 - `Created`. The empty log.
 - `Queued`, `Scheduled`, `Provisioning`, `Starting`, in that order.
 - `Running`. `RunStarted` from `Created` or from `Starting`. The `Created` edge is the local shortcut, so a local run does not have to visit every variant.
-- `Waiting { reason }`, `AwaitingApproval { approval_id }`, `Paused`, and `Recovering`, each only from `Running`.
+- `Waiting { reason }`, `AwaitingApproval { approval_id }`, `Paused`, and `Recovering` are entered from `Running`. `DispatchResume` returns those four phases to `running` and leaves the harness variables unchanged. From `Running` the four side phases can be entered again.
 - `Completed { outcome }` from `Running` or one of those four side phases.
 - `Failed { class, message }`, `Cancelled`, and `Expired` from any nonterminal dispatch phase.
 
 Those four terminals stay terminal. A scheduling event leaves `HarnessState` unchanged.
 
-Reducer guards match the checked relation. Bounds stay `maxSteps = 3` and `maxRetries = 2` until TLC and Lean are re-run. `RunSpec.limits` is the separate budget counter. A budget hit appends `RunFailed` with `Budget`. `RunExpired` reduces to `Failed` with `Timeout`.
+Reducer guards match the checked relation. `Harness.cfg` checks one `MaxSteps = 3`, the TLC instance of `Limits.max_steps`. Rust reads `Limits.max_steps` for the harness ceiling. The driver still compares the `EffectDecided` count to that field. `maxRetries` stays 2. A budget hit appends `RunFailed` with `Budget`. `RunExpired` reduces to `Failed` with `Timeout`.
 
 Events:
 
@@ -148,10 +148,10 @@ Events:
 - `EffectAuthorized` of `ToolCall` from unanswered `Running` enters `WaitingForTool` and emits that `ToolCall`.
 - `ToolResult` from `WaitingForTool` enters answered `Running` and emits nothing. A second `ToolResult`, or a `ToolResult` after a terminal phase, leaves the state in place.
 - `StepRetried` from answered `Running` with `attempt < 2` increments `attempt` and clears `answered`. From `Cancelled` it leaves `Cancelled`.
-- `StepAdvanced` from answered `Running` with `step < 3` increments `step` and clears `answered`.
+- `StepAdvanced` from answered `Running` with `step` below `Limits.max_steps` increments `step`, sets `attempt` to 0, and clears `answered`. `Advance` sets `attempt' = 0` under that same step guard with `MaxSteps`.
 - `EffectAuthorized` of `Complete`, and `RunCompleted`, from `Running` enter `Completed`.
 - `RunFailed` and `RunCancelled` from `Running` or `WaitingForTool` enter `Failed` and `Cancelled`. `RunFailed` from `WaitingForTool` clears the wait in that same step.
-- `RunQueued`, `RunScheduled`, `RunProvisioning`, `RunStarting`, `RunWaiting`, `RunRecovering`, `RunPaused`, and `RunAwaitingApproval` leave `HarnessState` unchanged and move only `DispatchPhase`, and only when the dispatch edge above is enabled.
+- `RunQueued`, `RunScheduled`, `RunProvisioning`, `RunStarting`, `RunWaiting`, `RunRecovering`, `RunPaused`, `RunAwaitingApproval`, and `RunResumed` leave `HarnessState` unchanged. The scheduling and side-phase payloads move `DispatchPhase` only when the dispatch edge above is enabled. `RunResumed` returns `Waiting`, `AwaitingApproval`, `Paused`, and `Recovering` to `Running`.
 - `RunExpired` leaves a terminal harness state unchanged. From `Running` or `WaitingForTool` it enters harness `Failed` with `Timeout`. Dispatch enters `Expired` from any nonterminal dispatch phase.
 - A disallowed event leaves the state unchanged. The driver performs an effect only when `reduce` emits it.
 
