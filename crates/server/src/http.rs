@@ -211,7 +211,7 @@ async fn create_run(
     };
     let folded = fold(&spec, &events);
     let store = state.store.clone();
-    tokio::task::spawn_blocking(move || store.put_run(StoredRun { spec, events }))
+    tokio::task::spawn_blocking(move || store.replace_run(StoredRun { spec, events }))
         .await
         .map_err(|error| ApiError::Decider(error.to_string()))?;
     Ok(Json(folded))
