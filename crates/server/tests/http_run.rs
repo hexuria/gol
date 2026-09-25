@@ -1,8 +1,10 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use protocol::{AgentId, Capability, EventPayload, HarnessState};
-use server::{router, AgentManifest, InMemoryStore};
+use protocol::{AgentId, ArtifactId, Capability, EventPayload, HarnessState, RunId};
+use server::{
+    router, router_with_queue, AgentManifest, InMemoryStore, RunStore, StoredArtifact, StoredRun,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -95,6 +97,7 @@ async fn post_run_reads_completed_and_events() {
 
     let fetched = client
         .get(format!("{base}/v1/runs/{}", created.run_id))
+        .header("authorization", "Bearer gol-gateway-local")
         .send()
         .await
         .expect("get run")
@@ -107,6 +110,7 @@ async fn post_run_reads_completed_and_events() {
 
     let events = client
         .get(format!("{base}/v1/runs/{}/events", created.run_id))
+        .header("authorization", "Bearer gol-gateway-local")
         .send()
         .await
         .expect("get events")
@@ -126,6 +130,7 @@ async fn post_run_reads_completed_and_events() {
 
     let ag_ui = client
         .get(format!("{base}/v1/runs/{}/ag-ui", created.run_id))
+        .header("authorization", "Bearer gol-gateway-local")
         .send()
         .await
         .expect("ag-ui")
@@ -148,6 +153,7 @@ async fn post_run_reads_completed_and_events() {
 
     let ui = client
         .get(format!("{base}/v1/runs/{}/ui", created.run_id))
+        .header("authorization", "Bearer gol-gateway-local")
         .send()
         .await
         .expect("ui")
@@ -256,7 +262,13 @@ async fn post_when_up(
 ) -> reqwest::Response {
     let mut last = None;
     for _ in 0..20 {
-        match client.post(url).json(body).send().await {
+        match client
+            .post(url)
+            .header("authorization", "Bearer gol-gateway-local")
+            .json(body)
+            .send()
+            .await
+        {
             Ok(response) => return response,
             Err(error) => {
                 last = Some(error);
@@ -265,4 +277,181 @@ async fn post_when_up(
         }
     }
     panic!("server did not accept {url}: {last:?}");
+}
+
+#[tokio::test]
+async fn missing_bearer_is_401_and_does_not_start_the_run() {
+    let jev = jev_mock().await;
+    let app = router(Arc::new(InMemoryStore::default()), jev.uri());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let missing = RunId::new();
+    let routes = [
+        ("POST", format!("{base}/v1/agents")),
+        ("POST", format!("{base}/v1/runs")),
+        ("GET", format!("{base}/v1/runs/{missing}")),
+        ("GET", format!("{base}/v1/runs/{missing}/events")),
+        ("GET", format!("{base}/v1/runs/{missing}/ag-ui")),
+        ("GET", format!("{base}/v1/runs/{missing}/ui")),
+        ("POST", format!("{base}/v1/coworker/turns")),
+        (
+            "POST",
+            format!("{base}/v1/coworker/turns/{missing}/completion"),
+        ),
+    ];
+    let headers: [Option<(&str, &str)>; 4] = [
+        None,
+        Some(("authorization", "")),
+        Some(("authorization", "Bearer ")),
+        Some(("x-api-key", "gol-desktop-fixture")),
+    ];
+
+    for (method, url) in &routes {
+        for header in headers {
+            let response = send_when_up(&client, method, url, header).await;
+            assert_eq!(response.status().as_u16(), 401, "{method} {url} {header:?}");
+            let body: serde_json::Value = response.json().await.expect("json");
+            assert_eq!(body, serde_json::json!({"error": "unauthorized"}));
+        }
+    }
+
+    let requests = jev.received_requests().await.expect("requests");
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path() == "/v1/systemone"),
+        "rejected create_run called Jev"
+    );
+}
+
+#[tokio::test]
+async fn redis_push_failure_does_not_run_the_harness() {
+    let jev = jev_mock().await;
+    let store = Arc::new(WatchedMemory::new());
+    let app = router_with_queue(
+        store.clone(),
+        jev.uri(),
+        Some("redis://127.0.0.1:6390".to_string()),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let response = post_when_up(
+        &reqwest::Client::new(),
+        &format!("http://{addr}/v1/runs"),
+        &serde_json::json!({
+            "agent_id": AgentId::new(),
+            "agent_version": "1",
+            "input": "hello",
+            "placement": "Local",
+            "work_model": {
+                "provider": "OpenAI",
+                "model_name": "gpt-test",
+                "credential": "PlatformGateway"
+            },
+            "capabilities": ["tool.echo"],
+            "limits": { "max_steps": 8, "max_model_calls": 4 }
+        }),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 502);
+
+    let ids = store.ids.lock().expect("ids").clone();
+    assert_eq!(ids.len(), 1, "user message was not stored");
+    let stored = store.run(ids[0]).expect("stored run");
+    assert!(matches!(
+        stored.events.as_slice(),
+        [protocol::Event {
+            payload: EventPayload::UserMessage { text },
+            ..
+        }] if text == "hello"
+    ));
+    assert!(!stored
+        .events
+        .iter()
+        .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. })));
+
+    let requests = jev.received_requests().await.expect("requests");
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path() == "/v1/systemone"),
+        "push failure still called Jev"
+    );
+}
+
+async fn send_when_up(
+    client: &reqwest::Client,
+    method: &str,
+    url: &str,
+    header: Option<(&str, &str)>,
+) -> reqwest::Response {
+    let mut last = None;
+    for _ in 0..20 {
+        let mut request = client.request(method.parse().expect("method"), url);
+        if method == "POST" {
+            request = request.json(&serde_json::json!({}));
+        }
+        if let Some((name, value)) = header {
+            request = request.header(name, value);
+        }
+        match request.send().await {
+            Ok(response) => return response,
+            Err(error) => {
+                last = Some(error);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+    panic!("server did not accept {url}: {last:?}");
+}
+
+struct WatchedMemory {
+    inner: InMemoryStore,
+    ids: Mutex<Vec<RunId>>,
+}
+
+impl WatchedMemory {
+    fn new() -> Self {
+        Self {
+            inner: InMemoryStore::default(),
+            ids: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl RunStore for WatchedMemory {
+    fn put_agent(&self, agent: AgentManifest) {
+        self.inner.put_agent(agent);
+    }
+
+    fn put_run(&self, run: StoredRun) {
+        self.ids.lock().expect("ids").push(run.spec.run_id);
+        self.inner.put_run(run);
+    }
+
+    fn run(&self, id: RunId) -> Option<StoredRun> {
+        self.inner.run(id)
+    }
+
+    fn put_artifact(&self, artifact: StoredArtifact) {
+        self.inner.put_artifact(artifact);
+    }
+
+    fn artifact(&self, id: ArtifactId) -> Option<StoredArtifact> {
+        self.inner.artifact(id)
+    }
 }
