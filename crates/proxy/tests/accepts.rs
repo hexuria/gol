@@ -108,6 +108,82 @@ async fn claude_stream_is_server_sent_events() {
     assert!(body.contains(CLAUDE_TEXT));
 }
 
+async fn assert_unauthorized(response: reqwest::Response) {
+    assert_eq!(response.status(), 401);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body, serde_json::json!({"error": "unauthorized"}));
+}
+
+#[tokio::test]
+async fn claude_non_fixture_key_is_401() {
+    let base = serve().await;
+    let client = client();
+    let key = "other-key";
+
+    let messages = client
+        .post(format!("{base}/v1/messages"))
+        .header("x-api-key", key)
+        .json(&serde_json::json!({"messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .expect("post");
+    assert_unauthorized(messages).await;
+
+    let count = client
+        .post(format!("{base}/v1/messages/count_tokens"))
+        .header("x-api-key", key)
+        .json(&serde_json::json!({"messages": []}))
+        .send()
+        .await
+        .expect("post");
+    assert_unauthorized(count).await;
+
+    let models = client
+        .get(format!("{base}/v1/models"))
+        .header("x-api-key", key)
+        .send()
+        .await
+        .expect("get");
+    assert_unauthorized(models).await;
+}
+
+#[tokio::test]
+async fn claude_non_fixture_bearer_is_401() {
+    let base = serve().await;
+    let response = client()
+        .post(format!("{base}/v1/messages"))
+        .header("authorization", "Bearer other-token")
+        .json(&serde_json::json!({"messages": []}))
+        .send()
+        .await
+        .expect("post");
+    assert_unauthorized(response).await;
+}
+
+#[tokio::test]
+async fn claude_non_bearer_authorization_is_401() {
+    let base = serve().await;
+    let client = client();
+
+    let bare = client
+        .post(format!("{base}/v1/messages"))
+        .header("authorization", "Bearer")
+        .json(&serde_json::json!({"messages": []}))
+        .send()
+        .await
+        .expect("post");
+    assert_unauthorized(bare).await;
+
+    let basic = client
+        .post(format!("{base}/v1/messages"))
+        .header("authorization", "Basic x")
+        .json(&serde_json::json!({"messages": []}))
+        .send()
+        .await
+        .expect("post");
+    assert_unauthorized(basic).await;
+}
+
 #[tokio::test]
 async fn codex_subscription_shape_requires_bearer_and_account() {
     let base = serve().await;
