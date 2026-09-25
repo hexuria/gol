@@ -78,7 +78,7 @@ The desktop chooses Local (start the local image with Docker) or Box (the server
 
 ## Bend
 
-Bend 2.0.27 is the pure counter workflow. Rust still owns effects. Install the pinned release, then verify syntax, types, laws, proofs, and the Rust adapter:
+Bend 2.0.28 is the pure counter workflow. Rust still owns effects. Install the pinned release, then verify syntax, types, laws, proofs, and the Rust adapter:
 
 ```bash
 ./scripts/install-bend.sh
@@ -87,15 +87,16 @@ export BEND_NO_TELEMETRY=1
 ./scripts/verify-bend.sh
 ```
 
-`scripts/install-bend.sh` downloads the 2.0.27 release archive, checks its pinned sha256, and installs it under `~/.bend`. The upstream `bend-lang.com/install.sh` installs the newest release, which fails the 2.0.27 pin. `docs/bend.md` is the boundary model. `experiments/bend/LAWS.bend` states the counter laws. `experiments/bend/PROOF.bend` proves them. `cargo test -p workflow-bend` compiles that program into `WorkflowProgram`. `cargo bench -p workflow-bend --bench boundary` measures the process boundary against `counter_program`.
+`scripts/install-bend.sh` downloads the 2.0.28 release archive, checks its pinned sha256, and installs it under `~/.bend`. The upstream `bend-lang.com/install.sh` installs the newest release, which fails the 2.0.28 pin. `docs/bend.md` is the boundary model. `experiments/bend/LAWS.bend` states the counter laws. `experiments/bend/PROOF.bend` proves them. `cargo test -p workflow-bend` compiles that program into `WorkflowProgram`. `cargo bench -p workflow-bend --bench boundary` measures the process boundary against `counter_program`.
 
 ## Formal model
 
-`formal/harness/Harness.tla` is the interleaving model. `formal/lean` is the single-turn proof. Findings are in `formal/harness/FINDINGS.md`.
+`formal/harness/Harness.tla` is the interleaving model. It composes `HarnessCore.tla` and `Dispatch.tla`, which TLC checks separately at full bounds. `formal/lean` is the single-turn proof. Findings are in `formal/harness/FINDINGS.md`.
 
-`./scripts/verify-tla.sh` runs TLC on every `formal/**/*.cfg` with `-workers auto -lncheck final -deadlock`. It reads the jar from `TLA_JAR`, then `~/.local/tla/tla2tools.jar`, then `/usr/share/java/tla2tools.jar`. `./scripts/verify-lean.sh` runs `lake build` in each Lean project.
+`./scripts/install-tla.sh` installs the pinned TLA+ tools, v1.7.4 (TLC 2.19), at `~/.local/tla/tla2tools.jar` and checks its sha256. `./scripts/verify-tla.sh` runs TLC on every `formal/**/*.cfg` with `-workers auto -lncheck final`. TLC checks deadlock unless a config says `CHECK_DEADLOCK FALSE`. The script reads the jar from `TLA_JAR`, then `~/.local/tla/tla2tools.jar`, then `/usr/share/java/tla2tools.jar`. `./scripts/verify-lean.sh` runs `lake build` in each Lean project.
 
 ```bash
+./scripts/install-tla.sh
 ./scripts/verify-tla.sh
 ./scripts/verify-lean.sh
 ```

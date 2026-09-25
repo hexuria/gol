@@ -1,14 +1,14 @@
 # Bend in gol
 
-Bend 2.0.27 is a pure, terminating language with executable proofs. gol keeps the harness in Rust. Bend owns one verified decision: the counter workflow. A proof check is not permission to touch the disk, the network, or a tool.
+Bend 2.0.28 is a pure, terminating language with executable proofs. gol keeps the harness in Rust. Bend owns one verified decision: the counter workflow. A proof check is not permission to touch the disk, the network, or a tool.
 
-The sources that were checked for this note are `bend guide`, `bend guide effects`, `bend --help`, and `bend base --types` from the 2.0.27 binary, plus the counter files under `experiments/bend/`. Older Bend and HVM1 writeups are ignored where they disagree with that guide.
+The sources that were checked for this note are `bend guide`, `bend guide effects`, `bend --help`, and `bend base --types` from the 2.0.28 binary, plus the counter files under `experiments/bend/`. Older Bend and HVM1 writeups are ignored where they disagree with that guide.
 
 ## What Bend is today
 
-Bend 2.0.27 is one dynamically linked CLI, `bend`, 82,818,248 bytes, linked to libc. The language is Python-shaped and Haskell/Lean-shaped underneath. Programs are affine by default, `Data` values may be copied, and recursion must shrink a matched argument or the def is outside the proof guarantee (`@unsafe`). There is one universe (`Type : Type`) and no positivity check. Live code must terminate. Dead code (types, erased arguments, equations) is not evidence.
+Bend 2.0.28 is one dynamically linked CLI, `bend`, 82,822,344 bytes, linked to libc. The language is Python-shaped and Haskell/Lean-shaped underneath. Programs are affine by default, `Data` values may be copied, and recursion must shrink a matched argument or the def is outside the proof guarantee (`@unsafe`). There is one universe (`Type : Type`) and no positivity check. Live code must terminate. Dead code (types, erased arguments, equations) is not evidence.
 
-The standard library is Base: `Nat`, `U32`, `F32`, `Bool`, `Maybe`, `Result`, `List`, `Array`, `String`, `Map`, and an `IO` monad for files, sockets, windows, and audio. There is no `I64` and no JSON type. `Fail` is already a Base constructor, so a gol command cannot use that name. The counter model uses `GolHalt` and prints the token `fail`.
+The standard library is Base: `Nat`, `U32`, `F32`, `Bool`, `Maybe`, `Result`, `List`, `Array`, `String`, `Map`, and an `IO` monad for files, sockets, windows, audio, and, since 2.0.28, child processes (`Process.run`). There is no `I64` and no JSON type. `Fail` is already a Base constructor, so a gol command cannot use that name. The counter model uses `GolHalt` and prints the token `fail`.
 
 Parallelism is a fork-join annotation (`a b = f(x) g(y)`, and `!` for the GPU). The JavaScript target runs those calls sequentially. gol does not use Bend parallelism. The counter decision is one match.
 
@@ -30,7 +30,7 @@ A value `main` of type `String` prints a Bend string literal, quotes included. T
 "v1 on_counter execute complete fail"
 ```
 
-Confirmed on 2.0.27: an `IO` main that calls `IO.print` prints when run, and prints nothing under `--check-only`. A `def` that returns `String` cannot `import` a `.c` file. Foreign imports typecheck only on a def whose result is `IO(...)` directly.
+Confirmed on 2.0.27 and again on 2.0.28: an `IO` main that calls `IO.print` prints when run, and prints nothing under `--check-only`. A `def` that returns `String` cannot `import` a `.c` file. Foreign imports typecheck only on a def whose result is `IO(...)` directly.
 
 ## Embed in Rust, or not
 
@@ -59,7 +59,7 @@ unshare -r -n -- env -i BEND_NO_TELEMETRY=1 bend counter.bend
 
 The process is its own group. On timeout or an output overrun, Rust sends `SIGKILL` to the group and reaps it. stdout is capped at 4KiB and stderr at 16KiB. The wait is 30 seconds. stdin is closed.
 
-`counter.bend` runs only when its one real `def main` returns `String`. The guard follows Bend 2.0.27: space, tab, `\n`, and a bare `\r` are whitespace; a `#` comment runs to the next `\n`; a `"` string, escapes included, hides the text inside it, line breaks too. A `def main() -> String:` sitting inside a string is not the main. Any other real main is refused before `bend` starts, so an `IO` main cannot run. A `String` result is normalized by the checker. An `IO` result would be compiled and run.
+`counter.bend` runs only when its one real `def main` returns `String`. The guard follows Bend 2.0.28, which lexes these the same as 2.0.27: space, tab, `\n`, and a bare `\r` are whitespace; a `#` comment runs to the next `\n`; a `"` string, escapes included, hides the text inside it, line breaks too. A `def main() -> String:` sitting inside a string is not the main. Any other real main is refused before `bend` starts, so an `IO` main cannot run. A `String` result is normalized by the checker. An `IO` result would be compiled and run.
 
 ## Formats across the boundary
 
@@ -120,11 +120,11 @@ The load is the cost. Steady-state evaluation is `evaluate_program` either way. 
 
 `decide` is not `eval_program` with the program already applied. The agreement law is a case split on the history. A reflexive `{==}` is rejected on that law until the cases are written. Changing the positive arm of `decide` to complete makes `positive_fails` fail with the expected and observed constructors. `?TODO` makes the gate fail with `Error: N TODO found.`
 
-`./scripts/verify-bend.sh` requires `bend 2.0.27`, runs the counter checker, requires `PROOF.bend --check-only` to print `All terms check.`, requires the normalized line, then runs `cargo test -p workflow-bend`. CI runs that script. A failing proof, a drifted encoding, or a Rust disagreement exits non-zero.
+`./scripts/verify-bend.sh` requires `bend 2.0.28`, runs the counter checker, requires `PROOF.bend --check-only` to print `All terms check.`, requires the normalized line, then runs `cargo test -p workflow-bend`. CI runs that script. A failing proof, a drifted encoding, or a Rust disagreement exits non-zero.
 
 ## Compile, proof, and runtime failures
 
-| Failure | What 2.0.27 prints | Exit |
+| Failure | What 2.0.28 prints (2.0.27 printed the same) | Exit |
 | --- | --- | --- |
 | Syntax, `def` with no name | `expected : a name` on stderr | 1 |
 | Type, `String` where `U32` is required | `expected : U32` / `observed : String` | 1 |
@@ -154,7 +154,7 @@ There is no Bend-level memory quota on the checker. The output cap and the timeo
 
 ## What is stable enough to build on
 
-- The 2.0.27 installer. The script served for this release pins `VER=2.0.27` and the linux-x64 archive sha256 `58adc86af6605ed0c48f7d84e4c23028f78893ce4a867a20a4f004b11582687b`. The installed `~/.bend/bin/bend` hashed to `38330ad07e228ba7a317836f484648cba93a1a3927357edccc65e3f2a0de253a`. `bend version` must print `bend 2.0.27`.
+- The pinned 2.0.28 release. `scripts/install-bend.sh` refuses the linux-x64 archive unless its sha256 is `22bb6d5f6bce8ae2c5b340371fedddcbd90edc07a48b6e2b351a944c4558a3eb`. The installed `~/.bend/bin/bend` hashes to `871df0ae7b0895236e14a5c2dac4fa014fbe770c3470ee3f60f6dcfe8ae4cfcf`. `bend version` must print `bend 2.0.28`. The upstream `bend-lang.com/install.sh` installs the newest release, so it is not used.
 - `bend guide` for the language that binary implements.
 - `--check-only`, the `LAWS.bend` / `PROOF.bend` split, and `All terms check.`
 - A pure `String` `main` as a one-line encoding, re-validated in Rust.

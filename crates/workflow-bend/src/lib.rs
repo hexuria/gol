@@ -333,6 +333,6 @@ mod tests {
 
     #[test]
     fn version_constant_is_the_pinned_release() {
-        assert_eq!(crate::boundary::BEND_VERSION, "bend 2.0.27");
+        assert_eq!(crate::boundary::BEND_VERSION, "bend 2.0.28");
     }
 }

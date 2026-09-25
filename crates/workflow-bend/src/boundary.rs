@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::FrontendError;
 
-pub const BEND_VERSION: &str = "bend 2.0.27";
+pub const BEND_VERSION: &str = "bend 2.0.28";
 const SOURCE_LIMIT: u64 = 64 * 1024;
 const STDOUT_LIMIT: usize = 4 * 1024;
 const STDERR_LIMIT: usize = 16 * 1024;
@@ -56,7 +56,7 @@ pub fn bend_program() -> Result<PathBuf, FrontendError> {
         }
     }
     Err(FrontendError::Setup(
-        "bend 2.0.27 is not installed; run ./scripts/install-bend.sh".to_string(),
+        "bend 2.0.28 is not installed; run ./scripts/install-bend.sh".to_string(),
     ))
 }
 
@@ -211,7 +211,7 @@ fn main_must_be_string() -> FrontendError {
     FrontendError::Encoding("counter.bend main must return String; IO is not executed".to_string())
 }
 
-// Bend 2.0.27 lexing for the main guard. Whitespace is space, tab, `\n`, and a
+// Bend 2.0.28 lexing for the main guard. Whitespace is space, tab, `\n`, and a
 // bare `\r`. A `#` comment runs to the next `\n` only. A `"` string, including
 // one that spans lines, hides its text. Escapes match the compiler.
 struct BendScan<'a> {
