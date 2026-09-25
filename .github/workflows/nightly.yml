@@ -9,7 +9,7 @@ jobs:
   miri:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install desktop build libraries
         run: |
           sudo apt-get update
@@ -42,7 +42,7 @@ jobs:
   loom:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.98.1
       - name: Late tool result against cancel
         run: RUSTFLAGS="--cfg loom" cargo test -p protocol --test loom_cancel -- --test-threads=1
