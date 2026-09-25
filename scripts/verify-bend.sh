@@ -23,7 +23,19 @@ if [ ! -x /usr/bin/unshare ]; then
   exit 1
 fi
 
-version="$(/usr/bin/unshare -r -n -- env -i BEND_NO_TELEMETRY=1 "${bend_bin}" version)"
+# Prefer a user namespace so an unprivileged runner can create a network
+# namespace. If writing /proc/self/uid_map fails, keep -n when the kernel
+# allows a network namespace. Never run bend on the host network.
+if /usr/bin/unshare -r -n -- /bin/true >/dev/null 2>&1; then
+  unshare_net=(-r -n)
+elif /usr/bin/unshare -n -- /bin/true >/dev/null 2>&1; then
+  unshare_net=(-n)
+else
+  echo "unshare cannot create a network namespace (writing /proc/self/uid_map failed and unshare -n was rejected)" >&2
+  exit 1
+fi
+
+version="$(/usr/bin/unshare "${unshare_net[@]}" -- env -i BEND_NO_TELEMETRY=1 "${bend_bin}" version)"
 if [ "${version}" != "bend 2.0.27" ]; then
   echo "expected bend 2.0.27, found: ${version}" >&2
   exit 1
@@ -31,7 +43,7 @@ fi
 
 src="${root}/experiments/bend"
 run_bend() {
-  /usr/bin/unshare -r -n -- env -i BEND_NO_TELEMETRY=1 "${bend_bin}" "$@"
+  /usr/bin/unshare "${unshare_net[@]}" -- env -i BEND_NO_TELEMETRY=1 "${bend_bin}" "$@"
 }
 
 counter_check="$(run_bend "${src}/counter.bend" --check-only)"

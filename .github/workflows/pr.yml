@@ -67,6 +67,26 @@ jobs:
           curl -fsSL https://bend-lang.com/install.sh | sh
           echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
           test "$(BEND_NO_TELEMETRY=1 "$HOME/.bend/bin/bend" version)" = "bend 2.0.27"
+      - name: Allow user namespaces for unshare
+        run: |
+          # ubuntu-latest sets apparmor_restrict_unprivileged_userns=1, which
+          # makes `unshare -r -n` fail with: unshare: write failed /proc/self/uid_map.
+          # Lift that restriction when the host allows it. If uid_map still cannot
+          # be written, keep a network namespace when `unshare -n` works.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -f /etc/apparmor.d/unprivileged_userns ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/unprivileged_userns || true
+          fi
+          if unshare -r -n -- true; then
+            exit 0
+          fi
+          if unshare -n -- true; then
+            exit 0
+          fi
+          echo "unshare cannot create a network namespace" >&2
+          exit 1
       - name: cargo test --workspace
         run: cargo test --workspace
       - name: cargo build --workspace --all-targets
@@ -82,8 +102,34 @@ jobs:
           curl -fsSL https://bend-lang.com/install.sh | sh
           echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
           test "$(BEND_NO_TELEMETRY=1 "$HOME/.bend/bin/bend" version)" = "bend 2.0.27"
+      - name: Allow user namespaces for unshare
+        run: |
+          # ubuntu-latest sets apparmor_restrict_unprivileged_userns=1, which
+          # makes `unshare -r -n` fail with: unshare: write failed /proc/self/uid_map.
+          # Lift that restriction when the host allows it. If uid_map still cannot
+          # be written, keep a network namespace when `unshare -n` works.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -f /etc/apparmor.d/unprivileged_userns ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/unprivileged_userns || true
+          fi
+          if unshare -r -n -- true; then
+            exit 0
+          fi
+          if unshare -n -- true; then
+            exit 0
+          fi
+          echo "unshare cannot create a network namespace" >&2
+          exit 1
       - name: Workflow histories agree on WorkflowStep
-        run: cargo test -p workflow-bend histories_agree_across_rust_rhai_js_and_bend -- --exact
+        run: |
+          log="$(mktemp)"
+          cargo test -p workflow-bend tests::histories_agree_across_rust_rhai_js_and_bend -- --exact | tee "$log"
+          if ! grep -q 'test tests::histories_agree_across_rust_rhai_js_and_bend \.\.\. ok' "$log"; then
+            echo "tests::histories_agree_across_rust_rhai_js_and_bend did not run" >&2
+            exit 1
+          fi
 
   formal:
     runs-on: ubuntu-latest
@@ -95,6 +141,26 @@ jobs:
           curl -fsSL https://bend-lang.com/install.sh | sh
           echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
           test "$(BEND_NO_TELEMETRY=1 "$HOME/.bend/bin/bend" version)" = "bend 2.0.27"
+      - name: Allow user namespaces for unshare
+        run: |
+          # ubuntu-latest sets apparmor_restrict_unprivileged_userns=1, which
+          # makes `unshare -r -n` fail with: unshare: write failed /proc/self/uid_map.
+          # Lift that restriction when the host allows it. If uid_map still cannot
+          # be written, keep a network namespace when `unshare -n` works.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -f /etc/apparmor.d/unprivileged_userns ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/unprivileged_userns || true
+          fi
+          if unshare -r -n -- true; then
+            exit 0
+          fi
+          if unshare -n -- true; then
+            exit 0
+          fi
+          echo "unshare cannot create a network namespace" >&2
+          exit 1
       - name: Install TLA+ tools
         run: |
           mkdir -p "$HOME/.local/tla"

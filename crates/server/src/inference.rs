@@ -202,13 +202,26 @@ impl MemorySandbox {
     }
 }
 
+trait RunDocker: Send + Sync {
+    fn run(&self, args: &[String]) -> Result<(), String>;
+}
+
+impl<F> RunDocker for F
+where
+    F: Fn(&[String]) -> Result<(), String> + Send + Sync,
+{
+    fn run(&self, args: &[String]) -> Result<(), String> {
+        self(args)
+    }
+}
+
 pub struct DockerSandbox {
-    command: Arc<dyn Fn(&[String]) -> Result<(), String> + Send + Sync>,
+    command: Arc<dyn RunDocker>,
 }
 
 impl DockerSandbox {
     pub fn new() -> Self {
-        Self::from_command(|args| docker(args))
+        Self::from_command(docker)
     }
 
     pub fn from_command<F>(command: F) -> Self
@@ -222,7 +235,7 @@ impl DockerSandbox {
 
     fn command(&self, args: &[&str]) -> Result<(), SandboxError> {
         let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-        (self.command)(&owned).map_err(SandboxError::Host)
+        self.command.run(&owned).map_err(SandboxError::Host)
     }
 }
 

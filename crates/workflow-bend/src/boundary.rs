@@ -5,7 +5,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -69,6 +69,41 @@ fn unshare_program() -> Result<PathBuf, FrontendError> {
     search_path("unshare").ok_or_else(|| {
         FrontendError::Setup("unshare is required to run bend without network".to_string())
     })
+}
+
+/// Prefer `unshare -r -n` so an unprivileged process can create a network
+/// namespace. If writing `/proc/self/uid_map` fails, keep `-n` when the kernel
+/// still allows a network namespace. Never fall back to the host network.
+fn network_unshare_args(unshare: &Path) -> Result<&'static [&'static str], FrontendError> {
+    static ARGS: OnceLock<Result<&'static [&'static str], String>> = OnceLock::new();
+    match ARGS.get_or_init(|| {
+        if unshare_ok(unshare, &["-r", "-n"]) {
+            Ok(&["-r", "-n"][..])
+        } else if unshare_ok(unshare, &["-n"]) {
+            Ok(&["-n"][..])
+        } else {
+            Err(
+                "unshare cannot create a network namespace (writing /proc/self/uid_map failed and unshare -n was rejected)"
+                    .to_string(),
+            )
+        }
+    }) {
+        Ok(args) => Ok(*args),
+        Err(message) => Err(FrontendError::Setup(message.clone())),
+    }
+}
+
+fn unshare_ok(unshare: &Path, args: &[&str]) -> bool {
+    Command::new(unshare)
+        .args(args)
+        .arg("--")
+        .arg("/bin/true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn search_path(name: &str) -> Option<PathBuf> {
@@ -395,10 +430,10 @@ pub fn run_sandboxed(
     limits: Limits,
 ) -> Result<Captured, FrontendError> {
     let unshare = unshare_program()?;
+    let flags = network_unshare_args(&unshare)?;
     let mut command = Command::new(&unshare);
     command
-        .arg("-r")
-        .arg("-n")
+        .args(flags)
         .arg("--")
         .arg(program)
         .args(args)
