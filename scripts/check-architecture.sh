@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fail when workflow or protocol crates take a runtime or server dependency.
+# Fail when workflow, protocol, or surface crates take a runtime or server dependency.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -29,7 +29,10 @@ rules = {
     "workflow-bend": {"server", "tokio", "axum"},
     "harness-core": {"tokio", "axum"},
     "protocol": {"tokio", "axum"},
+    "surface-core": {"harness", "server", "tokio", "axum"},
 }
+# crux_core is the surface's shell contract. No other workspace crate takes it directly.
+crux_owner = "surface-core"
 
 def reachable(root_id):
     seen = set()
@@ -58,6 +61,14 @@ for crate, banned in rules.items():
         name = packages[package_id]["name"]
         if name in banned:
             print(f"{crate} depends on {name}", file=sys.stderr)
+            failed = True
+
+for crate, package_id in workspace.items():
+    if crate == crux_owner:
+        continue
+    for dep in packages[package_id]["dependencies"]:
+        if dep["name"] == "crux_core":
+            print(f"{crate} depends on crux_core", file=sys.stderr)
             failed = True
 
 if failed:

@@ -6,3 +6,4 @@ publish = false
 
 [dependencies]
 crux_core = { version = "=0.20.0", default-features = false }
+protocol = { path = "../protocol" }

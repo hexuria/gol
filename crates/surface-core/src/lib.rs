@@ -1,25 +1,19 @@
 use crux_core::{App, Command, Effect};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Placement {
-    Local,
-    Reverse,
-    Box,
-}
+use protocol::ExecutionPlacement;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SurfaceEvent {
-    pub placement: Placement,
+    pub placement: ExecutionPlacement,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SurfaceModel {
-    pub placement: Option<Placement>,
+    pub placement: Option<ExecutionPlacement>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SurfaceViewModel {
-    pub placement: Option<Placement>,
+    pub placement: Option<ExecutionPlacement>,
 }
 
 pub enum SurfaceEffect {}
@@ -54,13 +48,18 @@ impl App for Surface {
 #[cfg(test)]
 mod tests {
     use crux_core::App;
+    use protocol::ExecutionPlacement;
 
-    use super::{Placement, Surface, SurfaceEvent, SurfaceModel, SurfaceViewModel};
+    use super::{Surface, SurfaceEvent, SurfaceModel, SurfaceViewModel};
 
     #[test]
     fn one_local_event_selects_a_placement() {
         let app = Surface;
-        for placement in [Placement::Local, Placement::Reverse, Placement::Box] {
+        for placement in [
+            ExecutionPlacement::Local,
+            ExecutionPlacement::Reverse,
+            ExecutionPlacement::Box,
+        ] {
             let mut model = SurfaceModel { placement: None };
             let mut command = app.update(SurfaceEvent { placement }, &mut model);
             assert!(command.is_done());
