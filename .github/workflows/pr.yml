@@ -5,11 +5,22 @@ on:
   push:
     branches: [main]
 
+# A new push to a pull request cancels the run it replaces. Each push to main keeps its own run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  # Line tables keep file and line numbers in panics and backtraces. Full debuginfo only makes
+  # compiling, linking, and the rust-cache archive bigger. Keep this equal in bend.yml: the
+  # workflow-bend cache key hashes CARGO_* variables.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
 jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: rustfmt
@@ -19,7 +30,7 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install desktop build libraries
         run: |
           sudo apt-get update
@@ -27,6 +38,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: clippy
+      - uses: Swatinem/rust-cache@v2
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -56,12 +68,13 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install desktop build libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libvulkan-dev clang g++
       - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
       - name: Install Bend 2.0.27
         run: |
           curl -fsSL https://bend-lang.com/install.sh | sh
@@ -95,8 +108,12 @@ jobs:
   differential:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The bend job in bend.yml builds the same workflow-bend test binary.
+          shared-key: workflow-bend
       - name: Install Bend 2.0.27
         run: |
           curl -fsSL https://bend-lang.com/install.sh | sh
@@ -132,35 +149,11 @@ jobs:
           fi
 
   formal:
+    # verify-formal.sh is verify-bend.sh, verify-tla.sh, and verify-lean.sh. The bend workflow runs
+    # verify-bend.sh on the same events, so this job runs the other two and needs no Rust or Bend.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.1
-      - name: Install Bend 2.0.27
-        run: |
-          curl -fsSL https://bend-lang.com/install.sh | sh
-          echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
-          test "$(BEND_NO_TELEMETRY=1 "$HOME/.bend/bin/bend" version)" = "bend 2.0.27"
-      - name: Allow user namespaces for unshare
-        run: |
-          # ubuntu-latest sets apparmor_restrict_unprivileged_userns=1, which
-          # makes `unshare -r -n` fail with: unshare: write failed /proc/self/uid_map.
-          # Lift that restriction when the host allows it. If uid_map still cannot
-          # be written, keep a network namespace when `unshare -n` works.
-          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-          if [ -f /etc/apparmor.d/unprivileged_userns ]; then
-            sudo apparmor_parser -R /etc/apparmor.d/unprivileged_userns || true
-          fi
-          if unshare -r -n -- true; then
-            exit 0
-          fi
-          if unshare -n -- true; then
-            exit 0
-          fi
-          echo "unshare cannot create a network namespace" >&2
-          exit 1
+      - uses: actions/checkout@v5
       - name: Install TLA+ tools
         run: |
           mkdir -p "$HOME/.local/tla"
@@ -170,13 +163,16 @@ jobs:
         run: |
           curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-      - name: ./scripts/verify-formal.sh
-        run: ./scripts/verify-formal.sh
+      # Lean takes seconds and TLC takes minutes, so a Lean failure shows up first.
+      - name: ./scripts/verify-lean.sh
+        run: ./scripts/verify-lean.sh
+      - name: ./scripts/verify-tla.sh
+        run: ./scripts/verify-tla.sh
 
   supply-chain:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.98.1
       - name: Install cargo-deny and cargo-audit
         run: |
@@ -198,7 +194,7 @@ jobs:
   architecture:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.98.1
       - name: Architecture guard
         run: ./scripts/check-architecture.sh

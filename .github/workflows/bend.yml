@@ -1,15 +1,29 @@
 name: bend
 
 on:
-  push:
   pull_request:
+  push:
+    branches: [main]
+
+# A new push to a pull request cancels the run it replaces. Each push to main keeps its own run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  # Keep this equal in pr.yml: the workflow-bend cache key hashes CARGO_* variables.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   bend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The differential job in pr.yml builds the same workflow-bend test binary.
+          shared-key: workflow-bend
       - name: Install Bend 2.0.27
         run: |
           curl -fsSL https://bend-lang.com/install.sh | sh
