@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{FromRequestParts, Path, State};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use harness::{
@@ -108,7 +109,45 @@ fn router_with_parts(
         })
 }
 
+struct Bearer(String);
+
+impl<S> FromRequestParts<S> for Bearer
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        bearer(&parts.headers)
+            .map(Self)
+            .ok_or(ApiError::Unauthorized)
+    }
+}
+
+fn bearer(headers: &HeaderMap) -> Option<String> {
+    let value = header_value(headers, "authorization")?;
+    let token = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))?;
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let value = headers.get(name)?.to_str().ok()?.trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 async fn create_agent(
+    Bearer(_principal): Bearer,
     State(state): State<AppState>,
     Json(agent): Json<AgentManifest>,
 ) -> Result<Json<AgentManifest>, ApiError> {
@@ -121,10 +160,32 @@ async fn create_agent(
 }
 
 async fn create_run(
+    Bearer(_principal): Bearer,
     State(state): State<AppState>,
     Json(body): Json<RunBody>,
 ) -> Result<Json<RunState>, ApiError> {
     let spec = spec_from_body(body);
+    if let Some(url) = state.redis_url.clone() {
+        let message = crate::inference::user_message_event(&spec);
+        let store = state.store.clone();
+        let spec_for_store = spec.clone();
+        let message_for_store = message.clone();
+        tokio::task::spawn_blocking(move || {
+            store.put_run(StoredRun {
+                spec: spec_for_store,
+                events: vec![message_for_store],
+            });
+        })
+        .await
+        .map_err(|error| ApiError::Decider(error.to_string()))?;
+        let run_id = spec.run_id;
+        tokio::task::spawn_blocking(move || RedisRunQueue::open(url).push(run_id))
+            .await
+            .map_err(|error| ApiError::Decider(error.to_string()))?
+            .map_err(ApiError::Decider)?;
+        return Ok(Json(fold(&spec, &[message])));
+    }
+
     let jev_base_url = state.jev_base_url.clone();
     let spec_for_run = spec.clone();
     let store_for_run = state.store.clone();
@@ -149,21 +210,15 @@ async fn create_run(
         Err(error) => return Err(ApiError::Decider(error.to_string())),
     };
     let folded = fold(&spec, &events);
-    let run_id = spec.run_id;
     let store = state.store.clone();
     tokio::task::spawn_blocking(move || store.put_run(StoredRun { spec, events }))
         .await
         .map_err(|error| ApiError::Decider(error.to_string()))?;
-    if let Some(url) = state.redis_url.clone() {
-        tokio::task::spawn_blocking(move || RedisRunQueue::open(url).push(run_id))
-            .await
-            .map_err(|error| ApiError::Decider(error.to_string()))?
-            .map_err(ApiError::Decider)?;
-    }
     Ok(Json(folded))
 }
 
 async fn create_coworker_turn(
+    Bearer(_principal): Bearer,
     State(state): State<AppState>,
     Json(body): Json<RunBody>,
 ) -> Result<Json<TurnBody>, ApiError> {
@@ -181,6 +236,7 @@ async fn create_coworker_turn(
 }
 
 async fn complete_coworker_turn(
+    Bearer(_principal): Bearer,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
     Json(body): Json<CompletionBody>,
@@ -254,6 +310,7 @@ impl ComputerBody {
 }
 
 async fn get_run(
+    Bearer(_principal): Bearer,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
 ) -> Result<Json<RunState>, ApiError> {
@@ -266,6 +323,7 @@ async fn get_run(
 }
 
 async fn get_events(
+    Bearer(_principal): Bearer,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
 ) -> Result<Json<Vec<Event>>, ApiError> {
@@ -278,6 +336,7 @@ async fn get_events(
 }
 
 async fn get_ag_ui(
+    Bearer(_principal): Bearer,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -293,6 +352,7 @@ async fn get_ag_ui(
 }
 
 async fn get_ui(
+    Bearer(_principal): Bearer,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -369,6 +429,7 @@ enum ApiError {
     Sandbox(String),
     Conflict(&'static str),
     BadRequest(&'static str),
+    Unauthorized,
 }
 
 impl From<TurnError> for ApiError {
@@ -422,6 +483,11 @@ impl axum::response::IntoResponse for ApiError {
             Self::BadRequest(message) => (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": message })),
+            )
+                .into_response(),
+            Self::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "unauthorized" })),
             )
                 .into_response(),
         }
