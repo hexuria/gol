@@ -148,6 +148,9 @@ pub enum SandboxError {
 pub trait SandboxHost: Send + Sync {
     fn provision(&self, name: &str) -> Result<(), SandboxError>;
     fn destroy(&self, name: &str) -> Result<(), SandboxError>;
+    /// Whether the host reports sandbox `name`. A host that cannot be asked
+    /// answers `false`, so this is not a safety answer: deciding whether a turn
+    /// may end without removing its sandbox goes through `absent`.
     fn exists(&self, name: &str) -> bool;
     /// `Ok(true)` when the host confirms no sandbox `name` is left, `Ok(false)`
     /// when one is, and an error when the host cannot tell. Only a confirmed
@@ -294,8 +297,6 @@ impl SandboxHost for DockerSandbox {
             .is_ok()
     }
 
-    /// Absent only when Docker answers that there is no such container. Any
-    /// other failure (the daemon is unreachable, say) says nothing about it.
     /// Absent only when Docker answers that there is no such container. Any
     /// other failure (the daemon is unreachable, say) says nothing about it.
     fn absent(&self, name: &str) -> Result<bool, SandboxError> {
