@@ -214,6 +214,34 @@ fn texts(events: &[Value]) -> Vec<&str> {
         .collect()
 }
 
+fn types(events: &[Value]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .collect()
+}
+
+fn reply(run_id: RunId, role: MessageRole, text: &str) -> Event {
+    event(
+        run_id,
+        EventPayload::ModelResponded {
+            message: ModelMessage {
+                role,
+                text: text.to_string(),
+            },
+        },
+    )
+}
+
+fn completed(run_id: RunId, outcome: &str) -> Event {
+    event(
+        run_id,
+        EventPayload::RunCompleted {
+            outcome: outcome.to_string(),
+        },
+    )
+}
+
 #[test]
 fn coworker_text_emitted_once() {
     let spec = RunSpec::builder()
@@ -233,43 +261,112 @@ fn coworker_text_emitted_once() {
     open_turn(&store, spec.clone(), &NoPoster, &sandbox).expect("open");
     let turn = accept_subscription_completion(&store, spec.run_id, "fixture reply", &sandbox)
         .expect("completion");
+    let reply_id = turn
+        .events
+        .iter()
+        .find(|event| matches!(event.payload, EventPayload::ModelResponded { .. }))
+        .expect("reply")
+        .envelope
+        .event_id
+        .to_string();
 
     let events = ag_ui_events(spec.run_id, &turn.events);
+    assert_eq!(
+        types(&events),
+        [
+            "RUN_STARTED",
+            "TEXT_MESSAGE_START",
+            "TEXT_MESSAGE_CONTENT",
+            "TEXT_MESSAGE_END",
+            "TEXT_MESSAGE_START",
+            "TEXT_MESSAGE_CONTENT",
+            "TEXT_MESSAGE_END",
+            "RUN_FINISHED",
+        ]
+    );
     assert_eq!(texts(&events), ["hello from the desktop", "fixture reply"]);
-    assert_eq!(events.last().expect("last")["type"], "RUN_FINISHED");
+    // The reply's own message survives; the outcome message is the one dropped.
+    assert_eq!(events[4]["messageId"], Value::String(reply_id));
+    assert_eq!(events[4]["role"], "assistant");
+}
 
-    // The outcome is dropped only right after an assistant message with the same text.
+#[test]
+fn harness_reply_then_complete_emitted_once() {
+    // The Driver's log: the reply, then Complete decided and authorized, then RunCompleted.
     let run_id = RunId::new();
-    let echoed = ag_ui_events(
+    let complete = Effect::Complete {
+        outcome: "done".to_string(),
+    };
+    let events = ag_ui_events(
         run_id,
         &[
+            reply(run_id, MessageRole::Assistant, "done"),
+            event(
+                run_id,
+                EventPayload::EffectDecided {
+                    effect: complete.clone(),
+                },
+            ),
+            event(run_id, EventPayload::EffectAuthorized { effect: complete }),
+            completed(run_id, "done"),
+        ],
+    );
+    assert_eq!(
+        types(&events),
+        [
+            "RUN_STARTED",
+            "TEXT_MESSAGE_START",
+            "TEXT_MESSAGE_CONTENT",
+            "TEXT_MESSAGE_END",
+            "RUN_FINISHED",
+        ]
+    );
+    assert_eq!(texts(&events), ["done"]);
+}
+
+#[test]
+fn an_empty_reply_between_keeps_the_outcome_dropped() {
+    let run_id = RunId::new();
+    let events = ag_ui_events(
+        run_id,
+        &[
+            reply(run_id, MessageRole::Assistant, "done"),
+            reply(run_id, MessageRole::Assistant, ""),
+            completed(run_id, "done"),
+        ],
+    );
+    assert_eq!(texts(&events), ["done"]);
+}
+
+#[test]
+fn an_outcome_that_does_not_repeat_the_last_assistant_reply_is_emitted() {
+    let run_id = RunId::new();
+    let cases = [
+        vec![
             event(
                 run_id,
                 EventPayload::UserMessage {
                     text: "same".to_string(),
                 },
             ),
-            event(
-                run_id,
-                EventPayload::RunCompleted {
-                    outcome: "same".to_string(),
-                },
-            ),
+            completed(run_id, "same"),
         ],
-    );
-    assert_eq!(texts(&echoed), ["same", "same"]);
-    let restated = ag_ui_events(
-        run_id,
-        &[
-            event(
-                run_id,
-                EventPayload::ModelResponded {
-                    message: ModelMessage {
-                        role: MessageRole::Assistant,
-                        text: "done".to_string(),
-                    },
-                },
-            ),
+        vec![
+            reply(run_id, MessageRole::User, "same"),
+            completed(run_id, "same"),
+        ],
+        vec![
+            reply(run_id, MessageRole::Assistant, "same"),
+            reply(run_id, MessageRole::System, "note"),
+            completed(run_id, "same"),
+        ],
+        vec![
+            reply(run_id, MessageRole::Assistant, "same"),
+            reply(run_id, MessageRole::Assistant, "other"),
+            completed(run_id, "same"),
+        ],
+        vec![
+            reply(run_id, MessageRole::Assistant, "same"),
             event(
                 run_id,
                 EventPayload::ToolResult {
@@ -280,68 +377,34 @@ fn coworker_text_emitted_once() {
                     output: "ok".to_string(),
                 },
             ),
-            event(
-                run_id,
-                EventPayload::RunCompleted {
-                    outcome: "done".to_string(),
-                },
-            ),
+            completed(run_id, "same"),
         ],
-    );
-    assert_eq!(texts(&restated), ["done", "done"]);
-    let from_user = ag_ui_events(
-        run_id,
-        &[
-            event(
-                run_id,
-                EventPayload::ModelResponded {
-                    message: ModelMessage {
-                        role: MessageRole::User,
-                        text: "done".to_string(),
-                    },
-                },
-            ),
-            event(
-                run_id,
-                EventPayload::RunCompleted {
-                    outcome: "done".to_string(),
-                },
-            ),
-        ],
-    );
-    assert_eq!(texts(&from_user), ["done", "done"]);
+    ];
+    for (case, log) in cases.iter().enumerate() {
+        let events = ag_ui_events(run_id, log);
+        let outcome: Vec<_> = events
+            .iter()
+            .filter(|event| event["messageId"] == format!("outcome-{run_id}").as_str())
+            .map(|event| event["type"].as_str().expect("type"))
+            .collect();
+        assert_eq!(
+            outcome,
+            [
+                "TEXT_MESSAGE_START",
+                "TEXT_MESSAGE_CONTENT",
+                "TEXT_MESSAGE_END"
+            ],
+            "case {case}"
+        );
+        assert_eq!(texts(&events).last(), Some(&"same"), "case {case}");
+    }
+}
 
-    // A harness run authorizes Complete between the reply and RunCompleted.
-    let harness = ag_ui_events(
-        run_id,
-        &[
-            event(
-                run_id,
-                EventPayload::ModelResponded {
-                    message: ModelMessage {
-                        role: MessageRole::Assistant,
-                        text: "done".to_string(),
-                    },
-                },
-            ),
-            event(
-                run_id,
-                EventPayload::EffectAuthorized {
-                    effect: Effect::Complete {
-                        outcome: "done".to_string(),
-                    },
-                },
-            ),
-            event(
-                run_id,
-                EventPayload::RunCompleted {
-                    outcome: "done".to_string(),
-                },
-            ),
-        ],
-    );
-    assert_eq!(texts(&harness), ["done"]);
-    assert_eq!(harness.last().expect("last")["type"], "RUN_FINISHED");
+#[test]
+fn an_empty_outcome_emits_no_text_message() {
+    let run_id = RunId::new();
+    let events = ag_ui_events(run_id, &[completed(run_id, "")]);
+    assert_eq!(types(&events), ["RUN_STARTED", "RUN_FINISHED"]);
 }
 
 #[test]
@@ -357,6 +420,16 @@ fn run_expired_maps_to_run_error() {
 fn tool_call_id_is_invocation_id() {
     let run_id = RunId::new();
     let invocation = InvocationId::new();
+    let result = event(
+        run_id,
+        EventPayload::ToolResult {
+            name: "ping".to_string(),
+            invocation,
+            step: 1,
+            attempt: 0,
+            output: "pong:hi".to_string(),
+        },
+    );
     let events = ag_ui_events(
         run_id,
         &[
@@ -370,16 +443,7 @@ fn tool_call_id_is_invocation_id() {
                     },
                 },
             ),
-            event(
-                run_id,
-                EventPayload::ToolResult {
-                    name: "ping".to_string(),
-                    invocation,
-                    step: 1,
-                    attempt: 0,
-                    output: "pong:hi".to_string(),
-                },
-            ),
+            result.clone(),
         ],
     );
     let ids: Vec<_> = events
@@ -390,4 +454,12 @@ fn tool_call_id_is_invocation_id() {
     for id in ids {
         assert_eq!(id, &Value::String(invocation.to_string()));
     }
+    let tool_result = events
+        .iter()
+        .find(|event| event["type"] == "TOOL_CALL_RESULT")
+        .expect("result");
+    assert_eq!(
+        tool_result["messageId"],
+        Value::String(format!("result-{}", result.envelope.event_id))
+    );
 }

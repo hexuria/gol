@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use protocol::{Effect, Event, EventPayload, InvocationId, MessageRole, RunId};
 use serde_json::{json, Value};
 
+/// Map a run's events to AG-UI events. A tool call's `toolCallId` is its invocation id,
+/// which deciders mint fresh for each call. `RunCompleted` sends its outcome as an
+/// assistant message unless that repeats the reply sent just before it.
 pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
     let run = run_id.to_string();
     let mut out = vec![json!({
@@ -23,12 +26,14 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
             _ => None,
         })
         .collect();
-    // The text of the assistant message emitted last, while nothing else followed it.
-    // A coworker turn records its reply and then completes with the same text.
-    let mut last_assistant: Option<&str> = None;
+    // The assistant reply, while it is the last thing emitted. A coworker turn records
+    // its reply and then completes with the same text, so RunCompleted skips an
+    // outcome that repeats it. Events that emit nothing leave it in place.
+    let mut last_reply: Option<&str> = None;
     for event in events {
         let id = event.envelope.event_id.to_string();
-        let assistant = last_assistant.take();
+        let emitted = out.len();
+        let mut reply = None;
         match &event.payload {
             EventPayload::ToolResult {
                 name,
@@ -76,11 +81,11 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
                 );
                 out.push(json!({"type": "TEXT_MESSAGE_END", "messageId": id}));
                 if message.role == MessageRole::Assistant {
-                    last_assistant = Some(&message.text);
+                    reply = Some(message.text.as_str());
                 }
             }
             EventPayload::RunCompleted { outcome } => {
-                if assistant != Some(outcome.as_str()) {
+                if !outcome.is_empty() && last_reply != Some(outcome.as_str()) {
                     let message_id = format!("outcome-{run}");
                     out.push(json!({"type": "TEXT_MESSAGE_START", "messageId": message_id, "role": "assistant"}));
                     out.push(json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": message_id, "delta": outcome}));
@@ -97,8 +102,10 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
             EventPayload::RunExpired => {
                 out.push(json!({"type": "RUN_ERROR", "message": "expired"}));
             }
-            // Events that emit nothing leave the last assistant message in place.
-            _ => last_assistant = assistant,
+            _ => {}
+        }
+        if out.len() != emitted {
+            last_reply = reply;
         }
     }
     out
