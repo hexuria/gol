@@ -379,3 +379,158 @@ fn choice(effect: &str) -> serde_json::Value {
         }
     })
 }
+
+/// Postgres, recording the id of every run the server stores.
+struct WatchedPostgres {
+    inner: PostgresStore,
+    ids: std::sync::Mutex<Vec<RunId>>,
+}
+
+impl RunStore for WatchedPostgres {
+    fn put_agent(&self, agent: AgentManifest) {
+        self.inner.put_agent(agent);
+    }
+
+    fn put_run(&self, run: StoredRun) {
+        self.ids.lock().expect("ids").push(run.spec.run_id);
+        self.inner.put_run(run);
+    }
+
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Append {
+        self.inner.append_events(id, events)
+    }
+
+    fn run(&self, id: RunId) -> Option<StoredRun> {
+        self.inner.run(id)
+    }
+
+    fn put_artifact(&self, artifact: StoredArtifact) {
+        self.inner.put_artifact(artifact);
+    }
+
+    fn artifact(&self, id: ArtifactId) -> Option<StoredArtifact> {
+        self.inner.artifact(id)
+    }
+}
+
+/// Posts one run to a server on `store` and returns the status and the id of
+/// the stored run, read back on a new connection.
+async fn post_run(
+    store: Arc<WatchedPostgres>,
+    jev: &wiremock::MockServer,
+    redis: Option<&str>,
+) -> (u16, StoredRun) {
+    let app = router_with_queue(store.clone(), jev.uri(), redis.map(str::to_string));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/runs"))
+        .header("authorization", "Bearer gol-gateway-local")
+        .json(&serde_json::json!({
+            "agent_id": AgentId::new(),
+            "agent_version": "1",
+            "input": "hello",
+            "placement": "Local",
+            "work_model": {
+                "provider": "OpenAI",
+                "model_name": "gpt-test",
+                "credential": "PlatformGateway"
+            },
+            "capabilities": ["tool.echo"],
+            "limits": { "max_steps": 8, "max_model_calls": 4 }
+        }))
+        .send()
+        .await
+        .expect("post run");
+    let ids = store.ids.lock().expect("ids").clone();
+    assert_eq!(ids.len(), 1, "the run was not stored");
+    let id = ids[0];
+    let stored = tokio::task::spawn_blocking(move || reconnect(id))
+        .await
+        .expect("reconnect thread");
+    (response.status().as_u16(), stored)
+}
+
+async fn watched_postgres() -> Arc<WatchedPostgres> {
+    let inner =
+        tokio::task::spawn_blocking(|| PostgresStore::connect(POSTGRES_URL).expect("connect"))
+            .await
+            .expect("connect thread");
+    Arc::new(WatchedPostgres {
+        inner,
+        ids: std::sync::Mutex::new(Vec::new()),
+    })
+}
+
+#[tokio::test]
+async fn jev_error_leaves_run_failed_in_postgres() {
+    let jev = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/systemone"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(choice("echo")))
+        .up_to_n_times(1)
+        .mount(&jev)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/systemone"))
+        .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("jev is down"))
+        .mount(&jev)
+        .await;
+
+    let (status, stored) = post_run(watched_postgres().await, &jev, None).await;
+    assert_eq!(status, 502);
+    let payloads: Vec<&EventPayload> = stored.events.iter().map(|event| &event.payload).collect();
+    assert!(
+        payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::ToolResult { output, .. } if output == "hello")),
+        "{payloads:?}"
+    );
+    assert!(
+        matches!(
+            payloads.last(),
+            Some(EventPayload::RunFailed {
+                class: FailureClass::Dependency,
+                message,
+            }) if message.starts_with("decider: ")
+        ),
+        "{payloads:?}"
+    );
+}
+
+#[tokio::test]
+async fn redis_push_failure_leaves_run_failed_in_postgres() {
+    let jev = wiremock::MockServer::start().await;
+    let (status, stored) = post_run(
+        watched_postgres().await,
+        &jev,
+        Some("redis://127.0.0.1:6390"),
+    )
+    .await;
+    assert_eq!(status, 502);
+    assert!(
+        matches!(
+            stored.events.as_slice(),
+            [
+                Event {
+                    payload: EventPayload::UserMessage { .. },
+                    ..
+                },
+                Event {
+                    payload: EventPayload::RunFailed {
+                        class: FailureClass::Infrastructure,
+                        message,
+                    },
+                    ..
+                },
+            ] if message.starts_with("queue push failed: ")
+        ),
+        "{:?}",
+        stored.events
+    );
+}

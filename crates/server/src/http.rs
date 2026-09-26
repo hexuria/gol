@@ -10,14 +10,14 @@ use harness::{
     run_to_completion, BootError, Driver, EchoTool, InMemory, JevDecider, UnavailableModel,
 };
 use protocol::{
-    fold, AgentId, Capability, Event, EventPayload, ExecutionPlacement, Limits, RunId, RunSpec,
-    RunState, WorkModel,
+    fold, AgentId, Capability, Event, EventPayload, ExecutionPlacement, FailureClass, Limits,
+    RunId, RunSpec, RunState, WorkModel,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::inference::{
-    accept_subscription_completion, open_turn, sandbox_from_env, ComputerPlan, GatewayPoster,
-    HttpGatewayPoster, SandboxHost, SharedPoster, TurnError, TurnOutcome,
+    accept_subscription_completion, open_turn, run_failed_event, sandbox_from_env, ComputerPlan,
+    GatewayPoster, HttpGatewayPoster, SandboxHost, SharedPoster, TurnError, TurnOutcome,
 };
 use crate::queue::RedisRunQueue;
 use crate::store::{AgentManifest, RunStore, StoredRun};
@@ -179,10 +179,24 @@ async fn create_run(
         .await
         .map_err(|error| ApiError::Decider(error.to_string()))?;
         let run_id = spec.run_id;
-        tokio::task::spawn_blocking(move || RedisRunQueue::open(url).push(run_id))
-            .await
-            .map_err(|error| ApiError::Decider(error.to_string()))?
-            .map_err(ApiError::Decider)?;
+        let store = state.store.clone();
+        let spec_for_queue = spec.clone();
+        tokio::task::spawn_blocking(move || {
+            RedisRunQueue::open(url).push(run_id).map_err(|error| {
+                // The run is stored but will never be picked up: end it, so it is
+                // not left open.
+                let failed = run_failed_event(
+                    &spec_for_queue,
+                    FailureClass::Infrastructure,
+                    format!("queue push failed: {error}"),
+                );
+                store.append_events(run_id, vec![failed]);
+                error
+            })
+        })
+        .await
+        .map_err(|error| ApiError::Decider(error.to_string()))?
+        .map_err(ApiError::Decider)?;
         return Ok(Json(fold(&spec, &[message])));
     }
 
@@ -197,10 +211,25 @@ async fn create_run(
             spec: spec_for_run.clone(),
             events: vec![message],
         });
-        let events = run_with_jev(&jev_base_url, spec_for_run)?;
+        let (mut events, outcome) = run_with_jev(&jev_base_url, spec_for_run.clone());
+        // A run that could not finish still keeps what the harness did, and ends
+        // failed instead of being left open.
+        if let Err(error) = &outcome {
+            let (class, message) = match error {
+                RunStartError::Unsupported(placement) => (
+                    FailureClass::Environment,
+                    format!("unsupported placement: {placement:?}"),
+                ),
+                RunStartError::Decider(message) => {
+                    (FailureClass::Dependency, format!("decider: {message}"))
+                }
+            };
+            events.push(run_failed_event(&spec_for_run, class, message));
+        }
         // Append, never overwrite: anything stored while Jev ran stays. When the
         // run is already terminal the store keeps its log and refuses these.
         store_for_run.append_events(run_id, events);
+        outcome?;
         store_for_run
             .run(run_id)
             .ok_or_else(|| RunStartError::Decider("run is not stored".to_string()))
@@ -371,25 +400,31 @@ async fn get_ui(
     Ok(Json(json_render_spec(&stored.spec.input, &outcome)))
 }
 
-fn run_with_jev(jev_base_url: &str, spec: RunSpec) -> Result<Vec<Event>, RunStartError> {
+/// Runs the harness with Jev and returns every event it recorded, with how the
+/// run ended. On an error the events are still returned: they are what the
+/// harness did before it stopped.
+fn run_with_jev(jev_base_url: &str, spec: RunSpec) -> (Vec<Event>, Result<(), RunStartError>) {
     let mut driver = match Driver::boot(spec) {
         Ok(driver) => driver,
         Err(BootError::UnsupportedPlacement(placement)) => {
-            return Err(RunStartError::Unsupported(placement));
+            return (Vec::new(), Err(RunStartError::Unsupported(placement)));
         }
     };
-    let client = jev_client(jev_base_url).map_err(RunStartError::Decider)?;
+    let client = match jev_client(jev_base_url) {
+        Ok(client) => client,
+        Err(message) => return (Vec::new(), Err(RunStartError::Decider(message))),
+    };
     let mut decider = JevDecider::new(client);
     let echo = EchoTool;
-    run_to_completion(
+    let outcome = run_to_completion(
         &mut driver,
         &mut decider,
         &[&echo],
         &UnavailableModel,
         &mut InMemory::default(),
     )
-    .map_err(|error| RunStartError::Decider(error.message))?;
-    Ok(driver.events().to_vec())
+    .map_err(|error| RunStartError::Decider(error.message));
+    (driver.events().to_vec(), outcome)
 }
 
 fn jev_client(base_url: &str) -> Result<typesafe_sdk::blocking::Client, String> {

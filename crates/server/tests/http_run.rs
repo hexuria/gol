@@ -1,7 +1,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use protocol::{AgentId, ArtifactId, Capability, Event, EventPayload, HarnessState, RunId};
+use protocol::{
+    AgentId, ArtifactId, Capability, Event, EventPayload, FailureClass, HarnessState, RunId,
+};
 use server::{
     router, router_with_queue, AgentManifest, Append, InMemoryStore, RunStore, StoredArtifact,
     StoredRun,
@@ -493,13 +495,27 @@ async fn redis_push_failure_does_not_run_the_harness() {
     let ids = store.ids.lock().expect("ids").clone();
     assert_eq!(ids.len(), 1, "user message was not stored");
     let stored = store.run(ids[0]).expect("stored run");
-    assert!(matches!(
-        stored.events.as_slice(),
-        [protocol::Event {
-            payload: EventPayload::UserMessage { text },
-            ..
-        }] if text == "hello"
-    ));
+    // The run is not left open: the failed push ends it (decision 6).
+    assert!(
+        matches!(
+            stored.events.as_slice(),
+            [
+                protocol::Event {
+                    payload: EventPayload::UserMessage { text },
+                    ..
+                },
+                protocol::Event {
+                    payload: EventPayload::RunFailed {
+                        class: FailureClass::Infrastructure,
+                        message,
+                    },
+                    ..
+                },
+            ] if text == "hello" && message.starts_with("queue push failed: ")
+        ),
+        "{:?}",
+        stored.events
+    );
     assert!(!stored
         .events
         .iter()
@@ -579,4 +595,70 @@ impl RunStore for WatchedMemory {
     fn artifact(&self, id: ArtifactId) -> Option<StoredArtifact> {
         self.inner.artifact(id)
     }
+}
+
+/// Jev answers echo once, then fails every later request.
+async fn failing_jev_mock() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice("echo")))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("jev is down"))
+        .mount(&server)
+        .await;
+    server
+}
+
+// A decider error ends the run as failed and keeps what the harness did
+// before it: the stored log has the echo result and ends with RunFailed.
+#[tokio::test]
+async fn jev_error_leaves_run_failed() {
+    let jev = failing_jev_mock().await;
+    let store = Arc::new(WatchedMemory::new());
+    let app = router(store.clone(), jev.uri());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let response = post_when_up(
+        &reqwest::Client::new(),
+        &format!("http://{addr}/v1/runs"),
+        &run_body(AgentId::new(), 8, 4),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 502);
+
+    let ids = store.ids.lock().expect("ids").clone();
+    assert_eq!(ids.len(), 1);
+    let stored = store.run(ids[0]).expect("stored run");
+    let payloads: Vec<&EventPayload> = stored.events.iter().map(|event| &event.payload).collect();
+    assert!(
+        matches!(payloads.first(), Some(EventPayload::UserMessage { .. })),
+        "{payloads:?}"
+    );
+    assert!(
+        payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::ToolResult { output, .. } if output == "hello")),
+        "the echo before the error was dropped: {payloads:?}"
+    );
+    assert!(
+        matches!(
+            payloads.last(),
+            Some(EventPayload::RunFailed {
+                class: FailureClass::Dependency,
+                message,
+            }) if message.starts_with("decider: ")
+        ),
+        "{payloads:?}"
+    );
 }
