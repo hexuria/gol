@@ -164,7 +164,7 @@ async fn create_run(
     State(state): State<AppState>,
     Json(body): Json<RunBody>,
 ) -> Result<Json<RunState>, ApiError> {
-    let spec = spec_from_body(body);
+    let spec = spec_from_body(body)?;
     if let Some(url) = state.redis_url.clone() {
         let message = crate::inference::user_message_event(&spec);
         let store = state.store.clone();
@@ -222,7 +222,7 @@ async fn create_coworker_turn(
     State(state): State<AppState>,
     Json(body): Json<RunBody>,
 ) -> Result<Json<TurnBody>, ApiError> {
-    let spec = spec_from_body(body);
+    let spec = spec_from_body(body)?;
     let store = state.store.clone();
     let poster = state.poster.clone();
     let sandbox = state.sandbox.clone();
@@ -406,19 +406,28 @@ enum RunStartError {
     Decider(String),
 }
 
-fn spec_from_body(body: RunBody) -> RunSpec {
-    RunSpec::builder()
+/// The most steps or model calls a client may ask for. With `PlatformGateway` the
+/// platform pays for every model call, so a request cannot authorize an unbounded run.
+const MAX_LIMIT: u32 = 64;
+
+fn spec_from_body(body: RunBody) -> Result<RunSpec, ApiError> {
+    let limits = body.limits.unwrap_or(Limits {
+        max_steps: 8,
+        max_model_calls: 4,
+    });
+    let bounded = 1..=MAX_LIMIT;
+    if !bounded.contains(&limits.max_steps) || !bounded.contains(&limits.max_model_calls) {
+        return Err(ApiError::BadRequest("limits must be between 1 and 64"));
+    }
+    Ok(RunSpec::builder()
         .agent(body.agent_id, body.agent_version)
         .input(body.input)
         .placement(body.placement)
         .work_model(body.work_model)
         .capabilities(body.capabilities)
-        .limits(body.limits.unwrap_or(Limits {
-            max_steps: 8,
-            max_model_calls: 4,
-        }))
+        .limits(limits)
         .metadata(body.metadata)
-        .build()
+        .build())
 }
 
 enum ApiError {

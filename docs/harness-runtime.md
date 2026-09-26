@@ -18,7 +18,7 @@ A local run does the following.
 4. Append `EffectAuthorized` or `EffectDenied`, then `reduce`. Perform an effect only when `reduce` returns it.
 5. Stop on `Completed`, `Failed`, or `Cancelled`. A hit on `limits.max_steps` or `limits.max_model_calls` appends `RunFailed` with `FailureClass::Budget`.
 
-`limits.max_steps` counts `EffectDecided` events. `reduce` and `advance_answered_step` compare harness `step` to that same field. `limits.max_model_calls` counts authorized model calls. `FailureClass::Timeout` is the fold of `RunExpired`. This slice has no clock.
+`POST /v1/runs` and `POST /v1/coworker/turns` accept each limit from 1 to 64 and answer 400 otherwise; the defaults are 8 steps and 4 model calls. `limits.max_steps` counts `EffectDecided` events. `reduce` and `advance_answered_step` compare harness `step` to that same field. `limits.max_model_calls` counts authorized model calls. `FailureClass::Timeout` is the fold of `RunExpired`. This slice has no clock.
 
 `WaitingForTool` does not spin. A `Wait` effect is denied. The deny event is appended, `reduce` leaves the state in place, and the loop continues until a limit or `Complete`.
 

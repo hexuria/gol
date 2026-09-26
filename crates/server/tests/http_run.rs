@@ -333,6 +333,126 @@ async fn missing_bearer_is_401_and_does_not_start_the_run() {
     );
 }
 
+fn run_body(agent_id: AgentId, max_steps: u32, max_model_calls: u32) -> serde_json::Value {
+    run_body_with(
+        agent_id,
+        max_steps,
+        max_model_calls,
+        serde_json::json!("PlatformGateway"),
+    )
+}
+
+fn run_body_with(
+    agent_id: AgentId,
+    max_steps: u32,
+    max_model_calls: u32,
+    credential: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "agent_id": agent_id,
+        "agent_version": "1",
+        "input": "hello",
+        "placement": "Local",
+        "work_model": {
+            "provider": "OpenAI",
+            "model_name": "gpt-test",
+            "credential": credential
+        },
+        "capabilities": ["tool.echo"],
+        "limits": { "max_steps": max_steps, "max_model_calls": max_model_calls }
+    })
+}
+
+// A client sets its own limits. With PlatformGateway the platform pays for every model
+// call, so both limits are bounded: 1 to 64. Out of range is a 400 before anything is
+// stored or any decider is asked.
+#[tokio::test]
+async fn limits_outside_one_to_sixty_four_are_400_and_start_nothing() {
+    let jev = jev_mock().await;
+    let store = Arc::new(WatchedMemory::new());
+    let app = router(store.clone(), jev.uri());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let agent_id = AgentId::new();
+    for route in ["/v1/runs", "/v1/coworker/turns"] {
+        for (max_steps, max_model_calls) in [(0, 4), (8, 0), (65, 4), (8, 65), (u32::MAX, 4)] {
+            let response = post_when_up(
+                &client,
+                &format!("{base}{route}"),
+                &run_body(agent_id, max_steps, max_model_calls),
+            )
+            .await;
+            let at = format!("{route} max_steps={max_steps} max_model_calls={max_model_calls}");
+            assert_eq!(response.status().as_u16(), 400, "{at}");
+            let body: serde_json::Value = response.json().await.expect("json");
+            assert_eq!(
+                body,
+                serde_json::json!({"error": "limits must be between 1 and 64"}),
+                "{at}"
+            );
+        }
+    }
+    assert!(
+        store.ids.lock().expect("ids").is_empty(),
+        "a rejected run was stored"
+    );
+    let requests = jev.received_requests().await.expect("requests");
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path() == "/v1/systemone"),
+        "a rejected run called Jev"
+    );
+
+    let created = post_when_up(
+        &client,
+        &format!("{base}/v1/runs"),
+        &run_body(agent_id, 64, 64),
+    )
+    .await;
+    assert_eq!(created.status().as_u16(), 200);
+    let created: protocol::RunState = created.json().await.expect("run json");
+    assert_eq!(
+        created.harness,
+        HarnessState::Completed {
+            outcome: "done".to_string()
+        }
+    );
+
+    // Both ends of the range are accepted on both routes. The coworker turn uses the
+    // subscription credential so the server makes no gateway call.
+    let accepted = post_when_up(
+        &client,
+        &format!("{base}/v1/runs"),
+        &run_body(agent_id, 1, 1),
+    )
+    .await;
+    assert_eq!(accepted.status().as_u16(), 200, "/v1/runs 1/1");
+    let subscription =
+        serde_json::json!({ "BringYourOwn": { "secret_ref": "desktop-subscription" } });
+    for (max_steps, max_model_calls) in [(1, 1), (64, 64)] {
+        let turn = post_when_up(
+            &client,
+            &format!("{base}/v1/coworker/turns"),
+            &run_body_with(agent_id, max_steps, max_model_calls, subscription.clone()),
+        )
+        .await;
+        assert_eq!(
+            turn.status().as_u16(),
+            200,
+            "/v1/coworker/turns {max_steps}/{max_model_calls}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn redis_push_failure_does_not_run_the_harness() {
     let jev = jev_mock().await;

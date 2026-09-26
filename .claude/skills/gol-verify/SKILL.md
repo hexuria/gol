@@ -47,12 +47,12 @@ One owner per failure class. A new check on a property that already has an owner
 | Effect without authorization | `authorizer.rs`, `driver.rs` | unit tests | thin: 2 authorizer tests |
 | Concurrent run-log writers | `server/src/{store,postgres,inference,http}.rs` | `formal/runlog` + `server/tests/{inference,pg_redis}.rs` | linked: each counterexample is a Rust test |
 | Stores disagree | `store.rs` vs `postgres.rs` | tests on both stores | no shared contract suite yet |
-| Duplicate effect after a crash | `runtime-tokio/src/{journal,host}.rs` | `replay_proof.rs`; `formal/workflow/Replay.tla` for the design | the Lean restatement was deleted; `formal/RETIRED.md` maps each theorem to its Rust test |
+| Duplicate effect after a crash | `runtime-tokio/src/{journal,host}.rs` | `replay_proof.rs` (SIGKILL at each commit window); `journal.rs` and `program.rs` unit tests | `Replay.tla` and its Lean restatement were retired; `formal/RETIRED.md` maps each property to its Rust test |
 | Frontends disagree | `workflow-*` | `histories_agree_across_rust_rhai_js_and_bend` | runs in more than one CI job |
 | Bend laws and encoding | `experiments/bend` | `verify-bend.sh`, workflow-bend tests | see gol-bend |
 | gol `unsafe` | `workflow-bend/src/boundary.rs` `kill_group` | `forbid(unsafe_code)` in every other crate; `timeout_kills_the_process_group` | compiler-enforced |
 | Dependency UB | rhai, smartstring | nightly Miri on `workflow-rhai` | boa_engine excluded after Miri found UB |
-| Known-vulnerable dependencies | `Cargo.lock` | `cargo deny` | `cargo audit` repeats its vulnerability ignores |
+| Known-vulnerable dependencies | `Cargo.lock` | `cargo deny` (advisories: vulnerable, unmaintained, unsound, yanked) | the only advisory gate; `cargo audit` was retired as a subset |
 | Crate layering | crate graph | `check-architecture.sh` | keep |
 | Worker ownership, leases, queue ack | not built (`execution/src/lib.rs` joins one thread; `queue.rs` pops without ack) | T3 when built | no model: the `HarnessCore.tla` sketch was retired (`formal/RETIRED.md`); a new model of the real writers when T3 fires |
 

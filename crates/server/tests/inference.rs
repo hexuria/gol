@@ -1049,6 +1049,86 @@ fn a_completion_racing_another_completion_is_a_conflict() {
     assert_eq!(events.len(), 4);
 }
 
+// A completion answers an open coworker turn. `create_run`'s queued path stores a run
+// with only its user message, so the harness is idle; a run waiting on a tool has not
+// answered. Neither is an open turn, and the log must not gain a RunCompleted.
+#[test]
+fn a_completion_for_a_run_that_is_not_an_open_turn_is_a_conflict() {
+    let spec = subscription_spec(ExecutionPlacement::Local);
+    let at = |payload| {
+        Event::record(
+            EventSource::new(
+                spec.run_id,
+                spec.agent_id,
+                &spec.agent_version,
+                Actor::System,
+                Timestamp::unix_millis(0),
+            ),
+            payload,
+        )
+    };
+    let user_message = at(EventPayload::UserMessage {
+        text: spec.input.clone(),
+    });
+    let queued = vec![user_message.clone()];
+    let waiting = vec![
+        at(EventPayload::RunCreated),
+        at(EventPayload::RunStarted),
+        user_message,
+        at(EventPayload::EffectAuthorized {
+            effect: protocol::Effect::ToolCall {
+                name: "echo".to_string(),
+                input: "x".to_string(),
+                invocation: protocol::InvocationId::new(),
+            },
+        }),
+    ];
+    let invocation = protocol::InvocationId::new();
+    let answered = vec![
+        at(EventPayload::RunCreated),
+        at(EventPayload::RunStarted),
+        at(EventPayload::UserMessage {
+            text: spec.input.clone(),
+        }),
+        at(EventPayload::EffectAuthorized {
+            effect: protocol::Effect::ToolCall {
+                name: "echo".to_string(),
+                input: "x".to_string(),
+                invocation,
+            },
+        }),
+        at(EventPayload::ToolResult {
+            name: "echo".to_string(),
+            invocation,
+            step: 1,
+            attempt: 0,
+            output: "x".to_string(),
+        }),
+    ];
+    for (label, events) in [
+        ("queued", queued),
+        ("waiting for a tool", waiting),
+        ("already answered", answered),
+    ] {
+        let store = InMemoryStore::default();
+        store.put_run(StoredRun {
+            spec: spec.clone(),
+            events: events.clone(),
+        });
+
+        let error =
+            accept_subscription_completion(&store, spec.run_id, "done", &MemorySandbox::default())
+                .expect_err(label);
+
+        assert!(
+            matches!(error, TurnError::Conflict("turn is not open")),
+            "{label}: {error:?}"
+        );
+        let stored = store.run(spec.run_id).expect("run").events;
+        assert_eq!(stored, events, "{label}");
+    }
+}
+
 // formal/runlog NothingAfterTerminal and AckedDurable at the store boundary.
 #[test]
 fn the_store_log_grows_and_ends_at_the_first_terminal_event() {

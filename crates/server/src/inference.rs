@@ -3,8 +3,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use protocol::{
-    Actor, CredentialSource, Event, EventPayload, EventSource, ExecutionPlacement, MessageRole,
-    ModelMessage, RunId, RunSpec, Timestamp,
+    fold, Actor, CredentialSource, Event, EventPayload, EventSource, ExecutionPlacement,
+    HarnessState, MessageRole, ModelMessage, RunId, RunSpec, Timestamp,
 };
 
 use crate::store::{is_terminal, Append, RunStore, StoredRun};
@@ -427,6 +427,18 @@ pub fn accept_subscription_completion(
         .any(|event| is_terminal(&event.payload))
     {
         return Err(TurnError::Conflict("turn already completed"));
+    }
+    // A completion answers an open turn: `open_turn` leaves the harness running and
+    // unanswered. A queued run from `create_run` is idle, and a run waiting on a tool
+    // has an answer outstanding; completing either would end a run this turn never owned.
+    if !matches!(
+        fold(&stored.spec, &stored.events).harness,
+        HarnessState::Running {
+            answered: false,
+            ..
+        }
+    ) {
+        return Err(TurnError::Conflict("turn is not open"));
     }
     if !stored
         .events

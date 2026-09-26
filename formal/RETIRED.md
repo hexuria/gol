@@ -91,6 +91,33 @@ Events:
 
 Regression tests for the three TLC counterexamples are retry-after-cancel, late tool result after cancel, and fail-while-waiting ending in `Failed` rather than `WaitingForTool`.
 
+## `formal/workflow/Replay.tla` (TLA+)
+
+It restated the counter journal in `crates/runtime-tokio` (AGENTS.md Principle 4: do not restate the journal). One process writes the journal, so no concurrent writer needed a model, and `crates/runtime-tokio/tests/replay_proof.rs` checks the crash property on the real binary with SIGKILL.
+
+The model had three actions: `Perform` held a result in memory, `Commit` was the only action that wrote the journal, and `Crash` dropped what was held.
+
+### Last run
+
+2026-09-26, `./scripts/verify-tla.sh`, which runs `java -XX:+UseParallelGC -jar ~/.local/tla/tla2tools.jar -workers auto -lncheck final -config Replay.cfg Replay.tla`. TLC2 Version 2.19 of 08 August 2024, from tla2tools v1.7.4. No constants. Deadlock checked.
+
+| Config | Generated | Distinct | Depth | Result |
+|---|---|---|---|---|
+| `Replay.cfg` | 9 | 5 | 3 | no error |
+
+### Negative control
+
+Adding `EmptyStaysEmpty == [][(journal = "empty") => UNCHANGED journal]_vars` as a property fails: TLC reports it violated, because `Commit` writes the empty journal. The model can therefore reach a commit, and `HitSticks` is not vacuous.
+
+### Owner now
+
+| Invariant or property | Rust owner |
+|---|---|
+| `JournaledResultForcesBranch` | `branch_on_recorded_counter` in `crates/workflow-core/src/program.rs` |
+| `HeldIsNotAHit` | `kill_before_commit_leaves_the_next_unstarted`: a result held but not committed is not replayed, so the rerun performs the effect again; `held_bytes_are_not_a_hit_before_ok` in `crates/runtime-tokio/src/journal.rs` checks the log bytes only |
+| `JournaledIdNotReexecuted`, `HitSticks` | `kill_after_commit_skips_the_counter` in `crates/runtime-tokio/tests/replay_proof.rs`: after the rerun the effect count stays 1 |
+| a crash before commit performs again | `kill_before_commit_leaves_the_next_unstarted`: the effect count becomes 2 |
+
 ## Loom: `crates/protocol/tests/loom_cancel.rs`
 
 It ran a late tool result against `RunCancelled` on two Loom threads around a `loom::sync::Mutex<HarnessState>` and asserted the run ends `Cancelled`. `reduce` is pure, so Loom explored the two orders of two calls and checked no gol synchronization code ("Run Loom around a pure function" is on the Do-not list).
@@ -119,7 +146,7 @@ Loom stays in the gol-verify charter for T8: a Loom test of gol's own atomics or
 
 The Rust test covers more than the copy did: `max_steps` ∈ {0, 1, 2, 3, 9}, invocation matching, `RunExpired`, and every effect kind.
 
-`formal/replay/Replay.lean` restated `formal/workflow/Replay.tla` for the counter journal. `Replay.tla` stays as the design model; the Rust owners are:
+`formal/replay/Replay.lean` restated `formal/workflow/Replay.tla` (itself retired above) for the counter journal. The Rust owners are:
 
 | Lean theorem | Rust owner |
 |---|---|
