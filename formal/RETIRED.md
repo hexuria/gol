@@ -95,7 +95,7 @@ Regression tests for the three TLC counterexamples are retry-after-cancel, late 
 
 It restated the counter journal in `crates/runtime-tokio` (AGENTS.md Principle 4: do not restate the journal). One process writes the journal, so no concurrent writer needed a model, and `crates/runtime-tokio/tests/replay_proof.rs` checks the crash property on the real binary with SIGKILL.
 
-`Replay.tla` is the design model of one counter journal in `crates/runtime-tokio`: `Perform` holds a result in memory, `Commit` is the only action that writes the journal, and `Crash` drops what was held. The Rust owner of the crash property is `crates/runtime-tokio/tests/replay_proof.rs`.
+The model had three actions: `Perform` held a result in memory, `Commit` was the only action that wrote the journal, and `Crash` dropped what was held.
 
 ### Last run
 
@@ -114,7 +114,7 @@ Adding `EmptyStaysEmpty == [][(journal = "empty") => UNCHANGED journal]_vars` as
 | Invariant or property | Rust owner |
 |---|---|
 | `JournaledResultForcesBranch` | `branch_on_recorded_counter` in `crates/workflow-core/src/program.rs` |
-| `HeldIsNotAHit` | `held_bytes_are_not_a_hit_before_ok` in `crates/runtime-tokio/src/journal.rs` (it checks the log bytes, not a journal lookup) |
+| `HeldIsNotAHit` | `kill_before_commit_leaves_the_next_unstarted`: a result held but not committed is not replayed, so the rerun performs the effect again; `held_bytes_are_not_a_hit_before_ok` in `crates/runtime-tokio/src/journal.rs` checks the log bytes only |
 | `JournaledIdNotReexecuted`, `HitSticks` | `kill_after_commit_skips_the_counter` in `crates/runtime-tokio/tests/replay_proof.rs`: after the rerun the effect count stays 1 |
 | a crash before commit performs again | `kill_before_commit_leaves_the_next_unstarted`: the effect count becomes 2 |
 

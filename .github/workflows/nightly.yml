@@ -16,7 +16,7 @@ jobs:
       # Miri checks unsafe code that a test executes. gol forbids unsafe in every crate but
       # workflow-bend, so Miri runs where a dependency's unsafe is gol's risk: rhai and
       # smartstring behind workflow-rhai (gol-verify ownership map, "Dependency UB").
-      # workflow-core and harness-core have no dependencies. execution's tests run safe gol
+      # workflow-core and harness-core have no third-party dependencies. execution's tests run safe gol
       # code; the unsafe they reach is in std and general-purpose crates, not in code gol
       # owns, and only execution needed isolation off. Isolation stays on.
       - name: Miri
