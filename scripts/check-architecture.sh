@@ -77,28 +77,56 @@ print("architecture guard ok")
 PY
 
 # Every crate root forbids unsafe code. workflow-bend denies it and allows it on kill_group alone.
-unsafe_failed=0
-while IFS= read -r crate_root; do
-  if [[ "${crate_root}" == crates/workflow-bend/src/lib.rs ]]; then
-    want='#![deny(unsafe_code)]'
-  else
-    want='#![forbid(unsafe_code)]'
-  fi
-  if ! grep -qxF "${want}" "${root}/${crate_root}"; then
-    echo "${crate_root} lacks ${want}" >&2
-    unsafe_failed=1
-  fi
-done < <(cd "${root}" && ls crates/*/src/lib.rs crates/*/src/main.rs crates/*/src/bin/*.rs 2>/dev/null)
-allows="$(cd "${root}" && grep -rln 'allow(unsafe_code)' crates --include='*.rs' || true)"
-if [[ "${allows}" != crates/workflow-bend/src/boundary.rs ]] \
-  || [[ "$(grep -c 'allow(unsafe_code)' "${root}/crates/workflow-bend/src/boundary.rs")" != 1 ]]; then
-  echo "allow(unsafe_code) must appear once, on kill_group in crates/workflow-bend/src/boundary.rs; found in: ${allows:-nowhere}" >&2
-  unsafe_failed=1
-fi
-if [[ "${unsafe_failed}" != 0 ]]; then
-  exit 1
-fi
-echo "unsafe guard ok"
+# Crate roots come from cargo metadata, so a [lib] path or a nested bin cannot slip past.
+python3 - "${meta}" "${root}" <<'PY'
+import json
+import os
+import re
+import sys
+
+meta = json.load(open(sys.argv[1]))
+root = sys.argv[2]
+members = set(meta["workspace_members"])
+failed = False
+
+crate_kinds = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro", "bin"}
+roots = sorted(
+    os.path.relpath(target["src_path"], root)
+    for package in meta["packages"]
+    if package["id"] in members
+    for target in package["targets"]
+    if crate_kinds & set(target["kind"])
+)
+for crate_root in roots:
+    want = "#![deny(unsafe_code)]" if crate_root == "crates/workflow-bend/src/lib.rs" else "#![forbid(unsafe_code)]"
+    with open(os.path.join(root, crate_root)) as handle:
+        if want not in (line.strip() for line in handle):
+            print(f"{crate_root} lacks {want}", file=sys.stderr)
+            failed = True
+
+# Any attribute that lifts the lint: allow or expect, alone or in a list, inner or outer, or behind cfg_attr.
+lift = re.compile(r"#!?\[[^\]]*\b(?:allow|expect)\s*\([^)]*\bunsafe_code\b")
+found = []
+for directory, _, files in os.walk(os.path.join(root, "crates")):
+    for name in files:
+        if name.endswith(".rs"):
+            path = os.path.join(directory, name)
+            with open(path, errors="replace") as handle:
+                for number, line in enumerate(handle, 1):
+                    if lift.search(line):
+                        found.append((os.path.relpath(path, root), number, line.strip()))
+allowed = [("crates/workflow-bend/src/boundary.rs", "#[allow(unsafe_code)]")]
+if [(path, text) for path, _, text in found] != allowed:
+    print("unsafe_code may be lifted only by #[allow(unsafe_code)] on kill_group in "
+          "crates/workflow-bend/src/boundary.rs; found:", file=sys.stderr)
+    for path, number, text in found:
+        print(f"  {path}:{number}: {text}", file=sys.stderr)
+    failed = True
+
+if failed:
+    sys.exit(1)
+print("unsafe guard ok")
+PY
 
 # The verification planner reads its trigger table from AGENTS.md; keep both in step.
 "${root}/scripts/verify-plan.sh" --self-test

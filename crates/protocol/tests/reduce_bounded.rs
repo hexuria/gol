@@ -142,7 +142,7 @@ fn effects() -> Vec<Effect> {
             body: "b".to_string(),
         },
         Effect::Complete {
-            outcome: "done".to_string(),
+            outcome: "by effect".to_string(),
         },
     ];
     assert_covers(all.iter().map(effect_index), 11);
