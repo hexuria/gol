@@ -598,7 +598,10 @@ fn harness_reduce_keeps_validity_rank_and_table_on_every_bounded_pair() {
 
 // The driver authorizes an effect only when `applicable` holds, so an
 // authorized effect is never dropped: `applicable` is true exactly when
-// authorizing the effect changes the state or emits an effect.
+// authorizing the effect changes the state or emits an effect. `reduce`
+// itself calls `applicable`, so a wrong `applicable` would move `reduce` with
+// it; the independent table above (`may_change`, `expected_next`,
+// `expected_effects`) is what pins both to the intended rule.
 #[test]
 fn applicable_matches_reduce_on_every_bounded_pair() {
     let mut checked = 0usize;
