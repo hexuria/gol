@@ -205,22 +205,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.98.1
-      - name: Install cargo-deny and cargo-audit
+      # cargo deny's advisories check reads the same RustSec database as cargo audit and also
+      # fails on unmaintained, unsound and yanked crates, so it is the one advisory gate.
+      - name: Install cargo-deny
         run: |
           mkdir -p "$HOME/.local/bin"
           curl -fsSL -o /tmp/cargo-deny.tgz \
             https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
           tar -xzf /tmp/cargo-deny.tgz -C /tmp
           install -m 755 /tmp/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny "$HOME/.local/bin/cargo-deny"
-          curl -fsSL -o /tmp/cargo-audit.tgz \
-            https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz
-          tar -xzf /tmp/cargo-audit.tgz -C /tmp
-          install -m 755 /tmp/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2/cargo-audit "$HOME/.local/bin/cargo-audit"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: cargo deny check
         run: cargo deny check
-      - name: cargo audit
-        run: cargo audit
 
   architecture:
     needs: scope

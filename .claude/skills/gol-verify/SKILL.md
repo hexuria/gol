@@ -52,7 +52,7 @@ One owner per failure class. A new check on a property that already has an owner
 | Bend laws and encoding | `experiments/bend` | `verify-bend.sh`, workflow-bend tests | see gol-bend |
 | gol `unsafe` | `workflow-bend/src/boundary.rs` `kill_group` | `forbid(unsafe_code)` in every other crate; `timeout_kills_the_process_group` | compiler-enforced |
 | Dependency UB | rhai, smartstring | nightly Miri on `workflow-rhai` | boa_engine excluded after Miri found UB |
-| Known-vulnerable dependencies | `Cargo.lock` | `cargo deny` | `cargo audit` repeats its vulnerability ignores |
+| Known-vulnerable dependencies | `Cargo.lock` | `cargo deny` (advisories: vulnerable, unmaintained, unsound, yanked) | the only advisory gate; `cargo audit` was retired as a subset |
 | Crate layering | crate graph | `check-architecture.sh` | keep |
 | Worker ownership, leases, queue ack | not built (`execution/src/lib.rs` joins one thread; `queue.rs` pops without ack) | T3 when built | no model: the `HarnessCore.tla` sketch was retired (`formal/RETIRED.md`); a new model of the real writers when T3 fires |
 
