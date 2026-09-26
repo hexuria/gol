@@ -921,3 +921,39 @@ fn a_zero_timeout_is_rejected_at_load() {
     assert_eq!(error.to_string(), "local: timeout_ms must be at least 1");
     assert_eq!(starts(&dir), 0);
 }
+
+// A server whose cursor never runs out cannot hold session start (and every
+// tool on that server, which waits on it) forever: the pages are capped.
+#[test]
+fn endless_tools_list_pages_are_capped() {
+    let dir = scratch();
+    let script = fake_server_with(
+        &dir,
+        r#"send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"ping"}],"nextCursor":"again"}})"#,
+        "answer(msg)",
+    );
+    write_server_catalog(&dir, &script, "", PING);
+    let catalog = load_catalog(&dir).unwrap();
+    let output = within(Duration::from_secs(10), || call(&catalog, "ping", "hi"));
+    assert_eq!(
+        output,
+        Err("mcp local.ping: tools/list: more than 16 pages".to_string())
+    );
+}
+
+#[test]
+fn a_listed_tool_without_a_name_is_malformed() {
+    let dir = scratch();
+    let script = fake_server_with(
+        &dir,
+        r#"send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"ping"},{}]}})"#,
+        "answer(msg)",
+    );
+    write_server_catalog(&dir, &script, "", PING);
+    let catalog = load_catalog(&dir).unwrap();
+    let output = within(Duration::from_secs(10), || call(&catalog, "ping", "hi"));
+    assert_eq!(
+        output,
+        Err("mcp local.ping: tools/list: malformed result".to_string())
+    );
+}
