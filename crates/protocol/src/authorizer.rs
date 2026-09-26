@@ -7,6 +7,11 @@ const MEMORY_WRITE: &str = "memory.write";
 
 pub fn authorize(spec: &RunSpec, effect: &Effect, tools: &[ToolDescriptor]) -> PolicyDecision {
     match effect {
+        // Always allowed. The budget rule depends on it: a Complete decided
+        // while the harness is Running is not a step because it always ends
+        // the run (fold, Driver::decide_with_skills). A Complete that could be
+        // denied would be free and never end. Pinned by
+        // complete_is_allowed_without_capabilities.
         Effect::Complete { .. } => PolicyDecision::Allow,
         Effect::ModelCall { .. } => allow_capability(spec, MODEL_CALL),
         Effect::MemoryRead { .. } => allow_capability(spec, MEMORY_READ),

@@ -21,6 +21,12 @@ pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
 
     for event in events {
         match &event.payload {
+            // A Complete that finishes the run is not a step of the budget.
+            // Only a running harness completes on it (`reduce`); anywhere
+            // else it cannot finish the run and counts like any decision.
+            EventPayload::EffectDecided {
+                effect: Effect::Complete { .. },
+            } if matches!(harness, HarnessState::Running { .. }) => {}
             EventPayload::EffectDecided { .. } => steps += 1,
             EventPayload::EffectAuthorized {
                 effect: Effect::ModelCall { .. },
@@ -66,6 +72,71 @@ mod tests {
 
     fn started(spec: &RunSpec, terminal: EventPayload) -> Vec<Event> {
         vec![ev(spec, EventPayload::RunStarted), ev(spec, terminal)]
+    }
+
+    // A Complete that cannot finish the run (a tool call is outstanding) is a
+    // step like any other decision.
+    #[test]
+    fn a_complete_while_waiting_for_a_tool_is_a_step() {
+        let spec = sample_spec();
+        let tool_call = Effect::ToolCall {
+            name: "echo".into(),
+            input: "x".into(),
+            invocation: InvocationId::new(),
+        };
+        let events = vec![
+            ev(&spec, EventPayload::RunStarted),
+            ev(
+                &spec,
+                EventPayload::EffectDecided {
+                    effect: tool_call.clone(),
+                },
+            ),
+            ev(&spec, EventPayload::EffectAuthorized { effect: tool_call }),
+            ev(
+                &spec,
+                EventPayload::EffectDecided {
+                    effect: Effect::Complete {
+                        outcome: "done".into(),
+                    },
+                },
+            ),
+        ];
+        let state = fold(&spec, &events);
+        assert!(matches!(state.harness, HarnessState::WaitingForTool { .. }));
+        assert_eq!(state.steps, 2);
+    }
+
+    // A Complete decided in Idle cannot finish the run either, so it is a step.
+    #[test]
+    fn a_complete_before_the_run_starts_is_a_step() {
+        let spec = sample_spec();
+        let events = vec![ev(
+            &spec,
+            EventPayload::EffectDecided {
+                effect: Effect::Complete {
+                    outcome: "done".into(),
+                },
+            },
+        )];
+        let state = fold(&spec, &events);
+        assert_eq!(state.harness, HarnessState::Idle);
+        assert_eq!(state.steps, 1);
+    }
+
+    // A Complete decided while Running finishes the run, so it is not a step.
+    #[test]
+    fn complete_is_not_a_step() {
+        let spec = sample_spec();
+        let decided = |effect| ev(&spec, EventPayload::EffectDecided { effect });
+        let events = vec![
+            ev(&spec, EventPayload::RunStarted),
+            decided(Effect::ModelCall { prompt: "p".into() }),
+            decided(Effect::Complete {
+                outcome: "done".into(),
+            }),
+        ];
+        assert_eq!(fold(&spec, &events).steps, 1);
     }
 
     #[test]

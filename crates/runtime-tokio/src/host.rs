@@ -342,7 +342,8 @@ mod tests {
         assert_eq!(step.commands, [WorkflowCommand::SpawnAgent]);
         assert_eq!(step.wait, WaitCondition::None);
         let state = harness.unwrap();
-        assert_eq!(state.steps, 1);
+        // The spawned agent only completes, and Complete is not a step.
+        assert_eq!(state.steps, 0);
         assert_eq!(state.model_calls, 0);
         assert_eq!(
             state.harness,
