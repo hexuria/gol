@@ -4,8 +4,9 @@ use protocol::{Effect, Event, EventPayload, InvocationId, MessageRole, RunId};
 use serde_json::{json, Value};
 
 /// Map a run's events to AG-UI events. A tool call's `toolCallId` is its invocation id,
-/// which deciders mint fresh for each call. `RunCompleted` sends its outcome as an
-/// assistant message unless that repeats the reply sent just before it.
+/// which is unique only if the decider mints a fresh id per call (not enforced).
+/// `RunCompleted` sends its outcome as an assistant message unless it is empty or
+/// repeats the reply sent just before it.
 pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
     let run = run_id.to_string();
     let mut out = vec![json!({

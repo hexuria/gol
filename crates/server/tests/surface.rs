@@ -1,6 +1,7 @@
 use protocol::{
     Actor, AgentId, CredentialSource, Effect, Event, EventPayload, EventSource, ExecutionPlacement,
-    InvocationId, MessageRole, ModelMessage, ModelProvider, RunId, RunSpec, Timestamp, WorkModel,
+    FailureClass, InvocationId, MessageRole, ModelMessage, ModelProvider, RunId, RunSpec,
+    Timestamp, WorkModel,
 };
 use serde_json::Value;
 use server::{
@@ -339,48 +340,68 @@ fn an_empty_reply_between_keeps_the_outcome_dropped() {
 }
 
 #[test]
-fn an_outcome_that_does_not_repeat_the_last_assistant_reply_is_emitted() {
+fn an_outcome_is_emitted_unless_the_same_reply_was_emitted_just_before_it() {
     let run_id = RunId::new();
     let cases = [
-        vec![
-            event(
-                run_id,
-                EventPayload::UserMessage {
-                    text: "same".to_string(),
-                },
-            ),
-            completed(run_id, "same"),
-        ],
-        vec![
-            reply(run_id, MessageRole::User, "same"),
-            completed(run_id, "same"),
-        ],
-        vec![
-            reply(run_id, MessageRole::Assistant, "same"),
-            reply(run_id, MessageRole::System, "note"),
-            completed(run_id, "same"),
-        ],
-        vec![
-            reply(run_id, MessageRole::Assistant, "same"),
-            reply(run_id, MessageRole::Assistant, "other"),
-            completed(run_id, "same"),
-        ],
-        vec![
-            reply(run_id, MessageRole::Assistant, "same"),
-            event(
-                run_id,
-                EventPayload::ToolResult {
-                    name: "echo".to_string(),
-                    invocation: InvocationId::new(),
-                    step: 1,
-                    attempt: 0,
-                    output: "ok".to_string(),
-                },
-            ),
-            completed(run_id, "same"),
-        ],
+        // A user message is not a reply.
+        (
+            vec!["same", "same"],
+            vec![
+                event(
+                    run_id,
+                    EventPayload::UserMessage {
+                        text: "same".to_string(),
+                    },
+                ),
+                completed(run_id, "same"),
+            ],
+        ),
+        // Only an assistant message is a reply.
+        (
+            vec!["same", "same"],
+            vec![
+                reply(run_id, MessageRole::User, "same"),
+                completed(run_id, "same"),
+            ],
+        ),
+        // A system message sent after the reply clears it.
+        (
+            vec!["same", "note", "same"],
+            vec![
+                reply(run_id, MessageRole::Assistant, "same"),
+                reply(run_id, MessageRole::System, "note"),
+                completed(run_id, "same"),
+            ],
+        ),
+        // A later, different reply replaces it.
+        (
+            vec!["same", "other", "same"],
+            vec![
+                reply(run_id, MessageRole::Assistant, "same"),
+                reply(run_id, MessageRole::Assistant, "other"),
+                completed(run_id, "same"),
+            ],
+        ),
+        // A tool result sent after the reply clears it.
+        (
+            vec!["same", "same"],
+            vec![
+                reply(run_id, MessageRole::Assistant, "same"),
+                event(
+                    run_id,
+                    EventPayload::ToolResult {
+                        name: "echo".to_string(),
+                        invocation: InvocationId::new(),
+                        step: 1,
+                        attempt: 0,
+                        output: "ok".to_string(),
+                    },
+                ),
+                completed(run_id, "same"),
+            ],
+        ),
     ];
-    for (case, log) in cases.iter().enumerate() {
+    for (case, (expected, log)) in cases.iter().enumerate() {
         let events = ag_ui_events(run_id, log);
         let outcome: Vec<_> = events
             .iter()
@@ -396,7 +417,7 @@ fn an_outcome_that_does_not_repeat_the_last_assistant_reply_is_emitted() {
             ],
             "case {case}"
         );
-        assert_eq!(texts(&events).last(), Some(&"same"), "case {case}");
+        assert_eq!(&texts(&events), expected, "case {case}");
     }
 }
 
@@ -414,6 +435,41 @@ fn run_expired_maps_to_run_error() {
     assert_eq!(events.len(), 2);
     assert_eq!(events[1]["type"], "RUN_ERROR");
     assert_eq!(events[1]["message"], "expired");
+}
+
+#[test]
+fn run_failed_and_cancelled_map_to_run_error() {
+    let run_id = RunId::new();
+    let events = ag_ui_events(
+        run_id,
+        &[event(
+            run_id,
+            EventPayload::RunFailed {
+                class: FailureClass::Dependency,
+                message: "proxy: refused".to_string(),
+            },
+        )],
+    );
+    assert_eq!(types(&events), ["RUN_STARTED", "RUN_ERROR"]);
+    assert_eq!(events[1]["message"], "proxy: refused");
+    let events = ag_ui_events(run_id, &[event(run_id, EventPayload::RunCancelled)]);
+    assert_eq!(types(&events), ["RUN_STARTED", "RUN_ERROR"]);
+    assert_eq!(events[1]["message"], "cancelled");
+}
+
+#[test]
+fn an_empty_user_message_emits_nothing() {
+    let run_id = RunId::new();
+    let events = ag_ui_events(
+        run_id,
+        &[event(
+            run_id,
+            EventPayload::UserMessage {
+                text: String::new(),
+            },
+        )],
+    );
+    assert_eq!(types(&events), ["RUN_STARTED"]);
 }
 
 #[test]
