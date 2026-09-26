@@ -33,11 +33,3 @@ jobs:
           # runtime-tokio: replay_proof calls posix_spawn, which Miri cannot execute.
           # workflow-js: boa_engine trips stacked-borrows UB inside Context::default.
           # workflow-bend: staging sources calls copy_file_range (syscall 326), which Miri cannot execute.
-
-  loom:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.98.1
-      - name: Late tool result against cancel
-        run: RUSTFLAGS="--cfg loom" cargo test -p protocol --test loom_cancel -- --test-threads=1

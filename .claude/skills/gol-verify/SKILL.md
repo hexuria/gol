@@ -41,20 +41,20 @@ One owner per failure class. A new check on a property that already has an owner
 | Failure class | Code | Owner | Status |
 |---|---|---|---|
 | Wrong harness transition, lost validity, no progress | `protocol/src/{reduce,phase}.rs` | unit tests in `reduce.rs`; `reduce_bounded` | owned in Rust; the Lean copy was deleted once `reduce_bounded` covered its theorems |
-| Dispatch lifecycle | `reduce_dispatch` | `reduce_bounded` (the exact next phase of every pair, terminal stuck, rank, every open phase has an exit) | `formal/harness/Dispatch.tla` states the same properties; this test is its Rust link |
-| Late tool result vs cancel | `reduce.rs` | unit tests of both orders | `protocol/tests/loom_cancel.rs` runs Loom around the pure reducer, which AGENTS.md "Do not" excludes; it checks no gol sync code, and retiring it is the owner's call |
+| Dispatch lifecycle | `reduce_dispatch` | `reduce_bounded` (the exact next phase of every pair, terminal stuck, rank, every open phase has an exit) | owned in Rust; `Dispatch.tla` was retired (`formal/RETIRED.md`) |
+| Late tool result vs cancel | `reduce.rs` | unit tests of both orders | `reduce_bounded` covers every other order; the Loom test around the pure reducer was retired (`formal/RETIRED.md`) |
 | Run never ends | `harness/src/driver.rs` budget | `harness/tests/budget.rs` | covers `EventuallyDone` for real runs |
 | Effect without authorization | `authorizer.rs`, `driver.rs` | unit tests | thin: 2 authorizer tests |
 | Concurrent run-log writers | `server/src/{store,postgres,inference,http}.rs` | `formal/runlog` + `server/tests/{inference,pg_redis}.rs` | linked: each counterexample is a Rust test |
 | Stores disagree | `store.rs` vs `postgres.rs` | tests on both stores | no shared contract suite yet |
-| Duplicate effect after a crash | `runtime-tokio/src/{journal,host}.rs` | `replay_proof.rs`; `formal/workflow/Replay.tla` for the design | the Lean restatement was deleted; `formal/harness/FINDINGS.md` "Lean (retired)" maps each theorem to its Rust test |
+| Duplicate effect after a crash | `runtime-tokio/src/{journal,host}.rs` | `replay_proof.rs`; `formal/workflow/Replay.tla` for the design | the Lean restatement was deleted; `formal/RETIRED.md` maps each theorem to its Rust test |
 | Frontends disagree | `workflow-*` | `histories_agree_across_rust_rhai_js_and_bend` | runs in more than one CI job |
 | Bend laws and encoding | `experiments/bend` | `verify-bend.sh`, workflow-bend tests | see gol-bend |
 | gol `unsafe` | `workflow-bend/src/boundary.rs` `kill_group` | `forbid(unsafe_code)` in every other crate; `timeout_kills_the_process_group` | compiler-enforced |
 | Dependency UB | rhai, smartstring | nightly Miri on `workflow-rhai` | boa_engine excluded after Miri found UB |
 | Known-vulnerable dependencies | `Cargo.lock` | `cargo deny` | `cargo audit` repeats its vulnerability ignores |
 | Crate layering | crate graph | `check-architecture.sh` | keep |
-| Worker ownership, leases, queue ack | not built (`execution/src/lib.rs` joins one thread; `queue.rs` pops without ack) | T3 when built | `formal/harness/HarnessCore.tla` sketches workers: design model (unlinked) |
+| Worker ownership, leases, queue ack | not built (`execution/src/lib.rs` joins one thread; `queue.rs` pops without ack) | T3 when built | no model: the `HarnessCore.tla` sketch was retired (`formal/RETIRED.md`); a new model of the real writers when T3 fires |
 
 ## 3. Vocabulary
 
@@ -84,7 +84,7 @@ A model result is evidence about Rust only through a Rust test that runs in CI.
 
 `crates/protocol/tests/reduce_bounded.rs` enumerates, for `max_steps` ∈ {0, 1, 2, 3, 9}, every valid `HarnessState`, all 25 `EventPayload` kinds (every `FailureClass`, every `Effect` inside `EffectDecided`/`EffectAuthorized`/`EffectDenied`, and matching and mismatching tool results), and all 14 `DispatchPhase`s. The alphabets come from matches with no `_` arm, so a new variant stops the file from compiling until it is enumerated.
 
-It asserts: validity is preserved; a change happens exactly where the transition table allows it, to exactly the expected next state; a lexicographic rank strictly drops on every change; terminal states absorb every event and emit nothing; the effects equal a total `expected_effects` (an authorized model call or memory access from any running step, a tool call only from an unanswered step inside the budget, nothing else); dispatch equals the `Dispatch.tla` action table on every pair, stays terminal, lowers its rank on every change except `DispatchResume` (a paused live phase back to running), and every open phase has an exit.
+It asserts: validity is preserved; a change happens exactly where the transition table allows it, to exactly the expected next state; a lexicographic rank strictly drops on every change; terminal states absorb every event and emit nothing; the effects equal a total `expected_effects` (an authorized model call or memory access from any running step, a tool call only from an unanswered step inside the budget, nothing else); dispatch equals the transition table (transcribed from the retired `Dispatch.tla`) on every pair, stays terminal, lowers its rank on every change except `DispatchResume` (a paused live phase back to running), and every open phase has an exit.
 
 Data fields take one value each, so a reducer that copies the wrong payload field is caught by the unit tests in `reduce.rs`, not here.
 

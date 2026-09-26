@@ -12,12 +12,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 criterion = "0.5"
 proptest = "1.6"
 
-[target.'cfg(loom)'.dev-dependencies]
-loom = "0.7"
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
-
 [[bench]]
 name = "fold_reduce"
 harness = false
