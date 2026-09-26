@@ -521,6 +521,30 @@ async fn redis_push_failure_does_not_run_the_harness() {
         .iter()
         .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. })));
 
+    // A client polling the run sees it failed, not running forever.
+    let ui: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://{addr}/v1/runs/{}/ui", ids[0]))
+        .header("authorization", "Bearer gol-gateway-local")
+        .send()
+        .await
+        .expect("ui")
+        .json()
+        .await
+        .expect("ui json");
+    let outcome = ui["elements"]["outcome"]["props"]["text"]
+        .as_str()
+        .expect("outcome text");
+    assert!(outcome.starts_with("queue push failed: "), "{outcome}");
+    // One terminal event, not one per writer.
+    assert_eq!(
+        stored
+            .events
+            .iter()
+            .filter(|event| matches!(event.payload, EventPayload::RunFailed { .. }))
+            .count(),
+        1
+    );
+
     let requests = jev.received_requests().await.expect("requests");
     assert!(
         !requests
@@ -659,6 +683,14 @@ async fn jev_error_leaves_run_failed() {
                 message,
             }) if message.starts_with("decider: ")
         ),
+        "{payloads:?}"
+    );
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|payload| matches!(payload, EventPayload::RunFailed { .. }))
+            .count(),
+        1,
         "{payloads:?}"
     );
 }

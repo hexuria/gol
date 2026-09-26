@@ -391,10 +391,17 @@ async fn get_ui(
         .map_err(|error| ApiError::Decider(error.to_string()))?
         .ok_or(ApiError::NotFound)?;
     let folded = fold(&stored.spec, &stored.events);
-    let outcome = match &folded.harness {
-        protocol::HarnessState::Completed { outcome } => outcome.clone(),
-        protocol::HarnessState::Failed { message, .. } => message.clone(),
-        protocol::HarnessState::Cancelled => "cancelled".to_string(),
+    // A run can end before its harness starts (a failed queue push records
+    // RunFailed on a harness still Idle), so fall back to the dispatch phase.
+    let outcome = match (&folded.harness, &folded.dispatch) {
+        (protocol::HarnessState::Completed { outcome }, _)
+        | (_, protocol::DispatchPhase::Completed { outcome }) => outcome.clone(),
+        (protocol::HarnessState::Failed { message, .. }, _)
+        | (_, protocol::DispatchPhase::Failed { message, .. }) => message.clone(),
+        (protocol::HarnessState::Cancelled, _) | (_, protocol::DispatchPhase::Cancelled) => {
+            "cancelled".to_string()
+        }
+        (_, protocol::DispatchPhase::Expired) => "expired".to_string(),
         _ => "running".to_string(),
     };
     Ok(Json(json_render_spec(&stored.spec.input, &outcome)))
