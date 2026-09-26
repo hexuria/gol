@@ -2,7 +2,7 @@
 # Fail when workflow, protocol, or surface crates take a runtime or server dependency.
 set -euo pipefail
 
-root="$(cd "$(dirname "$0")/.." && pwd)"
+root="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "${root}"
 
 meta="$(mktemp)"
@@ -85,7 +85,8 @@ import re
 import sys
 
 meta = json.load(open(sys.argv[1]))
-root = sys.argv[2]
+# cargo metadata reports physical paths; compare against the physical root.
+root = os.path.realpath(sys.argv[2])
 members = set(meta["workspace_members"])
 failed = False
 
@@ -112,9 +113,12 @@ for directory, _, files in os.walk(os.path.join(root, "crates")):
         if name.endswith(".rs"):
             path = os.path.join(directory, name)
             with open(path, errors="replace") as handle:
-                for number, line in enumerate(handle, 1):
-                    if lift.search(line):
-                        found.append((os.path.relpath(path, root), number, line.strip()))
+                text = handle.read()
+            # Scan the whole file: rustfmt wraps a long attribute list over several lines.
+            for match in lift.finditer(text):
+                number = text.count("\n", 0, match.start()) + 1
+                attribute = " ".join(text[match.start():text.find("]", match.end()) + 1].split())
+                found.append((os.path.relpath(path, root), number, attribute))
 allowed = [("crates/workflow-bend/src/boundary.rs", "#[allow(unsafe_code)]")]
 if [(path, text) for path, _, text in found] != allowed:
     print("unsafe_code may be lifted only by #[allow(unsafe_code)] on kill_group in "
