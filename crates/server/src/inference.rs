@@ -353,13 +353,17 @@ pub fn open_turn(
     let name = box_container_name(spec.run_id);
     if box_turn {
         if let Err(SandboxError::Host(message)) = sandbox.provision(&name) {
-            // No sandbox is running, so the turn can end: it is over.
-            end_failed(
-                store,
-                &spec,
-                FailureClass::Environment,
-                format!("provision: {message}"),
-            );
+            // The turn is over. It ends only if no sandbox was left behind (a
+            // failed start whose cleanup also failed leaves one): a turn never
+            // ends with its sandbox running.
+            if !sandbox.exists(&name) {
+                end_failed(
+                    store,
+                    &spec,
+                    FailureClass::Environment,
+                    format!("provision: {message}"),
+                );
+            }
             return Err(TurnError::Sandbox(message));
         }
     }

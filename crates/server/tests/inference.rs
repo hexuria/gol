@@ -1284,7 +1284,7 @@ fn proxy_failure_run_failed() {
     }
 }
 
-// formal/runlog TerminalHasNoSandbox: when the sandbox cannot be removed the
+// formal/runlog CompletedHasNoSandbox: when the sandbox cannot be removed the
 // turn stays open rather than end with a sandbox still running.
 #[test]
 fn a_proxy_failure_with_a_failed_destroy_leaves_the_turn_open() {
@@ -1460,4 +1460,95 @@ async fn fail_endpoint_is_terminal_and_destroys_sandbox() {
     )
     .await;
     assert_eq!(again.status().as_u16(), 409);
+}
+
+/// A sandbox host whose provision fails but leaves the sandbox behind (Docker's
+/// `start` failed and so did the cleanup `rm -f`).
+struct ProvisionLeavesSandbox;
+
+impl SandboxHost for ProvisionLeavesSandbox {
+    fn provision(&self, name: &str) -> Result<(), server::SandboxError> {
+        Err(server::SandboxError::Host(format!("start {name} failed")))
+    }
+
+    fn destroy(&self, name: &str) -> Result<(), server::SandboxError> {
+        Err(server::SandboxError::Host(format!("rm -f {name} failed")))
+    }
+
+    fn exists(&self, _name: &str) -> bool {
+        true
+    }
+
+    fn launches_docker(&self) -> bool {
+        false
+    }
+}
+
+// formal/runlog CompletedHasNoSandbox: a provision that failed but left its
+// sandbox behind does not end the turn with that sandbox running.
+#[test]
+fn a_provision_failure_that_leaves_a_sandbox_keeps_the_turn_open() {
+    let spec = subscription_spec(ExecutionPlacement::Box);
+    let store = InMemoryStore::default();
+    open_turn(&store, spec.clone(), &SilentPoster, &ProvisionLeavesSandbox)
+        .expect_err("provision fails");
+    let events = store.run(spec.run_id).expect("run").events;
+    assert_eq!(terminals(&events), Vec::<String>::new());
+}
+
+// formal/runlog CompletedHasNoSandbox for the failer: fail_turn removes the
+// sandbox before it appends, so a failed removal leaves the turn open and the
+// log without a terminal event.
+#[test]
+fn a_failed_destroy_keeps_a_failed_turn_open() {
+    let state = Arc::new(FailingRemove {
+        live: Mutex::new(HashSet::new()),
+    });
+    let command = state.clone();
+    let sandbox = DockerSandbox::from_command(move |args| command.call(args));
+    let spec = subscription_spec(ExecutionPlacement::Box);
+    let store = InMemoryStore::default();
+    open_turn(&store, spec.clone(), &SilentPoster, &sandbox).expect("open");
+
+    let error = fail_turn(&store, spec.run_id, "proxy said 529", &sandbox)
+        .expect_err("rm must fail the failure");
+
+    assert!(matches!(error, TurnError::Sandbox(_)), "{error:?}");
+    assert!(sandbox.exists(&box_container_name(spec.run_id)));
+    let events = store.run(spec.run_id).expect("run").events;
+    assert_eq!(terminals(&events), Vec::<String>::new());
+}
+
+// fail_turn ends only an open coworker turn: a subscription run stored with
+// just its user message (the shape of a queued create_run) is not one, and the
+// store's own refusal would not stop it, since that run is not terminal.
+#[test]
+fn fail_on_a_run_that_is_not_an_open_turn_is_a_conflict() {
+    let spec = subscription_spec(ExecutionPlacement::Local);
+    let store = InMemoryStore::default();
+    store.put_run(StoredRun {
+        spec: spec.clone(),
+        events: vec![Event::record(
+            EventSource::new(
+                spec.run_id,
+                spec.agent_id,
+                &spec.agent_version,
+                Actor::System,
+                Timestamp::now(),
+            ),
+            EventPayload::UserMessage {
+                text: spec.input.clone(),
+            },
+        )],
+    });
+    let error = fail_turn(&store, spec.run_id, "nope", &MemorySandbox::default())
+        .expect_err("not an open turn");
+    assert!(
+        matches!(error, TurnError::Conflict("turn is not open")),
+        "{error:?}"
+    );
+    assert_eq!(
+        terminals(&store.run(spec.run_id).expect("run").events),
+        Vec::<String>::new()
+    );
 }

@@ -1,7 +1,7 @@
 // Subscription calls the local fixture proxy after the server has the user
 // message. Gateway mode stops at the server. The desktop does not call the proxy.
-// A subscription turn the desktop cannot finish is ended on the server with
-// /fail, so it never stays open.
+// When the proxy call fails, the desktop ends the subscription turn on the
+// server with /fail rather than leave it open.
 
 const VENDOR_HOSTS = ["anthropic.com", "openai.com", "chatgpt.com", "x.ai", "grok.com"];
 

@@ -144,13 +144,14 @@ FailCheck(f) ==
   /\ UNCHANGED <<log, sandbox, jevPc, cPc, snap, latePc, putPc, acked>>
 
 \* Destroy first, as a completer does; a sandbox already gone needs nothing. A
-\* failed destroy leaves the log untouched and the turn open.
+\* failed destroy leaves the log untouched and the turn open. It can fail even
+\* with the sandbox gone: fail_turn checks exists, then destroys, and a
+\* completer can remove the sandbox in between.
 FailDestroy(f) ==
   /\ fPc[f] = "checked"
   /\ \/ /\ sandbox' = "gone"
         /\ fPc' = [fPc EXCEPT ![f] = "destroyed"]
-     \/ /\ sandbox = "up"
-        /\ fPc' = [fPc EXCEPT ![f] = "failed"]
+     \/ /\ fPc' = [fPc EXCEPT ![f] = "failed"]
         /\ UNCHANGED sandbox
   /\ UNCHANGED <<log, jevPc, cPc, snap, latePc, putPc, acked>>
 
