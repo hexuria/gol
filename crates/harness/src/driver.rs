@@ -1,6 +1,7 @@
 use protocol::{
-    authorize, fold, Actor, Effect, Event, EventPayload, ExecutionPlacement, FailureClass,
-    HarnessState, InvocationId, PolicyDecision, RunSpec, RunState, Timestamp, ToolDescriptor,
+    applicable, authorize, fold, Actor, Effect, Event, EventPayload, ExecutionPlacement,
+    FailureClass, HarnessState, InvocationId, PolicyDecision, RunSpec, RunState, Timestamp,
+    ToolDescriptor,
 };
 
 use crate::{
@@ -169,6 +170,16 @@ impl Driver {
         );
 
         match authorize(&self.spec, &effect, tools) {
+            // Allowed, but the harness would not act on it now: deny it with
+            // the reason rather than authorize an effect `reduce` drops. The
+            // decision above already cost a step, so the budget still ends a
+            // decider that keeps proposing such effects.
+            PolicyDecision::Allow if !applicable(&state.harness, &effect, &self.spec) => {
+                // The policy allowed it; the harness state is what refuses it.
+                let reason = format!("not applicable while {}", describe(&state.harness));
+                self.push(EventPayload::EffectDenied { effect, reason }, Actor::System);
+                Ok(Vec::new())
+            }
             PolicyDecision::Allow => {
                 self.push(
                     EventPayload::EffectAuthorized {
@@ -362,6 +373,19 @@ pub fn run_to_completion(
         }
         driver.perform(&effects, tools, models, memory);
         driver.advance_answered_step();
+    }
+}
+
+/// The harness state in words, for the reason of a denied effect.
+fn describe(state: &HarnessState) -> &'static str {
+    match state {
+        HarnessState::Idle => "idle",
+        HarnessState::Running { answered: true, .. } => "running, answered",
+        HarnessState::Running { .. } => "running",
+        HarnessState::WaitingForTool { .. } => "waiting for a tool",
+        HarnessState::Completed { .. } | HarnessState::Failed { .. } | HarnessState::Cancelled => {
+            "finished"
+        }
     }
 }
 

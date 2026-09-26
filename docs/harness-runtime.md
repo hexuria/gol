@@ -15,12 +15,12 @@ A local run does the following.
 1. Append `RunStarted`. `reduce` moves `Idle` to `Running { step: 1, attempt: 0, answered: false }`. `reduce_dispatch` moves `Created` to `Running`.
 2. While the harness state is nonterminal, build a `DecisionView` from the spec, the folded state, the event log, and the tool catalog.
 3. Ask the decider for one effect. Append `EffectDecided`. Authorize that effect.
-4. Append `EffectAuthorized` or `EffectDenied`, then `reduce`. Perform an effect only when `reduce` returns it.
+4. Append `EffectAuthorized` or `EffectDenied`, then `reduce`. Perform an effect only when `reduce` returns it. An effect the policy allows is authorized only when `protocol::applicable` holds, that is when `reduce` would change the state or return the effect; otherwise it is denied with `not applicable while <state>`, so no authorized effect is dropped.
 5. Stop on `Completed`, `Failed`, or `Cancelled`. A `Complete` that finishes the run is always allowed and is not a step. Any other decision (including a `Complete` while a tool call is outstanding, which cannot finish the run) once `limits.max_steps` is spent, or a model call once `limits.max_model_calls` is spent, appends `RunFailed` with `FailureClass::Budget`.
 
 `POST /v1/runs` and `POST /v1/coworker/turns` accept each limit from 1 to 64 and answer 400 otherwise; the defaults are 8 steps and 4 model calls. `limits.max_steps` counts `EffectDecided` events, except a `Complete` decided while the harness is `Running`. `reduce` and `advance_answered_step` compare harness `step` to that same field. `limits.max_model_calls` counts authorized model calls. `FailureClass::Timeout` is the fold of `RunExpired`. This slice has no clock.
 
-`WaitingForTool` does not spin. A `Wait` effect is denied. The deny event is appended, `reduce` leaves the state in place, and the loop continues until the tool result arrives or the step budget runs out; a `Complete` while waiting cannot finish the run and costs a step.
+`WaitingForTool` does not spin. A `Wait` effect is denied. The deny event is appended, `reduce` leaves the state in place, and the loop continues until the tool result arrives or the step budget runs out; a `Complete` or model call while waiting is denied as not applicable, and still costs a step.
 
 Cancellation is terminal. A later `ToolResult` stays `Cancelled`. A later `StepRetried` stays `Cancelled`. A second `ToolResult` for a call that is already answered does not move the state and does not emit another effect.
 

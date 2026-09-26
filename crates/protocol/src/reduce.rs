@@ -183,25 +183,41 @@ pub fn reduce(state: HarnessState, event: &Event, spec: &RunSpec) -> (HarnessSta
     }
 }
 
-fn on_authorized(state: HarnessState, effect: &Effect, spec: &RunSpec) -> (HarnessState, Effects) {
-    let HarnessState::Running {
-        step,
-        attempt,
-        answered,
-    } = state
-    else {
-        return (state, Vec::new());
+/// Whether the harness acts on `effect` when it is authorized in `state`:
+/// `reduce` either changes the state or emits the effect. Everywhere else
+/// `reduce` would drop it, so the driver denies such an effect instead of
+/// authorizing it. `on_authorized` uses the same rule.
+pub fn applicable(state: &HarnessState, effect: &Effect, spec: &RunSpec) -> bool {
+    let HarnessState::Running { step, answered, .. } = state else {
+        return false;
     };
-    let running = HarnessState::Running {
-        step,
-        attempt,
-        answered,
+    match effect {
+        Effect::ToolCall { .. } => !answered && (1..=spec.limits.max_steps).contains(step),
+        Effect::Complete { .. }
+        | Effect::ModelCall { .. }
+        | Effect::MemoryRead { .. }
+        | Effect::MemoryWrite { .. } => true,
+        Effect::Execute { .. }
+        | Effect::Delegate { .. }
+        | Effect::AskUser { .. }
+        | Effect::RequestApproval { .. }
+        | Effect::Wait { .. }
+        | Effect::PublishArtifact { .. } => false,
+    }
+}
+
+fn on_authorized(state: HarnessState, effect: &Effect, spec: &RunSpec) -> (HarnessState, Effects) {
+    if !applicable(&state, effect, spec) {
+        return (state, Vec::new());
+    }
+    let HarnessState::Running { step, attempt, .. } = state else {
+        return (state, Vec::new());
     };
 
     match effect {
         Effect::ToolCall {
             name, invocation, ..
-        } if !answered && (1..=spec.limits.max_steps).contains(&step) => (
+        } => (
             HarnessState::WaitingForTool {
                 step,
                 attempt,
@@ -216,10 +232,7 @@ fn on_authorized(state: HarnessState, effect: &Effect, spec: &RunSpec) -> (Harne
             },
             Vec::new(),
         ),
-        Effect::ModelCall { .. } | Effect::MemoryRead { .. } | Effect::MemoryWrite { .. } => {
-            (running, vec![effect.clone()])
-        }
-        _ => (running, Vec::new()),
+        _ => (state, vec![effect.clone()]),
     }
 }
 
@@ -240,6 +253,45 @@ mod tests {
 
     fn other_invocation() -> InvocationId {
         InvocationId::from_uuid(Uuid::from_u128(2))
+    }
+
+    #[test]
+    fn applicable_names_where_the_harness_acts() {
+        let spec = sample_spec();
+        let running = |answered| HarnessState::Running {
+            step: 1,
+            attempt: 0,
+            answered,
+        };
+        let waiting = HarnessState::WaitingForTool {
+            step: 1,
+            attempt: 0,
+            name: "echo".to_string(),
+            invocation: invocation(),
+        };
+        let complete = Effect::Complete {
+            outcome: "done".to_string(),
+        };
+        let model = Effect::ModelCall {
+            prompt: "p".to_string(),
+        };
+        let wait = Effect::Wait {
+            reason: "r".to_string(),
+        };
+
+        assert!(applicable(&running(false), &echo_call("x"), &spec));
+        assert!(!applicable(&running(true), &echo_call("x"), &spec));
+        assert!(!applicable(&waiting, &echo_call("x"), &spec));
+
+        assert!(applicable(&running(true), &complete, &spec));
+        assert!(!applicable(&waiting, &complete, &spec));
+        assert!(!applicable(&HarnessState::Idle, &complete, &spec));
+
+        assert!(applicable(&running(false), &model, &spec));
+        assert!(!applicable(&waiting, &model, &spec));
+
+        assert!(!applicable(&running(false), &wait, &spec));
+        assert!(!applicable(&HarnessState::Cancelled, &complete, &spec));
     }
 
     fn echo_call(input: &str) -> Effect {

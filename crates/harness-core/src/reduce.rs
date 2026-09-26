@@ -7,6 +7,10 @@ pub enum WorkflowRun {
     Open,
     Completed,
     Failed,
+    /// The driver returned no command, or several commands that are not all
+    /// tools. A step is one command, or a join of tools; anything else cannot
+    /// go on.
+    Invalid,
 }
 
 pub fn transition(
@@ -19,10 +23,19 @@ pub fn transition(
         wait: WaitCondition::None,
     } = driver.evaluate(ctx, history);
     let next = match commands.as_slice() {
-        [WorkflowCommand::ExecuteTool(_)] => WorkflowRun::Open,
+        [] => WorkflowRun::Invalid,
+        [WorkflowCommand::ExecuteTool(_) | WorkflowCommand::SpawnAgent] => WorkflowRun::Open,
         [WorkflowCommand::Complete] => WorkflowRun::Completed,
         [WorkflowCommand::Fail] => WorkflowRun::Failed,
-        _ => WorkflowRun::Open,
+        // A join: several tools run together (`runtime_tokio::host::join_all`).
+        joined
+            if joined
+                .iter()
+                .all(|command| matches!(command, WorkflowCommand::ExecuteTool(_))) =>
+        {
+            WorkflowRun::Open
+        }
+        _ => WorkflowRun::Invalid,
     };
     (next, commands)
 }

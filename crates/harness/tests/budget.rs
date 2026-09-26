@@ -283,6 +283,20 @@ fn a_complete_that_cannot_finish_the_run_costs_a_step() {
     assert!(failed_on_budget(&driver), "{:?}", driver.state().harness);
     assert_eq!(driver.state().steps, 2);
     assert_eq!(decider.calls, 2);
+    // The first Complete is denied, not authorized and dropped (applicable.rs). The
+    // second is over the budget, which ends the run.
+    let denied: Vec<&str> = driver
+        .events()
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::EffectDenied {
+                effect: Effect::Complete { .. },
+                reason,
+            } => Some(reason.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(denied, ["not applicable while waiting for a tool"]);
 }
 
 /// Records the budget flags of each view it is shown.
