@@ -169,7 +169,7 @@ There is no Bend-level memory quota on the checker. The output cap and the timeo
 - Linking generated C, or wrapping effect symbols, as if the ABI were stable.
 - A parser for Bend syntax. The adapter reads one quoted token line.
 - A Bend JSON stack.
-- A duplicate of `formal/harness/Harness.tla` or of `protocol::reduce` in Bend. TLA+ covers time, races and the architecture, and Rust tests cover the reducer. Bend covers this decision and its local laws.
+- A duplicate of `protocol::reduce` or of a TLA+ model in Bend. TLA+ covers concurrent writers, and Rust tests cover the reducer. Bend covers this decision and its local laws.
 - GPU or data-parallel scheduling of effects. Parallelism in Bend is for independent pure work. This decision has none.
 - Publishing to the Bend hub, or `bend login`.
 - Treating `All terms check.` as authorization to run the next Bend program with ambient rights.

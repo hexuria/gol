@@ -645,7 +645,7 @@ fn phase_index(phase: &DispatchPhase) -> usize {
     }
 }
 
-/// The rank `formal/harness/Dispatch.tla` uses. Terminal phases are 0.
+/// The dispatch rank: every forward step lowers it. Terminal phases are 0.
 fn dispatch_rank(phase: &DispatchPhase) -> u32 {
     match phase {
         DispatchPhase::Created => 140,
@@ -665,8 +665,9 @@ fn dispatch_rank(phase: &DispatchPhase) -> u32 {
     }
 }
 
-/// The transition table of `formal/harness/Dispatch.tla`, one arm per action,
-/// as a total function: every pair outside an action is the identity.
+/// The dispatch transition table, one arm per action of the retired
+/// `Dispatch.tla` (formal/RETIRED.md), as a total function: every pair outside
+/// an action is the identity.
 fn dispatch_expected(phase: &DispatchPhase, payload: &EventPayload) -> DispatchPhase {
     use DispatchPhase as D;
     use EventPayload as P;
@@ -713,7 +714,7 @@ fn dispatch_expected(phase: &DispatchPhase, payload: &EventPayload) -> DispatchP
 }
 
 /// `DispatchResume`: a paused live phase returns to running. It is the only
-/// change that may raise the rank (`RankDecreases` in `Dispatch.tla`).
+/// change that may raise the rank.
 fn is_resume(phase: &DispatchPhase, next: &DispatchPhase) -> bool {
     matches!(
         phase,
@@ -724,10 +725,9 @@ fn is_resume(phase: &DispatchPhase, next: &DispatchPhase) -> bool {
     ) && *next == DispatchPhase::Running
 }
 
-/// The properties `formal/harness/Dispatch.cfg` checks, on production
-/// `reduce_dispatch`: the exact next phase of every pair, terminal phases stay
-/// put, every change except `DispatchResume` lowers the rank, and every open
-/// phase has an exit.
+/// The dispatch lifecycle, on production `reduce_dispatch`: the exact next
+/// phase of every pair, terminal phases stay put, every change except
+/// `DispatchResume` lowers the rank, and every open phase has an exit.
 #[test]
 fn dispatch_reduce_matches_the_table_on_every_pair() {
     let payloads = payloads(3);
