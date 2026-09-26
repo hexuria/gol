@@ -131,17 +131,24 @@ def fired(rows, changes):
     return hits
 
 
+# Diff output must not depend on the user's git config (color, external diff tools).
+DIFF = ("diff", "--no-color", "--no-ext-diff", "--no-renames")
+
+
 def git(*args):
     out = subprocess.run(["git", *args], check=True, capture_output=True).stdout
     return out.decode("utf-8", errors="replace")
 
 
 def hunk_lines(merge_base, path):
-    """Added and removed lines of one file. Headers end at the first @@, so a
-    content line that starts with -- or ++ is still content."""
+    """Added and removed lines of one file. Each patch's headers end at its first @@, so a
+    content line that starts with -- or ++ is still content. A type change (symlink to file)
+    prints two patches, and the second one's headers are skipped the same way."""
     added, removed, in_hunk = [], [], False
-    for line in git("diff", "--no-renames", "-U0", merge_base, "--", f":(literal){path}").splitlines():
-        if line.startswith("@@"):
+    for line in git(*DIFF, "-U0", merge_base, "--", f":(literal){path}").splitlines():
+        if line.startswith("diff --git "):
+            in_hunk = False
+        elif line.startswith("@@"):
             in_hunk = True
         elif in_hunk and line.startswith("+"):
             added.append(line[1:])
@@ -154,16 +161,20 @@ def diff_changes(base):
     """{path: (added_lines, removed_lines)} for the working tree against merge-base(base, HEAD).
     Paths come from -z listings, so spaces, " b/" and non-ASCII names stay intact; content that
     is not UTF-8 is decoded with replacement."""
-    merge_base = git("merge-base", base, "HEAD").strip()
+    try:
+        merge_base = git("merge-base", base, "HEAD").strip()
+    except subprocess.CalledProcessError:
+        raise SystemExit(f"verify-plan: no merge base between {base} and HEAD; run git fetch origin")
     changes = {}
-    for path in filter(None, git("diff", "--no-renames", "--name-only", "-z", merge_base).split("\0")):
+    for path in filter(None, git(*DIFF, "--name-only", "-z", merge_base).split("\0")):
         changes[path] = hunk_lines(merge_base, path)
     for new in filter(None, git("ls-files", "--others", "--exclude-standard", "-z").split("\0")):
         lines = []
         if os.path.isfile(new):
             with open(new, "rb") as handle:
                 lines = handle.read().decode("utf-8", errors="replace").splitlines()
-        changes[new] = (lines, [])
+        # A tracked file removed from the index but kept on disk keeps its removed lines.
+        changes[new] = (lines, changes.get(new, ([], []))[1])
     return changes
 
 
@@ -207,6 +218,9 @@ SELF_TEST = [
     ("add a test", {"crates/protocol/tests/probe.rs": (["#[test]", "fn probe() {}"], [])}, {"T0"}),
     ("fewer proptest cases", {"crates/protocol/src/reduce.rs": (["    #![proptest_config(ProptestConfig { cases: 4, ..ProptestConfig::default() })]"], [])}, {"T0", "T1", "T12"}),
     ("tests off for a crate", {"crates/memory/Cargo.toml": (["test = false"], [])}, {"T0", "T12"}),
+    ("ignore behind a cfg_attr", {"crates/server/tests/pg_redis.rs": (['#[cfg_attr(not(feature = "pg"), ignore)]'], [])}, {"T0", "T12"}),
+    ("autotests off", {"crates/memory/Cargo.toml": (["autotests = false"], [])}, {"T0", "T12"}),
+    ("a serde attribute", {"crates/protocol/src/event.rs": (['#[serde(rename = "ignored_field")]'], [])}, {"T0", "T1"}),
     ("toolchain pin", {"rust-toolchain.toml": (['channel = "1.80"'], [])}, {"T0", "T12"}),
     ("ci scope", {"scripts/ci-scope.sh": (["docs_only='^.*$'"], [])}, {"T0", "T12"}),
 ]
@@ -252,13 +266,19 @@ def diff_self_test():
     """diff_changes on a scratch repo with awkward paths and bytes."""
     import tempfile
     here = os.getcwd()
+    # Isolate the scratch repo from the caller: a hook's GIT_INDEX_FILE or GIT_DIR, commit
+    # signing and global hooks must not reach it, and it must not reach the caller's repo.
+    saved = {k: v for k, v in os.environ.items() if k.startswith("GIT_")}
+    for key in saved:
+        del os.environ[key]
     with tempfile.TemporaryDirectory() as tmp:
         os.chdir(tmp)
         try:
             def run(*args):
-                subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                                "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args],
                                check=True, capture_output=True)
-            run("init", "-q", "-b", "main")
+            run("init", "-q")
             os.makedirs("docs/x b/formal")
             with open("docs/x b/formal/M.tla", "w") as f:
                 f.write("a\n")
@@ -275,14 +295,22 @@ def diff_self_test():
             with open("bytes.rs", "wb") as f:
                 f.write(b"\xff\xfe spawn(\n")
             os.symlink("missing", "dangling")
+            os.symlink("bytes.rs", "link.rs")
+            run("add", "link.rs")
+            run("commit", "-q", "-m", "link")
+            os.remove("link.rs")
+            with open("link.rs", "w") as f:
+                f.write("now a file\n")
             changes = diff_changes("HEAD")
         finally:
             os.chdir(here)
+            os.environ.update(saved)
     want = {
         "docs/x b/formal/M.tla": (["b"], ["a"]),
         "café.rs": (["-- on conflict"], ["a"]),
         "bytes.rs": (["\ufffd\ufffd spawn("], ["a"]),
         "dangling": ([], []),
+        "link.rs": (["now a file"], ["bytes.rs"]),
     }
     if changes != want:
         print(f"self-test diff parsing: expected {want}, got {changes}", file=sys.stderr)
