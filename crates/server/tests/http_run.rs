@@ -334,6 +334,20 @@ async fn missing_bearer_is_401_and_does_not_start_the_run() {
 }
 
 fn run_body(agent_id: AgentId, max_steps: u32, max_model_calls: u32) -> serde_json::Value {
+    run_body_with(
+        agent_id,
+        max_steps,
+        max_model_calls,
+        serde_json::json!("PlatformGateway"),
+    )
+}
+
+fn run_body_with(
+    agent_id: AgentId,
+    max_steps: u32,
+    max_model_calls: u32,
+    credential: serde_json::Value,
+) -> serde_json::Value {
     serde_json::json!({
         "agent_id": agent_id,
         "agent_version": "1",
@@ -342,7 +356,7 @@ fn run_body(agent_id: AgentId, max_steps: u32, max_model_calls: u32) -> serde_js
         "work_model": {
             "provider": "OpenAI",
             "model_name": "gpt-test",
-            "credential": "PlatformGateway"
+            "credential": credential
         },
         "capabilities": ["tool.echo"],
         "limits": { "max_steps": max_steps, "max_model_calls": max_model_calls }
@@ -412,6 +426,31 @@ async fn limits_outside_one_to_sixty_four_are_400_and_start_nothing() {
             outcome: "done".to_string()
         }
     );
+
+    // Both ends of the range are accepted on both routes. The coworker turn uses the
+    // subscription credential so the server makes no gateway call.
+    let accepted = post_when_up(
+        &client,
+        &format!("{base}/v1/runs"),
+        &run_body(agent_id, 1, 1),
+    )
+    .await;
+    assert_eq!(accepted.status().as_u16(), 200, "/v1/runs 1/1");
+    let subscription =
+        serde_json::json!({ "BringYourOwn": { "secret_ref": "desktop-subscription" } });
+    for (max_steps, max_model_calls) in [(1, 1), (64, 64)] {
+        let turn = post_when_up(
+            &client,
+            &format!("{base}/v1/coworker/turns"),
+            &run_body_with(agent_id, max_steps, max_model_calls, subscription.clone()),
+        )
+        .await;
+        assert_eq!(
+            turn.status().as_u16(),
+            200,
+            "/v1/coworker/turns {max_steps}/{max_model_calls}"
+        );
+    }
 }
 
 #[tokio::test]

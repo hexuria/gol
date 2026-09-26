@@ -1083,7 +1083,33 @@ fn a_completion_for_a_run_that_is_not_an_open_turn_is_a_conflict() {
             },
         }),
     ];
-    for (label, events) in [("queued", queued), ("waiting for a tool", waiting)] {
+    let invocation = protocol::InvocationId::new();
+    let answered = vec![
+        at(EventPayload::RunCreated),
+        at(EventPayload::RunStarted),
+        at(EventPayload::UserMessage {
+            text: spec.input.clone(),
+        }),
+        at(EventPayload::EffectAuthorized {
+            effect: protocol::Effect::ToolCall {
+                name: "echo".to_string(),
+                input: "x".to_string(),
+                invocation,
+            },
+        }),
+        at(EventPayload::ToolResult {
+            name: "echo".to_string(),
+            invocation,
+            step: 1,
+            attempt: 0,
+            output: "x".to_string(),
+        }),
+    ];
+    for (label, events) in [
+        ("queued", queued),
+        ("waiting for a tool", waiting),
+        ("already answered", answered),
+    ] {
         let store = InMemoryStore::default();
         store.put_run(StoredRun {
             spec: spec.clone(),
