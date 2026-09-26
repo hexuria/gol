@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 use boa_engine::{
-    js_string, Context, JsError, JsNativeError, JsResult, JsValue, NativeFunction, Source,
+    js_string, Context, JsError, JsNativeError, JsObject, JsResult, JsValue, NativeFunction, Source,
 };
 use workflow_core::{Decision, ToolName, WorkflowProgram};
 
@@ -22,15 +22,31 @@ impl std::fmt::Display for FrontendError {
 
 impl std::error::Error for FrontendError {}
 
+/// Every decision the script made, keyed by the object handed back to it. A
+/// script cannot forge one: lookup is by object identity, not by shape.
 struct Builder {
-    stack: Vec<Decision>,
+    nodes: Vec<Node>,
     fault: Option<String>,
 }
 
+struct Node {
+    handle: JsObject,
+    decision: Decision,
+    used: bool,
+}
+
+// Scripts run at compile time, so every one is bounded: an endless loop or a
+// runaway recursion is a script error, never a hung compiler.
+const MAX_LOOP_ITERATIONS: u64 = 100_000;
+const MAX_RECURSION: usize = 64;
+
 pub fn compile(source: &str) -> Result<WorkflowProgram, FrontendError> {
     let mut context = Context::default();
+    let limits = context.runtime_limits_mut();
+    limits.set_loop_iteration_limit(MAX_LOOP_ITERATIONS);
+    limits.set_recursion_limit(MAX_RECURSION);
     context.insert_data(Builder {
-        stack: Vec::new(),
+        nodes: Vec::new(),
         fault: None,
     });
     register(&mut context, "onCounter", 3, on_counter);
@@ -48,9 +64,11 @@ pub fn compile(source: &str) -> Result<WorkflowProgram, FrontendError> {
     if let Err(error) = evaluated {
         return Err(FrontendError::Script(error.to_string()));
     }
-    match builder.stack.as_slice() {
-        [decision] => Ok(WorkflowProgram {
-            root: decision.clone(),
+    // The program is the one decision no other decision consumed.
+    let mut roots = builder.nodes.iter().filter(|node| !node.used);
+    match (roots.next(), roots.next()) {
+        (Some(root), None) => Ok(WorkflowProgram {
+            root: root.decision.clone(),
         }),
         _ => Err(FrontendError::InvalidProgram(
             "script must record one decision".to_string(),
@@ -70,13 +88,17 @@ fn register(
 }
 
 fn on_counter(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    if args.len() != 3 {
+    let [missing, zero, other] = args else {
         return fault(context, "onCounter takes three decisions");
-    }
-    let other = pop(context)?;
-    let zero = pop(context)?;
-    let missing = pop(context)?;
-    push(
+    };
+    let mut builder = take(context)?;
+    let branches = [missing, zero, other].map(|arg| builder.consume(arg));
+    let [Some(missing), Some(zero), Some(other)] = branches else {
+        context.insert_data(builder);
+        return fault(context, "onCounter takes three decisions");
+    };
+    context.insert_data(builder);
+    make(
         context,
         Decision::OnCounter {
             missing: Box::new(missing),
@@ -97,29 +119,41 @@ fn tool(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<Js
     if name != "counter" {
         return fault(context, "unknown tool");
     }
-    push(context, Decision::Tool(ToolName::Counter))
+    make(context, Decision::Tool(ToolName::Counter))
 }
 
 fn complete(_this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    push(context, Decision::Complete)
+    make(context, Decision::Complete)
 }
 
 fn fail(_this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    push(context, Decision::Fail)
+    make(context, Decision::Fail)
 }
 
-fn push(context: &mut Context, decision: Decision) -> JsResult<JsValue> {
-    let mut builder = take(context)?;
-    builder.stack.push(decision);
-    context.insert_data(builder);
-    Ok(JsValue::undefined())
+impl Builder {
+    /// Marks the decision behind `value` as used and returns it, or `None`
+    /// when `value` is not an object this compiler handed out.
+    fn consume(&mut self, value: &JsValue) -> Option<Decision> {
+        let object = value.as_object()?;
+        let node = self
+            .nodes
+            .iter_mut()
+            .find(|node| JsObject::equals(&node.handle, &object))?;
+        node.used = true;
+        Some(node.decision.clone())
+    }
 }
 
-fn pop(context: &mut Context) -> JsResult<Decision> {
+fn make(context: &mut Context, decision: Decision) -> JsResult<JsValue> {
+    let handle = JsObject::with_null_proto();
     let mut builder = take(context)?;
-    let decision = builder.stack.pop();
+    builder.nodes.push(Node {
+        handle: handle.clone(),
+        decision,
+        used: false,
+    });
     context.insert_data(builder);
-    decision.ok_or_else(|| native("missing decision"))
+    Ok(handle.into())
 }
 
 fn fault(context: &mut Context, message: &str) -> JsResult<JsValue> {

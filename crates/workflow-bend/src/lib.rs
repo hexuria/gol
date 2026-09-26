@@ -204,6 +204,16 @@ mod tests {
         let rhai =
             workflow_rhai::compile(include_str!("../../workflow-rhai/counter.rhai")).unwrap();
         let js = workflow_js::compile(include_str!("../../workflow-js/counter.js")).unwrap();
+        // The same program with its branches bound to names first: a frontend
+        // must take each branch from its argument, not from evaluation order.
+        let rhai_bound = workflow_rhai::compile(
+            "let a = complete();\nlet b = fail();\non_counter(tool(\"counter\"), a, b);\n",
+        )
+        .unwrap();
+        let js_bound = workflow_js::compile(
+            "const a = complete();\nconst b = fail();\nonCounter(tool(\"counter\"), a, b);\n",
+        )
+        .unwrap();
         let ctx = WorkflowContext;
         let driver = BendDriver::new(bend.clone());
         for counter in histories() {
@@ -212,6 +222,8 @@ mod tests {
             assert_eq!(evaluate_program(&counter_program(), &history), step);
             assert_eq!(evaluate_program(&rhai, &history), step);
             assert_eq!(evaluate_program(&js, &history), step);
+            assert_eq!(evaluate_program(&rhai_bound, &history), step);
+            assert_eq!(evaluate_program(&js_bound, &history), step);
             assert_eq!(evaluate_program(&bend, &history), step);
             assert_eq!(
                 transition(&driver, &ctx, &history),

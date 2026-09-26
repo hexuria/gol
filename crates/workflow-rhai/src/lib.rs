@@ -22,18 +22,54 @@ impl std::fmt::Display for FrontendError {
 
 impl std::error::Error for FrontendError {}
 
+/// A decision the script holds. It indexes the builder, so a script cannot
+/// forge one: only `tool`, `complete`, `fail` and `on_counter` make them.
+#[derive(Clone, Copy)]
+struct Node(usize);
+
 struct Builder {
-    stack: Vec<Decision>,
+    nodes: Vec<Decision>,
+    used: Vec<bool>,
     fault: Option<String>,
 }
 
+impl Builder {
+    fn make(&mut self, decision: Decision) -> Node {
+        self.nodes.push(decision);
+        self.used.push(false);
+        Node(self.nodes.len() - 1)
+    }
+
+    fn take(&mut self, node: Node) -> Decision {
+        self.used[node.0] = true;
+        self.nodes[node.0].clone()
+    }
+}
+
+// Scripts run at compile time, so every one is bounded: an endless loop or a
+// deep expression is a script error, never a hung compiler.
+const MAX_OPERATIONS: u64 = 100_000;
+const MAX_CALL_LEVELS: usize = 32;
+const MAX_EXPR_DEPTH: usize = 64;
+const MAX_FUNCTION_EXPR_DEPTH: usize = 32;
+const MAX_STRING_SIZE: usize = 64 * 1024;
+const MAX_COLLECTION_SIZE: usize = 1024;
+
 pub fn compile(source: &str) -> Result<WorkflowProgram, FrontendError> {
     let builder = Rc::new(RefCell::new(Builder {
-        stack: Vec::new(),
+        nodes: Vec::new(),
+        used: Vec::new(),
         fault: None,
     }));
     let mut engine = Engine::new();
-    engine.set_optimization_level(OptimizationLevel::None);
+    engine
+        .set_optimization_level(OptimizationLevel::None)
+        .set_max_operations(MAX_OPERATIONS)
+        .set_max_call_levels(MAX_CALL_LEVELS)
+        .set_max_expr_depths(MAX_EXPR_DEPTH, MAX_FUNCTION_EXPR_DEPTH)
+        .set_max_string_size(MAX_STRING_SIZE)
+        .set_max_array_size(MAX_COLLECTION_SIZE)
+        .set_max_map_size(MAX_COLLECTION_SIZE);
     register(&mut engine, &builder);
 
     let evaluated = engine.run(source);
@@ -44,10 +80,15 @@ pub fn compile(source: &str) -> Result<WorkflowProgram, FrontendError> {
     if let Err(error) = evaluated {
         return Err(FrontendError::Script(error.to_string()));
     }
-    match built.stack.as_slice() {
-        [decision] => Ok(WorkflowProgram {
-            root: decision.clone(),
-        }),
+    // The program is the one decision no other decision consumed.
+    let mut roots = built
+        .used
+        .iter()
+        .zip(&built.nodes)
+        .filter(|(used, _)| !**used)
+        .map(|(_, decision)| decision);
+    match (roots.next(), roots.next()) {
+        (Some(root), None) => Ok(WorkflowProgram { root: root.clone() }),
         _ => Err(FrontendError::InvalidProgram(
             "script must record one decision".to_string(),
         )),
@@ -55,27 +96,19 @@ pub fn compile(source: &str) -> Result<WorkflowProgram, FrontendError> {
 }
 
 fn register(engine: &mut Engine, builder: &Rc<RefCell<Builder>>) {
+    engine.register_type_with_name::<Node>("Decision");
     {
         let builder = Rc::clone(builder);
         engine.register_fn(
             "on_counter",
-            move |_: (), _: (), _: ()| -> Result<(), Box<EvalAltResult>> {
+            move |missing: Node, zero: Node, other: Node| {
                 let mut built = builder.borrow_mut();
-                let Some(other) = built.stack.pop() else {
-                    return fault(&mut built, "missing decision");
+                let decision = Decision::OnCounter {
+                    missing: Box::new(built.take(missing)),
+                    zero: Box::new(built.take(zero)),
+                    other: Box::new(built.take(other)),
                 };
-                let Some(zero) = built.stack.pop() else {
-                    return fault(&mut built, "missing decision");
-                };
-                let Some(missing) = built.stack.pop() else {
-                    return fault(&mut built, "missing decision");
-                };
-                built.stack.push(Decision::OnCounter {
-                    missing: Box::new(missing),
-                    zero: Box::new(zero),
-                    other: Box::new(other),
-                });
-                Ok(())
+                built.make(decision)
             },
         );
     }
@@ -83,33 +116,28 @@ fn register(engine: &mut Engine, builder: &Rc<RefCell<Builder>>) {
         let builder = Rc::clone(builder);
         engine.register_fn(
             "tool",
-            move |name: String| -> Result<(), Box<EvalAltResult>> {
+            move |name: &str| -> Result<Node, Box<EvalAltResult>> {
+                let mut built = builder.borrow_mut();
                 if name != "counter" {
-                    return fault(&mut builder.borrow_mut(), "unknown tool");
+                    return fault(&mut built, "unknown tool");
                 }
-                builder
-                    .borrow_mut()
-                    .stack
-                    .push(Decision::Tool(ToolName::Counter));
-                Ok(())
+                Ok(built.make(Decision::Tool(ToolName::Counter)))
             },
         );
     }
     {
         let builder = Rc::clone(builder);
         engine.register_fn("complete", move || {
-            builder.borrow_mut().stack.push(Decision::Complete);
+            builder.borrow_mut().make(Decision::Complete)
         });
     }
     {
         let builder = Rc::clone(builder);
-        engine.register_fn("fail", move || {
-            builder.borrow_mut().stack.push(Decision::Fail);
-        });
+        engine.register_fn("fail", move || builder.borrow_mut().make(Decision::Fail));
     }
 }
 
-fn fault(builder: &mut Builder, message: &str) -> Result<(), Box<EvalAltResult>> {
+fn fault<T>(builder: &mut Builder, message: &str) -> Result<T, Box<EvalAltResult>> {
     builder.fault = Some(message.to_string());
     Err(EvalAltResult::ErrorRuntime(message.into(), Position::NONE).into())
 }
