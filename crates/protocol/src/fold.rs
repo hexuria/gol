@@ -107,7 +107,24 @@ mod tests {
         assert_eq!(state.steps, 2);
     }
 
-    // Complete is always allowed, so it is not a step of the budget.
+    // A Complete decided in Idle cannot finish the run either, so it is a step.
+    #[test]
+    fn a_complete_before_the_run_starts_is_a_step() {
+        let spec = sample_spec();
+        let events = vec![ev(
+            &spec,
+            EventPayload::EffectDecided {
+                effect: Effect::Complete {
+                    outcome: "done".into(),
+                },
+            },
+        )];
+        let state = fold(&spec, &events);
+        assert_eq!(state.harness, HarnessState::Idle);
+        assert_eq!(state.steps, 1);
+    }
+
+    // A Complete decided while Running finishes the run, so it is not a step.
     #[test]
     fn complete_is_not_a_step() {
         let spec = sample_spec();

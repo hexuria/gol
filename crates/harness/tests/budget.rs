@@ -2,9 +2,11 @@
 //! "every run eventually finishes" property: a decider that never completes is
 //! stopped by `limits.max_steps`, and the run fails with `FailureClass::Budget`.
 //!
-//! `Complete` is always allowed and never counts against either budget, so a
-//! run that has spent its budget can still finish. Every other effect counts,
-//! which is what stops a decider that never completes.
+//! A `Complete` that finishes the run is always allowed and never counts
+//! against either budget, so a run that has spent its budget can still finish.
+//! Every other decision counts, including a `Complete` while a tool call is
+//! outstanding (it cannot finish the run), which is what stops a decider that
+//! never completes.
 
 use harness::{
     run_to_completion, Decider, DeciderError, DecisionView, Driver, EchoTool, InMemory,

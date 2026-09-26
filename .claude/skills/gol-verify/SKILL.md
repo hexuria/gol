@@ -88,4 +88,4 @@ It asserts: validity is preserved; a change happens exactly where the transition
 
 Data fields take one value each, so a reducer that copies the wrong payload field is caught by the unit tests in `reduce.rs`, not here.
 
-`max_steps = 0` is enumerated with today's behavior: `RunStarted` enters `Running { step: 1 }` and no tool call is accepted. The driver lets a first `Complete` finish the run (`Complete` never counts against a budget) and fails any other first decision with `Budget` (`harness/tests/budget.rs`).
+`max_steps = 0` is enumerated with today's behavior: `RunStarted` enters `Running { step: 1 }` and no tool call is accepted. The driver lets a first `Complete` finish the run (a `Complete` that finishes the run never counts against a budget) and fails any other first decision with `Budget` (`harness/tests/budget.rs`).

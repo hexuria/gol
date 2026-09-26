@@ -20,7 +20,7 @@ A local run does the following.
 
 `POST /v1/runs` and `POST /v1/coworker/turns` accept each limit from 1 to 64 and answer 400 otherwise; the defaults are 8 steps and 4 model calls. `limits.max_steps` counts `EffectDecided` events, except a `Complete` decided while the harness is `Running`. `reduce` and `advance_answered_step` compare harness `step` to that same field. `limits.max_model_calls` counts authorized model calls. `FailureClass::Timeout` is the fold of `RunExpired`. This slice has no clock.
 
-`WaitingForTool` does not spin. A `Wait` effect is denied. The deny event is appended, `reduce` leaves the state in place, and the loop continues until a limit or `Complete`.
+`WaitingForTool` does not spin. A `Wait` effect is denied. The deny event is appended, `reduce` leaves the state in place, and the loop continues until the tool result arrives or the step budget runs out; a `Complete` while waiting cannot finish the run and costs a step.
 
 Cancellation is terminal. A later `ToolResult` stays `Cancelled`. A later `StepRetried` stays `Cancelled`. A second `ToolResult` for a call that is already answered does not move the state and does not emit another effect.
 
