@@ -151,10 +151,9 @@ pub trait SandboxHost: Send + Sync {
     fn exists(&self, name: &str) -> bool;
     /// `Ok(true)` when the host confirms no sandbox `name` is left, `Ok(false)`
     /// when one is, and an error when the host cannot tell. Only a confirmed
-    /// absence lets a turn end without removing its sandbox.
-    fn absent(&self, name: &str) -> Result<bool, SandboxError> {
-        Ok(!self.exists(name))
-    }
+    /// absence lets a turn end without removing its sandbox. Every host answers
+    /// it itself: `exists` cannot tell "gone" from "cannot ask".
+    fn absent(&self, name: &str) -> Result<bool, SandboxError>;
     fn launches_docker(&self) -> bool;
 }
 
@@ -195,6 +194,10 @@ impl SandboxHost for MemorySandbox {
 
     fn exists(&self, name: &str) -> bool {
         self.live.lock().expect("sandbox").contains(name)
+    }
+
+    fn absent(&self, name: &str) -> Result<bool, SandboxError> {
+        Ok(!self.exists(name))
     }
 
     fn launches_docker(&self) -> bool {
@@ -240,8 +243,13 @@ impl DockerSandbox {
     }
 
     fn command(&self, args: &[&str]) -> Result<(), SandboxError> {
+        self.run(args)
+            .map_err(|message| SandboxError::Host(last_line(&message)))
+    }
+
+    fn run(&self, args: &[&str]) -> Result<(), String> {
         let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-        self.command.run(&owned).map_err(SandboxError::Host)
+        self.command.run(&owned)
     }
 }
 
@@ -288,26 +296,38 @@ impl SandboxHost for DockerSandbox {
 
     /// Absent only when Docker answers that there is no such container. Any
     /// other failure (the daemon is unreachable, say) says nothing about it.
+    /// Absent only when Docker answers that there is no such container. Any
+    /// other failure (the daemon is unreachable, say) says nothing about it.
     fn absent(&self, name: &str) -> Result<bool, SandboxError> {
-        match self.command.run(&[
-            "inspect".to_string(),
-            "--type".to_string(),
-            "container".to_string(),
-            name.to_string(),
-        ]) {
+        match self.run(&["inspect", "--type", "container", name]) {
             Ok(()) => Ok(false),
-            Err(message)
-                if message.contains("No such object") || message.contains("No such container") =>
-            {
-                Ok(true)
-            }
-            Err(message) => Err(SandboxError::Host(message)),
+            Err(message) if message.contains("No such container") => Ok(true),
+            Err(message) => Err(SandboxError::Host(last_line(&message))),
         }
     }
 
     fn launches_docker(&self) -> bool {
         true
     }
+}
+
+/// The longest Docker error, in characters, a failure keeps.
+const MAX_DOCKER_ERROR: usize = 512;
+
+/// The last non-empty line of a Docker error, cut to `MAX_DOCKER_ERROR`
+/// characters. Docker's stderr can carry a whole image pull before the error,
+/// and the error ends up in the run's log.
+fn last_line(message: &str) -> String {
+    let line = message
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or("");
+    if line.chars().count() <= MAX_DOCKER_ERROR {
+        return line.to_string();
+    }
+    let kept: String = line.chars().take(MAX_DOCKER_ERROR).collect();
+    format!("{kept}…")
 }
 
 fn docker(args: &[String]) -> Result<(), String> {
@@ -476,7 +496,7 @@ pub fn accept_subscription_completion(
     check_open_turn(&stored)?;
     let box_turn = stored.spec.placement == ExecutionPlacement::Box;
     let name = box_container_name(stored.spec.run_id);
-    if box_turn && !sandbox.exists(&name) {
+    if box_turn && sandbox.absent(&name).map_err(sandbox_error)? {
         return Err(TurnError::Sandbox(
             "box sandbox is gone before the turn completed".to_string(),
         ));

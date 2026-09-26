@@ -561,6 +561,10 @@ impl SandboxHost for NoProvision {
         false
     }
 
+    fn absent(&self, _name: &str) -> Result<bool, SandboxError> {
+        Ok(true)
+    }
+
     fn launches_docker(&self) -> bool {
         false
     }

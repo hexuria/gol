@@ -441,7 +441,7 @@ impl FailingRemove {
                 if self.live.lock().expect("docker").contains(&name) {
                     Ok(())
                 } else {
-                    Err(format!("Error: No such object: {name}"))
+                    Err(no_such_container(&name))
                 }
             }
             other => Err(format!("unexpected docker {other:?}")),
@@ -1214,6 +1214,10 @@ impl SandboxHost for NoProvision {
         false
     }
 
+    fn absent(&self, _name: &str) -> Result<bool, server::SandboxError> {
+        Ok(true)
+    }
+
     fn launches_docker(&self) -> bool {
         false
     }
@@ -1479,6 +1483,10 @@ impl SandboxHost for ProvisionLeavesSandbox {
         true
     }
 
+    fn absent(&self, _name: &str) -> Result<bool, server::SandboxError> {
+        Ok(false)
+    }
+
     fn launches_docker(&self) -> bool {
         false
     }
@@ -1554,22 +1562,52 @@ fn fail_on_a_run_that_is_not_an_open_turn_is_a_conflict() {
     );
 }
 
-/// A Docker CLI stand-in. `inspect` answers as the real CLI does: success for a
-/// live container, "No such object" for a missing one. With `down` set every
-/// command fails as it does when the daemon cannot be reached.
+/// What the Docker 29 CLI prints for `inspect --type container` on a missing
+/// container.
+fn no_such_container(name: &str) -> String {
+    format!("Error response from daemon: No such container: {name}")
+}
+
+/// What the Docker 29 CLI prints when the daemon's socket is missing. It says
+/// "no such", but about the socket, not the container.
+const DAEMON_UNREACHABLE: &str = "failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct and if the daemon is running: dial unix /var/run/docker.sock: connect: no such file or directory";
+
+/// What the Docker 29 CLI prints when the socket refuses this user.
+const SOCKET_DENIED: &str =
+    "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock";
+
+/// A Docker CLI stand-in. `inspect` answers as the Docker 29 CLI does: success
+/// for a live container, "No such container" for a missing one. While `down`
+/// holds a message every command fails with it, as when the daemon cannot be
+/// reached. `create_error` makes `create` fail with that text.
 struct ScriptedDocker {
     live: Mutex<HashSet<String>>,
-    down: Mutex<bool>,
+    down: Mutex<Option<&'static str>>,
     fail_start: bool,
+    create_error: Option<String>,
 }
 
 impl ScriptedDocker {
     fn new(fail_start: bool) -> Arc<Self> {
         Arc::new(Self {
             live: Mutex::new(HashSet::new()),
-            down: Mutex::new(false),
+            down: Mutex::new(None),
             fail_start,
+            create_error: None,
         })
+    }
+
+    fn failing_create(error: String) -> Arc<Self> {
+        Arc::new(Self {
+            live: Mutex::new(HashSet::new()),
+            down: Mutex::new(None),
+            fail_start: false,
+            create_error: Some(error),
+        })
+    }
+
+    fn set_down(&self, message: Option<&'static str>) {
+        *self.down.lock().expect("docker") = message;
     }
 
     fn sandbox(self: &Arc<Self>) -> DockerSandbox {
@@ -1578,18 +1616,19 @@ impl ScriptedDocker {
     }
 
     fn call(&self, args: &[String]) -> Result<(), String> {
-        if *self.down.lock().expect("docker") {
-            return Err(
-                "Cannot connect to the Docker daemon at unix:///var/run/docker.sock".to_string(),
-            );
+        if let Some(message) = *self.down.lock().expect("docker") {
+            return Err(message.to_string());
         }
         let name = docker_target(args);
         let mut live = self.live.lock().expect("docker");
         match args.first().map(String::as_str) {
-            Some("create") => {
-                live.insert(name);
-                Ok(())
-            }
+            Some("create") => match &self.create_error {
+                Some(error) => Err(error.clone()),
+                None => {
+                    live.insert(name);
+                    Ok(())
+                }
+            },
             Some("start") if self.fail_start => Err(format!("start {name} failed")),
             Some("start") => Ok(()),
             Some("rm") => {
@@ -1597,7 +1636,7 @@ impl ScriptedDocker {
                 Ok(())
             }
             Some("inspect") if live.contains(&name) => Ok(()),
-            Some("inspect") => Err(format!("Error: No such object: {name}")),
+            Some("inspect") => Err(no_such_container(&name)),
             other => Err(format!("unexpected docker {other:?}")),
         }
     }
@@ -1623,39 +1662,99 @@ fn a_provision_whose_container_is_gone_ends_the_turn() {
 }
 
 // formal/runlog CompletedHasNoSandbox: when Docker cannot say whether the
-// container is gone (the daemon is unreachable), a failed provision does not
-// end the turn.
+// container is gone (the daemon is unreachable or refuses this user), a failed
+// provision does not end the turn.
 #[test]
 fn an_unreachable_docker_does_not_end_a_failed_provision() {
-    let docker = ScriptedDocker::new(false);
-    *docker.down.lock().expect("docker") = true;
-    let sandbox = docker.sandbox();
-    let spec = subscription_spec(ExecutionPlacement::Box);
-    let store = InMemoryStore::default();
-    let error =
-        open_turn(&store, spec.clone(), &SilentPoster, &sandbox).expect_err("docker is down");
-    assert!(matches!(error, TurnError::Sandbox(_)), "{error:?}");
-    let events = store.run(spec.run_id).expect("run").events;
-    assert_eq!(terminals(&events), Vec::<String>::new());
+    for message in [DAEMON_UNREACHABLE, SOCKET_DENIED] {
+        let docker = ScriptedDocker::new(false);
+        docker.set_down(Some(message));
+        let sandbox = docker.sandbox();
+        let spec = subscription_spec(ExecutionPlacement::Box);
+        let store = InMemoryStore::default();
+        let error =
+            open_turn(&store, spec.clone(), &SilentPoster, &sandbox).expect_err("docker is down");
+        assert!(matches!(error, TurnError::Sandbox(_)), "{error:?}");
+        let events = store.run(spec.run_id).expect("run").events;
+        assert_eq!(terminals(&events), Vec::<String>::new(), "{message}");
+    }
 }
 
 // formal/runlog CompletedHasNoSandbox for the failer: fail_turn does not skip
 // the removal because Docker could not be asked, and does not end the turn.
 #[test]
 fn an_unreachable_docker_does_not_end_a_failed_turn() {
+    for message in [DAEMON_UNREACHABLE, SOCKET_DENIED] {
+        let docker = ScriptedDocker::new(false);
+        let sandbox = docker.sandbox();
+        let spec = subscription_spec(ExecutionPlacement::Box);
+        let store = InMemoryStore::default();
+        open_turn(&store, spec.clone(), &SilentPoster, &sandbox).expect("open");
+        docker.set_down(Some(message));
+
+        let error =
+            fail_turn(&store, spec.run_id, "proxy said 529", &sandbox).expect_err("docker is down");
+
+        assert!(
+            matches!(&error, TurnError::Sandbox(text) if text == message),
+            "{error:?}"
+        );
+        let events = store.run(spec.run_id).expect("run").events;
+        assert_eq!(terminals(&events), Vec::<String>::new(), "{message}");
+        docker.set_down(None);
+        assert!(sandbox.exists(&box_container_name(spec.run_id)));
+    }
+}
+
+// A completion while Docker cannot be reached reports Docker's error, not a
+// sandbox that is gone, and leaves the turn open.
+#[test]
+fn an_unreachable_docker_does_not_complete_a_turn() {
     let docker = ScriptedDocker::new(false);
     let sandbox = docker.sandbox();
     let spec = subscription_spec(ExecutionPlacement::Box);
     let store = InMemoryStore::default();
     open_turn(&store, spec.clone(), &SilentPoster, &sandbox).expect("open");
-    *docker.down.lock().expect("docker") = true;
+    docker.set_down(Some(DAEMON_UNREACHABLE));
 
-    let error =
-        fail_turn(&store, spec.run_id, "proxy said 529", &sandbox).expect_err("docker is down");
+    let error = accept_subscription_completion(&store, spec.run_id, "done", &sandbox)
+        .expect_err("docker is down");
 
-    assert!(matches!(error, TurnError::Sandbox(_)), "{error:?}");
+    assert!(
+        matches!(&error, TurnError::Sandbox(text) if text == DAEMON_UNREACHABLE),
+        "{error:?}"
+    );
     let events = store.run(spec.run_id).expect("run").events;
     assert_eq!(terminals(&events), Vec::<String>::new());
-    *docker.down.lock().expect("docker") = false;
-    assert!(sandbox.exists(&box_container_name(spec.run_id)));
+}
+
+// Docker's stderr can carry a whole image pull before the error. The recorded
+// failure keeps its last line, and at most 512 characters of it.
+#[test]
+fn a_docker_error_is_recorded_as_its_last_line() {
+    let progress = "Unable to find image 'gol-agent:production' locally\n".to_string()
+        + &"Pulling fs layer\n".repeat(1_000);
+    for (last, kept) in [
+        (
+            "Error response from daemon: pull access denied".to_string(),
+            "Error response from daemon: pull access denied".to_string(),
+        ),
+        ("x".repeat(2_000), format!("{}…", "x".repeat(512))),
+    ] {
+        let docker = ScriptedDocker::failing_create(format!("{progress}{last}\n"));
+        let sandbox = docker.sandbox();
+        let spec = subscription_spec(ExecutionPlacement::Box);
+        let store = InMemoryStore::default();
+        let error =
+            open_turn(&store, spec.clone(), &SilentPoster, &sandbox).expect_err("create fails");
+        assert!(
+            matches!(&error, TurnError::Sandbox(text) if *text == kept),
+            "{error:?}"
+        );
+        let events = store.run(spec.run_id).expect("run").events;
+        assert_eq!(
+            terminals(&events),
+            vec![format!("failed Environment: provision: {kept}")]
+        );
+    }
 }
