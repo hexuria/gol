@@ -6,4 +6,6 @@ publish = false
 
 [dependencies]
 workflow-core = { path = "../workflow-core" }
-rhai = "1.26.1"
+# internals exposes on_missing_function, which makes a misuse a sticky fault.
+# The hook is a volatile rhai API, so the version is pinned exactly.
+rhai = { version = "=1.26.1", features = ["internals"] }
