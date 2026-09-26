@@ -8,6 +8,9 @@ use crate::{Decider, DeciderError, DecisionView};
 /// How many of the latest events `jev_state` shows Jev.
 pub const RECENT_EVENTS: usize = 16;
 
+/// The longest string, in characters, `jev_state` keeps inside a recent event.
+pub const MAX_EVENT_TEXT: usize = 2048;
+
 const MODEL: &str = "model";
 const COMPLETE: &str = "complete";
 
@@ -22,7 +25,9 @@ impl JevDecider {
 }
 
 /// The run as Jev sees it: the input, a summary of the fold, the latest
-/// `RECENT_EVENTS` event payloads, the tool catalog and the skills.
+/// `RECENT_EVENTS` event payloads (each string capped at `MAX_EVENT_TEXT`
+/// characters), the tool catalog and the skills. The input is sent once, in
+/// full.
 pub fn jev_state(view: &DecisionView<'_>) -> Value {
     let limits = &view.spec.limits;
     let recent = &view.events[view.events.len().saturating_sub(RECENT_EVENTS)..];
@@ -37,7 +42,10 @@ pub fn jev_state(view: &DecisionView<'_>) -> Value {
             "steps_exhausted": view.steps_exhausted,
             "model_calls_exhausted": view.model_calls_exhausted,
         },
-        "recent_events": recent.iter().map(|event| &event.payload).collect::<Vec<_>>(),
+        "recent_events": recent
+            .iter()
+            .map(|event| capped(json!(event.payload)))
+            .collect::<Vec<_>>(),
         "tools": view.tools.iter().map(|tool| json!({
             "name": tool.name,
             "description": tool.description,
@@ -50,8 +58,36 @@ pub fn jev_state(view: &DecisionView<'_>) -> Value {
     })
 }
 
+/// `value` with every string longer than `MAX_EVENT_TEXT` characters cut to
+/// that length and marked. Event payloads repeat the input and tool outputs, so
+/// without the cap each step would resend them in full.
+fn capped(value: Value) -> Value {
+    match value {
+        Value::String(text) => {
+            let length = text.chars().count();
+            if length <= MAX_EVENT_TEXT {
+                return Value::String(text);
+            }
+            let kept: String = text.chars().take(MAX_EVENT_TEXT).collect();
+            Value::String(format!(
+                "{kept}… [truncated {} chars]",
+                length - MAX_EVENT_TEXT
+            ))
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(capped).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, field)| (key, capped(field)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 /// The choices Jev is offered, as (label, description). Once the step budget
-/// is spent only `complete` is offered, the one decision that is still free.
+/// is spent only `complete` is offered: while the harness is running it is the
+/// one decision that is still free.
 /// Otherwise each catalog tool is offered under its own name, then `model`
 /// while model calls remain, then `complete`. A tool named `model` or
 /// `complete` is left out, since its label would be ambiguous.

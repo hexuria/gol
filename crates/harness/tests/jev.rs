@@ -4,8 +4,8 @@
 //! `/v1/systemone`; the requests it receives are read back and checked.
 
 use harness::{
-    jev_choices, jev_state, run_to_completion, DecisionView, Driver, EchoTool, InMemory,
-    JevDecider, ModelCompletion, Skill, Tool,
+    jev_choices, jev_state, run_to_completion, DeciderError, DecisionView, Driver, EchoTool,
+    InMemory, JevDecider, ModelCompletion, Skill, Tool, MAX_EVENT_TEXT,
 };
 use protocol::{
     AgentId, Capability, CredentialSource, Event, EventPayload, ExecutionPlacement, HarnessState,
@@ -29,9 +29,13 @@ impl ModelCompletion for Answering {
 }
 
 fn spec(limits: Limits) -> RunSpec {
+    spec_with_input(limits, "hi")
+}
+
+fn spec_with_input(limits: Limits, input: &str) -> RunSpec {
     RunSpec::builder()
         .agent(AgentId::new(), "1")
-        .input("hi")
+        .input(input)
         .placement(ExecutionPlacement::Local)
         .work_model(WorkModel {
             provider: ModelProvider::Anthropic,
@@ -97,6 +101,15 @@ struct Ran {
 
 /// Runs a fresh driver against Jev at `base_url` until the run ends.
 async fn run(base_url: String, limits: Limits) -> Ran {
+    let (ended, ran) = try_run(base_url, limits, "hi").await;
+    ended.unwrap();
+    ran
+}
+
+/// Runs a fresh driver with `input` against Jev at `base_url`, and returns how
+/// the loop ended with the run as it then stood.
+async fn try_run(base_url: String, limits: Limits, input: &str) -> (Result<(), DeciderError>, Ran) {
+    let input = input.to_string();
     tokio::task::spawn_blocking(move || {
         let client = typesafe_sdk::blocking::Client::builder()
             .api_key("gol")
@@ -105,21 +118,21 @@ async fn run(base_url: String, limits: Limits) -> Ran {
             .build()
             .unwrap();
         let mut decider = JevDecider::new(client);
-        let mut driver = Driver::boot(spec(limits)).unwrap();
+        let mut driver = Driver::boot(spec_with_input(limits, &input)).unwrap();
         let echo = EchoTool;
         let tools: [&dyn Tool; 1] = [&echo];
-        run_to_completion(
+        let ended = run_to_completion(
             &mut driver,
             &mut decider,
             &tools,
             &Answering,
             &mut InMemory::default(),
-        )
-        .unwrap();
-        Ran {
+        );
+        let ran = Ran {
             events: driver.events().to_vec(),
             state: driver.state(),
-        }
+        };
+        (ended, ran)
     })
     .await
     .unwrap()
@@ -222,6 +235,84 @@ async fn jev_leaves_out_model_after_the_model_budget() {
     assert_eq!(
         *criteria(&sent[1]),
         json!({"echo": "Returns the input text.", "complete": "Finish the run."})
+    );
+}
+
+fn decided(ran: &Ran) -> usize {
+    ran.events
+        .iter()
+        .filter(|event| matches!(event.payload, EventPayload::EffectDecided { .. }))
+        .count()
+}
+
+// Jev may only pick what it was offered. After the last model call `model` is
+// not offered, so answering it anyway is an error, not a model call that would
+// fail the run on its budget.
+#[tokio::test]
+async fn an_answer_that_was_not_offered_is_an_error() {
+    let server = jev(&["model", "model"]).await;
+    let (ended, ran) = try_run(server.uri(), limits(4, 1), "hi").await;
+    assert_eq!(
+        ended,
+        Err(DeciderError {
+            message: "unknown effect choice: model".into()
+        })
+    );
+    assert_eq!(ran.state.model_calls, 1);
+    assert_eq!(decided(&ran), 1);
+}
+
+// A label no one offered is not taken as a tool name.
+#[tokio::test]
+async fn an_invented_label_is_an_error() {
+    let server = jev(&["shell"]).await;
+    let (ended, ran) = try_run(server.uri(), limits(4, 4), "hi").await;
+    assert_eq!(
+        ended,
+        Err(DeciderError {
+            message: "unknown effect choice: shell".into()
+        })
+    );
+    assert_eq!(decided(&ran), 0);
+}
+
+fn strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => out.push(text.clone()),
+        Value::Array(items) => items.iter().for_each(|item| strings(item, out)),
+        Value::Object(fields) => fields.values().for_each(|field| strings(field, out)),
+        _ => {}
+    }
+}
+
+// The input is sent once in full; the copies of it inside recent events are
+// cut, so a long input does not grow the request with every step.
+#[tokio::test]
+async fn long_event_text_is_capped_in_the_state() {
+    let input = "x".repeat(100_000);
+    let server = jev(&["echo", "complete"]).await;
+    let (ended, _) = try_run(server.uri(), limits(4, 4), &input).await;
+    ended.unwrap();
+
+    let sent = requests(&server).await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["state"]["input"], input.as_str());
+    let mut texts = Vec::new();
+    strings(&sent[1]["state"]["recent_events"], &mut texts);
+    let longest = texts.iter().map(|text| text.chars().count()).max().unwrap();
+    assert!(
+        longest < MAX_EVENT_TEXT + 64,
+        "longest event text: {longest}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.ends_with("… [truncated 97952 chars]")),
+        "{:?}",
+        texts
+            .iter()
+            .map(|text| text.chars().count())
+            .collect::<Vec<_>>()
     );
 }
 
