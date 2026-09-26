@@ -1,6 +1,6 @@
 # Harness findings
 
-Checked on 2026-09-23. The harness phase and the control-plane dispatch phase are separate variables. This file does not call the machine minimal. It records no Lean lower bound on the number of phases.
+Checked on 2026-09-23. The harness phase and the control-plane dispatch phase are separate variables. This file does not call the machine minimal.
 
 ## Model
 
@@ -12,7 +12,7 @@ Variables are `session`, `dispatch`, `turnPhase`, `turnStep`, `owner`, `attempt`
 
 The numeric bounds are unchanged. `MaxTurns = 2`, `MaxSteps = 3`, `MaxWorkers = 2`, `MaxRetries = 2`, `MaxTools = 2`. The dispatch phase set is the full control-plane enum. No numeric bound was raised. Waiting reasons and approval ids are payload data on those variants. TLC stores the phase name.
 
-`formal/lean/Harness.lean` is the single-turn relation. It has the same six phases and the same tool, retry, advance, cancel, complete, and fail steps. It does not model a second turn, workers, or dispatch. Those interleavings stay in TLA+.
+The single-turn relation is checked on production Rust, not on a copy: `crates/protocol/tests/reduce_bounded.rs` enumerates every bounded (state, event) pair of `reduce` and `reduce_dispatch`. See Lean (retired) below.
 
 ## Properties
 
@@ -33,13 +33,6 @@ TLC properties:
 - `SchedulingPreserves`. Queue, schedule, provision, prepare, wait, approval, pause, recover, and resume leave the harness variables unchanged.
 - `RankDecreases`. A state-changing step lowers `Rank`, except `DispatchResume`, which returns dispatch to `running` and is exempt.
 - `EventuallyDone`. `FairSpec` is `Spec /\ WF_vars(Next) /\ WF_vars(DispatchComplete)`. The 2026-09-23 run recorded below used the earlier `FairSpec` and does not cover this formula. The 2026-09-25 run does.
-
-Lean theorems:
-
-- `Valid s` means the attempt is at most 2, the step is at most 3, `waiting` lines up with `pending`, a terminal phase has no pending tool, `idle` is the zero record, and `running` or `waiting` has step at least 1.
-- `step_preserves_validity`. `Valid s` and `allowed s e` imply `Valid (step s e)`.
-- `rank_decreases` on every allowed event except `duplicateResult`.
-- `terminal_stuck`, `late_tool_result`, `retry_after_cancel`, `duplicate_is_identity`, and `disallowed_is_identity`.
 
 ## TLA+ Findings
 
@@ -171,22 +164,31 @@ That runs `java -XX:+UseParallelGC -jar ~/.local/tla/tla2tools.jar -workers auto
 
 Bounds are `MaxTurns`, `MaxSteps`, `MaxWorkers`, `MaxRetries`, `MaxTools`. The whole `verify-tla.sh` took 49s against 17min 55s before, on the same machine. The old `Harness.cfg` took about 28 minutes on the 4-vCPU GitHub runner.
 
-## Lean Findings
+## Lean (retired)
 
-Command, from `formal/lean`, toolchain `leanprover/lean4:v4.34.0`:
+`formal/lean/Harness.lean` was a hand copy of the single-turn reducer. Its `step_preserves_validity` and `rank_decreases` were decided by `native_decide` over a scan of 2,592 (state, event) pairs of the copy, with the attempt at most 2 and the step at most 3. It was removed after `crates/protocol/tests/reduce_bounded.rs` checked the same properties on production `reduce`:
 
-```text
-lake build
-```
+| Lean theorem | Rust owner |
+|---|---|
+| `step_preserves_validity` | `reduce_bounded`: validity is preserved on every pair |
+| `rank_decreases` | `reduce_bounded`: a lexicographic rank drops on every change |
+| `terminal_stuck` | `reduce_bounded`: terminal states absorb every event; proptest `terminal_state_is_stuck` |
+| `late_tool_result` | `late_tool_result_after_cancel_stays_cancelled` in `reduce.rs` |
+| `retry_after_cancel`, `no_retry_after_cancel` | `retry_after_cancel_stays_cancelled` in `reduce.rs` |
+| `duplicate_is_identity` | `duplicate_tool_result_stays_answered` in `reduce.rs`; `reduce_bounded` table |
+| `disallowed_is_identity` | `reduce_bounded`: a pair outside the transition table leaves the state unchanged |
 
-```text
-✔ [2/3] Built Harness (499ms)
-Build completed successfully (3 jobs).
-```
+The Rust test covers more than the copy did: `max_steps` ∈ {0, 1, 2, 3, 9}, invocation matching, `RunExpired`, and every effect kind.
 
-`scanOk` and `scanRank` evaluate `okStep` and `rankOk` on every phase, every attempt in `0..2`, every step in `0..3`, both booleans, and all nine events. `native_decide` accepts both scans. The theorems lift that rectangle through `Valid`, which already forces the attempt and step bounds. This is a bounded check of preservation and rank. It is not a proof that fewer phases would fail.
+`formal/replay/Replay.lean` restated `formal/workflow/Replay.tla` for the counter journal. `Replay.tla` stays as the design model; the Rust owners are:
 
-`duplicateResult` is the stutter Lean excludes from the rank theorem. `apply` returns the same state for that event.
+| Lean theorem | Rust owner |
+|---|---|
+| `journaled_result_forces_branch` | `branch_on_recorded_counter` in `crates/workflow-core/src/program.rs`: no record executes the counter, 0 completes, nonzero fails, no wait |
+| `branch_changes_id` | `branch_on_recorded_counter`: each recorded path gets its own effect id at sequence 0 |
+| `held_is_not_a_hit` | `held_bytes_are_not_a_hit_before_ok` in `crates/runtime-tokio/src/journal.rs` |
+| `journaled_id_not_executed_again`, `hit_sticks`, `hit_disables_perform` | `kill_after_commit_skips_the_counter` in `crates/runtime-tokio/tests/replay_proof.rs`: after the rerun the effect count stays 1 and the log keeps the committed zero |
+| `crash_reenables_perform` | `kill_before_commit_leaves_the_next_unstarted`: a kill before commit leaves no record, so the rerun performs the effect again |
 
 ## Simplification
 

@@ -165,8 +165,8 @@ jobs:
           fi
 
   formal:
-    # verify-formal.sh is verify-bend.sh, verify-tla.sh, and verify-lean.sh. The bend workflow runs
-    # verify-bend.sh on the same events, so this job runs the other two and needs no Rust or Bend.
+    # verify-formal.sh is verify-bend.sh and verify-tla.sh. The bend workflow runs verify-bend.sh on
+    # the same events, so this job runs TLC and needs no Rust or Bend.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -178,14 +178,14 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
         run: |
-          # TLC and lake read only these paths, and the TLC jar is pinned. A pull
+          # TLC reads only these paths, and the TLC jar is pinned. A pull
           # request that leaves them unchanged gets the result main already has.
           # Pushes to main always check.
-          inputs=(formal scripts/install-tla.sh scripts/verify-tla.sh scripts/verify-lean.sh .github/workflows/pr.yml)
+          inputs=(formal scripts/install-tla.sh scripts/verify-tla.sh .github/workflows/pr.yml)
           if [ "$EVENT" = pull_request ] \
             && git rev-parse --verify --quiet HEAD^1 >/dev/null \
             && git diff --quiet HEAD^1 HEAD -- "${inputs[@]}"; then
-            echo "No formal input changed against the base. TLC and lake are skipped."
+            echo "No formal input changed against the base. TLC is skipped."
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -193,15 +193,6 @@ jobs:
       - name: Install TLA+ tools
         if: steps.scope.outputs.run == 'true'
         run: ./scripts/install-tla.sh
-      - name: Install Lean
-        if: steps.scope.outputs.run == 'true'
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
-          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-      # Lean takes seconds and TLC takes minutes, so a Lean failure shows up first.
-      - name: ./scripts/verify-lean.sh
-        if: steps.scope.outputs.run == 'true'
-        run: ./scripts/verify-lean.sh
       - name: ./scripts/verify-tla.sh
         if: steps.scope.outputs.run == 'true'
         run: ./scripts/verify-tla.sh

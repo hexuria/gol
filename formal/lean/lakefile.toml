@@ -1,6 +1,0 @@
-name = "harness"
-version = "0.1.0"
-defaultTargets = ["Harness"]
-
-[[lean_lib]]
-name = "Harness"

@@ -1,6 +1,0 @@
-name = "replay"
-version = "0.1.0"
-defaultTargets = ["Replay"]
-
-[[lean_lib]]
-name = "Replay"

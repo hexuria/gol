@@ -6,4 +6,3 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 
 "${root}/scripts/verify-bend.sh"
 "${root}/scripts/verify-tla.sh"
-"${root}/scripts/verify-lean.sh"

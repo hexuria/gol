@@ -1,6 +1,6 @@
 //! Every bounded (state, event) pair of the production reducers.
 //!
-//! This owns what `formal/lean/Harness.lean` decided over a copy of the reducer:
+//! This owns what the retired Lean copy (`Harness.lean`) decided over a copy of the reducer:
 //! validity is preserved, a lexicographic rank strictly drops on every change,
 //! terminal states absorb every event, and a pair outside the transition table
 //! leaves the state unchanged. Here the subject is `protocol::reduce` and
