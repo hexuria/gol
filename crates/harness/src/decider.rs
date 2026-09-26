@@ -16,6 +16,8 @@ pub struct DecisionView<'a> {
     pub skills: &'a [Skill],
     /// The run has spent its step budget. Only a `Complete` that finishes the
     /// run is still allowed; any other decision fails the run with `Budget`.
+    /// While a tool call is outstanding even a `Complete` cannot finish the
+    /// run, so it fails too.
     pub steps_exhausted: bool,
     /// The run has spent its model-call budget. A model call fails the run
     /// with `Budget`; other effects are still allowed while steps remain.

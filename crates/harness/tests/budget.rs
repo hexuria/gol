@@ -339,3 +339,17 @@ fn a_decider_sees_which_budget_is_spent() {
     assert!(completed(&driver), "{:?}", driver.state().harness);
     assert_eq!(decider.seen, [(false, false), (false, true), (true, true)]);
 }
+
+// A model call needs a step as well as a model call: with model calls left
+// but no step left, it fails on the step budget.
+#[test]
+fn a_model_call_past_the_step_limit_fails() {
+    let limits = Limits {
+        max_steps: 1,
+        max_model_calls: 4,
+    };
+    let driver = run_with(limits, vec![model(), model(), complete()], &Answering);
+    assert!(failed_on_budget(&driver), "{:?}", driver.state().harness);
+    assert_eq!(budget_failures(&driver), 1);
+    assert_eq!(driver.state().steps, 1);
+}
