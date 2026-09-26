@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use std::sync::Arc;
 
 use server::{router_with_gateway, HttpGatewayPoster, InMemoryStore};

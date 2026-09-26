@@ -1,0 +1,14 @@
+# The verification policy and the models it relies on. GitHub requests the owner's review on
+# pull requests that change these paths; branch protection decides whether that review is required.
+/AGENTS.md                  @codeitlikemiley
+/CLAUDE.md                  @codeitlikemiley
+/.claude/                   @codeitlikemiley
+/formal/                    @codeitlikemiley
+/scripts/verify-*.sh        @codeitlikemiley
+/scripts/check-architecture.sh @codeitlikemiley
+/scripts/ci-scope.sh        @codeitlikemiley
+/.github/                   @codeitlikemiley
+/deny.toml                  @codeitlikemiley
+/.cargo/                    @codeitlikemiley
+/rust-toolchain*            @codeitlikemiley
+proptest-regressions/       @codeitlikemiley

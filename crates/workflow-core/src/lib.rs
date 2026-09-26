@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 mod driver;
 mod program;
 mod step;
