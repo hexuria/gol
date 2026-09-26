@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use protocol::{
     fold, Actor, CredentialSource, Event, EventPayload, EventSource, ExecutionPlacement,
-    HarnessState, MessageRole, ModelMessage, RunId, RunSpec, Timestamp,
+    FailureClass, HarnessState, MessageRole, ModelMessage, RunId, RunSpec, Timestamp,
 };
 
 use crate::store::{is_terminal, Append, RunStore, StoredRun};
@@ -502,6 +502,21 @@ pub fn user_message_event(spec: &RunSpec) -> Event {
         EventPayload::UserMessage {
             text: spec.input.clone(),
         },
+    )
+}
+
+/// The terminal event for a run the server could not finish. Appending it ends
+/// the run, so a failure never leaves the run open.
+pub fn run_failed_event(spec: &RunSpec, class: FailureClass, message: String) -> Event {
+    Event::record(
+        EventSource::new(
+            spec.run_id,
+            spec.agent_id,
+            &spec.agent_version,
+            Actor::System,
+            Timestamp::now(),
+        ),
+        EventPayload::RunFailed { class, message },
     )
 }
 
