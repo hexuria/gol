@@ -77,7 +77,7 @@ fn a_decision_used_twice_is_rejected() {
 fn a_doubling_loop_is_rejected() {
     assert!(matches!(
         compile("let d = complete();\nfor (let i = 0; i < 8; i++) { d = onCounter(d, d, d); }\n"),
-        Err(FrontendError::InvalidProgram(_))
+        Err(FrontendError::InvalidProgram(message)) if message == "decision used twice"
     ));
 }
 
@@ -112,6 +112,10 @@ fn misuse_is_an_invalid_program() {
         "onCounter(1, 2, 3);\n",
         "onCounter(complete(), fail());\n",
         "onCounter(tool(\"counter\"), complete(), fail(), fail());\n",
+        "onCounter(tool(\"counter\"), complete(), fail(), fail(), fail());\n",
+        "tool(\"counter\", 1);\n",
+        "complete(1);\n",
+        "fail(1);\n",
     ] {
         assert!(
             matches!(compile(source), Err(FrontendError::InvalidProgram(_))),
@@ -119,4 +123,44 @@ fn misuse_is_an_invalid_program() {
             compile(source)
         );
     }
+}
+
+// complete() plus 341 links of three decisions each is exactly the cap.
+#[test]
+fn the_decision_cap_is_exactly_1024() {
+    let at_cap = "let d = complete();\nfor (let i = 0; i < 341; i++) { d = onCounter(d, fail(), fail()); }\n";
+    assert!(compile(at_cap).is_ok(), "{:?}", compile(at_cap));
+    let past_cap = "let d = complete();\nfor (let i = 0; i < 341; i++) { d = onCounter(d, fail(), fail()); }\nfail();\n";
+    assert!(matches!(
+        compile(past_cap),
+        Err(FrontendError::InvalidProgram(message)) if message == "too many decisions"
+    ));
+}
+
+// Catching a misuse must not turn it into a valid program: a fault stays set
+// even when the script catches the exception it raised.
+#[test]
+fn a_caught_misuse_is_still_rejected() {
+    for source in [
+        "try { tool(1); } catch (e) {}\ncomplete();\n",
+        "try { onCounter(1, 2, 3); } catch (e) {}\ncomplete();\n",
+        "try { tool(\"counter\", 1); } catch (e) {}\ncomplete();\n",
+        "try { complete(1); } catch (e) {}\ncomplete();\n",
+        "[1, 2].sort((a, b) => { try { tool(1); } catch (e) {} return 0; });\ncomplete();\n",
+    ] {
+        assert!(
+            matches!(compile(source), Err(FrontendError::InvalidProgram(_))),
+            "{source}: {:?}",
+            compile(source)
+        );
+    }
+}
+
+// The first fault is the one reported.
+#[test]
+fn the_first_fault_is_reported() {
+    assert!(matches!(
+        compile("try { tool(1); } catch (e) {}\ntool(\"nope\");\n"),
+        Err(FrontendError::InvalidProgram(message)) if message == "tool name must be a string"
+    ));
 }

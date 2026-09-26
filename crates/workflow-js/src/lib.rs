@@ -116,9 +116,11 @@ fn on_counter(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
 }
 
 fn tool(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(name) = args
-        .first()
-        .and_then(JsValue::as_string)
+    let [name] = args else {
+        return fault(context, "tool takes exactly one name");
+    };
+    let Some(name) = name
+        .as_string()
         .and_then(|value| value.to_std_string().ok())
     else {
         return fault(context, "tool name must be a string");
@@ -129,11 +131,17 @@ fn tool(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<Js
     make(context, Decision::Tool(ToolName::Counter))
 }
 
-fn complete(_this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn complete(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    if !args.is_empty() {
+        return fault(context, "complete takes no arguments");
+    }
     make(context, Decision::Complete)
 }
 
-fn fail(_this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn fail(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    if !args.is_empty() {
+        return fault(context, "fail takes no arguments");
+    }
     make(context, Decision::Fail)
 }
 
@@ -168,9 +176,10 @@ fn make(context: &mut Context, decision: Decision) -> JsResult<JsValue> {
     Ok(handle.into())
 }
 
+/// Records the first fault; a later one does not replace it.
 fn fault(context: &mut Context, message: &str) -> JsResult<JsValue> {
     if let Some(mut builder) = context.remove_data::<Builder>() {
-        builder.fault = Some(message.to_string());
+        builder.fault.get_or_insert_with(|| message.to_string());
         context.insert_data(*builder);
     }
     Err(native(message))

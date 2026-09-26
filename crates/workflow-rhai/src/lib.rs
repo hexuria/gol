@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+use rhai::packages::{ArithmeticPackage, BasicIteratorPackage, LogicPackage, Package};
 use rhai::{Dynamic, Engine, EvalAltResult, OptimizationLevel, Position};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -68,7 +69,7 @@ pub fn compile(source: &str) -> Result<WorkflowProgram, FrontendError> {
         nodes: Vec::new(),
         fault: None,
     }));
-    let mut engine = Engine::new();
+    let mut engine = language();
     engine
         .set_optimization_level(OptimizationLevel::None)
         .set_max_operations(MAX_OPERATIONS)
@@ -97,8 +98,48 @@ pub fn compile(source: &str) -> Result<WorkflowProgram, FrontendError> {
     }
 }
 
+const BUILTINS: [&str; 4] = ["on_counter", "tool", "complete", "fail"];
+
+/// The language a workflow script is written in: numbers, comparisons,
+/// ranges, variables, control flow, script functions and the builtins below.
+/// It leaves out Rhai's standard library and function pointers. Array, map
+/// and string methods take callbacks that drop their errors (a sort comparator
+/// that misuses a builtin would compile), `sleep` stalls without spending
+/// operations, and `eval` compiles code the budget never sees at parse time.
+fn language() -> Engine {
+    let mut engine = Engine::new_raw();
+    for package in [
+        ArithmeticPackage::new().as_shared_module(),
+        LogicPackage::new().as_shared_module(),
+        BasicIteratorPackage::new().as_shared_module(),
+    ] {
+        engine.register_global_module(package);
+    }
+    for keyword in ["Fn", "call", "curry", "eval"] {
+        engine.disable_symbol(keyword);
+    }
+    engine
+}
+
 fn register(engine: &mut Engine, builder: &Rc<RefCell<Builder>>) {
     engine.register_type_with_name::<Node>("Decision");
+    {
+        // A call to a builtin that no overload takes is a malformed program,
+        // as in JS. The fault is recorded where the call fails, so a script
+        // that catches the error still fails to compile. Rhai also runs this
+        // hook when a matching overload fails (a fault of its own, or the
+        // operation budget running out at that call), so only arguments no
+        // overload accepts count as misuse.
+        let builder = Rc::clone(builder);
+        #[allow(deprecated)] // rhai marks this API volatile, not deprecated.
+        engine.on_missing_function(move |name, args, _, _| {
+            if BUILTINS.contains(&name) && !has_overload(name, args) {
+                let message = format!("{name} called with the wrong arguments");
+                let _ = fault::<()>(&mut builder.borrow_mut(), &message);
+            }
+            Ok(None)
+        });
+    }
     {
         let builder = Rc::clone(builder);
         engine.register_fn(
@@ -137,50 +178,23 @@ fn register(engine: &mut Engine, builder: &Rc<RefCell<Builder>>) {
         let builder = Rc::clone(builder);
         engine.register_fn("fail", move || builder.borrow_mut().make(Decision::Fail));
     }
-    register_misuse(engine, builder);
 }
 
-/// Overloads that only match a wrong call, so misuse is an invalid program
-/// here as it is in the JS frontend, not a "function not found" script error.
-/// Rhai tries the typed overloads above before these `Dynamic` ones.
-fn register_misuse(engine: &mut Engine, builder: &Rc<RefCell<Builder>>) {
-    const ON_COUNTER: &str = "on_counter takes exactly three decisions";
-    const TOOL: &str = "tool name must be a string";
-    let misuse = |message: &'static str| {
-        let builder = Rc::clone(builder);
-        move || -> Result<Node, Box<EvalAltResult>> { fault(&mut builder.borrow_mut(), message) }
-    };
-    engine.register_fn("on_counter", misuse(ON_COUNTER));
-    {
-        let reject = misuse(ON_COUNTER);
-        engine.register_fn("on_counter", move |_: Dynamic| reject());
-    }
-    {
-        let reject = misuse(ON_COUNTER);
-        engine.register_fn("on_counter", move |_: Dynamic, _: Dynamic| reject());
-    }
-    {
-        let reject = misuse(ON_COUNTER);
-        engine.register_fn("on_counter", move |_: Dynamic, _: Dynamic, _: Dynamic| {
-            reject()
-        });
-    }
-    {
-        let reject = misuse(ON_COUNTER);
-        engine.register_fn(
-            "on_counter",
-            move |_: Dynamic, _: Dynamic, _: Dynamic, _: Dynamic| reject(),
-        );
-    }
-    engine.register_fn("tool", misuse(TOOL));
-    {
-        let reject = misuse(TOOL);
-        engine.register_fn("tool", move |_: Dynamic| reject());
+/// Whether one of the overloads registered above takes these arguments.
+fn has_overload(name: &str, args: &[&mut Dynamic]) -> bool {
+    match (name, args) {
+        ("on_counter", [missing, zero, other]) => {
+            missing.is::<Node>() && zero.is::<Node>() && other.is::<Node>()
+        }
+        ("tool", [name]) => name.is_string(),
+        ("complete" | "fail", []) => true,
+        _ => false,
     }
 }
 
+/// Records the first fault; a later one does not replace it.
 fn fault<T>(builder: &mut Builder, message: &str) -> Result<T, Box<EvalAltResult>> {
-    builder.fault = Some(message.to_string());
+    builder.fault.get_or_insert_with(|| message.to_string());
     Err(EvalAltResult::ErrorRuntime(message.into(), Position::NONE).into())
 }
 
