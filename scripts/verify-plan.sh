@@ -219,6 +219,8 @@ SELF_TEST = [
     ("fewer proptest cases", {"crates/protocol/src/reduce.rs": (["    #![proptest_config(ProptestConfig { cases: 4, ..ProptestConfig::default() })]"], [])}, {"T0", "T1", "T12"}),
     ("tests off for a crate", {"crates/memory/Cargo.toml": (["test = false"], [])}, {"T0", "T12"}),
     ("ignore behind a cfg_attr", {"crates/server/tests/pg_redis.rs": (['#[cfg_attr(not(feature = "pg"), ignore)]'], [])}, {"T0", "T12"}),
+    ("ignore with a reason", {"crates/server/tests/pg_redis.rs": (['#[ignore = "needs postgres"]'], [])}, {"T0", "T12"}),
+    ("the word ignore in a doc or comment", {"crates/memory/tests/probe.rs": (['#[doc = "ignore this"]', "#[test] // TODO ignore flaky", "// see #[ignore]"], [])}, {"T0"}),
     ("autotests off", {"crates/memory/Cargo.toml": (["autotests = false"], [])}, {"T0", "T12"}),
     ("a serde attribute", {"crates/protocol/src/event.rs": (['#[serde(rename = "ignored_field")]'], [])}, {"T0", "T1"}),
     ("toolchain pin", {"rust-toolchain.toml": (['channel = "1.80"'], [])}, {"T0", "T12"}),
