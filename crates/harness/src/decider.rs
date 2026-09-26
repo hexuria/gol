@@ -14,9 +14,12 @@ pub struct DecisionView<'a> {
     pub events: &'a [Event],
     pub tools: &'a [ToolDescriptor],
     pub skills: &'a [Skill],
-    /// The run has spent its step or model-call budget. Only `Complete` is
-    /// still allowed; any other effect fails the run with `Budget`.
-    pub budget_exhausted: bool,
+    /// The run has spent its step budget. Only a `Complete` that finishes the
+    /// run is still allowed; any other decision fails the run with `Budget`.
+    pub steps_exhausted: bool,
+    /// The run has spent its model-call budget. A model call fails the run
+    /// with `Budget`; other effects are still allowed while steps remain.
+    pub model_calls_exhausted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

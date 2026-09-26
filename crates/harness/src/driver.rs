@@ -135,14 +135,19 @@ impl Driver {
                 events: &self.events,
                 tools,
                 skills,
-                budget_exhausted: steps_spent || model_calls_spent,
+                steps_exhausted: steps_spent,
+                model_calls_exhausted: model_calls_spent,
             };
             decider.decide(&view)?
         };
-        // Complete is always allowed and costs nothing. Any other effect needs
-        // a step left, and a model call also needs a model call left.
+        // A Complete that finishes the run is always allowed and costs
+        // nothing. Only a running harness completes on it; anywhere else it
+        // is a step like any other decision (see `fold`). Any other effect
+        // needs a step left, and a model call also needs a model call left.
         let over_budget = match effect {
-            Effect::Complete { .. } => false,
+            Effect::Complete { .. } if matches!(state.harness, HarnessState::Running { .. }) => {
+                false
+            }
             Effect::ModelCall { .. } => steps_spent || model_calls_spent,
             _ => steps_spent,
         };

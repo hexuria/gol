@@ -21,10 +21,12 @@ pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
 
     for event in events {
         match &event.payload {
-            // Complete is always allowed, so it is not a step of the budget.
+            // A Complete that finishes the run is not a step of the budget.
+            // Only a running harness completes on it (`reduce`); anywhere
+            // else it cannot finish the run and counts like any decision.
             EventPayload::EffectDecided {
                 effect: Effect::Complete { .. },
-            } => {}
+            } if matches!(harness, HarnessState::Running { .. }) => {}
             EventPayload::EffectDecided { .. } => steps += 1,
             EventPayload::EffectAuthorized {
                 effect: Effect::ModelCall { .. },
@@ -70,6 +72,39 @@ mod tests {
 
     fn started(spec: &RunSpec, terminal: EventPayload) -> Vec<Event> {
         vec![ev(spec, EventPayload::RunStarted), ev(spec, terminal)]
+    }
+
+    // A Complete that cannot finish the run (a tool call is outstanding) is a
+    // step like any other decision.
+    #[test]
+    fn a_complete_while_waiting_for_a_tool_is_a_step() {
+        let spec = sample_spec();
+        let tool_call = Effect::ToolCall {
+            name: "echo".into(),
+            input: "x".into(),
+            invocation: InvocationId::new(),
+        };
+        let events = vec![
+            ev(&spec, EventPayload::RunStarted),
+            ev(
+                &spec,
+                EventPayload::EffectDecided {
+                    effect: tool_call.clone(),
+                },
+            ),
+            ev(&spec, EventPayload::EffectAuthorized { effect: tool_call }),
+            ev(
+                &spec,
+                EventPayload::EffectDecided {
+                    effect: Effect::Complete {
+                        outcome: "done".into(),
+                    },
+                },
+            ),
+        ];
+        let state = fold(&spec, &events);
+        assert!(matches!(state.harness, HarnessState::WaitingForTool { .. }));
+        assert_eq!(state.steps, 2);
     }
 
     // Complete is always allowed, so it is not a step of the budget.
