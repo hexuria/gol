@@ -1268,9 +1268,11 @@ dependencies = [
  "protocol",
  "serde",
  "serde_json",
+ "tokio",
  "toml",
  "typesafe-sdk",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
