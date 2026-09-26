@@ -1,17 +1,5 @@
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
-
 use workflow_core::counter_program;
 use workflow_js::{compile, FrontendError};
-
-fn compile_within(source: &'static str, limit: Duration) -> Option<Result<(), FrontendError>> {
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = sender.send(compile(source).map(|_| ()));
-    });
-    receiver.recv_timeout(limit).ok()
-}
 
 #[test]
 fn on_counter_takes_its_branches_from_its_arguments() {
@@ -54,23 +42,23 @@ fn two_unused_decisions_are_not_one_program() {
     );
 }
 
+// A loop ten times longer than the operation budget must stop at the budget.
+// It is finite, so a compiler without the budget returns instead of hanging.
 #[test]
-fn an_endless_loop_is_rejected_instead_of_hanging() {
-    let outcome = compile_within("while (true) {}\n", Duration::from_secs(5));
+fn a_loop_past_the_budget_is_a_script_error() {
+    let outcome = compile("let i = 0;\nwhile (i < 1000000) { i++; }\ncomplete();\n");
     assert!(
-        matches!(outcome, Some(Err(FrontendError::Script(_)))),
+        matches!(outcome, Err(FrontendError::Script(_))),
         "{outcome:?}"
     );
 }
 
 #[test]
-fn unbounded_recursion_is_rejected() {
-    let outcome = compile_within(
-        "function f(n) { return f(n + 1); }\nf(0);\n",
-        Duration::from_secs(5),
-    );
+fn deep_recursion_is_a_script_error() {
+    let outcome =
+        compile("function f(n) { return n > 0 ? f(n - 1) : 0; }\nf(1000);\ncomplete();\n");
     assert!(
-        matches!(outcome, Some(Err(FrontendError::Script(_)))),
+        matches!(outcome, Err(FrontendError::Script(_))),
         "{outcome:?}"
     );
 }
