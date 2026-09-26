@@ -28,6 +28,7 @@ Last results, TLC 2.19 (tla2tools v1.7.4), deadlock checked, 2026-09-25:
 | `SchedulingPreserves` | `reduce_bounded` (scheduling events are outside the harness table); `fold::tests::scheduling_event_does_not_move_harness_state` |
 | harness `RankDecreases` | `reduce_bounded`: a lexicographic rank drops on every change |
 | `EventuallyDone` for one run | `crates/harness/tests/budget.rs`: a run that never completes fails with `Budget` |
+| `Settles` (`Dispatch.cfg`: dispatch eventually stops changing, under `WF(DispatchComplete)`) | no owner for the liveness itself. `reduce_bounded` checks the parts it rested on: every open phase has an exit, and every change except a resume lowers the rank |
 | `SingleOwner`, `NoActiveWhenDone`, session `EventuallyDone` | no owner: they describe multi-worker sessions, which are not built (T3 when they are) |
 
 The dispatch transition table that `reduce_bounded` checks (`dispatch_expected`) was transcribed from `Dispatch.tla`'s actions, one arm per action.
@@ -47,7 +48,7 @@ Deleted as phases:
 - `ToolResult` as a phase. `ReceiveResult` is an event from `waiting` back to answered `running`.
 - Scheduling names as harness phases. They are dispatch phases. `RunExpired` still sends the harness to `Failed` with `Timeout`. Dispatch records `expired` on its own reducer.
 
-No second TLC run measured a model that still had `Planning` and `Retrying`. This file therefore records no state-count delta, no transition-count delta, and no branch-count delta against that larger diagram. The checked graph's own outdegree is the TLC line above. Mutable variables are the ten names in the Model section.
+No second TLC run measured a model that still had `Planning` and `Retrying`. This file therefore records no state-count delta, no transition-count delta, and no branch-count delta against that larger diagram. `HarnessCore` had ten mutable variables: `session`, `dispatch`, `turnPhase`, `turnStep`, `owner`, `attempt`, `pending`, `answered`, `live` and `issued`.
 
 ### Implementation mapping
 
@@ -73,7 +74,7 @@ Dispatch variants:
 
 Those four terminals stay terminal. A scheduling event leaves `HarnessState` unchanged.
 
-Reducer guards match the checked relation. `Harness.cfg` checks one `MaxSteps = 3`, the TLC instance of `Limits.max_steps`. Rust reads `Limits.max_steps` for the harness ceiling. The driver still compares the `EffectDecided` count to that field. `maxRetries` stays 2. A budget hit appends `RunFailed` with `Budget`. `RunExpired` reduces to `Failed` with `Timeout`.
+Reducer guards match the checked relation. `HarnessCore.cfg` checked `MaxSteps = 3`, the TLC instance of `Limits.max_steps`. Rust reads `Limits.max_steps` for the harness ceiling. The driver still compares the `EffectDecided` count to that field. `maxRetries` stays 2. A budget hit appends `RunFailed` with `Budget`. `RunExpired` reduces to `Failed` with `Timeout`.
 
 Events:
 

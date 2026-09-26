@@ -725,9 +725,9 @@ fn is_resume(phase: &DispatchPhase, next: &DispatchPhase) -> bool {
     ) && *next == DispatchPhase::Running
 }
 
-/// The dispatch lifecycle, on production `reduce_dispatch`: the exact next phase of every pair, terminal phases stay
-/// put, every change except `DispatchResume` lowers the rank, and every open
-/// phase has an exit.
+/// The dispatch lifecycle, on production `reduce_dispatch`: the exact next
+/// phase of every pair, terminal phases stay put, every change except
+/// `DispatchResume` lowers the rank, and every open phase has an exit.
 #[test]
 fn dispatch_reduce_matches_the_table_on_every_pair() {
     let payloads = payloads(3);
