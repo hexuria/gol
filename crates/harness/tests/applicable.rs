@@ -5,8 +5,8 @@
 
 use harness::{Driver, EchoTool, ScriptedDecider, Tool};
 use protocol::{
-    AgentId, Capability, CredentialSource, Effect, EventPayload, ExecutionPlacement, HarnessState,
-    InvocationId, Limits, ModelProvider, RunSpec, ToolDescriptor, WorkModel,
+    Actor, AgentId, Capability, CredentialSource, Effect, EventPayload, ExecutionPlacement,
+    HarnessState, InvocationId, Limits, ModelProvider, RunSpec, ToolDescriptor, WorkModel,
 };
 
 fn boot() -> Driver {
@@ -96,6 +96,9 @@ fn tool_call_after_answer_is_denied_not_dropped() {
     let second = echo(InvocationId::new());
     assert_eq!(decide(&mut driver, second.clone()), []);
     denied_as_not_applicable(&after_last_decision(&driver), &second, "running, answered");
+    // The policy allowed it; the harness state refused it.
+    let denial = driver.events().last().unwrap();
+    assert_eq!(denial.envelope.actor, Actor::System);
     assert_eq!(driver.state().harness, before);
     assert_eq!(driver.state().steps, 2);
 }
@@ -116,7 +119,7 @@ fn a_complete_while_waiting_for_a_tool_is_denied() {
         "waiting for a tool",
     );
     assert_eq!(driver.state().harness, before);
-    // It cannot finish the run, so it is charged a step (A2).
+    // It cannot finish the run, so it is charged a step (see budget.rs).
     assert_eq!(driver.state().steps, 2);
 }
 

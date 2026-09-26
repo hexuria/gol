@@ -175,8 +175,9 @@ impl Driver {
             // decision above already cost a step, so the budget still ends a
             // decider that keeps proposing such effects.
             PolicyDecision::Allow if !applicable(&state.harness, &effect, &self.spec) => {
+                // The policy allowed it; the harness state is what refuses it.
                 let reason = format!("not applicable while {}", describe(&state.harness));
-                self.push(EventPayload::EffectDenied { effect, reason }, Actor::Policy);
+                self.push(EventPayload::EffectDenied { effect, reason }, Actor::System);
                 Ok(Vec::new())
             }
             PolicyDecision::Allow => {

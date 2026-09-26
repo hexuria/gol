@@ -1,9 +1,10 @@
 //! `transition` names the run's next state for every command list a driver can
-//! return. A list that is not exactly one command is invalid, never `Open`.
+//! return. Several tools together are a join and stay `Open`; no command, or
+//! several commands that are not all tools, is invalid, never `Open`.
 
 use harness_core::{transition, WorkflowRun};
 use workflow_core::{
-    History, ToolSpec, WaitCondition, WorkflowCommand, WorkflowContext, WorkflowDriver,
+    History, JoinBranch, ToolSpec, WaitCondition, WorkflowCommand, WorkflowContext, WorkflowDriver,
     WorkflowStep,
 };
 
@@ -33,10 +34,13 @@ fn empty_command_list_is_invalid() {
 }
 
 #[test]
-fn two_commands_are_invalid() {
-    assert_eq!(next(vec![COUNTER, COUNTER]), WorkflowRun::Invalid);
+fn two_commands_are_invalid_unless_both_are_tools() {
     assert_eq!(
         next(vec![WorkflowCommand::Complete, WorkflowCommand::Fail]),
+        WorkflowRun::Invalid
+    );
+    assert_eq!(
+        next(vec![COUNTER, WorkflowCommand::Complete]),
         WorkflowRun::Invalid
     );
     assert_eq!(
@@ -46,6 +50,17 @@ fn two_commands_are_invalid() {
         ]),
         WorkflowRun::Invalid
     );
+}
+
+// A join runs several tools at once (`runtime_tokio::host::join_all`), so the
+// run is still open.
+#[test]
+fn a_join_of_tools_is_open() {
+    assert_eq!(next(vec![COUNTER, COUNTER]), WorkflowRun::Open);
+    assert_eq!(next(vec![COUNTER, COUNTER, COUNTER]), WorkflowRun::Open);
+    let (run, commands) = transition(&JoinBranch, &WorkflowContext, &History::default());
+    assert_eq!(run, WorkflowRun::Open);
+    assert_eq!(commands, [COUNTER, COUNTER]);
 }
 
 #[test]
