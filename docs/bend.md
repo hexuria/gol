@@ -71,7 +71,7 @@ v1 on_counter execute complete fail
 
 | Token | `WorkflowProgram` |
 | --- | --- |
-| `execute` | `Decision::Tool(ToolName::Counter)` |
+| `execute` | `Decision::Tool { name: "counter", input: "" }` |
 | `complete` | `Decision::Complete` |
 | `fail` | `Decision::Fail` |
 

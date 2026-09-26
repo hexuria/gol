@@ -1,4 +1,4 @@
-use workflow_core::counter_program;
+use workflow_core::{counter_program, Decision, WorkflowProgram};
 use workflow_js::{compile, FrontendError};
 
 #[test]
@@ -160,7 +160,98 @@ fn a_caught_misuse_is_still_rejected() {
 #[test]
 fn the_first_fault_is_reported() {
     assert!(matches!(
-        compile("try { tool(1); } catch (e) {}\ntool(\"nope\");\n"),
+        compile("try { tool(1); } catch (e) {}\ntool(\"\");\n"),
         Err(FrontendError::InvalidProgram(message)) if message == "tool name must be a string"
     ));
+}
+
+fn invalid(source: &str) -> String {
+    match compile(source) {
+        Err(FrontendError::InvalidProgram(message)) => message,
+        other => panic!("{source}: {other:?}"),
+    }
+}
+
+#[test]
+fn tool_spawn_and_seq_build_the_program() {
+    let program =
+        compile("seq([tool(\"search\", \"q\"), spawnAgent(\"helper\", \"go\"), complete()]);\n")
+            .unwrap();
+    assert_eq!(
+        program,
+        WorkflowProgram {
+            root: Decision::Seq(vec![
+                Decision::Tool {
+                    name: "search".to_string(),
+                    input: "q".to_string(),
+                },
+                Decision::SpawnAgent {
+                    agent: "helper".to_string(),
+                    input: "go".to_string(),
+                },
+                Decision::Complete,
+            ]),
+        }
+    );
+    // Items bound first keep their position in the array.
+    let bound = compile(
+        "const b = spawnAgent(\"helper\", \"go\");\nconst a = tool(\"search\", \"q\");\nseq([a, b, complete()]);\n",
+    )
+    .unwrap();
+    assert_eq!(bound, program);
+}
+
+#[test]
+fn tool_without_an_input_has_an_empty_input() {
+    assert_eq!(
+        compile("tool(\"counter\");\n").unwrap(),
+        compile("tool(\"counter\", \"\");\n").unwrap()
+    );
+}
+
+#[test]
+fn tool_and_agent_names_are_1_to_128_bytes() {
+    let longest = "a".repeat(128);
+    let too_long = "a".repeat(129);
+    assert!(compile(&format!("tool(\"{longest}\");\n")).is_ok());
+    assert!(compile(&format!("spawnAgent(\"{longest}\", \"\");\n")).is_ok());
+    for name in ["", too_long.as_str()] {
+        assert_eq!(
+            invalid(&format!("tool(\"{name}\", \"x\");\n")),
+            "tool name must be 1 to 128 bytes"
+        );
+        assert_eq!(
+            invalid(&format!("spawnAgent(\"{name}\", \"x\");\n")),
+            "agent name must be 1 to 128 bytes"
+        );
+    }
+}
+
+#[test]
+fn seq_and_spawn_misuse_is_an_invalid_program() {
+    assert_eq!(invalid("seq([]);\n"), "seq takes at least one decision");
+    assert_eq!(invalid("seq([1]);\n"), "seq takes an array of decisions");
+    assert_eq!(
+        invalid("seq([complete(), 1]);\n"),
+        "seq takes an array of decisions"
+    );
+    assert_eq!(
+        invalid("seq(complete());\n"),
+        "seq takes an array of decisions"
+    );
+    assert_eq!(
+        invalid("const d = complete();\nseq([d, d]);\n"),
+        "decision used twice"
+    );
+    assert_eq!(
+        invalid("spawnAgent(\"helper\");\n"),
+        "spawnAgent takes an agent and an input"
+    );
+    assert!(!invalid("spawnAgent(\"helper\", 1);\n").is_empty());
+    assert!(!invalid("tool(\"search\", 1);\n").is_empty());
+    // A caught misuse still fails the compile.
+    assert_eq!(
+        invalid("try { seq([]); } catch (e) {}\ncomplete();\n"),
+        "seq takes at least one decision"
+    );
 }

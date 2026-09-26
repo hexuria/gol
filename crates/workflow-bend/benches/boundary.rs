@@ -4,13 +4,13 @@ use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use workflow_bend::compile;
-use workflow_core::{counter_program, evaluate_program, History};
+use workflow_core::{counter_program, evaluate_program, History, Record};
 
 fn experiment() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../experiments/bend")
 }
 
-fn histories() -> [Option<i64>; 6] {
+fn histories() -> Vec<History> {
     [
         None,
         Some(0),
@@ -19,20 +19,28 @@ fn histories() -> [Option<i64>; 6] {
         Some(i64::MAX),
         Some(i64::MIN),
     ]
+    .into_iter()
+    .map(|counter| match counter {
+        None => History::default(),
+        Some(value) => History::new(vec![Record::counter(value)]),
+    })
+    .collect()
 }
 
 fn bench_boundary(c: &mut Criterion) {
     let rust_program = counter_program();
+    // Built once, outside the timed loops, so the benches time evaluation only.
+    let histories = histories();
     let mut group = c.benchmark_group("bend_boundary");
     group.sample_size(10);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(2));
     group.bench_function("rust_eval", |b| {
         b.iter(|| {
-            for counter in histories() {
+            for history in &histories {
                 black_box(evaluate_program(
                     black_box(&rust_program),
-                    black_box(&History { counter }),
+                    black_box(history),
                 ));
             }
         })
@@ -56,11 +64,8 @@ fn bench_boundary(c: &mut Criterion) {
     steady.measurement_time(Duration::from_secs(2));
     steady.bench_function("loaded_eval", |b| {
         b.iter(|| {
-            for counter in histories() {
-                black_box(evaluate_program(
-                    black_box(&program),
-                    black_box(&History { counter }),
-                ));
+            for history in &histories {
+                black_box(evaluate_program(black_box(&program), black_box(history)));
             }
         })
     });

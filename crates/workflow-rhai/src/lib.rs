@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 use rhai::packages::{ArithmeticPackage, BasicIteratorPackage, LogicPackage, Package};
-use rhai::{Dynamic, Engine, EvalAltResult, OptimizationLevel, Position};
+use rhai::{Array, Dynamic, Engine, EvalAltResult, OptimizationLevel, Position};
 use std::cell::RefCell;
 use std::rc::Rc;
-use workflow_core::{Decision, ToolName, WorkflowProgram};
+use workflow_core::{Decision, WorkflowProgram};
 
 #[derive(Debug)]
 pub enum FrontendError {
@@ -24,7 +24,7 @@ impl std::fmt::Display for FrontendError {
 impl std::error::Error for FrontendError {}
 
 /// A decision the script holds. It indexes the builder, so a script cannot
-/// forge one: only `tool`, `complete`, `fail` and `on_counter` make them.
+/// forge one: only the builtins make them.
 #[derive(Clone, Copy)]
 struct Node(usize);
 
@@ -63,6 +63,9 @@ const MAX_FUNCTION_EXPR_DEPTH: usize = 32;
 const MAX_STRING_SIZE: usize = 64 * 1024;
 const MAX_COLLECTION_SIZE: usize = 1024;
 const MAX_DECISIONS: usize = 1024;
+// A tool or agent name is checked against the catalog when the workflow is
+// registered; here it only has to be a short, non-empty string.
+const MAX_NAME_BYTES: usize = 128;
 
 pub fn compile(source: &str) -> Result<WorkflowProgram, FrontendError> {
     let builder = Rc::new(RefCell::new(Builder {
@@ -98,7 +101,14 @@ pub fn compile(source: &str) -> Result<WorkflowProgram, FrontendError> {
     }
 }
 
-const BUILTINS: [&str; 4] = ["on_counter", "tool", "complete", "fail"];
+const BUILTINS: [&str; 6] = [
+    "on_counter",
+    "tool",
+    "spawn_agent",
+    "seq",
+    "complete",
+    "fail",
+];
 
 /// The language a workflow script is written in: numbers, comparisons,
 /// ranges, variables, control flow, script functions and the builtins below.
@@ -157,14 +167,49 @@ fn register(engine: &mut Engine, builder: &Rc<RefCell<Builder>>) {
     }
     {
         let builder = Rc::clone(builder);
+        engine.register_fn("tool", move |name: &str| {
+            make_tool(&mut builder.borrow_mut(), name, "")
+        });
+    }
+    {
+        let builder = Rc::clone(builder);
+        engine.register_fn("tool", move |name: &str, input: &str| {
+            make_tool(&mut builder.borrow_mut(), name, input)
+        });
+    }
+    {
+        let builder = Rc::clone(builder);
         engine.register_fn(
-            "tool",
-            move |name: &str| -> Result<Node, Box<EvalAltResult>> {
+            "spawn_agent",
+            move |agent: &str, input: &str| -> Result<Node, Box<EvalAltResult>> {
                 let mut built = builder.borrow_mut();
-                if name != "counter" {
-                    return fault(&mut built, "unknown tool");
+                if !valid_name(agent) {
+                    return fault(&mut built, AGENT_NAME);
                 }
-                built.make(Decision::Tool(ToolName::Counter))
+                built.make(Decision::SpawnAgent {
+                    agent: agent.to_string(),
+                    input: input.to_string(),
+                })
+            },
+        );
+    }
+    {
+        let builder = Rc::clone(builder);
+        engine.register_fn(
+            "seq",
+            move |items: Array| -> Result<Node, Box<EvalAltResult>> {
+                let mut built = builder.borrow_mut();
+                if items.is_empty() {
+                    return fault(&mut built, SEQ_EMPTY);
+                }
+                let mut decisions = Vec::with_capacity(items.len());
+                for item in items {
+                    let Some(node) = item.try_cast::<Node>() else {
+                        return fault(&mut built, SEQ_ITEMS);
+                    };
+                    decisions.push(built.take(node)?);
+                }
+                built.make(Decision::Seq(decisions))
             },
         );
     }
@@ -180,6 +225,25 @@ fn register(engine: &mut Engine, builder: &Rc<RefCell<Builder>>) {
     }
 }
 
+const TOOL_NAME: &str = "tool name must be 1 to 128 bytes";
+const AGENT_NAME: &str = "agent name must be 1 to 128 bytes";
+const SEQ_EMPTY: &str = "seq takes at least one decision";
+const SEQ_ITEMS: &str = "seq takes an array of decisions";
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= MAX_NAME_BYTES
+}
+
+fn make_tool(built: &mut Builder, name: &str, input: &str) -> Result<Node, Box<EvalAltResult>> {
+    if !valid_name(name) {
+        return fault(built, TOOL_NAME);
+    }
+    built.make(Decision::Tool {
+        name: name.to_string(),
+        input: input.to_string(),
+    })
+}
+
 /// Whether one of the overloads registered above takes these arguments.
 fn has_overload(name: &str, args: &[&mut Dynamic]) -> bool {
     match (name, args) {
@@ -187,6 +251,8 @@ fn has_overload(name: &str, args: &[&mut Dynamic]) -> bool {
             missing.is::<Node>() && zero.is::<Node>() && other.is::<Node>()
         }
         ("tool", [name]) => name.is_string(),
+        ("tool" | "spawn_agent", [name, input]) => name.is_string() && input.is_string(),
+        ("seq", [items]) => items.is_array(),
         ("complete" | "fail", []) => true,
         _ => false,
     }
@@ -202,7 +268,7 @@ fn fault<T>(builder: &mut Builder, message: &str) -> Result<T, Box<EvalAltResult
 mod tests {
     use super::compile;
     use workflow_core::{
-        evaluate_program, Decision, History, ToolName, ToolSpec, WaitCondition, WorkflowCommand,
+        evaluate_program, Decision, History, Record, ToolSpec, WaitCondition, WorkflowCommand,
     };
 
     #[test]
@@ -216,24 +282,27 @@ mod tests {
         assert_eq!(
             program.root,
             Decision::OnCounter {
-                missing: Box::new(Decision::Tool(ToolName::Counter)),
+                missing: Box::new(Decision::Tool {
+                    name: "counter".to_string(),
+                    input: String::new(),
+                }),
                 zero: Box::new(Decision::Complete),
                 other: Box::new(Decision::Fail),
             }
         );
 
-        let unrecorded = evaluate_program(&program, &History { counter: None });
+        let unrecorded = evaluate_program(&program, &History::default());
         assert_eq!(
             unrecorded.commands,
-            [WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" })]
+            [WorkflowCommand::ExecuteTool(ToolSpec::new("counter", ""))]
         );
         assert_eq!(unrecorded.wait, WaitCondition::None);
 
-        let zero = evaluate_program(&program, &History { counter: Some(0) });
+        let zero = evaluate_program(&program, &History::new(vec![Record::counter(0)]));
         assert_eq!(zero.commands, [WorkflowCommand::Complete]);
         assert_eq!(zero.wait, WaitCondition::None);
 
-        let other = evaluate_program(&program, &History { counter: Some(1) });
+        let other = evaluate_program(&program, &History::new(vec![Record::counter(1)]));
         assert_eq!(other.commands, [WorkflowCommand::Fail]);
         assert_eq!(other.wait, WaitCondition::None);
 
@@ -241,9 +310,17 @@ mod tests {
             compile("let x = 1;\n").unwrap_err().to_string(),
             "script must record one decision"
         );
+        // Any short, non-empty tool name compiles; the catalog check comes later.
         assert_eq!(
-            compile("tool(\"nope\");\n").unwrap_err().to_string(),
-            "unknown tool"
+            compile("tool(\"nope\");\n").unwrap().root,
+            Decision::Tool {
+                name: "nope".to_string(),
+                input: String::new(),
+            }
+        );
+        assert_eq!(
+            compile("tool(\"\");\n").unwrap_err().to_string(),
+            "tool name must be 1 to 128 bytes"
         );
     }
 }
