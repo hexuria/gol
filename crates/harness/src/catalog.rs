@@ -69,8 +69,11 @@ struct McpServer {
     command: String,
     #[serde(default)]
     args: Vec<String>,
-    /// How long one request may wait for its response. Defaults to
-    /// `DEFAULT_TIMEOUT_MS`.
+    /// How long one request may wait for its response, at least 1. Defaults
+    /// to `DEFAULT_TIMEOUT_MS`. Starting a session makes several requests
+    /// (`initialize`, then each `tools/list` page), each with this limit. It
+    /// does not bound a write: a server that stops reading its stdin can still
+    /// block a call whose input overflows the pipe.
     timeout_ms: Option<u64>,
     #[serde(default)]
     tools: Vec<McpToolDecl>,
@@ -87,28 +90,29 @@ struct McpToolDecl {
 }
 
 /// The longest line, in bytes, the client reads from an MCP server.
-pub const MAX_LINE: usize = 1024 * 1024;
+const MAX_LINE: usize = 1024 * 1024;
 
 /// How long a request waits for its response when the catalog names no
 /// `timeout_ms`.
-pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 const DEFAULT_INPUT_SCHEMA: &str = "{\"type\":\"object\"}";
 
 /// One line from an MCP server, as the client waiting for response `id` reads
 /// it.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Frame {
+enum Frame {
     /// A JSON object whose `id` is the number `id`: the response.
     Response(Value),
     /// Anything else a server may send between responses: a blank line, a
-    /// notification (no `id`), or a message with another id.
+    /// notification or a request of its own (it has a `method`, and its id is
+    /// in the server's id space), or a message with another id.
     Skip,
     /// Not UTF-8, not JSON, or not a JSON object.
     Invalid(String),
 }
 
-pub fn parse_frame(line: &[u8], id: i64) -> Frame {
+fn parse_frame(line: &[u8], id: i64) -> Frame {
     if line.iter().all(u8::is_ascii_whitespace) {
         return Frame::Skip;
     }
@@ -119,6 +123,9 @@ pub fn parse_frame(line: &[u8], id: i64) -> Frame {
     let Some(object) = value.as_object() else {
         return Frame::Invalid("not a JSON object".to_string());
     };
+    if object.contains_key("method") {
+        return Frame::Skip;
+    }
     match object.get("id").and_then(Value::as_i64) {
         Some(found) if found == id => Frame::Response(value),
         _ => Frame::Skip,
@@ -199,6 +206,12 @@ pub fn load_catalog(dir: impl AsRef<Path>) -> Result<LoadedCatalog, LoadError> {
     }
 
     for server in file.mcp {
+        if server.timeout_ms == Some(0) {
+            return Err(LoadError::Mcp(format!(
+                "{}: timeout_ms must be at least 1",
+                server.name
+            )));
+        }
         if server.tools.is_empty() {
             return Err(LoadError::Mcp(format!(
                 "{}: declare tools in the catalog; loading does not start {}",
@@ -276,6 +289,7 @@ pub fn load_catalog(dir: impl AsRef<Path>) -> Result<LoadedCatalog, LoadError> {
 /// Why an MCP call failed. After a transport failure the session can no longer
 /// be trusted (a response may still be in flight), so it is dropped and the
 /// next call starts a new server.
+#[derive(Debug, PartialEq)]
 enum McpFailure {
     /// The server answered: a JSON-RPC error, or a tool result with `isError`.
     Answered(String),
@@ -290,7 +304,18 @@ impl McpFailure {
             Self::Answered(message) | Self::Transport(message) => message,
         }
     }
+
+    /// The same failure, its message prefixed with the request it came from.
+    fn within(self, request: &str) -> Self {
+        match self {
+            Self::Answered(message) => Self::Answered(format!("{request}: {message}")),
+            Self::Transport(message) => Self::Transport(format!("{request}: {message}")),
+        }
+    }
 }
+
+/// The most `tools/list` pages a session start follows.
+const MAX_TOOL_PAGES: usize = 16;
 
 struct PendingMcp {
     dir: PathBuf,
@@ -383,19 +408,42 @@ impl McpSession {
             }),
         )?;
         session.notify("notifications/initialized", serde_json::json!({}))?;
-        let tools = session.request("tools/list", serde_json::json!({}))?;
-        session.listed = tools
-            .get("tools")
-            .and_then(Value::as_array)
-            .map(|tools| {
-                tools
-                    .iter()
-                    .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        session.listed = session.list_tools()?;
         Ok(session)
+    }
+
+    /// Every tool name the server lists, following `nextCursor` pages.
+    fn list_tools(&mut self) -> Result<Vec<String>, McpFailure> {
+        let malformed = || McpFailure::Transport("tools/list: malformed result".to_string());
+        let mut names = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_TOOL_PAGES {
+            let params = match &cursor {
+                Some(cursor) => serde_json::json!({ "cursor": cursor }),
+                None => serde_json::json!({}),
+            };
+            let page = self
+                .request("tools/list", params)
+                .map_err(|failure| failure.within("tools/list"))?;
+            let tools = page
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(malformed)?;
+            for tool in tools {
+                let name = tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(malformed)?;
+                names.push(name.to_string());
+            }
+            match page.get("nextCursor").and_then(Value::as_str) {
+                Some(next) => cursor = Some(next.to_string()),
+                None => return Ok(names),
+            }
+        }
+        Err(McpFailure::Transport(format!(
+            "tools/list: more than {MAX_TOOL_PAGES} pages"
+        )))
     }
 
     fn call(&mut self, name: &str, input: &str) -> Result<String, McpFailure> {
@@ -430,31 +478,7 @@ impl McpSession {
         });
         self.send(&message)?;
         let deadline = Instant::now() + self.timeout;
-        let value = loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let line = match self.lines.recv_timeout(left) {
-                Ok(Ok(line)) => line,
-                Ok(Err(message)) => return Err(McpFailure::Transport(message)),
-                Err(RecvTimeoutError::Timeout) => {
-                    return Err(McpFailure::Transport(format!(
-                        "timed out after {} ms",
-                        self.timeout.as_millis()
-                    )))
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(McpFailure::Transport("server closed stdout".to_string()))
-                }
-            };
-            match parse_frame(&line, id) {
-                Frame::Response(value) => break value,
-                Frame::Skip => continue,
-                Frame::Invalid(message) => {
-                    return Err(McpFailure::Transport(format!(
-                        "malformed message: {message}"
-                    )))
-                }
-            }
-        };
+        let value = await_response(&self.lines, id, deadline, self.timeout)?;
         if let Some(error) = value.get("error") {
             let message = error
                 .get("message")
@@ -487,7 +511,47 @@ impl McpSession {
     }
 }
 
+/// Waits for the response to request `id`, skipping stray frames, until
+/// `deadline`. The deadline is checked on every pass, so a server that keeps
+/// the channel full of notifications cannot hold the call past it.
+fn await_response(
+    lines: &Receiver<Result<Vec<u8>, String>>,
+    id: i64,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<Value, McpFailure> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(McpFailure::Transport(format!(
+                "timed out after {} ms",
+                timeout.as_millis()
+            )));
+        }
+        let line = match lines.recv_timeout(deadline - now) {
+            Ok(Ok(line)) => line,
+            Ok(Err(message)) => return Err(McpFailure::Transport(message)),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(McpFailure::Transport("server closed stdout".to_string()))
+            }
+        };
+        match parse_frame(&line, id) {
+            Frame::Response(value) => return Ok(value),
+            Frame::Skip => continue,
+            Frame::Invalid(message) => {
+                return Err(McpFailure::Transport(format!(
+                    "malformed message: {message}"
+                )))
+            }
+        }
+    }
+}
+
 impl Drop for McpSession {
+    /// Kills and reaps the server. The reader thread then sees stdout end and
+    /// exits; if the server left a process of its own holding stdout open,
+    /// that thread waits on it until it exits.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -533,9 +597,10 @@ mod tests {
     use serde_json::json;
     use std::io::Cursor;
 
-    /// The spec of `parse_frame`, written without it: blank lines and objects
-    /// whose `id` is not the number `id` are skipped, the object whose `id` is
-    /// `id` is the response, and anything that is not a JSON object is
+    /// The spec of `parse_frame`, written without it: blank lines, objects
+    /// with a `method` (the server's own notifications and requests) and
+    /// objects whose `id` is not the number `id` are skipped, the object whose
+    /// `id` is `id` is the response, and anything that is not a JSON object is
     /// invalid.
     fn oracle(line: &[u8], id: i64) -> &'static str {
         let Ok(text) = std::str::from_utf8(line) else {
@@ -548,6 +613,7 @@ mod tests {
             return "skip";
         }
         match serde_json::from_str::<Value>(text) {
+            Ok(Value::Object(fields)) if fields.contains_key("method") => "skip",
             Ok(Value::Object(fields)) if fields.get("id") == Some(&json!(id)) => "response",
             Ok(Value::Object(_)) => "skip",
             _ => "invalid",
@@ -624,6 +690,51 @@ mod tests {
             Err("line over 4 bytes".to_string())
         );
         assert_eq!(size(MAX_LINE), "1 MiB");
+    }
+
+    #[test]
+    fn a_line_is_capped_across_buffer_refills() {
+        let mut exact = BufReader::with_capacity(2, Cursor::new(b"abcd\nxy".to_vec()));
+        assert_eq!(read_capped_line(&mut exact, 4), Ok(Some(b"abcd".to_vec())));
+        assert_eq!(read_capped_line(&mut exact, 4), Ok(Some(b"xy".to_vec())));
+        let mut over = BufReader::with_capacity(2, Cursor::new(b"abcde\n".to_vec()));
+        assert_eq!(
+            read_capped_line(&mut over, 4),
+            Err("line over 4 bytes".to_string())
+        );
+    }
+
+    fn queued(frames: &[Value]) -> Receiver<Result<Vec<u8>, String>> {
+        let (sender, lines) = mpsc::sync_channel(frames.len());
+        for frame in frames {
+            sender.send(Ok(frame.to_string().into_bytes())).unwrap();
+        }
+        lines
+    }
+
+    // Queued frames do not outlast the deadline: once it has passed, the
+    // request times out even though its response is already waiting.
+    #[test]
+    fn the_deadline_is_checked_before_every_frame() {
+        let timeout = Duration::from_millis(200);
+        let lines = queued(&[
+            json!({"jsonrpc": "2.0", "method": "notifications/progress"}),
+            json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
+        ]);
+        assert_eq!(
+            await_response(&lines, 3, Instant::now(), timeout),
+            Err(McpFailure::Transport("timed out after 200 ms".to_string()))
+        );
+
+        let lines = queued(&[
+            json!({"jsonrpc": "2.0", "method": "notifications/progress"}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
+        ]);
+        assert_eq!(
+            await_response(&lines, 3, Instant::now() + timeout, timeout),
+            Ok(json!({"jsonrpc": "2.0", "id": 3, "result": {}}))
+        );
     }
 
     #[test]

@@ -549,12 +549,26 @@ fn fake_server(dir: &Path, listed: &[&str], call_arm: &str) -> std::path::PathBu
         .map(|name| format!("{{\"name\":\"{name}\",\"inputSchema\":{{\"type\":\"object\"}}}}"))
         .collect::<Vec<_>>()
         .join(",");
+    fake_server_with(
+        dir,
+        &format!(
+            "send({{\"jsonrpc\":\"2.0\",\"id\":msg[\"id\"],\"result\":{{\"tools\":[{tools}]}}}})"
+        ),
+        call_arm,
+    )
+}
+
+/// A fake MCP server that answers `tools/list` with `list_arm` and
+/// `tools/call` with `call_arm`. Each start appends a line to `starts`.
+fn fake_server_with(dir: &Path, list_arm: &str, call_arm: &str) -> std::path::PathBuf {
     let script = dir.join("mcp.py");
     fs::write(
         &script,
         format!(
             r#"import json, os, sys, time
 MARK = {mark:?}
+with open({starts:?}, "a") as starts:
+    starts.write("start\n")
 def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
@@ -569,17 +583,24 @@ for line in sys.stdin:
     if method == "initialize":
         send({{"jsonrpc":"2.0","id":msg["id"],"result":{{"protocolVersion":"2024-11-05","capabilities":{{}},"serverInfo":{{"name":"fake","version":"0"}}}}}})
     elif method == "tools/list":
-        send({{"jsonrpc":"2.0","id":msg["id"],"result":{{"tools":[{tools}]}}}})
+        {list_arm}
     elif method == "tools/call":
         {call_arm}
     else:
         send({{"jsonrpc":"2.0","id":msg["id"],"error":{{"code":-32601,"message":"no"}}}})
 "#,
             mark = dir.join("called").display().to_string(),
+            starts = dir.join("starts").display().to_string(),
         ),
     )
     .unwrap();
     script
+}
+
+fn starts(dir: &Path) -> usize {
+    fs::read_to_string(dir.join("starts"))
+        .map(|text| text.lines().count())
+        .unwrap_or(0)
 }
 
 /// Writes a catalog with one `local` server run by `python3 script`, the given
@@ -770,4 +791,133 @@ fn a_tool_the_server_does_not_list_fails_clearly() {
         unlisted,
         Err("mcp local.pong: not listed by the server".to_string())
     );
+}
+
+// MCP lets a server send its own requests (a ping, say) at any time, numbered
+// in its own id space. One that happens to carry our id is not our answer.
+#[test]
+fn a_server_request_with_our_id_is_skipped() {
+    let dir = scratch();
+    let script = fake_server(
+        &dir,
+        &["ping"],
+        r#"send({"jsonrpc":"2.0","id":msg["id"],"method":"ping"})
+        answer(msg)"#,
+    );
+    write_server_catalog(&dir, &script, "", PING);
+    let catalog = load_catalog(&dir).unwrap();
+    let output = within(Duration::from_secs(10), || call(&catalog, "ping", "hi"));
+    assert_eq!(output, Ok("pong:hi".to_string()));
+}
+
+// The timeout bounds the whole request: notifications arriving more often than
+// the timeout do not keep a call that is never answered alive.
+#[test]
+fn notifications_do_not_extend_the_timeout() {
+    let dir = scratch();
+    let script = fake_server(
+        &dir,
+        &["ping"],
+        r#"while True:
+            send({"jsonrpc":"2.0","method":"notifications/progress","params":{}})
+            time.sleep(0.1)"#,
+    );
+    write_server_catalog(&dir, &script, "timeout_ms = 300", PING);
+    let catalog = load_catalog(&dir).unwrap();
+    let start = Instant::now();
+    let output = within(Duration::from_secs(10), || call(&catalog, "ping", "hi"));
+    assert_eq!(
+        output,
+        Err("mcp local.ping: timed out after 300 ms".to_string())
+    );
+    assert!(start.elapsed() < Duration::from_secs(5));
+}
+
+// The server answered, with an error: the session is sound, so the next call
+// reuses it instead of starting the server again.
+#[test]
+fn an_answered_error_keeps_the_session() {
+    let dir = scratch();
+    let script = fake_server(
+        &dir,
+        &["ping"],
+        r#"if msg["params"]["arguments"].get("input") == "bad":
+            send({"jsonrpc":"2.0","id":msg["id"],"error":{"code":-32000,"message":"bad"}})
+        else:
+            answer(msg)"#,
+    );
+    write_server_catalog(&dir, &script, "", PING);
+    let catalog = load_catalog(&dir).unwrap();
+    let (first, second) = within(Duration::from_secs(10), || {
+        (call(&catalog, "ping", "bad"), call(&catalog, "ping", "ok"))
+    });
+    assert_eq!(first, Err("mcp local.ping: bad (code -32000)".to_string()));
+    assert_eq!(second, Ok("pong:ok".to_string()));
+    assert_eq!(starts(&dir), 1);
+}
+
+#[test]
+fn a_tools_list_error_names_tools_list() {
+    let dir = scratch();
+    let script = fake_server_with(
+        &dir,
+        r#"send({"jsonrpc":"2.0","id":msg["id"],"error":{"code":-32601,"message":"no tools"}})"#,
+        "answer(msg)",
+    );
+    write_server_catalog(&dir, &script, "", PING);
+    let catalog = load_catalog(&dir).unwrap();
+    let output = within(Duration::from_secs(10), || call(&catalog, "ping", "hi"));
+    assert_eq!(
+        output,
+        Err("mcp local.ping: tools/list: no tools (code -32601)".to_string())
+    );
+}
+
+#[test]
+fn a_malformed_tools_list_is_an_error() {
+    let dir = scratch();
+    let script = fake_server_with(
+        &dir,
+        r#"send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":"ping"}})"#,
+        "answer(msg)",
+    );
+    write_server_catalog(&dir, &script, "", PING);
+    let catalog = load_catalog(&dir).unwrap();
+    let output = within(Duration::from_secs(10), || call(&catalog, "ping", "hi"));
+    assert_eq!(
+        output,
+        Err("mcp local.ping: tools/list: malformed result".to_string())
+    );
+}
+
+#[test]
+fn tools_list_pages_are_followed() {
+    let dir = scratch();
+    let script = fake_server_with(
+        &dir,
+        r#"if msg.get("params", {}).get("cursor") is None:
+            send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"ping"}],"nextCursor":"2"}})
+        else:
+            send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"pong"}]}})"#,
+        "answer(msg)",
+    );
+    write_server_catalog(
+        &dir,
+        &script,
+        "",
+        "[[mcp.tools]]\nname = \"ping\"\n\n[[mcp.tools]]\nname = \"pong\"\n",
+    );
+    let catalog = load_catalog(&dir).unwrap();
+    let output = within(Duration::from_secs(10), || call(&catalog, "pong", "hi"));
+    assert_eq!(output, Ok("pong:hi".to_string()));
+}
+
+#[test]
+fn a_zero_timeout_is_rejected_at_load() {
+    let dir = scratch();
+    let script = fake_server(&dir, &["ping"], "answer(msg)");
+    write_server_catalog(&dir, &script, "timeout_ms = 0", PING);
+    let error = load_catalog(&dir).err().expect("a zero timeout is refused");
+    assert_eq!(error.to_string(), "local: timeout_ms must be at least 1");
+    assert_eq!(starts(&dir), 0);
 }
