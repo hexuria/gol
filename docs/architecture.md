@@ -22,7 +22,7 @@ The coworker desktop picks the computer and the credential. Subscription model H
 
 `RunSpec` is built with a typestate builder. Agent, input, placement, and work model are required. The gateway client cannot send until provider and credential source are set.
 
-Jev is the production decider. It calls System One and is not used by `cargo test`. `POST /v1/runs` uses `JevDecider`. It stores one user message, runs the driver to the end inside one `spawn_blocking`, then replaces the stored event array from a second `spawn_blocking`. The work model stays on the spec and is not the decider.
+Jev is the production decider. It calls System One; `cargo test` never calls the real System One, and the tests run `JevDecider` against a wiremock stand-in. `jev_state` shows Jev the input once in full, a summary of the fold, the last 16 event payloads with each string cut to 2048 characters, the tool catalog and the skills. `jev_choices` offers each catalog tool by name, `model` while model calls remain, and `complete`; once the step budget is spent it offers only `complete`, which while the harness is running is the one decision still free. An answer that was not offered is a decider error. `POST /v1/runs` uses `JevDecider`. Inside one `spawn_blocking` it stores the user message, runs the driver to the end, and appends the run's events to the stored log. The work model stays on the spec and is not the decider.
 
 ## Later slices
 
