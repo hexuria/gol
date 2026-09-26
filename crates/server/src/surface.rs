@@ -23,8 +23,12 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
             _ => None,
         })
         .collect();
+    // The text of the assistant message emitted last, while nothing else followed it.
+    // A coworker turn records its reply and then completes with the same text.
+    let mut last_assistant: Option<&str> = None;
     for event in events {
         let id = event.envelope.event_id.to_string();
+        let assistant = last_assistant.take();
         match &event.payload {
             EventPayload::ToolResult {
                 name,
@@ -33,24 +37,25 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
                 ..
             } => {
                 let delta = inputs.get(invocation).copied().unwrap_or("");
+                let call = invocation.to_string();
                 out.push(json!({
                     "type": "TOOL_CALL_START",
-                    "toolCallId": id,
+                    "toolCallId": call,
                     "toolCallName": name,
                 }));
                 out.push(json!({
                     "type": "TOOL_CALL_ARGS",
-                    "toolCallId": id,
+                    "toolCallId": call,
                     "delta": delta,
                 }));
                 out.push(json!({
                     "type": "TOOL_CALL_END",
-                    "toolCallId": id,
+                    "toolCallId": call,
                 }));
                 out.push(json!({
                     "type": "TOOL_CALL_RESULT",
                     "messageId": format!("result-{id}"),
-                    "toolCallId": id,
+                    "toolCallId": call,
                     "content": output,
                 }));
             }
@@ -70,12 +75,17 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
                     json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": id, "delta": message.text}),
                 );
                 out.push(json!({"type": "TEXT_MESSAGE_END", "messageId": id}));
+                if message.role == MessageRole::Assistant {
+                    last_assistant = Some(&message.text);
+                }
             }
             EventPayload::RunCompleted { outcome } => {
-                let message_id = format!("outcome-{run}");
-                out.push(json!({"type": "TEXT_MESSAGE_START", "messageId": message_id, "role": "assistant"}));
-                out.push(json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": message_id, "delta": outcome}));
-                out.push(json!({"type": "TEXT_MESSAGE_END", "messageId": message_id}));
+                if assistant != Some(outcome.as_str()) {
+                    let message_id = format!("outcome-{run}");
+                    out.push(json!({"type": "TEXT_MESSAGE_START", "messageId": message_id, "role": "assistant"}));
+                    out.push(json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": message_id, "delta": outcome}));
+                    out.push(json!({"type": "TEXT_MESSAGE_END", "messageId": message_id}));
+                }
                 out.push(json!({"type": "RUN_FINISHED", "threadId": run, "runId": run}));
             }
             EventPayload::RunFailed { message, .. } => {
@@ -84,7 +94,11 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
             EventPayload::RunCancelled => {
                 out.push(json!({"type": "RUN_ERROR", "message": "cancelled"}));
             }
-            _ => {}
+            EventPayload::RunExpired => {
+                out.push(json!({"type": "RUN_ERROR", "message": "expired"}));
+            }
+            // Events that emit nothing leave the last assistant message in place.
+            _ => last_assistant = assistant,
         }
     }
     out

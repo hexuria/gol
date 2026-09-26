@@ -1,9 +1,12 @@
 use protocol::{
-    Actor, AgentId, Effect, Event, EventPayload, EventSource, InvocationId, MessageRole,
-    ModelMessage, RunId, Timestamp,
+    Actor, AgentId, CredentialSource, Effect, Event, EventPayload, EventSource, ExecutionPlacement,
+    InvocationId, MessageRole, ModelMessage, ModelProvider, RunId, RunSpec, Timestamp, WorkModel,
 };
 use serde_json::Value;
-use server::{ag_ui_events, json_render_spec};
+use server::{
+    accept_subscription_completion, ag_ui_events, json_render_spec, open_turn, GatewayCall,
+    GatewayPoster, InMemoryStore, MemorySandbox,
+};
 
 fn event(run_id: RunId, payload: EventPayload) -> Event {
     Event::record(
@@ -193,4 +196,198 @@ fn json_render_spec_names_the_outcome() {
     assert_eq!(spec["elements"]["screen"]["children"][2], "outcome");
     assert_eq!(spec["elements"]["outcome"]["props"]["text"], "done");
     assert_eq!(spec["elements"]["input"]["props"]["text"], "hello");
+}
+
+struct NoPoster;
+
+impl GatewayPoster for NoPoster {
+    fn complete(&self, _call: &GatewayCall) -> Result<String, String> {
+        Err("subscription must not post".to_string())
+    }
+}
+
+fn texts(events: &[Value]) -> Vec<&str> {
+    events
+        .iter()
+        .filter(|event| event["type"] == "TEXT_MESSAGE_CONTENT")
+        .filter_map(|event| event["delta"].as_str())
+        .collect()
+}
+
+#[test]
+fn coworker_text_emitted_once() {
+    let spec = RunSpec::builder()
+        .agent(AgentId::new(), "1")
+        .input("hello from the desktop")
+        .placement(ExecutionPlacement::Local)
+        .work_model(WorkModel {
+            provider: ModelProvider::Anthropic,
+            model_name: "claude-fixture".to_string(),
+            credential: CredentialSource::BringYourOwn {
+                secret_ref: "desktop-subscription".to_string(),
+            },
+        })
+        .build();
+    let store = InMemoryStore::default();
+    let sandbox = MemorySandbox::default();
+    open_turn(&store, spec.clone(), &NoPoster, &sandbox).expect("open");
+    let turn = accept_subscription_completion(&store, spec.run_id, "fixture reply", &sandbox)
+        .expect("completion");
+
+    let events = ag_ui_events(spec.run_id, &turn.events);
+    assert_eq!(texts(&events), ["hello from the desktop", "fixture reply"]);
+    assert_eq!(events.last().expect("last")["type"], "RUN_FINISHED");
+
+    // The outcome is dropped only right after an assistant message with the same text.
+    let run_id = RunId::new();
+    let echoed = ag_ui_events(
+        run_id,
+        &[
+            event(
+                run_id,
+                EventPayload::UserMessage {
+                    text: "same".to_string(),
+                },
+            ),
+            event(
+                run_id,
+                EventPayload::RunCompleted {
+                    outcome: "same".to_string(),
+                },
+            ),
+        ],
+    );
+    assert_eq!(texts(&echoed), ["same", "same"]);
+    let restated = ag_ui_events(
+        run_id,
+        &[
+            event(
+                run_id,
+                EventPayload::ModelResponded {
+                    message: ModelMessage {
+                        role: MessageRole::Assistant,
+                        text: "done".to_string(),
+                    },
+                },
+            ),
+            event(
+                run_id,
+                EventPayload::ToolResult {
+                    name: "echo".to_string(),
+                    invocation: InvocationId::new(),
+                    step: 1,
+                    attempt: 0,
+                    output: "ok".to_string(),
+                },
+            ),
+            event(
+                run_id,
+                EventPayload::RunCompleted {
+                    outcome: "done".to_string(),
+                },
+            ),
+        ],
+    );
+    assert_eq!(texts(&restated), ["done", "done"]);
+    let from_user = ag_ui_events(
+        run_id,
+        &[
+            event(
+                run_id,
+                EventPayload::ModelResponded {
+                    message: ModelMessage {
+                        role: MessageRole::User,
+                        text: "done".to_string(),
+                    },
+                },
+            ),
+            event(
+                run_id,
+                EventPayload::RunCompleted {
+                    outcome: "done".to_string(),
+                },
+            ),
+        ],
+    );
+    assert_eq!(texts(&from_user), ["done", "done"]);
+
+    // A harness run authorizes Complete between the reply and RunCompleted.
+    let harness = ag_ui_events(
+        run_id,
+        &[
+            event(
+                run_id,
+                EventPayload::ModelResponded {
+                    message: ModelMessage {
+                        role: MessageRole::Assistant,
+                        text: "done".to_string(),
+                    },
+                },
+            ),
+            event(
+                run_id,
+                EventPayload::EffectAuthorized {
+                    effect: Effect::Complete {
+                        outcome: "done".to_string(),
+                    },
+                },
+            ),
+            event(
+                run_id,
+                EventPayload::RunCompleted {
+                    outcome: "done".to_string(),
+                },
+            ),
+        ],
+    );
+    assert_eq!(texts(&harness), ["done"]);
+    assert_eq!(harness.last().expect("last")["type"], "RUN_FINISHED");
+}
+
+#[test]
+fn run_expired_maps_to_run_error() {
+    let run_id = RunId::new();
+    let events = ag_ui_events(run_id, &[event(run_id, EventPayload::RunExpired)]);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1]["type"], "RUN_ERROR");
+    assert_eq!(events[1]["message"], "expired");
+}
+
+#[test]
+fn tool_call_id_is_invocation_id() {
+    let run_id = RunId::new();
+    let invocation = InvocationId::new();
+    let events = ag_ui_events(
+        run_id,
+        &[
+            event(
+                run_id,
+                EventPayload::EffectAuthorized {
+                    effect: Effect::ToolCall {
+                        name: "ping".to_string(),
+                        input: "hi".to_string(),
+                        invocation,
+                    },
+                },
+            ),
+            event(
+                run_id,
+                EventPayload::ToolResult {
+                    name: "ping".to_string(),
+                    invocation,
+                    step: 1,
+                    attempt: 0,
+                    output: "pong:hi".to_string(),
+                },
+            ),
+        ],
+    );
+    let ids: Vec<_> = events
+        .iter()
+        .filter_map(|event| event.get("toolCallId"))
+        .collect();
+    assert_eq!(ids.len(), 4);
+    for id in ids {
+        assert_eq!(id, &Value::String(invocation.to_string()));
+    }
 }
