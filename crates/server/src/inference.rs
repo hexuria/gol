@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use protocol::{
@@ -149,6 +149,12 @@ pub trait SandboxHost: Send + Sync {
     fn provision(&self, name: &str) -> Result<(), SandboxError>;
     fn destroy(&self, name: &str) -> Result<(), SandboxError>;
     fn exists(&self, name: &str) -> bool;
+    /// `Ok(true)` when the host confirms no sandbox `name` is left, `Ok(false)`
+    /// when one is, and an error when the host cannot tell. Only a confirmed
+    /// absence lets a turn end without removing its sandbox.
+    fn absent(&self, name: &str) -> Result<bool, SandboxError> {
+        Ok(!self.exists(name))
+    }
     fn launches_docker(&self) -> bool;
 }
 
@@ -280,20 +286,44 @@ impl SandboxHost for DockerSandbox {
             .is_ok()
     }
 
+    /// Absent only when Docker answers that there is no such container. Any
+    /// other failure (the daemon is unreachable, say) says nothing about it.
+    fn absent(&self, name: &str) -> Result<bool, SandboxError> {
+        match self.command.run(&[
+            "inspect".to_string(),
+            "--type".to_string(),
+            "container".to_string(),
+            name.to_string(),
+        ]) {
+            Ok(()) => Ok(false),
+            Err(message)
+                if message.contains("No such object") || message.contains("No such container") =>
+            {
+                Ok(true)
+            }
+            Err(message) => Err(SandboxError::Host(message)),
+        }
+    }
+
     fn launches_docker(&self) -> bool {
         true
     }
 }
 
 fn docker(args: &[String]) -> Result<(), String> {
-    let status = Command::new("docker")
+    let output = Command::new("docker")
         .args(args)
-        .status()
+        .stdin(Stdio::null())
+        .output()
         .map_err(|error| error.to_string())?;
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
-        Err(format!("docker {args:?} exited {status}"))
+        Err(format!(
+            "docker {args:?} exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     }
 }
 
@@ -353,10 +383,11 @@ pub fn open_turn(
     let name = box_container_name(spec.run_id);
     if box_turn {
         if let Err(SandboxError::Host(message)) = sandbox.provision(&name) {
-            // The turn is over. It ends only if no sandbox was left behind (a
-            // failed start whose cleanup also failed leaves one): a turn never
-            // ends with its sandbox running.
-            if !sandbox.exists(&name) {
+            // The turn is over. It ends only if the host confirms no sandbox
+            // was left behind (a failed start whose cleanup also failed leaves
+            // one, and an unreachable host cannot say): a turn never ends with
+            // its sandbox running.
+            if matches!(sandbox.absent(&name), Ok(true)) {
                 end_failed(
                     store,
                     &spec,
@@ -521,7 +552,9 @@ pub fn fail_turn(
     }
     check_open_turn(&stored)?;
     let name = box_container_name(stored.spec.run_id);
-    if stored.spec.placement == ExecutionPlacement::Box && sandbox.exists(&name) {
+    if stored.spec.placement == ExecutionPlacement::Box
+        && !sandbox.absent(&name).map_err(sandbox_error)?
+    {
         sandbox.destroy(&name).map_err(sandbox_error)?;
     }
     let failed = run_failed_event(&stored.spec, FailureClass::Dependency, message.to_string());

@@ -1,7 +1,7 @@
 ---- MODULE RunLog ----
 \* One stored run and the writers that race on its event log: the Jev driver in
-\* create_run, subscription or gateway completers, failers (fail_turn, and
-\* open_turn's own failure paths), a late user message, and a redelivered put_run. Design "old" is the store before this change (replace_run,
+\* create_run, subscription or gateway completers, failers (fail_turn), a late
+\* user message, and a redelivered put_run. Design "old" is the store before this change (replace_run,
 \* rollback on a failed sandbox destroy, put_run that overwrites). Design "new" is
 \* insert-once put_run, append-only writes that the store refuses after a terminal
 \* event, and destroy before the completion is appended.
@@ -145,8 +145,9 @@ FailCheck(f) ==
 
 \* Destroy first, as a completer does; a sandbox already gone needs nothing. A
 \* failed destroy leaves the log untouched and the turn open. It can fail even
-\* with the sandbox gone: fail_turn checks exists, then destroys, and a
-\* completer can remove the sandbox in between.
+\* with the sandbox gone: fail_turn asks whether it is absent, then destroys,
+\* and a completer can remove the sandbox in between. A host that cannot say
+\* whether it is absent also takes the failed branch.
 FailDestroy(f) ==
   /\ fPc[f] = "checked"
   /\ \/ /\ sandbox' = "gone"
