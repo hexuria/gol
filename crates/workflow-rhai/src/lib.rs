@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-use rhai::{Engine, EvalAltResult, OptimizationLevel, Position};
+use rhai::{Dynamic, Engine, EvalAltResult, OptimizationLevel, Position};
 use std::cell::RefCell;
 use std::rc::Rc;
 use workflow_core::{Decision, ToolName, WorkflowProgram};
@@ -27,38 +27,45 @@ impl std::error::Error for FrontendError {}
 #[derive(Clone, Copy)]
 struct Node(usize);
 
+/// Every decision the script made. A slot is `None` once another decision
+/// consumed it, so each handle is used at most once and the program is built
+/// by moving subtrees, never by copying them.
 struct Builder {
-    nodes: Vec<Decision>,
-    used: Vec<bool>,
+    nodes: Vec<Option<Decision>>,
     fault: Option<String>,
 }
 
 impl Builder {
-    fn make(&mut self, decision: Decision) -> Node {
-        self.nodes.push(decision);
-        self.used.push(false);
-        Node(self.nodes.len() - 1)
+    fn make(&mut self, decision: Decision) -> Result<Node, Box<EvalAltResult>> {
+        if self.nodes.len() >= MAX_DECISIONS {
+            return fault(self, "too many decisions");
+        }
+        self.nodes.push(Some(decision));
+        Ok(Node(self.nodes.len() - 1))
     }
 
-    fn take(&mut self, node: Node) -> Decision {
-        self.used[node.0] = true;
-        self.nodes[node.0].clone()
+    fn take(&mut self, node: Node) -> Result<Decision, Box<EvalAltResult>> {
+        match self.nodes[node.0].take() {
+            Some(decision) => Ok(decision),
+            None => fault(self, "decision used twice"),
+        }
     }
 }
 
-// Scripts run at compile time, so every one is bounded: an endless loop or a
-// deep expression is a script error, never a hung compiler.
+// Scripts run at compile time, so every one is bounded. Operations, call
+// levels and expression depth bound the time a script can run; the string,
+// collection and decision caps bound what it can build.
 const MAX_OPERATIONS: u64 = 100_000;
 const MAX_CALL_LEVELS: usize = 32;
 const MAX_EXPR_DEPTH: usize = 64;
 const MAX_FUNCTION_EXPR_DEPTH: usize = 32;
 const MAX_STRING_SIZE: usize = 64 * 1024;
 const MAX_COLLECTION_SIZE: usize = 1024;
+const MAX_DECISIONS: usize = 1024;
 
 pub fn compile(source: &str) -> Result<WorkflowProgram, FrontendError> {
     let builder = Rc::new(RefCell::new(Builder {
         nodes: Vec::new(),
-        used: Vec::new(),
         fault: None,
     }));
     let mut engine = Engine::new();
@@ -73,22 +80,17 @@ pub fn compile(source: &str) -> Result<WorkflowProgram, FrontendError> {
     register(&mut engine, &builder);
 
     let evaluated = engine.run(source);
-    let built = builder.borrow();
-    if let Some(message) = built.fault.clone() {
+    let mut built = builder.borrow_mut();
+    if let Some(message) = built.fault.take() {
         return Err(FrontendError::InvalidProgram(message));
     }
     if let Err(error) = evaluated {
         return Err(FrontendError::Script(error.to_string()));
     }
     // The program is the one decision no other decision consumed.
-    let mut roots = built
-        .used
-        .iter()
-        .zip(&built.nodes)
-        .filter(|(used, _)| !**used)
-        .map(|(_, decision)| decision);
+    let mut roots = built.nodes.iter_mut().filter_map(Option::take);
     match (roots.next(), roots.next()) {
-        (Some(root), None) => Ok(WorkflowProgram { root: root.clone() }),
+        (Some(root), None) => Ok(WorkflowProgram { root }),
         _ => Err(FrontendError::InvalidProgram(
             "script must record one decision".to_string(),
         )),
@@ -101,12 +103,12 @@ fn register(engine: &mut Engine, builder: &Rc<RefCell<Builder>>) {
         let builder = Rc::clone(builder);
         engine.register_fn(
             "on_counter",
-            move |missing: Node, zero: Node, other: Node| {
+            move |missing: Node, zero: Node, other: Node| -> Result<Node, Box<EvalAltResult>> {
                 let mut built = builder.borrow_mut();
                 let decision = Decision::OnCounter {
-                    missing: Box::new(built.take(missing)),
-                    zero: Box::new(built.take(zero)),
-                    other: Box::new(built.take(other)),
+                    missing: Box::new(built.take(missing)?),
+                    zero: Box::new(built.take(zero)?),
+                    other: Box::new(built.take(other)?),
                 };
                 built.make(decision)
             },
@@ -121,7 +123,7 @@ fn register(engine: &mut Engine, builder: &Rc<RefCell<Builder>>) {
                 if name != "counter" {
                     return fault(&mut built, "unknown tool");
                 }
-                Ok(built.make(Decision::Tool(ToolName::Counter)))
+                built.make(Decision::Tool(ToolName::Counter))
             },
         );
     }
@@ -134,6 +136,46 @@ fn register(engine: &mut Engine, builder: &Rc<RefCell<Builder>>) {
     {
         let builder = Rc::clone(builder);
         engine.register_fn("fail", move || builder.borrow_mut().make(Decision::Fail));
+    }
+    register_misuse(engine, builder);
+}
+
+/// Overloads that only match a wrong call, so misuse is an invalid program
+/// here as it is in the JS frontend, not a "function not found" script error.
+/// Rhai tries the typed overloads above before these `Dynamic` ones.
+fn register_misuse(engine: &mut Engine, builder: &Rc<RefCell<Builder>>) {
+    const ON_COUNTER: &str = "on_counter takes exactly three decisions";
+    const TOOL: &str = "tool name must be a string";
+    let misuse = |message: &'static str| {
+        let builder = Rc::clone(builder);
+        move || -> Result<Node, Box<EvalAltResult>> { fault(&mut builder.borrow_mut(), message) }
+    };
+    engine.register_fn("on_counter", misuse(ON_COUNTER));
+    {
+        let reject = misuse(ON_COUNTER);
+        engine.register_fn("on_counter", move |_: Dynamic| reject());
+    }
+    {
+        let reject = misuse(ON_COUNTER);
+        engine.register_fn("on_counter", move |_: Dynamic, _: Dynamic| reject());
+    }
+    {
+        let reject = misuse(ON_COUNTER);
+        engine.register_fn("on_counter", move |_: Dynamic, _: Dynamic, _: Dynamic| {
+            reject()
+        });
+    }
+    {
+        let reject = misuse(ON_COUNTER);
+        engine.register_fn(
+            "on_counter",
+            move |_: Dynamic, _: Dynamic, _: Dynamic, _: Dynamic| reject(),
+        );
+    }
+    engine.register_fn("tool", misuse(TOOL));
+    {
+        let reject = misuse(TOOL);
+        engine.register_fn("tool", move |_: Dynamic| reject());
     }
 }
 

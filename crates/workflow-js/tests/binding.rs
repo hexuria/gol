@@ -62,3 +62,61 @@ fn deep_recursion_is_a_script_error() {
         "{outcome:?}"
     );
 }
+
+// A handle is used once. Reusing one would clone its subtree on every use, so
+// a short loop could build an exponentially large program.
+#[test]
+fn a_decision_used_twice_is_rejected() {
+    assert!(matches!(
+        compile("const d = complete();\nonCounter(tool(\"counter\"), d, d);\n"),
+        Err(FrontendError::InvalidProgram(message)) if message == "decision used twice"
+    ));
+}
+
+#[test]
+fn a_doubling_loop_is_rejected() {
+    assert!(matches!(
+        compile("let d = complete();\nfor (let i = 0; i < 8; i++) { d = onCounter(d, d, d); }\n"),
+        Err(FrontendError::InvalidProgram(_))
+    ));
+}
+
+#[test]
+fn a_program_past_the_decision_cap_is_rejected() {
+    assert!(matches!(
+        compile("let d = complete();\nfor (let i = 0; i < 400; i++) { d = onCounter(d, fail(), fail()); }\n"),
+        Err(FrontendError::InvalidProgram(message)) if message == "too many decisions"
+    ));
+}
+
+#[test]
+fn a_long_chain_under_the_cap_compiles() {
+    let program = compile(
+        "let d = complete();\nfor (let i = 0; i < 100; i++) { d = onCounter(d, fail(), fail()); }\n",
+    )
+    .unwrap();
+    let mut depth = 0;
+    let mut node = &program.root;
+    while let workflow_core::Decision::OnCounter { missing, .. } = node {
+        depth += 1;
+        node = missing;
+    }
+    assert_eq!(depth, 100);
+}
+
+// The same misuse is the same error kind in Rhai and JS.
+#[test]
+fn misuse_is_an_invalid_program() {
+    for source in [
+        "tool(1);\n",
+        "onCounter(1, 2, 3);\n",
+        "onCounter(complete(), fail());\n",
+        "onCounter(tool(\"counter\"), complete(), fail(), fail());\n",
+    ] {
+        assert!(
+            matches!(compile(source), Err(FrontendError::InvalidProgram(_))),
+            "{source}: {:?}",
+            compile(source)
+        );
+    }
+}
