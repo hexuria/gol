@@ -21,6 +21,10 @@ pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
 
     for event in events {
         match &event.payload {
+            // Complete is always allowed, so it is not a step of the budget.
+            EventPayload::EffectDecided {
+                effect: Effect::Complete { .. },
+            } => {}
             EventPayload::EffectDecided { .. } => steps += 1,
             EventPayload::EffectAuthorized {
                 effect: Effect::ModelCall { .. },
@@ -66,6 +70,21 @@ mod tests {
 
     fn started(spec: &RunSpec, terminal: EventPayload) -> Vec<Event> {
         vec![ev(spec, EventPayload::RunStarted), ev(spec, terminal)]
+    }
+
+    // Complete is always allowed, so it is not a step of the budget.
+    #[test]
+    fn complete_is_not_a_step() {
+        let spec = sample_spec();
+        let decided = |effect| ev(&spec, EventPayload::EffectDecided { effect });
+        let events = vec![
+            ev(&spec, EventPayload::RunStarted),
+            decided(Effect::ModelCall { prompt: "p".into() }),
+            decided(Effect::Complete {
+                outcome: "done".into(),
+            }),
+        ];
+        assert_eq!(fold(&spec, &events).steps, 1);
     }
 
     #[test]

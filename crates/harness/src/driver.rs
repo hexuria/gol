@@ -124,9 +124,29 @@ impl Driver {
         if state.harness.is_terminal() {
             return Ok(Vec::new());
         }
-        if state.steps >= self.spec.limits.max_steps
-            || state.model_calls >= self.spec.limits.max_model_calls
-        {
+        let limits = &self.spec.limits;
+        let steps_spent = state.steps >= limits.max_steps;
+        let model_calls_spent = state.model_calls >= limits.max_model_calls;
+
+        let effect = {
+            let view = DecisionView {
+                spec: &self.spec,
+                state: &state,
+                events: &self.events,
+                tools,
+                skills,
+                budget_exhausted: steps_spent || model_calls_spent,
+            };
+            decider.decide(&view)?
+        };
+        // Complete is always allowed and costs nothing. Any other effect needs
+        // a step left, and a model call also needs a model call left.
+        let over_budget = match effect {
+            Effect::Complete { .. } => false,
+            Effect::ModelCall { .. } => steps_spent || model_calls_spent,
+            _ => steps_spent,
+        };
+        if over_budget {
             self.push(
                 EventPayload::RunFailed {
                     class: FailureClass::Budget,
@@ -136,17 +156,6 @@ impl Driver {
             );
             return Ok(Vec::new());
         }
-
-        let effect = {
-            let view = DecisionView {
-                spec: &self.spec,
-                state: &state,
-                events: &self.events,
-                tools,
-                skills,
-            };
-            decider.decide(&view)?
-        };
         self.push(
             EventPayload::EffectDecided {
                 effect: effect.clone(),
