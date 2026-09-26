@@ -1,5 +1,7 @@
 // Subscription calls the local fixture proxy after the server has the user
 // message. Gateway mode stops at the server. The desktop does not call the proxy.
+// A subscription turn the desktop cannot finish is ended on the server with
+// /fail, so it never stays open.
 
 const VENDOR_HOSTS = ["anthropic.com", "openai.com", "chatgpt.com", "x.ai", "grok.com"];
 
@@ -42,6 +44,11 @@ export async function sendTurn({
     throw new Error("message is empty");
   }
 
+  // Refuse a vendor proxy before anything is opened on the server.
+  if (credential === "subscription") {
+    assertFixtureProxy(proxyUrl);
+  }
+
   const placement = computer === "box" ? "Box" : "Local";
   const credentialBody =
     credential === "gateway"
@@ -80,26 +87,31 @@ export async function sendTurn({
     };
   }
 
-  assertFixtureProxy(proxyUrl);
-  const proxy = await postJson(
-    fetchImpl,
-    `${proxyUrl}/v1/messages?beta=true`,
-    {
-      model: "claude-fixture",
-      max_tokens: 64,
-      stream: false,
-      messages: [{ role: "user", content: message }],
-    },
-    {
-      "x-api-key": FIXTURE_KEY,
-      "anthropic-version": "2023-06-01",
-      "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
-      "x-claude-code-session-id": "gol-desktop",
-    },
-  );
-  const assistant = proxy?.content?.[0]?.text;
-  if (typeof assistant !== "string" || assistant.length === 0) {
-    throw new Error("proxy fixture missing assistant text");
+  let assistant;
+  try {
+    const proxy = await postJson(
+      fetchImpl,
+      `${proxyUrl}/v1/messages?beta=true`,
+      {
+        model: "claude-fixture",
+        max_tokens: 64,
+        stream: false,
+        messages: [{ role: "user", content: message }],
+      },
+      {
+        "x-api-key": FIXTURE_KEY,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+        "x-claude-code-session-id": "gol-desktop",
+      },
+    );
+    assistant = proxy?.content?.[0]?.text;
+    if (typeof assistant !== "string" || assistant.length === 0) {
+      throw new Error("proxy fixture missing assistant text");
+    }
+  } catch (error) {
+    await failTurn(fetchImpl, serverUrl, recorded.run_id, error);
+    throw error;
   }
   const accepted = await postJson(
     fetchImpl,
@@ -113,6 +125,21 @@ export async function sendTurn({
     proxyCalledByDesktop: true,
     computer: recorded.computer,
   };
+}
+
+// Ends the open turn on the server. The original error is what the caller
+// sees; a failure to report it is secondary and is not thrown over it.
+async function failTurn(fetchImpl, serverUrl, runId, error) {
+  try {
+    await postJson(
+      fetchImpl,
+      `${serverUrl}/v1/coworker/turns/${runId}/fail`,
+      { message: error instanceof Error ? error.message : String(error) },
+      { authorization: "Bearer gol-gateway-local" },
+    );
+  } catch {
+    // The server keeps the turn open; the caller still gets the first error.
+  }
 }
 
 async function postJson(fetchImpl, url, body, headers = {}) {

@@ -352,7 +352,16 @@ pub fn open_turn(
     let box_turn = spec.placement == ExecutionPlacement::Box;
     let name = box_container_name(spec.run_id);
     if box_turn {
-        sandbox.provision(&name).map_err(sandbox_error)?;
+        if let Err(SandboxError::Host(message)) = sandbox.provision(&name) {
+            // No sandbox is running, so the turn can end: it is over.
+            end_failed(
+                store,
+                &spec,
+                FailureClass::Environment,
+                format!("provision: {message}"),
+            );
+            return Err(TurnError::Sandbox(message));
+        }
     }
     let completion = match &spec.work_model.credential {
         CredentialSource::PlatformGateway => {
@@ -364,8 +373,16 @@ pub fn open_turn(
             }) {
                 Ok(text) => Some(text),
                 Err(message) => {
-                    if box_turn {
-                        let _ = sandbox.destroy(&name);
+                    // The sandbox goes first. A turn whose sandbox could not be
+                    // removed stays open: it never ends with a sandbox running.
+                    let removed = !box_turn || sandbox.destroy(&name).is_ok();
+                    if removed {
+                        end_failed(
+                            store,
+                            &spec,
+                            FailureClass::Dependency,
+                            format!("proxy: {message}"),
+                        );
                     }
                     return Err(TurnError::Proxy(message));
                 }
@@ -421,32 +438,7 @@ pub fn accept_subscription_completion(
             "gateway completions come from the server",
         ));
     }
-    if stored
-        .events
-        .iter()
-        .any(|event| is_terminal(&event.payload))
-    {
-        return Err(TurnError::Conflict("turn already completed"));
-    }
-    // A completion answers an open turn: `open_turn` leaves the harness running and
-    // unanswered. A queued run from `create_run` is idle, and a run waiting on a tool
-    // has an answer outstanding; completing either would end a run this turn never owned.
-    if !matches!(
-        fold(&stored.spec, &stored.events).harness,
-        HarnessState::Running {
-            answered: false,
-            ..
-        }
-    ) {
-        return Err(TurnError::Conflict("turn is not open"));
-    }
-    if !stored
-        .events
-        .iter()
-        .any(|event| matches!(event.payload, EventPayload::UserMessage { .. }))
-    {
-        return Err(TurnError::Conflict("user message is not recorded"));
-    }
+    check_open_turn(&stored)?;
     let box_turn = stored.spec.placement == ExecutionPlacement::Box;
     let name = box_container_name(stored.spec.run_id);
     if box_turn && !sandbox.exists(&name) {
@@ -469,6 +461,82 @@ pub fn accept_subscription_completion(
         credential_mode: "subscription",
         computer: computer_plan(stored.spec.placement, stored.spec.run_id),
     })
+}
+
+/// A subscription turn is open when nothing has ended it and `open_turn` left the
+/// harness running and unanswered. A queued run from `create_run` is idle, and a
+/// run waiting on a tool has an answer outstanding; ending either would end a run
+/// this turn never owned.
+fn check_open_turn(stored: &StoredRun) -> Result<(), TurnError> {
+    if stored
+        .events
+        .iter()
+        .any(|event| is_terminal(&event.payload))
+    {
+        return Err(TurnError::Conflict("turn already completed"));
+    }
+    if !matches!(
+        fold(&stored.spec, &stored.events).harness,
+        HarnessState::Running {
+            answered: false,
+            ..
+        }
+    ) {
+        return Err(TurnError::Conflict("turn is not open"));
+    }
+    if !stored
+        .events
+        .iter()
+        .any(|event| matches!(event.payload, EventPayload::UserMessage { .. }))
+    {
+        return Err(TurnError::Conflict("user message is not recorded"));
+    }
+    Ok(())
+}
+
+/// The desktop reports that its turn failed (its model call through the
+/// subscription proxy did not answer). Same order as a completion: check the
+/// turn is open, remove its sandbox, then append `RunFailed`. A turn another
+/// writer ended first is a conflict.
+pub fn fail_turn(
+    store: &dyn RunStore,
+    run_id: RunId,
+    message: &str,
+    sandbox: &dyn SandboxHost,
+) -> Result<TurnOutcome, TurnError> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err(TurnError::BadRequest("failure message is empty"));
+    }
+    let stored = store.run(run_id).ok_or(TurnError::NotFound)?;
+    if matches!(
+        stored.spec.work_model.credential,
+        CredentialSource::PlatformGateway
+    ) {
+        return Err(TurnError::Conflict("gateway turns end on the server"));
+    }
+    check_open_turn(&stored)?;
+    let name = box_container_name(stored.spec.run_id);
+    if stored.spec.placement == ExecutionPlacement::Box && sandbox.exists(&name) {
+        sandbox.destroy(&name).map_err(sandbox_error)?;
+    }
+    let failed = run_failed_event(&stored.spec, FailureClass::Dependency, message.to_string());
+    record_completion(store, run_id, vec![failed.clone()])?;
+    let mut events = stored.events;
+    events.push(failed);
+    Ok(TurnOutcome {
+        spec: stored.spec.clone(),
+        events,
+        completion: None,
+        credential_mode: "subscription",
+        computer: computer_plan(stored.spec.placement, stored.spec.run_id),
+    })
+}
+
+/// Ends a turn that failed before anything else could end it. The store
+/// refuses the append if another writer ended the run first.
+fn end_failed(store: &dyn RunStore, spec: &RunSpec, class: FailureClass, message: String) {
+    store.append_events(spec.run_id, vec![run_failed_event(spec, class, message)]);
 }
 
 /// Append the completion events. Two completions racing on one run get one

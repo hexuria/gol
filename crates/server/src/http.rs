@@ -16,8 +16,9 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::inference::{
-    accept_subscription_completion, open_turn, run_failed_event, sandbox_from_env, ComputerPlan,
-    GatewayPoster, HttpGatewayPoster, SandboxHost, SharedPoster, TurnError, TurnOutcome,
+    accept_subscription_completion, fail_turn, open_turn, run_failed_event, sandbox_from_env,
+    ComputerPlan, GatewayPoster, HttpGatewayPoster, SandboxHost, SharedPoster, TurnError,
+    TurnOutcome,
 };
 use crate::queue::RedisRunQueue;
 use crate::store::{AgentManifest, RunStore, StoredRun};
@@ -100,6 +101,7 @@ fn router_with_parts(
             "/v1/coworker/turns/{id}/completion",
             post(complete_coworker_turn),
         )
+        .route("/v1/coworker/turns/{id}/fail", post(fail_coworker_turn))
         .with_state(AppState {
             store,
             jev_base_url: jev_base_url.into(),
@@ -284,6 +286,28 @@ async fn complete_coworker_turn(
 #[derive(Debug, Deserialize)]
 struct CompletionBody {
     text: String,
+}
+
+async fn fail_coworker_turn(
+    Bearer(_principal): Bearer,
+    State(state): State<AppState>,
+    Path(id): Path<RunId>,
+    Json(body): Json<FailBody>,
+) -> Result<Json<TurnBody>, ApiError> {
+    let store = state.store.clone();
+    let sandbox = state.sandbox.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        fail_turn(store.as_ref(), id, &body.message, sandbox.as_ref())
+    })
+    .await
+    .map_err(|error| ApiError::Decider(error.to_string()))?
+    .map_err(ApiError::from)?;
+    Ok(Json(TurnBody::from_outcome(outcome)))
+}
+
+#[derive(Debug, Deserialize)]
+struct FailBody {
+    message: String,
 }
 
 #[derive(Debug, Serialize)]

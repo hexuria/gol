@@ -7,15 +7,15 @@ use axum::http::Request;
 use axum::middleware::Next;
 use protocol::{
     Actor, AgentId, ArtifactId, Capability, CredentialSource, DispatchPhase, Event, EventPayload,
-    EventSource, ExecutionPlacement, HarnessState, Limits, MessageRole, ModelProvider, RunId,
-    RunSpec, Timestamp, WorkModel,
+    EventSource, ExecutionPlacement, FailureClass, HarnessState, Limits, MessageRole,
+    ModelProvider, RunId, RunSpec, Timestamp, WorkModel,
 };
 use proxy::GATEWAY_TEXT;
 use server::{
     accept_subscription_completion, box_container_name, box_workspace_volume, computer_plan,
-    ensure_fixture_proxy, open_turn, router_with_gateway, router_with_sandbox, AgentManifest,
-    Append, DockerSandbox, GatewayCall, GatewayPoster, HttpGatewayPoster, InMemoryStore,
-    MemorySandbox, RunStore, SandboxHost, StoredArtifact, StoredRun, TurnError,
+    ensure_fixture_proxy, fail_turn, open_turn, router_with_gateway, router_with_sandbox,
+    AgentManifest, Append, DockerSandbox, GatewayCall, GatewayPoster, HttpGatewayPoster,
+    InMemoryStore, MemorySandbox, RunStore, SandboxHost, StoredArtifact, StoredRun, TurnError,
 };
 
 async fn proxy_server() -> (String, Arc<Mutex<Vec<String>>>) {
@@ -1196,4 +1196,268 @@ fn the_store_log_grows_and_ends_at_the_first_terminal_event() {
             done.envelope.event_id
         ]
     );
+}
+
+/// A sandbox host whose provision always fails.
+struct NoProvision;
+
+impl SandboxHost for NoProvision {
+    fn provision(&self, name: &str) -> Result<(), server::SandboxError> {
+        Err(server::SandboxError::Host(format!("cannot start {name}")))
+    }
+
+    fn destroy(&self, _name: &str) -> Result<(), server::SandboxError> {
+        Ok(())
+    }
+
+    fn exists(&self, _name: &str) -> bool {
+        false
+    }
+
+    fn launches_docker(&self) -> bool {
+        false
+    }
+}
+
+/// The run's terminal events, as (kind, class or outcome, message) text.
+fn terminals(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::RunCompleted { outcome } => Some(format!("completed: {outcome}")),
+            EventPayload::RunFailed { class, message } => {
+                Some(format!("failed {class:?}: {message}"))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn gateway_spec(placement: ExecutionPlacement) -> RunSpec {
+    RunSpec::builder()
+        .agent(AgentId::new(), "1")
+        .input("hello from the gateway")
+        .placement(placement)
+        .work_model(WorkModel {
+            provider: ModelProvider::Anthropic,
+            model_name: "claude-fixture".to_string(),
+            credential: CredentialSource::PlatformGateway,
+        })
+        .build()
+}
+
+// A Box turn whose sandbox cannot start is over: it ends failed, not open.
+#[test]
+fn provision_failure_run_failed() {
+    let spec = subscription_spec(ExecutionPlacement::Box);
+    let store = InMemoryStore::default();
+    let error =
+        open_turn(&store, spec.clone(), &SilentPoster, &NoProvision).expect_err("provision fails");
+    assert!(matches!(error, TurnError::Sandbox(_)), "{error:?}");
+    let events = store.run(spec.run_id).expect("run").events;
+    assert_eq!(
+        terminals(&events),
+        vec![format!(
+            "failed Environment: provision: cannot start {}",
+            box_container_name(spec.run_id)
+        )]
+    );
+}
+
+// The gateway proxy failed: the sandbox is removed and the turn ends failed.
+#[test]
+fn proxy_failure_run_failed() {
+    for placement in [ExecutionPlacement::Local, ExecutionPlacement::Box] {
+        let spec = gateway_spec(placement);
+        let store = InMemoryStore::default();
+        let sandbox = MemorySandbox::default();
+        let error =
+            open_turn(&store, spec.clone(), &SilentPoster, &sandbox).expect_err("the proxy fails");
+        assert!(matches!(error, TurnError::Proxy(_)), "{error:?}");
+        assert!(!sandbox.exists(&box_container_name(spec.run_id)));
+        let events = store.run(spec.run_id).expect("run").events;
+        assert_eq!(
+            terminals(&events),
+            vec!["failed Dependency: proxy: subscription must not post".to_string()],
+            "{placement:?}"
+        );
+    }
+}
+
+// formal/runlog TerminalHasNoSandbox: when the sandbox cannot be removed the
+// turn stays open rather than end with a sandbox still running.
+#[test]
+fn a_proxy_failure_with_a_failed_destroy_leaves_the_turn_open() {
+    let state = Arc::new(FailingRemove {
+        live: Mutex::new(HashSet::new()),
+    });
+    let command = state.clone();
+    let sandbox = DockerSandbox::from_command(move |args| command.call(args));
+    let spec = gateway_spec(ExecutionPlacement::Box);
+    let store = InMemoryStore::default();
+    open_turn(&store, spec.clone(), &SilentPoster, &sandbox).expect_err("the proxy fails");
+    assert!(sandbox.exists(&box_container_name(spec.run_id)));
+    let events = store.run(spec.run_id).expect("run").events;
+    assert_eq!(terminals(&events), Vec::<String>::new());
+}
+
+// The desktop reports a failed turn: the sandbox is removed, then the turn ends
+// failed with the desktop's message.
+#[test]
+fn fail_turn_is_terminal_and_destroys_sandbox() {
+    let spec = subscription_spec(ExecutionPlacement::Box);
+    let store = InMemoryStore::default();
+    let sandbox = MemorySandbox::default();
+    open_turn(&store, spec.clone(), &SilentPoster, &sandbox).expect("open");
+    let name = box_container_name(spec.run_id);
+    assert!(sandbox.exists(&name));
+
+    fail_turn(&store, spec.run_id, "proxy said 529", &sandbox).expect("fail");
+
+    assert!(!sandbox.exists(&name));
+    let events = store.run(spec.run_id).expect("run").events;
+    assert_eq!(
+        terminals(&events),
+        vec!["failed Dependency: proxy said 529".to_string()]
+    );
+}
+
+#[test]
+fn fail_on_a_finished_or_gateway_turn_is_a_conflict() {
+    let spec = subscription_spec(ExecutionPlacement::Local);
+    let store = InMemoryStore::default();
+    let sandbox = MemorySandbox::default();
+    open_turn(&store, spec.clone(), &SilentPoster, &sandbox).expect("open");
+    accept_subscription_completion(&store, spec.run_id, "done", &sandbox).expect("complete");
+    let error = fail_turn(&store, spec.run_id, "late", &sandbox).expect_err("already done");
+    assert!(
+        matches!(error, TurnError::Conflict("turn already completed")),
+        "{error:?}"
+    );
+    assert_eq!(
+        terminals(&store.run(spec.run_id).expect("run").events),
+        vec!["completed: done".to_string()]
+    );
+
+    let gateway = gateway_spec(ExecutionPlacement::Local);
+    let store = InMemoryStore::default();
+    open_turn(&store, gateway.clone(), &OkPoster, &sandbox).expect("open");
+    let error = fail_turn(&store, gateway.run_id, "nope", &sandbox).expect_err("gateway");
+    assert!(
+        matches!(
+            error,
+            TurnError::Conflict("gateway turns end on the server")
+        ),
+        "{error:?}"
+    );
+
+    let error = fail_turn(&store, RunId::new(), "nope", &sandbox).expect_err("missing");
+    assert!(matches!(error, TurnError::NotFound), "{error:?}");
+    let error = fail_turn(&store, gateway.run_id, "  ", &sandbox).expect_err("empty");
+    assert!(
+        matches!(error, TurnError::BadRequest("failure message is empty")),
+        "{error:?}"
+    );
+}
+
+// formal/runlog AtMostOneTerminal with a failer: a failure and a completion that
+// both read an open turn end it once. Whichever lands second is refused, in
+// either order.
+#[test]
+fn fail_races_completion_exactly_one_terminal() {
+    // The completion lands between the failure's check and its append.
+    let spec = subscription_spec(ExecutionPlacement::Local);
+    let inner = InMemoryStore::default();
+    let sandbox = MemorySandbox::default();
+    open_turn(&inner, spec.clone(), &SilentPoster, &sandbox).expect("open");
+    let store = WriteAfterSnapshot::new(
+        inner,
+        EventPayload::RunCompleted {
+            outcome: "the completer".to_string(),
+        },
+    );
+    let error = fail_turn(&store, spec.run_id, "the failer", &sandbox).expect_err("refused");
+    assert!(
+        matches!(error, TurnError::Conflict("turn already completed")),
+        "{error:?}"
+    );
+    assert_eq!(
+        terminals(&store.run(spec.run_id).expect("run").events),
+        vec!["completed: the completer".to_string()]
+    );
+
+    // The failure lands between the completion's check and its append.
+    let spec = subscription_spec(ExecutionPlacement::Local);
+    let inner = InMemoryStore::default();
+    open_turn(&inner, spec.clone(), &SilentPoster, &sandbox).expect("open");
+    let store = WriteAfterSnapshot::new(
+        inner,
+        EventPayload::RunFailed {
+            class: FailureClass::Dependency,
+            message: "the failer".to_string(),
+        },
+    );
+    let error = accept_subscription_completion(&store, spec.run_id, "the completer", &sandbox)
+        .expect_err("refused");
+    assert!(
+        matches!(error, TurnError::Conflict("turn already completed")),
+        "{error:?}"
+    );
+    assert_eq!(
+        terminals(&store.run(spec.run_id).expect("run").events),
+        vec!["failed Dependency: the failer".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn fail_endpoint_is_terminal_and_destroys_sandbox() {
+    let store = Arc::new(InMemoryStore::default());
+    let sandbox = Arc::new(MemorySandbox::default());
+    let app = router_with_sandbox(
+        store,
+        "http://127.0.0.1:9",
+        Arc::new(OkPoster),
+        sandbox.clone(),
+    );
+    let base = listen(app).await;
+    let client = reqwest::Client::new();
+    let opened = post_when_up(
+        &client,
+        &format!("{base}/v1/coworker/turns"),
+        &turn_body("Box", subscription(), "this turn fails"),
+    )
+    .await
+    .error_for_status()
+    .expect("open")
+    .json::<serde_json::Value>()
+    .await
+    .expect("json");
+    let name = opened["computer"]["name"]
+        .as_str()
+        .expect("name")
+        .to_string();
+    let run_id = opened["run_id"].as_str().expect("run id");
+    assert!(sandbox.exists(&name));
+
+    let failed = post_when_up(
+        &client,
+        &format!("{base}/v1/coworker/turns/{run_id}/fail"),
+        &serde_json::json!({ "message": "502 proxy down" }),
+    )
+    .await;
+    assert_eq!(failed.status().as_u16(), 200);
+    assert!(!sandbox.exists(&name));
+    let events = events_of(&client, &base, run_id).await;
+    assert_eq!(
+        terminals(&events),
+        vec!["failed Dependency: 502 proxy down".to_string()]
+    );
+
+    let again = post_when_up(
+        &client,
+        &format!("{base}/v1/coworker/turns/{run_id}/fail"),
+        &serde_json::json!({ "message": "again" }),
+    )
+    .await;
+    assert_eq!(again.status().as_u16(), 409);
 }

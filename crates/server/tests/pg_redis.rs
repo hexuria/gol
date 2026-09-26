@@ -6,8 +6,9 @@ use protocol::{
     ModelProvider, RunId, RunSpec, Timestamp, WorkModel,
 };
 use server::{
-    router_with_queue, AgentManifest, Append, PostgresStore, RedisRunQueue, RunStore,
-    StoredArtifact, StoredRun,
+    accept_subscription_completion, box_container_name, fail_turn, open_turn, router_with_queue,
+    AgentManifest, Append, GatewayCall, GatewayPoster, MemorySandbox, PostgresStore, RedisRunQueue,
+    RunStore, SandboxError, SandboxHost, StoredArtifact, StoredRun, TurnError,
 };
 
 const POSTGRES_URL: &str = "postgres://gol:gol@127.0.0.1/gol";
@@ -533,4 +534,109 @@ async fn redis_push_failure_leaves_run_failed_in_postgres() {
         "{:?}",
         stored.events
     );
+}
+
+/// A subscription turn never posts to the gateway.
+struct NoPost;
+
+impl GatewayPoster for NoPost {
+    fn complete(&self, _call: &GatewayCall) -> Result<String, String> {
+        Err("subscription must not post".to_string())
+    }
+}
+
+/// A sandbox host whose provision always fails.
+struct NoProvision;
+
+impl SandboxHost for NoProvision {
+    fn provision(&self, name: &str) -> Result<(), SandboxError> {
+        Err(SandboxError::Host(format!("cannot start {name}")))
+    }
+
+    fn destroy(&self, _name: &str) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    fn exists(&self, _name: &str) -> bool {
+        false
+    }
+
+    fn launches_docker(&self) -> bool {
+        false
+    }
+}
+
+fn subscription_turn(placement: ExecutionPlacement) -> RunSpec {
+    RunSpec::builder()
+        .agent(AgentId::new(), "1")
+        .input("hello from the desktop")
+        .placement(placement)
+        .work_model(WorkModel {
+            provider: ModelProvider::Anthropic,
+            model_name: "claude-fixture".to_string(),
+            credential: CredentialSource::BringYourOwn {
+                secret_ref: "desktop-subscription".to_string(),
+            },
+        })
+        .build()
+}
+
+fn failures(events: &[Event]) -> Vec<(FailureClass, String)> {
+    events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::RunFailed { class, message } => Some((*class, message.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn provision_failure_run_failed_in_postgres() {
+    let spec = subscription_turn(ExecutionPlacement::Box);
+    let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    open_turn(&store, spec.clone(), &NoPost, &NoProvision).expect_err("provision fails");
+    let stored = reconnect(spec.run_id);
+    assert_eq!(
+        failures(&stored.events),
+        vec![(
+            FailureClass::Environment,
+            format!(
+                "provision: cannot start {}",
+                box_container_name(spec.run_id)
+            )
+        )]
+    );
+}
+
+#[test]
+fn fail_turn_is_terminal_in_postgres() {
+    let spec = subscription_turn(ExecutionPlacement::Box);
+    let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    let sandbox = MemorySandbox::default();
+    open_turn(&store, spec.clone(), &NoPost, &sandbox).expect("open");
+
+    fail_turn(&store, spec.run_id, "proxy said 529", &sandbox).expect("fail");
+    assert!(!sandbox.exists(&box_container_name(spec.run_id)));
+
+    let again = fail_turn(&store, spec.run_id, "again", &sandbox).expect_err("ended");
+    assert!(
+        matches!(again, TurnError::Conflict("turn already completed")),
+        "{again:?}"
+    );
+    let completion =
+        accept_subscription_completion(&store, spec.run_id, "late", &sandbox).expect_err("ended");
+    assert!(
+        matches!(completion, TurnError::Conflict("turn already completed")),
+        "{completion:?}"
+    );
+    let stored = reconnect(spec.run_id);
+    assert_eq!(
+        failures(&stored.events),
+        vec![(FailureClass::Dependency, "proxy said 529".to_string())]
+    );
+    assert!(!stored
+        .events
+        .iter()
+        .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. })));
 }
