@@ -1265,6 +1265,7 @@ dependencies = [
 name = "harness"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "protocol",
  "serde",
  "serde_json",
