@@ -14,7 +14,7 @@
 //! from compiling until the variant is enumerated here.
 
 use protocol::{
-    reduce, reduce_dispatch, Actor, AgentId, ApprovalId, ArtifactId, CredentialSource,
+    applicable, reduce, reduce_dispatch, Actor, AgentId, ApprovalId, ArtifactId, CredentialSource,
     DispatchPhase, Effect, Event, EventPayload, EventSource, ExecutionPlacement, FailureClass,
     HarnessState, InvocationId, Limits, MemoryScope, MessageRole, ModelMessage, ModelProvider,
     RunId, RunSpec, Timestamp, WorkModel, MAX_RETRIES,
@@ -594,6 +594,33 @@ fn harness_reduce_keeps_validity_rank_and_table_on_every_bounded_pair() {
         }
     }
     assert!(checked > 10_000, "only {checked} pairs");
+}
+
+// The driver authorizes an effect only when `applicable` holds, so an
+// authorized effect is never dropped: `applicable` is true exactly when
+// authorizing the effect changes the state or emits an effect.
+#[test]
+fn applicable_matches_reduce_on_every_bounded_pair() {
+    let mut checked = 0usize;
+    for max_steps in MAX_STEPS {
+        let spec = spec(max_steps);
+        for state in harness_states(max_steps) {
+            for effect in effects() {
+                let authorized = event(EventPayload::EffectAuthorized {
+                    effect: effect.clone(),
+                });
+                let (next, emitted) = reduce(state.clone(), &authorized, &spec);
+                let acts = next != state || !emitted.is_empty();
+                assert_eq!(
+                    applicable(&state, &effect, &spec),
+                    acts,
+                    "max_steps={max_steps} {state:?} + {effect:?} -> {next:?} {emitted:?}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 1_000, "only {checked} pairs");
 }
 
 fn dispatch_phases() -> Vec<DispatchPhase> {

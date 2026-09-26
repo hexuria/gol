@@ -7,6 +7,9 @@ pub enum WorkflowRun {
     Open,
     Completed,
     Failed,
+    /// The driver returned no command or more than one. A step names exactly
+    /// one command, so the run cannot go on.
+    Invalid,
 }
 
 pub fn transition(
@@ -19,10 +22,10 @@ pub fn transition(
         wait: WaitCondition::None,
     } = driver.evaluate(ctx, history);
     let next = match commands.as_slice() {
-        [WorkflowCommand::ExecuteTool(_)] => WorkflowRun::Open,
+        [WorkflowCommand::ExecuteTool(_) | WorkflowCommand::SpawnAgent] => WorkflowRun::Open,
         [WorkflowCommand::Complete] => WorkflowRun::Completed,
         [WorkflowCommand::Fail] => WorkflowRun::Failed,
-        _ => WorkflowRun::Open,
+        [] | [_, _, ..] => WorkflowRun::Invalid,
     };
     (next, commands)
 }
