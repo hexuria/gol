@@ -227,3 +227,34 @@ fn on_counter_inside_seq_reads_the_whole_history() {
         WorkflowCommand::Fail
     );
 }
+
+#[test]
+fn each_recorded_spawn_moves_the_cursor_one_record() {
+    let program = WorkflowProgram {
+        root: Decision::Seq(vec![
+            spawn_agent("first", "1"),
+            spawn_agent("second", "2"),
+            tool("search", "q"),
+            Decision::Complete,
+        ]),
+    };
+    assert_eq!(
+        next(&program, vec![spawned("first")]),
+        WorkflowCommand::SpawnAgent(AgentSpec::new("second", "2"))
+    );
+    assert_eq!(
+        next(&program, vec![spawned("first"), spawned("second")]),
+        WorkflowCommand::ExecuteTool(ToolSpec::new("search", "q"))
+    );
+    assert_eq!(
+        next(
+            &program,
+            vec![
+                spawned("first"),
+                spawned("second"),
+                tool_record("search", "")
+            ]
+        ),
+        WorkflowCommand::Complete
+    );
+}

@@ -255,3 +255,13 @@ fn seq_and_spawn_misuse_is_an_invalid_program() {
         "seq takes at least one decision"
     );
 }
+
+// A sparse array longer than the decision cap is refused before its elements
+// are read.
+#[test]
+fn seq_longer_than_the_decision_cap_is_rejected() {
+    assert_eq!(
+        invalid("const a = [];\na.length = 1025;\nseq(a);\n"),
+        "too many decisions"
+    );
+}
