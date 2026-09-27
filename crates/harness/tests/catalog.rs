@@ -16,6 +16,11 @@ use protocol::{
 
 fn spec(capabilities: Vec<&str>) -> RunSpec {
     RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::new(), "1")
         .input("hello")
         .placement(ExecutionPlacement::Local)

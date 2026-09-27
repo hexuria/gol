@@ -35,6 +35,11 @@ fn other_invocation() -> InvocationId {
 
 fn spec(max_steps: u32) -> RunSpec {
     RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::from_uuid(Uuid::from_u128(3)), "1")
         .input("hello")
         .placement(ExecutionPlacement::Local)

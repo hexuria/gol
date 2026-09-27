@@ -34,6 +34,11 @@ fn spec(limits: Limits) -> RunSpec {
 
 fn spec_with_input(limits: Limits, input: &str) -> RunSpec {
     RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::new(), "1")
         .input(input)
         .placement(ExecutionPlacement::Local)

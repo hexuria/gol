@@ -120,3 +120,8 @@ pub fn authenticator() -> Arc<dyn Authenticator> {
 pub fn bearer() -> String {
     format!("Bearer {}", sign(eddsa(), &claims("user-1", "tenant-1")))
 }
+
+/// A valid bearer header value for `subject` in the default tenant.
+pub fn bearer_for(subject: &str) -> String {
+    format!("Bearer {}", sign(eddsa(), &claims(subject, "tenant-1")))
+}

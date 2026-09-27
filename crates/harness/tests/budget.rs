@@ -43,6 +43,11 @@ fn run(max_steps: u32, effects: Vec<Effect>) -> Driver {
 
 fn run_with(limits: Limits, effects: Vec<Effect>, models: &dyn ModelCompletion) -> Driver {
     let spec = RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::new(), "1")
         .input("hi")
         .placement(ExecutionPlacement::Local)
@@ -241,6 +246,11 @@ impl Decider for AlwaysComplete {
 #[test]
 fn a_complete_that_cannot_finish_the_run_costs_a_step() {
     let spec = RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::new(), "1")
         .input("hi")
         .placement(ExecutionPlacement::Local)
@@ -318,6 +328,11 @@ impl Decider for Watching {
 #[test]
 fn a_decider_sees_which_budget_is_spent() {
     let spec = RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::new(), "1")
         .input("hi")
         .placement(ExecutionPlacement::Local)

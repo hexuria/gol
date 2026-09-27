@@ -9,6 +9,11 @@ use protocol::{
 
 fn spec(placement: ExecutionPlacement) -> RunSpec {
     RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(protocol::AgentId::new(), "1")
         .input("hello")
         .placement(placement)

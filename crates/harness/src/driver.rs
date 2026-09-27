@@ -412,6 +412,11 @@ mod tests {
 
     fn spec_with(placement: ExecutionPlacement, capabilities: Vec<Capability>) -> RunSpec {
         RunSpec::builder()
+            .owner(protocol::Owner::new(
+                "https://issuer.test",
+                "user-1",
+                "tenant-1",
+            ))
             .agent(AgentId::new(), "1")
             .input("hello")
             .placement(placement)

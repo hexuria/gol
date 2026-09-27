@@ -18,6 +18,11 @@ const REDIS_URL: &str = "redis://127.0.0.1/";
 
 fn spec() -> RunSpec {
     RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::new(), "1")
         .input("hello")
         .placement(ExecutionPlacement::Local)
@@ -40,12 +45,15 @@ fn postgres_round_trips_event_and_artifact_on_a_new_connection() {
     let artifact_id = ArtifactId::new();
     {
         let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
-        store.put_agent(AgentManifest {
-            id: run.agent_id,
-            version: "1".to_string(),
-            instructions: "store".to_string(),
-            tools: vec!["echo".to_string()],
-            required_capabilities: vec![Capability::new("tool.echo")],
+        store.put_agent(server::StoredAgent {
+            manifest: AgentManifest {
+                id: run.agent_id,
+                version: "1".to_string(),
+                instructions: "store".to_string(),
+                tools: vec!["echo".to_string()],
+                required_capabilities: vec![Capability::new("tool.echo")],
+            },
+            owner: run.owner.clone(),
         });
         let event = Event::record(
             protocol::EventSource::new(
@@ -160,7 +168,6 @@ async fn create_run_writes_postgres_and_enqueues_redis() {
                 "model_name": "gpt-test",
                 "credential": "PlatformGateway"
             },
-            "capabilities": ["tool.echo"],
             "limits": { "max_steps": 8, "max_model_calls": 4 }
         }))
         .send()
@@ -395,8 +402,12 @@ struct WatchedPostgres {
 }
 
 impl RunStore for WatchedPostgres {
-    fn put_agent(&self, agent: AgentManifest) {
-        self.inner.put_agent(agent);
+    fn put_agent(&self, agent: server::StoredAgent) -> server::PutAgent {
+        self.inner.put_agent(agent)
+    }
+
+    fn agent(&self, id: protocol::AgentId) -> Option<server::StoredAgent> {
+        self.inner.agent(id)
     }
 
     fn put_run(&self, run: StoredRun) {
@@ -441,11 +452,26 @@ async fn post_run(
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve");
     });
+    let agent_id = AgentId::new();
+    let agent = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/agents"))
+        .header("authorization", common::bearer())
+        .json(&AgentManifest {
+            id: agent_id,
+            version: "1".to_string(),
+            instructions: "Echo the input, then finish.".to_string(),
+            tools: vec!["echo".to_string()],
+            required_capabilities: vec![Capability::new("tool.echo")],
+        })
+        .send()
+        .await
+        .expect("agent");
+    assert!(agent.status().is_success());
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/v1/runs"))
         .header("authorization", common::bearer())
         .json(&serde_json::json!({
-            "agent_id": AgentId::new(),
+            "agent_id": agent_id,
             "agent_version": "1",
             "input": "hello",
             "placement": "Local",
@@ -454,7 +480,6 @@ async fn post_run(
                 "model_name": "gpt-test",
                 "credential": "PlatformGateway"
             },
-            "capabilities": ["tool.echo"],
             "limits": { "max_steps": 8, "max_model_calls": 4 }
         }))
         .send()
@@ -584,6 +609,11 @@ impl SandboxHost for NoProvision {
 
 fn subscription_turn(placement: ExecutionPlacement) -> RunSpec {
     RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::new(), "1")
         .input("hello from the desktop")
         .placement(placement)
@@ -655,4 +685,51 @@ fn fail_turn_is_terminal_in_postgres() {
         .events
         .iter()
         .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. })));
+}
+
+// formal/agentowner FirstOwnerKeeps and OnlyOwnerStores on Postgres: the
+// conditional upsert is one statement, so principals racing on their own
+// connections leave the agent with the first to store it.
+#[test]
+fn first_owner_keeps_the_agent_in_postgres() {
+    use server::{PutAgent, StoredAgent};
+    let id = AgentId::new();
+    let threads: Vec<_> = ["alice", "bob", "carol"]
+        .into_iter()
+        .map(|subject| {
+            std::thread::spawn(move || {
+                let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+                let owner = protocol::Owner::new("https://issuer.test", subject, "tenant-1");
+                (0..20)
+                    .map(|version| {
+                        let put = store.put_agent(StoredAgent {
+                            manifest: AgentManifest {
+                                id,
+                                version: version.to_string(),
+                                instructions: "race".to_string(),
+                                tools: Vec::new(),
+                                required_capabilities: Vec::new(),
+                            },
+                            owner: owner.clone(),
+                        });
+                        (subject, put)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let puts: Vec<_> = threads
+        .into_iter()
+        .flat_map(|t| t.join().unwrap())
+        .collect();
+    let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    let owner = store.agent(id).expect("stored").owner.subject;
+    for (subject, put) in puts {
+        let expected = if subject == owner {
+            PutAgent::Stored
+        } else {
+            PutAgent::OwnedByOther
+        };
+        assert_eq!(put, expected, "{subject} with owner {owner}");
+    }
 }

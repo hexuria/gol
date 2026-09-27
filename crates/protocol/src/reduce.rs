@@ -557,6 +557,11 @@ mod tests {
     #[test]
     fn step_advanced_stops_at_the_spec_limit() {
         let spec = RunSpec::builder()
+            .owner(crate::Owner::new(
+                "https://issuer.test",
+                "user-1",
+                "tenant-1",
+            ))
             .agent(AgentId::new(), "3")
             .input("ship")
             .placement(ExecutionPlacement::Box)

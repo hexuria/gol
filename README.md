@@ -24,6 +24,14 @@ Every route needs `Authorization: Bearer <token>`. The server refuses to start u
   - When the JWKS cannot be fetched within 3 s, the answer is 503, and the next fetch waits 30 s. A refetch that fails keeps using the keys already loaded, for as long as the issuer stays unreachable.
 - **Local development only:** `GOL_AUTH=local-dev`, with no `GOL_OIDC_*` set, accepts exactly the desktop's static token `gol-gateway-local` and logs a warning on every request. Never use it in production.
 
+Runs and agents belong to the caller that created them, by token issuer and subject:
+
+- `POST /v1/agents` stores a manifest. The same caller may replace it, and anyone else gets 409.
+- `POST /v1/runs` needs a stored manifest the caller owns (otherwise 404), with the same `agent_version` (otherwise 409). The run takes its capabilities from the manifest, and a body with any unknown field, `capabilities` included, is 400.
+- A desktop turn (`POST /v1/coworker/turns`) needs no stored manifest and names its own capabilities.
+- Reading a run, its events, `ag-ui` or `ui`, and completing or failing a turn, answer 404 unless the caller owns the run.
+- Postgres keeps the owner with each agent. A database created before this version needs its `agents` and `runs` tables dropped.
+
 `cargo test` does not call a live model and does not need an API key. The local server echoes the run input through one tool, then completes. A run records the user message before that loop.
 
 ## Inference proxy
