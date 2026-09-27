@@ -1,28 +1,20 @@
 import Base
-import ./counter.bend as C
+import ./workflow.bend as W
 
-# Counter workflow. Do not weaken a law to make a proof pass.
-# Missing asks for the counter tool. Only non-negative zero completes.
-# Every positive magnitude fails. Every negative sign fails.
-# Rust i64 zero is NonNeg and 0n. i64::MIN is negative. i64::MAX is positive.
+# The gol workflow IR in Bend, encoding v2. Do not weaken a law to make a
+# proof pass; a failing proof means stop.
 
-law missing_executes:
-  {C.decide(C.GolMissing{}) == C.GolExecute{} : C.GolCmd}
+# Every program survives encoding: the postfix token list decodes back to it.
+law round_trip:
+  for +p: W.GolDec
+  {W.decode_program(W.encode(p, [])) == Some{p} : Maybe<W.GolDec>}
 
-law zero_completes:
-  {C.decide(C.GolRecorded{C.GolNonNeg{}, 0n}) == C.GolComplete{} : C.GolCmd}
-
-law positive_fails:
-  for n: Nat
-  {C.decide(C.GolRecorded{C.GolNonNeg{}, 1n+n}) == C.GolHalt{} : C.GolCmd}
-
-law negative_fails:
-  for n: Nat
-  {C.decide(C.GolRecorded{C.GolNeg{}, n}) == C.GolHalt{} : C.GolCmd}
-
+# The reference program does what its table says on every history drawn
+# from the eight records W.record names: search, then read the counter; on
+# zero spawn the helper and complete; any other record or counter fails.
 law program_agrees:
-  for h: C.GolHist
-  {C.eval_program(C.counter_program(), h) == C.decide(h) : C.GolCmd}
+  for +h: +List<W.GolKind>
+  {W.eval_program(W.search_program(), W.embed(h)) == W.spec(h) : W.GolCmd}
 
 law encoding:
-  {C.encode(C.counter_program()) == "v1 on_counter execute complete fail" : String}
+  {W.encode_line(W.search_program()) == "v2 tool.736561726368.71 tool.636f756e746572. spawn.68656c706572.7a65726f complete end seq seq fail on_counter end seq seq" : String}
