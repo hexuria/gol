@@ -109,7 +109,11 @@ struct SeeingPoster {
 impl GatewayPoster for SeeingPoster {
     fn complete(&self, call: &GatewayCall) -> Result<String, String> {
         self.called.store(true, Ordering::SeqCst);
-        let stored = self.store.run(call.run_id).expect("user message stored");
+        let stored = self
+            .store
+            .run(call.run_id)
+            .expect("store")
+            .expect("user message stored");
         assert!(
             stored.events.iter().any(|event| matches!(
                 &event.payload,
@@ -176,7 +180,11 @@ impl GatewayPoster for BoxWatch {
             "open_turn finished the turn before the container existed"
         );
         assert_ne!(name, "gol-agent-box");
-        let stored = self.store.run(call.run_id).expect("user message stored");
+        let stored = self
+            .store
+            .run(call.run_id)
+            .expect("store")
+            .expect("user message stored");
         assert!(
             !stored
                 .events
@@ -503,7 +511,7 @@ fn a_failed_sandbox_destroy_does_not_complete_the_turn() {
         TurnError::Sandbox(message) => assert!(message.contains("rm"), "{message}"),
         other => panic!("expected sandbox error, got {other:?}"),
     }
-    let stored = store.run(spec.run_id).expect("run stored");
+    let stored = store.run(spec.run_id).expect("store").expect("run stored");
     assert!(
         !stored
             .events
@@ -784,24 +792,32 @@ impl GatewayPoster for SilentPoster {
 }
 
 impl RunStore for WriteAfterSnapshot {
-    fn put_agent(&self, agent: server::StoredAgent) -> server::PutAgent {
+    fn put_agent(
+        &self,
+        agent: server::StoredAgent,
+    ) -> Result<server::PutAgent, server::StoreError> {
         self.inner.put_agent(agent)
     }
 
-    fn agent(&self, id: protocol::AgentId) -> Option<server::StoredAgent> {
+    fn agent(
+        &self,
+        id: protocol::AgentId,
+    ) -> Result<Option<server::StoredAgent>, server::StoreError> {
         self.inner.agent(id)
     }
 
-    fn put_run(&self, run: StoredRun) {
-        self.inner.put_run(run);
+    fn put_run(&self, run: StoredRun) -> Result<(), server::StoreError> {
+        self.inner.put_run(run)
     }
 
-    fn append_events(&self, id: RunId, events: Vec<Event>) -> Append {
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, server::StoreError> {
         self.inner.append_events(id, events)
     }
 
-    fn run(&self, id: RunId) -> Option<StoredRun> {
-        let snapshot = self.inner.run(id)?;
+    fn run(&self, id: RunId) -> Result<Option<StoredRun>, server::StoreError> {
+        let Some(snapshot) = self.inner.run(id)? else {
+            return Ok(None);
+        };
         if let Some(payload) = self.pending.lock().expect("pending").take() {
             let late = Event::record(
                 EventSource::new(
@@ -813,16 +829,19 @@ impl RunStore for WriteAfterSnapshot {
                 ),
                 payload,
             );
-            assert_eq!(self.inner.append_events(id, vec![late]), Append::Appended);
+            assert_eq!(
+                self.inner.append_events(id, vec![late]),
+                Ok(Append::Appended)
+            );
         }
-        Some(snapshot)
+        Ok(Some(snapshot))
     }
 
-    fn put_artifact(&self, artifact: StoredArtifact) {
-        self.inner.put_artifact(artifact);
+    fn put_artifact(&self, artifact: StoredArtifact) -> Result<(), server::StoreError> {
+        self.inner.put_artifact(artifact)
     }
 
-    fn artifact(&self, id: ArtifactId) -> Option<StoredArtifact> {
+    fn artifact(&self, id: ArtifactId) -> Result<Option<StoredArtifact>, server::StoreError> {
         self.inner.artifact(id)
     }
 }
@@ -887,7 +906,7 @@ fn an_event_stored_after_run_returns_stays_ahead_of_the_completion() {
         "the returned log is the loaded prefix plus the two completion events"
     );
 
-    let stored = store.run(spec.run_id).expect("stored run");
+    let stored = store.run(spec.run_id).expect("store").expect("stored run");
     assert_eq!(stored.spec, spec);
     let events = &stored.events;
     assert_eq!(events.len(), 6);
@@ -1038,7 +1057,7 @@ fn a_failed_destroy_keeps_a_message_stored_during_the_turn() {
         .expect_err("rm must fail the completion");
 
     assert!(matches!(error, TurnError::Sandbox(_)), "{error:?}");
-    let events = store.run(spec.run_id).expect("run").events;
+    let events = store.run(spec.run_id).expect("store").expect("run").events;
     assert_eq!(events.len(), 4);
     assert!(matches!(
         &events[3].payload,
@@ -1080,7 +1099,7 @@ fn a_completion_racing_another_completion_is_a_conflict() {
         matches!(error, TurnError::Conflict("turn already completed")),
         "{error:?}"
     );
-    let events = store.run(spec.run_id).expect("run").events;
+    let events = store.run(spec.run_id).expect("store").expect("run").events;
     assert_eq!(completions(&events), vec!["the other writer".to_string()]);
     assert_eq!(events.len(), 4);
 }
@@ -1147,10 +1166,12 @@ fn a_completion_for_a_run_that_is_not_an_open_turn_is_a_conflict() {
         ("already answered", answered),
     ] {
         let store = InMemoryStore::default();
-        store.put_run(StoredRun {
-            spec: spec.clone(),
-            events: events.clone(),
-        });
+        store
+            .put_run(StoredRun {
+                spec: spec.clone(),
+                events: events.clone(),
+            })
+            .expect("put run");
 
         let error =
             accept_subscription_completion(&store, spec.run_id, "done", &MemorySandbox::default())
@@ -1160,7 +1181,7 @@ fn a_completion_for_a_run_that_is_not_an_open_turn_is_a_conflict() {
             matches!(error, TurnError::Conflict("turn is not open")),
             "{label}: {error:?}"
         );
-        let stored = store.run(spec.run_id).expect("run").events;
+        let stored = store.run(spec.run_id).expect("store").expect("run").events;
         assert_eq!(stored, events, "{label}");
     }
 }
@@ -1194,31 +1215,36 @@ fn the_store_log_grows_and_ends_at_the_first_terminal_event() {
 
     assert_eq!(
         store.append_events(spec.run_id, vec![message.clone()]),
-        Append::Missing
+        Ok(Append::Missing)
     );
-    store.put_run(StoredRun {
-        spec: spec.clone(),
-        events: vec![message.clone()],
-    });
+    store
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: vec![message.clone()],
+        })
+        .expect("put run");
     assert_eq!(
         store.append_events(spec.run_id, vec![late.clone()]),
-        Append::Appended
+        Ok(Append::Appended)
     );
-    store.put_run(StoredRun {
-        spec: spec.clone(),
-        events: vec![message.clone()],
-    });
+    store
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: vec![message.clone()],
+        })
+        .expect("put run");
     assert_eq!(
         store.append_events(spec.run_id, vec![done.clone()]),
-        Append::Appended
+        Ok(Append::Appended)
     );
     assert_eq!(
         store.append_events(spec.run_id, vec![at(EventPayload::RunCancelled)]),
-        Append::Terminal
+        Ok(Append::Terminal)
     );
 
     let ids: Vec<_> = store
         .run(spec.run_id)
+        .expect("store")
         .expect("run")
         .events
         .iter()
@@ -1299,7 +1325,7 @@ fn provision_failure_run_failed() {
     let error =
         open_turn(&store, spec.clone(), &SilentPoster, &NoProvision).expect_err("provision fails");
     assert!(matches!(error, TurnError::Sandbox(_)), "{error:?}");
-    let events = store.run(spec.run_id).expect("run").events;
+    let events = store.run(spec.run_id).expect("store").expect("run").events;
     assert_eq!(
         terminals(&events),
         vec![format!(
@@ -1320,7 +1346,7 @@ fn proxy_failure_run_failed() {
             open_turn(&store, spec.clone(), &SilentPoster, &sandbox).expect_err("the proxy fails");
         assert!(matches!(error, TurnError::Proxy(_)), "{error:?}");
         assert!(!sandbox.exists(&box_container_name(spec.run_id)));
-        let events = store.run(spec.run_id).expect("run").events;
+        let events = store.run(spec.run_id).expect("store").expect("run").events;
         assert_eq!(
             terminals(&events),
             vec!["failed Dependency: proxy: subscription must not post".to_string()],
@@ -1342,7 +1368,7 @@ fn a_proxy_failure_with_a_failed_destroy_leaves_the_turn_open() {
     let store = InMemoryStore::default();
     open_turn(&store, spec.clone(), &SilentPoster, &sandbox).expect_err("the proxy fails");
     assert!(sandbox.exists(&box_container_name(spec.run_id)));
-    let events = store.run(spec.run_id).expect("run").events;
+    let events = store.run(spec.run_id).expect("store").expect("run").events;
     assert_eq!(terminals(&events), Vec::<String>::new());
 }
 
@@ -1360,7 +1386,7 @@ fn fail_turn_is_terminal_and_destroys_sandbox() {
     fail_turn(&store, spec.run_id, "proxy said 529", &sandbox).expect("fail");
 
     assert!(!sandbox.exists(&name));
-    let events = store.run(spec.run_id).expect("run").events;
+    let events = store.run(spec.run_id).expect("store").expect("run").events;
     assert_eq!(
         terminals(&events),
         vec!["failed Dependency: proxy said 529".to_string()]
@@ -1380,7 +1406,7 @@ fn fail_on_a_finished_or_gateway_turn_is_a_conflict() {
         "{error:?}"
     );
     assert_eq!(
-        terminals(&store.run(spec.run_id).expect("run").events),
+        terminals(&store.run(spec.run_id).expect("store").expect("run").events),
         vec!["completed: done".to_string()]
     );
 
@@ -1427,7 +1453,7 @@ fn fail_races_completion_exactly_one_terminal() {
         "{error:?}"
     );
     assert_eq!(
-        terminals(&store.run(spec.run_id).expect("run").events),
+        terminals(&store.run(spec.run_id).expect("store").expect("run").events),
         vec!["completed: the completer".to_string()]
     );
 
@@ -1449,7 +1475,7 @@ fn fail_races_completion_exactly_one_terminal() {
         "{error:?}"
     );
     assert_eq!(
-        terminals(&store.run(spec.run_id).expect("run").events),
+        terminals(&store.run(spec.run_id).expect("store").expect("run").events),
         vec!["failed Dependency: the failer".to_string()]
     );
 }
@@ -1543,7 +1569,7 @@ fn a_provision_failure_that_leaves_a_sandbox_keeps_the_turn_open() {
     let error = open_turn(&store, spec.clone(), &SilentPoster, &ProvisionLeavesSandbox)
         .expect_err("provision fails");
     assert!(matches!(error, TurnError::Sandbox(_)), "{error:?}");
-    let events = store.run(spec.run_id).expect("run").events;
+    let events = store.run(spec.run_id).expect("store").expect("run").events;
     assert_eq!(terminals(&events), Vec::<String>::new());
 }
 
@@ -1566,7 +1592,7 @@ fn a_failed_destroy_keeps_a_failed_turn_open() {
 
     assert!(matches!(error, TurnError::Sandbox(_)), "{error:?}");
     assert!(sandbox.exists(&box_container_name(spec.run_id)));
-    let events = store.run(spec.run_id).expect("run").events;
+    let events = store.run(spec.run_id).expect("store").expect("run").events;
     assert_eq!(terminals(&events), Vec::<String>::new());
 }
 
@@ -1577,21 +1603,23 @@ fn a_failed_destroy_keeps_a_failed_turn_open() {
 fn fail_on_a_run_that_is_not_an_open_turn_is_a_conflict() {
     let spec = subscription_spec(ExecutionPlacement::Local);
     let store = InMemoryStore::default();
-    store.put_run(StoredRun {
-        spec: spec.clone(),
-        events: vec![Event::record(
-            EventSource::new(
-                spec.run_id,
-                spec.agent_id,
-                &spec.agent_version,
-                Actor::System,
-                Timestamp::now(),
-            ),
-            EventPayload::UserMessage {
-                text: spec.input.clone(),
-            },
-        )],
-    });
+    store
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: vec![Event::record(
+                EventSource::new(
+                    spec.run_id,
+                    spec.agent_id,
+                    &spec.agent_version,
+                    Actor::System,
+                    Timestamp::now(),
+                ),
+                EventPayload::UserMessage {
+                    text: spec.input.clone(),
+                },
+            )],
+        })
+        .expect("put run");
     let error = fail_turn(&store, spec.run_id, "nope", &MemorySandbox::default())
         .expect_err("not an open turn");
     assert!(
@@ -1599,7 +1627,7 @@ fn fail_on_a_run_that_is_not_an_open_turn_is_a_conflict() {
         "{error:?}"
     );
     assert_eq!(
-        terminals(&store.run(spec.run_id).expect("run").events),
+        terminals(&store.run(spec.run_id).expect("store").expect("run").events),
         Vec::<String>::new()
     );
 }
@@ -1693,7 +1721,7 @@ fn a_provision_whose_container_is_gone_ends_the_turn() {
     let store = InMemoryStore::default();
     let error = open_turn(&store, spec.clone(), &SilentPoster, &sandbox).expect_err("start fails");
     assert!(matches!(error, TurnError::Sandbox(_)), "{error:?}");
-    let events = store.run(spec.run_id).expect("run").events;
+    let events = store.run(spec.run_id).expect("store").expect("run").events;
     assert_eq!(
         terminals(&events),
         vec![format!(
@@ -1717,7 +1745,7 @@ fn an_unreachable_docker_does_not_end_a_failed_provision() {
         let error =
             open_turn(&store, spec.clone(), &SilentPoster, &sandbox).expect_err("docker is down");
         assert!(matches!(error, TurnError::Sandbox(_)), "{error:?}");
-        let events = store.run(spec.run_id).expect("run").events;
+        let events = store.run(spec.run_id).expect("store").expect("run").events;
         assert_eq!(terminals(&events), Vec::<String>::new(), "{message}");
     }
 }
@@ -1741,7 +1769,7 @@ fn an_unreachable_docker_does_not_end_a_failed_turn() {
             matches!(&error, TurnError::Sandbox(text) if text == message),
             "{error:?}"
         );
-        let events = store.run(spec.run_id).expect("run").events;
+        let events = store.run(spec.run_id).expect("store").expect("run").events;
         assert_eq!(terminals(&events), Vec::<String>::new(), "{message}");
         docker.set_down(None);
         assert!(sandbox.exists(&box_container_name(spec.run_id)));
@@ -1766,7 +1794,7 @@ fn an_unreachable_docker_does_not_complete_a_turn() {
         matches!(&error, TurnError::Sandbox(text) if text == DAEMON_UNREACHABLE),
         "{error:?}"
     );
-    let events = store.run(spec.run_id).expect("run").events;
+    let events = store.run(spec.run_id).expect("store").expect("run").events;
     assert_eq!(terminals(&events), Vec::<String>::new());
 }
 
@@ -1793,7 +1821,7 @@ fn a_docker_error_is_recorded_as_its_last_line() {
             matches!(&error, TurnError::Sandbox(text) if *text == kept),
             "{error:?}"
         );
-        let events = store.run(spec.run_id).expect("run").events;
+        let events = store.run(spec.run_id).expect("store").expect("run").events;
         assert_eq!(
             terminals(&events),
             vec![format!("failed Environment: provision: {kept}")]

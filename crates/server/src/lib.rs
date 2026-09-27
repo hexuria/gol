@@ -27,3 +27,6 @@ pub use store::{
     StoredArtifact, StoredRun,
 };
 pub use surface::{ag_ui_events, json_render_spec};
+
+/// Returned by every `RunStore` method.
+pub use harness::StoreError;

@@ -527,7 +527,7 @@ async fn redis_push_failure_does_not_run_the_harness() {
 
     let ids = store.ids.lock().expect("ids").clone();
     assert_eq!(ids.len(), 1, "user message was not stored");
-    let stored = store.run(ids[0]).expect("stored run");
+    let stored = store.run(ids[0]).expect("store").expect("stored run");
     // The run is not left open: the failed push ends it (decision 6).
     assert!(
         matches!(
@@ -628,32 +628,38 @@ impl WatchedMemory {
 }
 
 impl RunStore for WatchedMemory {
-    fn put_agent(&self, agent: server::StoredAgent) -> server::PutAgent {
+    fn put_agent(
+        &self,
+        agent: server::StoredAgent,
+    ) -> Result<server::PutAgent, server::StoreError> {
         self.inner.put_agent(agent)
     }
 
-    fn agent(&self, id: protocol::AgentId) -> Option<server::StoredAgent> {
+    fn agent(
+        &self,
+        id: protocol::AgentId,
+    ) -> Result<Option<server::StoredAgent>, server::StoreError> {
         self.inner.agent(id)
     }
 
-    fn put_run(&self, run: StoredRun) {
+    fn put_run(&self, run: StoredRun) -> Result<(), server::StoreError> {
         self.ids.lock().expect("ids").push(run.spec.run_id);
-        self.inner.put_run(run);
+        self.inner.put_run(run)
     }
 
-    fn append_events(&self, id: RunId, events: Vec<Event>) -> Append {
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, server::StoreError> {
         self.inner.append_events(id, events)
     }
 
-    fn run(&self, id: RunId) -> Option<StoredRun> {
+    fn run(&self, id: RunId) -> Result<Option<StoredRun>, server::StoreError> {
         self.inner.run(id)
     }
 
-    fn put_artifact(&self, artifact: StoredArtifact) {
-        self.inner.put_artifact(artifact);
+    fn put_artifact(&self, artifact: StoredArtifact) -> Result<(), server::StoreError> {
+        self.inner.put_artifact(artifact)
     }
 
-    fn artifact(&self, id: ArtifactId) -> Option<StoredArtifact> {
+    fn artifact(&self, id: ArtifactId) -> Result<Option<StoredArtifact>, server::StoreError> {
         self.inner.artifact(id)
     }
 }
@@ -700,7 +706,7 @@ async fn jev_error_leaves_run_failed() {
 
     let ids = store.ids.lock().expect("ids").clone();
     assert_eq!(ids.len(), 1);
-    let stored = store.run(ids[0]).expect("stored run");
+    let stored = store.run(ids[0]).expect("store").expect("stored run");
     let payloads: Vec<&EventPayload> = stored.events.iter().map(|event| &event.payload).collect();
     assert!(
         matches!(payloads.first(), Some(EventPayload::UserMessage { .. })),

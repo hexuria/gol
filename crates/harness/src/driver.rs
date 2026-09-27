@@ -290,27 +290,44 @@ impl Driver {
                         ),
                     }
                 }
-                Effect::MemoryRead { scope, key } => {
-                    let value = memory.read(*scope, key);
-                    self.push(
+                // A memory store that cannot answer ends the run: the effect
+                // is not recorded as done, and nothing retries a write whose
+                // outcome is unknown.
+                Effect::MemoryRead { scope, key } => match memory.read(*scope, key) {
+                    Ok(value) => self.push(
                         EventPayload::MemoryRead {
                             scope: *scope,
                             key: key.clone(),
                             value,
                         },
                         Actor::System,
-                    );
-                }
-                Effect::MemoryWrite { scope, key, value } => {
-                    memory.write(*scope, key, value);
-                    self.push(
-                        EventPayload::MemoryWritten {
-                            scope: *scope,
-                            key: key.clone(),
-                            value: value.clone(),
+                    ),
+                    Err(error) => self.push(
+                        EventPayload::RunFailed {
+                            class: FailureClass::Infrastructure,
+                            message: format!("memory read: {error}"),
                         },
                         Actor::System,
-                    );
+                    ),
+                },
+                Effect::MemoryWrite { scope, key, value } => {
+                    match memory.write(*scope, key, value) {
+                        Ok(()) => self.push(
+                            EventPayload::MemoryWritten {
+                                scope: *scope,
+                                key: key.clone(),
+                                value: value.clone(),
+                            },
+                            Actor::System,
+                        ),
+                        Err(error) => self.push(
+                            EventPayload::RunFailed {
+                                class: FailureClass::Infrastructure,
+                                message: format!("memory write: {error}"),
+                            },
+                            Actor::System,
+                        ),
+                    }
                 }
                 Effect::Complete { .. }
                 | Effect::Execute { .. }

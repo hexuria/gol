@@ -8,7 +8,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use harness::{
-    run_to_completion, BootError, Driver, EchoTool, InMemory, JevDecider, UnavailableModel,
+    run_to_completion, BootError, Driver, EchoTool, InMemory, JevDecider, StoreError,
+    UnavailableModel,
 };
 use protocol::{
     fold, AgentId, Capability, Event, EventPayload, ExecutionPlacement, FailureClass, Limits,
@@ -88,6 +89,7 @@ async fn owned_run(
     tokio::task::spawn_blocking(move || store.run(id))
         .await
         .map_err(|error| ApiError::Decider(error.to_string()))?
+        .map_err(ApiError::from)?
         .filter(|run| run.spec.owner.is(&owner))
         .ok_or(ApiError::NotFound)
 }
@@ -225,6 +227,7 @@ async fn create_agent(
     match tokio::task::spawn_blocking(move || store.put_agent(stored))
         .await
         .map_err(|error| ApiError::Decider(error.to_string()))?
+        .map_err(ApiError::from)?
     {
         PutAgent::Stored => Ok(Json(agent)),
         PutAgent::OwnedByOther => Err(ApiError::Conflict("agent belongs to another principal")),
@@ -250,6 +253,7 @@ async fn create_run(
     let agent = tokio::task::spawn_blocking(move || store.agent(agent_id))
         .await
         .map_err(|error| ApiError::Decider(error.to_string()))?
+        .map_err(ApiError::from)?
         .filter(|agent| agent.owner.is(&owner))
         .ok_or(ApiError::AgentNotFound)?;
     if agent.manifest.version != body.agent_version {
@@ -279,10 +283,11 @@ async fn create_run(
             store.put_run(StoredRun {
                 spec: spec_for_store,
                 events: vec![message_for_store],
-            });
+            })
         })
         .await
-        .map_err(|error| ApiError::Decider(error.to_string()))?;
+        .map_err(|error| ApiError::Decider(error.to_string()))?
+        .map_err(ApiError::from)?;
         let run_id = spec.run_id;
         let store = state.store.clone();
         let spec_for_queue = spec.clone();
@@ -295,7 +300,9 @@ async fn create_run(
                     FailureClass::Infrastructure,
                     format!("queue push failed: {error}"),
                 );
-                store.append_events(run_id, vec![failed]);
+                if let Err(store_error) = store.append_events(run_id, vec![failed]) {
+                    eprintln!("gol: could not end run {run_id}: {store_error}");
+                }
                 error
             })
         })
@@ -312,10 +319,12 @@ async fn create_run(
         // The user message is on the record before the harness asks Jev.
         let message = crate::inference::user_message_event(&spec_for_run);
         let run_id = spec_for_run.run_id;
-        store_for_run.put_run(StoredRun {
-            spec: spec_for_run.clone(),
-            events: vec![message],
-        });
+        store_for_run
+            .put_run(StoredRun {
+                spec: spec_for_run.clone(),
+                events: vec![message],
+            })
+            .map_err(RunStartError::Store)?;
         let (mut events, outcome) = run_with_jev(&jev_base_url, spec_for_run.clone());
         // A run that could not finish still keeps what the harness did, and ends
         // failed instead of being left open.
@@ -328,15 +337,21 @@ async fn create_run(
                 RunStartError::Decider(message) => {
                     (FailureClass::Dependency, format!("decider: {message}"))
                 }
+                RunStartError::Store(error) => {
+                    (FailureClass::Infrastructure, format!("store: {error}"))
+                }
             };
             events.push(run_failed_event(&spec_for_run, class, message));
         }
         // Append, never overwrite: anything stored while Jev ran stays. When the
         // run is already terminal the store keeps its log and refuses these.
-        store_for_run.append_events(run_id, events);
+        store_for_run
+            .append_events(run_id, events)
+            .map_err(RunStartError::Store)?;
         outcome?;
         store_for_run
             .run(run_id)
+            .map_err(RunStartError::Store)?
             .ok_or_else(|| RunStartError::Decider("run is not stored".to_string()))
     })
     .await
@@ -346,6 +361,7 @@ async fn create_run(
             return Err(ApiError::Unsupported(placement));
         }
         Ok(Err(RunStartError::Decider(message))) => return Err(ApiError::Decider(message)),
+        Ok(Err(RunStartError::Store(error))) => return Err(ApiError::from(error)),
         Err(error) => return Err(ApiError::Decider(error.to_string())),
     };
     Ok(Json(fold(&stored.spec, &stored.events)))
@@ -572,6 +588,7 @@ fn jev_client(base_url: &str) -> Result<typesafe_sdk::blocking::Client, String> 
 enum RunStartError {
     Unsupported(ExecutionPlacement),
     Decider(String),
+    Store(StoreError),
 }
 
 /// The most steps or model calls a client may ask for. With `PlatformGateway` the
@@ -619,6 +636,8 @@ enum ApiError {
     Decider(String),
     NotFound,
     AgentNotFound,
+    /// The store could not answer: 503, with the detail on stderr only.
+    Store(String),
     Proxy(String),
     Sandbox(String),
     Conflict(&'static str),
@@ -629,9 +648,16 @@ enum ApiError {
     AuthUnavailable(String),
 }
 
+impl From<StoreError> for ApiError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error.to_string())
+    }
+}
+
 impl From<TurnError> for ApiError {
     fn from(error: TurnError) -> Self {
         match error {
+            TurnError::Store(message) => Self::Store(message),
             TurnError::Proxy(message) => Self::Proxy(message),
             TurnError::Sandbox(message) => Self::Sandbox(message),
             TurnError::NotFound => Self::NotFound,
@@ -662,6 +688,14 @@ impl axum::response::IntoResponse for ApiError {
                 Json(serde_json::json!({ "error": "run not found" })),
             )
                 .into_response(),
+            Self::Store(message) => {
+                eprintln!("gol: store unavailable: {message}");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": "store unavailable" })),
+                )
+                    .into_response()
+            }
             Self::AgentNotFound => (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "agent not found" })),

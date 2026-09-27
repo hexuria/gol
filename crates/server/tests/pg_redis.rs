@@ -45,16 +45,18 @@ fn postgres_round_trips_event_and_artifact_on_a_new_connection() {
     let artifact_id = ArtifactId::new();
     {
         let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
-        store.put_agent(server::StoredAgent {
-            manifest: AgentManifest {
-                id: run.agent_id,
-                version: "1".to_string(),
-                instructions: "store".to_string(),
-                tools: vec!["echo".to_string()],
-                required_capabilities: vec![Capability::new("tool.echo")],
-            },
-            owner: run.owner.clone(),
-        });
+        store
+            .put_agent(server::StoredAgent {
+                manifest: AgentManifest {
+                    id: run.agent_id,
+                    version: "1".to_string(),
+                    instructions: "store".to_string(),
+                    tools: vec!["echo".to_string()],
+                    required_capabilities: vec![Capability::new("tool.echo")],
+                },
+                owner: run.owner.clone(),
+            })
+            .expect("put agent");
         let event = Event::record(
             protocol::EventSource::new(
                 run_id,
@@ -65,19 +67,23 @@ fn postgres_round_trips_event_and_artifact_on_a_new_connection() {
             ),
             EventPayload::RunCreated,
         );
-        store.put_run(StoredRun {
-            spec: run.clone(),
-            events: vec![event.clone()],
-        });
-        store.put_artifact(StoredArtifact {
-            id: artifact_id,
-            run_id,
-            name: "note.txt".to_string(),
-            body: b"saved".to_vec(),
-        });
+        store
+            .put_run(StoredRun {
+                spec: run.clone(),
+                events: vec![event.clone()],
+            })
+            .expect("put run");
+        store
+            .put_artifact(StoredArtifact {
+                id: artifact_id,
+                run_id,
+                name: "note.txt".to_string(),
+                body: b"saved".to_vec(),
+            })
+            .expect("put artifact");
     }
     let store = PostgresStore::connect(POSTGRES_URL).expect("reconnect");
-    let loaded = store.run(run_id).expect("run");
+    let loaded = store.run(run_id).expect("store").expect("run");
     assert_eq!(loaded.spec.input, "hello");
     assert!(matches!(
         loaded.events.as_slice(),
@@ -86,7 +92,10 @@ fn postgres_round_trips_event_and_artifact_on_a_new_connection() {
             ..
         }]
     ));
-    let artifact = store.artifact(artifact_id).expect("artifact");
+    let artifact = store
+        .artifact(artifact_id)
+        .expect("store")
+        .expect("artifact");
     assert_eq!(artifact.body, b"saved");
     assert_eq!(artifact.name, "note.txt");
 }
@@ -188,6 +197,7 @@ async fn create_run_writes_postgres_and_enqueues_redis() {
         PostgresStore::connect(POSTGRES_URL)
             .expect("reconnect")
             .run(run_id)
+            .expect("store")
     })
     .await
     .expect("reconnect thread")
@@ -233,6 +243,7 @@ fn reconnect(id: RunId) -> StoredRun {
     PostgresStore::connect(POSTGRES_URL)
         .expect("reconnect")
         .run(id)
+        .expect("store")
         .expect("run")
 }
 
@@ -279,14 +290,18 @@ fn a_second_put_keeps_the_first_run() {
     let started = record(&spec, Actor::System, 2, EventPayload::RunStarted);
     {
         let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
-        store.put_run(StoredRun {
-            spec: spec.clone(),
-            events: vec![user.clone()],
-        });
-        store.put_run(StoredRun {
-            spec,
-            events: vec![user.clone(), started],
-        });
+        store
+            .put_run(StoredRun {
+                spec: spec.clone(),
+                events: vec![user.clone()],
+            })
+            .expect("put run");
+        store
+            .put_run(StoredRun {
+                spec,
+                events: vec![user.clone(), started],
+            })
+            .expect("put run");
     }
     assert_eq!(reconnect(run_id).events, vec![user]);
 }
@@ -302,13 +317,15 @@ fn append_extends_the_stored_log() {
     let first = vec![created, started, user];
     let appended = {
         let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
-        store.put_run(StoredRun {
-            spec,
-            events: first.clone(),
-        });
+        store
+            .put_run(StoredRun {
+                spec,
+                events: first.clone(),
+            })
+            .expect("put run");
         store.append_events(run_id, vec![responded.clone(), completed.clone()])
     };
-    assert_eq!(appended, Append::Appended);
+    assert_eq!(appended, Ok(Append::Appended));
     let mut expected = first;
     expected.push(responded);
     expected.push(completed);
@@ -325,10 +342,12 @@ fn a_terminal_log_refuses_every_append() {
     let late = user_message(&spec, 6);
     let outcomes = {
         let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
-        store.put_run(StoredRun {
-            spec,
-            events: vec![user.clone()],
-        });
+        store
+            .put_run(StoredRun {
+                spec,
+                events: vec![user.clone()],
+            })
+            .expect("put run");
         [
             store.append_events(run_id, vec![responded.clone(), completed.clone()]),
             store.append_events(run_id, vec![again_responded, again_completed]),
@@ -337,7 +356,11 @@ fn a_terminal_log_refuses_every_append() {
     };
     assert_eq!(
         outcomes,
-        [Append::Appended, Append::Terminal, Append::Terminal]
+        [
+            Ok(Append::Appended),
+            Ok(Append::Terminal),
+            Ok(Append::Terminal)
+        ]
     );
     assert_eq!(reconnect(run_id).events, vec![user, responded, completed]);
 }
@@ -358,13 +381,15 @@ fn every_terminal_payload_closes_the_log() {
         let late = user_message(&spec, 2);
         let outcome = {
             let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
-            store.put_run(StoredRun {
-                spec,
-                events: vec![ended.clone()],
-            });
+            store
+                .put_run(StoredRun {
+                    spec,
+                    events: vec![ended.clone()],
+                })
+                .expect("put run");
             store.append_events(run_id, vec![late])
         };
-        assert_eq!(outcome, Append::Terminal, "{:?}", ended.payload);
+        assert_eq!(outcome, Ok(Append::Terminal), "{:?}", ended.payload);
         assert_eq!(reconnect(run_id).events, vec![ended]);
     }
 }
@@ -374,8 +399,8 @@ fn append_to_a_missing_run_is_refused() {
     let spec = spec();
     let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
     let outcome = store.append_events(spec.run_id, vec![user_message(&spec, 1)]);
-    assert_eq!(outcome, Append::Missing);
-    assert!(store.run(spec.run_id).is_none());
+    assert_eq!(outcome, Ok(Append::Missing));
+    assert!(store.run(spec.run_id).expect("store").is_none());
 }
 
 fn choice(effect: &str) -> serde_json::Value {
@@ -402,32 +427,38 @@ struct WatchedPostgres {
 }
 
 impl RunStore for WatchedPostgres {
-    fn put_agent(&self, agent: server::StoredAgent) -> server::PutAgent {
+    fn put_agent(
+        &self,
+        agent: server::StoredAgent,
+    ) -> Result<server::PutAgent, server::StoreError> {
         self.inner.put_agent(agent)
     }
 
-    fn agent(&self, id: protocol::AgentId) -> Option<server::StoredAgent> {
+    fn agent(
+        &self,
+        id: protocol::AgentId,
+    ) -> Result<Option<server::StoredAgent>, server::StoreError> {
         self.inner.agent(id)
     }
 
-    fn put_run(&self, run: StoredRun) {
+    fn put_run(&self, run: StoredRun) -> Result<(), server::StoreError> {
         self.ids.lock().expect("ids").push(run.spec.run_id);
-        self.inner.put_run(run);
+        self.inner.put_run(run)
     }
 
-    fn append_events(&self, id: RunId, events: Vec<Event>) -> Append {
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, server::StoreError> {
         self.inner.append_events(id, events)
     }
 
-    fn run(&self, id: RunId) -> Option<StoredRun> {
+    fn run(&self, id: RunId) -> Result<Option<StoredRun>, server::StoreError> {
         self.inner.run(id)
     }
 
-    fn put_artifact(&self, artifact: StoredArtifact) {
-        self.inner.put_artifact(artifact);
+    fn put_artifact(&self, artifact: StoredArtifact) -> Result<(), server::StoreError> {
+        self.inner.put_artifact(artifact)
     }
 
-    fn artifact(&self, id: ArtifactId) -> Option<StoredArtifact> {
+    fn artifact(&self, id: ArtifactId) -> Result<Option<StoredArtifact>, server::StoreError> {
         self.inner.artifact(id)
     }
 }
@@ -723,14 +754,19 @@ fn first_owner_keeps_the_agent_in_postgres() {
         .flat_map(|t| t.join().unwrap())
         .collect();
     let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
-    let owner = store.agent(id).expect("stored").owner.subject;
+    let owner = store
+        .agent(id)
+        .expect("store")
+        .expect("stored")
+        .owner
+        .subject;
     for (subject, put) in puts {
         let expected = if subject == owner {
             PutAgent::Stored
         } else {
             PutAgent::OwnedByOther
         };
-        assert_eq!(put, expected, "{subject} with owner {owner}");
+        assert_eq!(put, Ok(expected), "{subject} with owner {owner}");
     }
 }
 
@@ -756,20 +792,29 @@ fn the_owner_replaces_from_any_tenant_in_postgres() {
     let id = AgentId::new();
     assert_eq!(
         store.put_agent(agent_for(id, "alice", "tenant-1", "1")),
-        PutAgent::Stored
+        Ok(PutAgent::Stored)
     );
     assert_eq!(
         store.put_agent(agent_for(id, "bob", "tenant-1", "9")),
-        PutAgent::OwnedByOther
+        Ok(PutAgent::OwnedByOther)
     );
-    assert_eq!(store.agent(id).expect("stored").manifest.version, "1");
+    assert_eq!(
+        store
+            .agent(id)
+            .expect("store")
+            .expect("stored")
+            .manifest
+            .version,
+        "1"
+    );
     assert_eq!(
         store.put_agent(agent_for(id, "alice", "tenant-2", "2")),
-        PutAgent::Stored
+        Ok(PutAgent::Stored)
     );
     let stored = PostgresStore::connect(POSTGRES_URL)
         .expect("connect")
         .agent(id)
+        .expect("store")
         .expect("stored");
     assert_eq!(stored.manifest.version, "2");
     assert_eq!(stored.owner.tenant, "tenant-2");
@@ -807,11 +852,12 @@ fn a_put_waits_for_a_concurrent_insert_of_the_same_id() {
         "bob's put finished while alice's insert was uncommitted"
     );
     tx.commit().expect("commit");
-    assert_eq!(receiver.recv().unwrap(), PutAgent::OwnedByOther);
+    assert_eq!(receiver.recv().unwrap(), Ok(PutAgent::OwnedByOther));
     bob.join().unwrap();
     let stored = PostgresStore::connect(POSTGRES_URL)
         .expect("connect")
         .agent(id)
+        .expect("store")
         .expect("stored");
     assert_eq!(stored.owner.subject, "alice");
 }
@@ -837,4 +883,87 @@ fn an_old_agents_table_is_refused_at_connect() {
         .expect("drop");
     let error = connected.expect_err("connect must fail");
     assert!(format!("{error:?}").contains("owner_issuer"), "{error:?}");
+}
+
+/// Terminates every backend whose `application_name` is `application` and
+/// waits until Postgres no longer lists them. Returns how many it terminated.
+fn terminate_backends(application: &str) -> i64 {
+    let mut admin = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("admin");
+    let terminated: i64 = admin
+        .query_one(
+            "select count(pg_terminate_backend(pid)) from pg_stat_activity
+             where application_name = $1",
+            &[&application],
+        )
+        .expect("terminate")
+        .get(0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let alive: i64 = admin
+            .query_one(
+                "select count(*) from pg_stat_activity where application_name = $1",
+                &[&application],
+            )
+            .expect("activity")
+            .get(0);
+        if alive == 0 {
+            return terminated;
+        }
+        assert!(std::time::Instant::now() < deadline, "backend still alive");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+// A dead connection answers 503 for the request that finds it, and the next
+// request reconnects (owner decision 1A). The server process never restarts.
+#[tokio::test]
+async fn a_killed_backend_is_503_then_the_next_request_reconnects() {
+    let application = format!("gol_c1_{}", uuid::Uuid::new_v4().simple());
+    let url = format!("{POSTGRES_URL}?application_name={application}");
+    let spec = spec();
+    let run_id = spec.run_id;
+    let store = tokio::task::spawn_blocking(move || {
+        let store = PostgresStore::connect(&url).expect("connect");
+        let events = vec![user_message(&spec, 1)];
+        store.put_run(StoredRun { spec, events }).expect("put run");
+        store
+    })
+    .await
+    .expect("connect thread");
+    let app = server::router(
+        Arc::new(store),
+        "http://127.0.0.1:9",
+        common::authenticator(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let get = || async {
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/v1/runs/{run_id}"))
+            .header("authorization", common::bearer())
+            .send()
+            .await
+            .expect("get");
+        (
+            response.status().as_u16(),
+            response.text().await.expect("body"),
+        )
+    };
+
+    assert_eq!(get().await.0, 200, "before the kill");
+    let killed = tokio::task::spawn_blocking(move || terminate_backends(&application))
+        .await
+        .expect("terminate thread");
+    assert_eq!(killed, 1);
+    let (status, body) = get().await;
+    assert_eq!(
+        (status, body.as_str()),
+        (503, r#"{"error":"store unavailable"}"#)
+    );
+    assert_eq!(get().await.0, 200, "after reconnect");
 }
