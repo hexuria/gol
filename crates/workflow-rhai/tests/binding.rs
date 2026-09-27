@@ -282,3 +282,31 @@ fn seq_and_spawn_misuse_is_an_invalid_program() {
         "seq takes at least one decision"
     );
 }
+
+// The same budget boundary as the test above, for the builtins with two
+// arguments or an array: at 16665 iterations the budget runs out exactly at
+// the call on the last line. That is the budget, not a misuse. Found the same
+// way; after a rhai upgrade, find it again.
+#[test]
+fn the_budget_running_out_at_tool_spawn_or_seq_is_not_a_misuse() {
+    for (source, line) in [
+        (
+            "let i = 0;\nwhile i < 16665 { i += 1; }\ntool(\"a\", \"b\");\n",
+            "line 3",
+        ),
+        (
+            "let i = 0;\nwhile i < 16665 { i += 1; }\nspawn_agent(\"h\", \"g\");\n",
+            "line 3",
+        ),
+        (
+            "let d = complete();\nlet i = 0;\nwhile i < 16665 { i += 1; }\nseq([d]);\n",
+            "line 4",
+        ),
+    ] {
+        let outcome = compile(source);
+        assert!(
+            matches!(&outcome, Err(FrontendError::Script(message)) if message.contains("Too many operations") && message.contains(line)),
+            "{source}: {outcome:?}"
+        );
+    }
+}
