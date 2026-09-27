@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use protocol::{AgentId, ArtifactId, Capability, Event, EventPayload, RunId, RunSpec};
+use protocol::{AgentId, ArtifactId, Capability, Event, EventPayload, Owner, RunId, RunSpec};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentManifest {
@@ -10,6 +10,23 @@ pub struct AgentManifest {
     pub instructions: String,
     pub tools: Vec<String>,
     pub required_capabilities: Vec<Capability>,
+}
+
+/// A manifest and the principal that stored it. Only that principal may
+/// replace it or start runs of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredAgent {
+    pub manifest: AgentManifest,
+    pub owner: Owner,
+}
+
+/// What `RunStore::put_agent` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PutAgent {
+    /// Stored, as a new agent or replacing the caller's own.
+    Stored,
+    /// Another principal owns that agent id. Nothing was written.
+    OwnedByOther,
 }
 
 #[derive(Clone, Debug)]
@@ -50,7 +67,10 @@ pub fn is_terminal(payload: &EventPayload) -> bool {
 }
 
 pub trait RunStore: Send + Sync {
-    fn put_agent(&self, agent: AgentManifest);
+    /// Store a manifest, unless another principal already owns its id. The
+    /// check and the write are one atomic step.
+    fn put_agent(&self, agent: StoredAgent) -> PutAgent;
+    fn agent(&self, id: AgentId) -> Option<StoredAgent>;
     /// Store a new run. A run already stored under that id keeps its spec and
     /// events, so a redelivered put cannot drop anything appended since.
     fn put_run(&self, run: StoredRun);
@@ -65,17 +85,27 @@ pub trait RunStore: Send + Sync {
 
 #[derive(Default)]
 pub struct InMemoryStore {
-    agents: Mutex<HashMap<AgentId, AgentManifest>>,
+    agents: Mutex<HashMap<AgentId, StoredAgent>>,
     runs: Mutex<HashMap<RunId, StoredRun>>,
     artifacts: Mutex<HashMap<ArtifactId, StoredArtifact>>,
 }
 
 impl RunStore for InMemoryStore {
-    fn put_agent(&self, agent: AgentManifest) {
-        self.agents
-            .lock()
-            .expect("agent store")
-            .insert(agent.id, agent);
+    fn put_agent(&self, agent: StoredAgent) -> PutAgent {
+        let mut agents = self.agents.lock().expect("agent store");
+        let id = agent.manifest.id;
+        if agents
+            .get(&id)
+            .is_some_and(|stored| !stored.owner.is(&agent.owner))
+        {
+            return PutAgent::OwnedByOther;
+        }
+        agents.insert(id, agent);
+        PutAgent::Stored
+    }
+
+    fn agent(&self, id: AgentId) -> Option<StoredAgent> {
+        self.agents.lock().expect("agent store").get(&id).cloned()
     }
 
     fn put_run(&self, run: StoredRun) {

@@ -23,6 +23,7 @@ pub use local::LocalEchoFactory;
 pub use postgres::PostgresStore;
 pub use queue::RedisRunQueue;
 pub use store::{
-    is_terminal, AgentManifest, Append, InMemoryStore, RunStore, StoredArtifact, StoredRun,
+    is_terminal, AgentManifest, Append, InMemoryStore, PutAgent, RunStore, StoredAgent,
+    StoredArtifact, StoredRun,
 };
 pub use surface::{ag_ui_events, json_render_spec};

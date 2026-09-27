@@ -120,6 +120,7 @@ fn on_command(command: &WorkflowCommand) -> Option<protocol::RunState> {
         WorkflowCommand::SpawnAgent(_) => {
             let mut driver = harness::Driver::boot(
                 protocol::RunSpec::builder()
+                    .owner(protocol::Owner::new("local", "runtime-tokio", "local"))
                     .agent(protocol::AgentId::new(), "1")
                     .input("hello")
                     .placement(protocol::ExecutionPlacement::Local)
@@ -274,6 +275,7 @@ mod tests {
     #[test]
     fn spawn_agent_calls_run_to_completion_once() {
         let spec = protocol::RunSpec::builder()
+            .owner(protocol::Owner::new("local", "runtime-tokio", "local"))
             .agent(protocol::AgentId::new(), "1")
             .input("hello")
             .placement(protocol::ExecutionPlacement::Local)

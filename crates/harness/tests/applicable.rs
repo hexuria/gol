@@ -11,6 +11,11 @@ use protocol::{
 
 fn boot() -> Driver {
     let spec = RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::new(), "1")
         .input("hi")
         .placement(ExecutionPlacement::Local)

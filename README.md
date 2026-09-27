@@ -24,6 +24,14 @@ Every route needs `Authorization: Bearer <token>`. The server refuses to start u
   - When the JWKS cannot be fetched within 3 s, the answer is 503, and the next fetch waits 30 s. A refetch that fails keeps using the keys already loaded, for as long as the issuer stays unreachable.
 - **Local development only:** `GOL_AUTH=local-dev`, with no `GOL_OIDC_*` set, accepts exactly the desktop's static token `gol-gateway-local` and logs a warning on every request. Never use it in production.
 
+Runs and agents belong to the caller that created them, by token issuer and subject:
+
+- `POST /v1/agents` stores a manifest. The same caller may replace it, and anyone else gets 409.
+- `POST /v1/runs` needs a stored manifest the caller owns (otherwise 404), with the same `agent_version` (otherwise 409). The run takes its capabilities from the manifest, and a body with any unknown field, `capabilities` included, is 400.
+- A desktop turn (`POST /v1/coworker/turns`) needs no stored manifest and names its own capabilities.
+- Reading a run, its events, `ag-ui` or `ui`, and completing or failing a turn, answer 404 unless the caller owns the run.
+- Postgres keeps the owner with each agent. A database created before this version needs its `agents` and `runs` tables dropped.
+
 `cargo test` does not call a live model and does not need an API key. The local server echoes the run input through one tool, then completes. A run records the user message before that loop.
 
 ## Inference proxy
@@ -101,7 +109,7 @@ export BEND_NO_TELEMETRY=1
 
 ## Formal model
 
-`formal/runlog/RunLog.tla` models the writers of a run's event log. Its findings are in `formal/runlog/FINDINGS.md`. `formal/RETIRED.md` records retired checks and what owns their properties now. The reducers themselves are checked in Rust: `crates/protocol/tests/reduce_bounded.rs` enumerates every bounded (state, event) pair of production `reduce` and `reduce_dispatch`.
+`formal/runlog/RunLog.tla` models the writers of a run's event log. Its findings are in `formal/runlog/FINDINGS.md`. `formal/agentowner/AgentOwner.tla` models principals racing to store one agent manifest; its findings are in `formal/agentowner/FINDINGS.md`. `formal/RETIRED.md` records retired checks and what owns their properties now. The reducers themselves are checked in Rust: `crates/protocol/tests/reduce_bounded.rs` enumerates every bounded (state, event) pair of production `reduce` and `reduce_dispatch`.
 
 `./scripts/install-tla.sh` installs the pinned TLA+ tools, v1.7.4 (TLC 2.19), at `~/.local/tla/tla2tools.jar` and checks its sha256. `./scripts/verify-tla.sh` runs TLC on every `formal/**/*.cfg` with `-workers auto -lncheck final`. TLC checks deadlock on every config; AGENTS.md forbids turning it off. The script reads the jar from `TLA_JAR`, then `~/.local/tla/tla2tools.jar`, then `/usr/share/java/tla2tools.jar`.
 

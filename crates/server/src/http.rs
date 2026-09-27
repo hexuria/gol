@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequestParts, Path, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
@@ -11,7 +12,7 @@ use harness::{
 };
 use protocol::{
     fold, AgentId, Capability, Event, EventPayload, ExecutionPlacement, FailureClass, Limits,
-    RunId, RunSpec, RunState, WorkModel,
+    Owner, RunId, RunSpec, RunState, WorkModel,
 };
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +23,7 @@ use crate::inference::{
     TurnOutcome,
 };
 use crate::queue::RedisRunQueue;
-use crate::store::{AgentManifest, RunStore, StoredRun};
+use crate::store::{AgentManifest, PutAgent, RunStore, StoredAgent, StoredRun};
 use crate::surface::{ag_ui_events, json_render_spec};
 
 #[derive(Clone)]
@@ -35,8 +36,25 @@ struct AppState {
     auth: Arc<dyn Authenticator>,
 }
 
+/// `POST /v1/runs`. Capabilities come from the stored manifest, so the body
+/// has none, and any unknown field is refused.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RunBody {
+    agent_id: AgentId,
+    agent_version: String,
+    input: String,
+    placement: ExecutionPlacement,
+    work_model: WorkModel,
+    limits: Option<Limits>,
+    #[serde(default)]
+    metadata: BTreeMap<String, String>,
+}
+
+/// `POST /v1/coworker/turns`. A desktop turn has no stored manifest, so it
+/// names its own capabilities (owner decision for B2).
+#[derive(Debug, Deserialize)]
+struct TurnRequest {
     agent_id: AgentId,
     agent_version: String,
     input: String,
@@ -47,6 +65,31 @@ struct RunBody {
     limits: Option<Limits>,
     #[serde(default)]
     metadata: BTreeMap<String, String>,
+}
+
+/// The owner a request's principal becomes.
+fn owner_of(principal: &Principal) -> Owner {
+    Owner::new(
+        principal.issuer.clone(),
+        principal.subject.clone(),
+        principal.tenant.clone(),
+    )
+}
+
+/// The run `id`, if the caller owns it. A run another principal owns is
+/// reported exactly like a missing one.
+async fn owned_run(
+    state: &AppState,
+    id: RunId,
+    principal: &Principal,
+) -> Result<StoredRun, ApiError> {
+    let store = state.store.clone();
+    let owner = owner_of(principal);
+    tokio::task::spawn_blocking(move || store.run(id))
+        .await
+        .map_err(|error| ApiError::Decider(error.to_string()))?
+        .filter(|run| run.spec.owner.is(&owner))
+        .ok_or(ApiError::NotFound)
 }
 
 pub fn router(
@@ -170,24 +213,63 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 async fn create_agent(
-    Authenticated(_principal): Authenticated,
+    Authenticated(principal): Authenticated,
     State(state): State<AppState>,
     Json(agent): Json<AgentManifest>,
 ) -> Result<Json<AgentManifest>, ApiError> {
     let store = state.store.clone();
-    let saved = agent.clone();
-    tokio::task::spawn_blocking(move || store.put_agent(saved))
+    let stored = StoredAgent {
+        manifest: agent.clone(),
+        owner: owner_of(&principal),
+    };
+    match tokio::task::spawn_blocking(move || store.put_agent(stored))
         .await
-        .map_err(|error| ApiError::Decider(error.to_string()))?;
-    Ok(Json(agent))
+        .map_err(|error| ApiError::Decider(error.to_string()))?
+    {
+        PutAgent::Stored => Ok(Json(agent)),
+        PutAgent::OwnedByOther => Err(ApiError::Conflict("agent belongs to another principal")),
+    }
 }
 
 async fn create_run(
-    Authenticated(_principal): Authenticated,
+    Authenticated(principal): Authenticated,
     State(state): State<AppState>,
-    Json(body): Json<RunBody>,
+    body: Result<Json<RunBody>, JsonRejection>,
 ) -> Result<Json<RunState>, ApiError> {
-    let spec = spec_from_body(body)?;
+    // An unknown field (such as `capabilities`), a bad value or bad JSON is a
+    // 400; any other rejection (content type, size) keeps its own status.
+    let Json(body) = body.map_err(|rejection| match rejection {
+        JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_) => {
+            ApiError::InvalidBody(rejection.body_text())
+        }
+        other => ApiError::Rejected(other),
+    })?;
+    let owner = owner_of(&principal);
+    let store = state.store.clone();
+    let agent_id = body.agent_id;
+    let agent = tokio::task::spawn_blocking(move || store.agent(agent_id))
+        .await
+        .map_err(|error| ApiError::Decider(error.to_string()))?
+        .filter(|agent| agent.owner.is(&owner))
+        .ok_or(ApiError::AgentNotFound)?;
+    if agent.manifest.version != body.agent_version {
+        return Err(ApiError::Conflict(
+            "agent_version does not match the stored manifest",
+        ));
+    }
+    let spec = build_spec(
+        owner,
+        SpecCore {
+            agent_id: body.agent_id,
+            agent_version: body.agent_version,
+            input: body.input,
+            placement: body.placement,
+            work_model: body.work_model,
+            limits: body.limits,
+            metadata: body.metadata,
+        },
+        agent.manifest.required_capabilities,
+    )?;
     if let Some(url) = state.redis_url.clone() {
         let message = crate::inference::user_message_event(&spec);
         let store = state.store.clone();
@@ -270,11 +352,23 @@ async fn create_run(
 }
 
 async fn create_coworker_turn(
-    Authenticated(_principal): Authenticated,
+    Authenticated(principal): Authenticated,
     State(state): State<AppState>,
-    Json(body): Json<RunBody>,
+    Json(body): Json<TurnRequest>,
 ) -> Result<Json<TurnBody>, ApiError> {
-    let spec = spec_from_body(body)?;
+    let spec = build_spec(
+        owner_of(&principal),
+        SpecCore {
+            agent_id: body.agent_id,
+            agent_version: body.agent_version,
+            input: body.input,
+            placement: body.placement,
+            work_model: body.work_model,
+            limits: body.limits,
+            metadata: body.metadata,
+        },
+        body.capabilities,
+    )?;
     let store = state.store.clone();
     let poster = state.poster.clone();
     let sandbox = state.sandbox.clone();
@@ -288,11 +382,13 @@ async fn create_coworker_turn(
 }
 
 async fn complete_coworker_turn(
-    Authenticated(_principal): Authenticated,
+    Authenticated(principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
     Json(body): Json<CompletionBody>,
 ) -> Result<Json<TurnBody>, ApiError> {
+    // The owner never changes, so checking it before the completion is exact.
+    owned_run(&state, id, &principal).await?;
     let store = state.store.clone();
     let sandbox = state.sandbox.clone();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -310,11 +406,12 @@ struct CompletionBody {
 }
 
 async fn fail_coworker_turn(
-    Authenticated(_principal): Authenticated,
+    Authenticated(principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
     Json(body): Json<FailBody>,
 ) -> Result<Json<TurnBody>, ApiError> {
+    owned_run(&state, id, &principal).await?;
     let store = state.store.clone();
     let sandbox = state.sandbox.clone();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -384,41 +481,29 @@ impl ComputerBody {
 }
 
 async fn get_run(
-    Authenticated(_principal): Authenticated,
+    Authenticated(principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
 ) -> Result<Json<RunState>, ApiError> {
-    let store = state.store.clone();
-    let stored = tokio::task::spawn_blocking(move || store.run(id))
-        .await
-        .map_err(|error| ApiError::Decider(error.to_string()))?
-        .ok_or(ApiError::NotFound)?;
+    let stored = owned_run(&state, id, &principal).await?;
     Ok(Json(fold(&stored.spec, &stored.events)))
 }
 
 async fn get_events(
-    Authenticated(_principal): Authenticated,
+    Authenticated(principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
 ) -> Result<Json<Vec<Event>>, ApiError> {
-    let store = state.store.clone();
-    let stored = tokio::task::spawn_blocking(move || store.run(id))
-        .await
-        .map_err(|error| ApiError::Decider(error.to_string()))?
-        .ok_or(ApiError::NotFound)?;
+    let stored = owned_run(&state, id, &principal).await?;
     Ok(Json(stored.events))
 }
 
 async fn get_ag_ui(
-    Authenticated(_principal): Authenticated,
+    Authenticated(principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.clone();
-    let stored = tokio::task::spawn_blocking(move || store.run(id))
-        .await
-        .map_err(|error| ApiError::Decider(error.to_string()))?
-        .ok_or(ApiError::NotFound)?;
+    let stored = owned_run(&state, id, &principal).await?;
     Ok(Json(serde_json::Value::Array(ag_ui_events(
         stored.spec.run_id,
         &stored.events,
@@ -426,15 +511,11 @@ async fn get_ag_ui(
 }
 
 async fn get_ui(
-    Authenticated(_principal): Authenticated,
+    Authenticated(principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.clone();
-    let stored = tokio::task::spawn_blocking(move || store.run(id))
-        .await
-        .map_err(|error| ApiError::Decider(error.to_string()))?
-        .ok_or(ApiError::NotFound)?;
+    let stored = owned_run(&state, id, &principal).await?;
     let folded = fold(&stored.spec, &stored.events);
     // A run can end before its harness starts (a failed queue push records
     // RunFailed on a harness still Idle), so fall back to the dispatch phase.
@@ -497,8 +578,23 @@ enum RunStartError {
 /// platform pays for every model call, so a request cannot authorize an unbounded run.
 const MAX_LIMIT: u32 = 64;
 
-fn spec_from_body(body: RunBody) -> Result<RunSpec, ApiError> {
-    let limits = body.limits.unwrap_or(Limits {
+/// The fields a run and a coworker turn share.
+struct SpecCore {
+    agent_id: AgentId,
+    agent_version: String,
+    input: String,
+    placement: ExecutionPlacement,
+    work_model: WorkModel,
+    limits: Option<Limits>,
+    metadata: BTreeMap<String, String>,
+}
+
+fn build_spec(
+    owner: Owner,
+    core: SpecCore,
+    capabilities: Vec<Capability>,
+) -> Result<RunSpec, ApiError> {
+    let limits = core.limits.unwrap_or(Limits {
         max_steps: 8,
         max_model_calls: 4,
     });
@@ -507,13 +603,14 @@ fn spec_from_body(body: RunBody) -> Result<RunSpec, ApiError> {
         return Err(ApiError::BadRequest("limits must be between 1 and 64"));
     }
     Ok(RunSpec::builder()
-        .agent(body.agent_id, body.agent_version)
-        .input(body.input)
-        .placement(body.placement)
-        .work_model(body.work_model)
-        .capabilities(body.capabilities)
+        .owner(owner)
+        .agent(core.agent_id, core.agent_version)
+        .input(core.input)
+        .placement(core.placement)
+        .work_model(core.work_model)
+        .capabilities(capabilities)
         .limits(limits)
-        .metadata(body.metadata)
+        .metadata(core.metadata)
         .build())
 }
 
@@ -521,10 +618,13 @@ enum ApiError {
     Unsupported(ExecutionPlacement),
     Decider(String),
     NotFound,
+    AgentNotFound,
     Proxy(String),
     Sandbox(String),
     Conflict(&'static str),
     BadRequest(&'static str),
+    InvalidBody(String),
+    Rejected(JsonRejection),
     Unauthorized,
     AuthUnavailable(String),
 }
@@ -562,6 +662,11 @@ impl axum::response::IntoResponse for ApiError {
                 Json(serde_json::json!({ "error": "run not found" })),
             )
                 .into_response(),
+            Self::AgentNotFound => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "agent not found" })),
+            )
+                .into_response(),
             Self::Proxy(message) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({ "error": message })),
@@ -582,6 +687,12 @@ impl axum::response::IntoResponse for ApiError {
                 Json(serde_json::json!({ "error": message })),
             )
                 .into_response(),
+            Self::InvalidBody(message) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response(),
+            Self::Rejected(rejection) => rejection.into_response(),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({ "error": "unauthorized" })),

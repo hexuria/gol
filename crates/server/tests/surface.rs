@@ -246,6 +246,11 @@ fn completed(run_id: RunId, outcome: &str) -> Event {
 #[test]
 fn coworker_text_emitted_once() {
     let spec = RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::new(), "1")
         .input("hello from the desktop")
         .placement(ExecutionPlacement::Local)

@@ -91,7 +91,6 @@ async fn post_run_reads_completed_and_events() {
                 "model_name": "gpt-test",
                 "credential": "PlatformGateway"
             },
-            "capabilities": ["tool.echo"],
             "limits": { "max_steps": 8, "max_model_calls": 4 }
         }),
     )
@@ -203,7 +202,7 @@ async fn reverse_and_box_placements_complete() {
             &client,
             &format!("http://{addr}/v1/runs"),
             &serde_json::json!({
-                "agent_id": AgentId::new(),
+                "agent_id": registered(&format!("http://{addr}")).await,
                 "agent_version": "1",
                 "input": "hello",
                 "placement": placement,
@@ -212,7 +211,6 @@ async fn reverse_and_box_placements_complete() {
                     "model_name": "gpt-test",
                     "credential": "PlatformGateway"
                 },
-                "capabilities": ["tool.echo"],
                 "limits": { "max_steps": 8, "max_model_calls": 4 }
             }),
         )
@@ -248,7 +246,7 @@ async fn run_calls_jev_system_one() {
         &client,
         &format!("http://{addr}/v1/runs"),
         &serde_json::json!({
-            "agent_id": AgentId::new(),
+            "agent_id": registered(&format!("http://{addr}")).await,
             "agent_version": "1",
             "input": "hello",
             "placement": "Local",
@@ -257,7 +255,6 @@ async fn run_calls_jev_system_one() {
                 "model_name": "gpt-test",
                 "credential": "PlatformGateway"
             },
-            "capabilities": ["tool.echo"],
             "limits": { "max_steps": 8, "max_model_calls": 4 }
         }),
     )
@@ -353,6 +350,25 @@ async fn missing_bearer_is_401_and_does_not_start_the_run() {
     );
 }
 
+/// Stores an echo agent owned by the default test user and returns its id.
+async fn registered(base: &str) -> AgentId {
+    let agent_id = AgentId::new();
+    let response = post_when_up(
+        &reqwest::Client::new(),
+        &format!("{base}/v1/agents"),
+        &AgentManifest {
+            id: agent_id,
+            version: "1".to_string(),
+            instructions: "Echo the input, then finish.".to_string(),
+            tools: vec!["echo".to_string()],
+            required_capabilities: vec![Capability::new("tool.echo")],
+        },
+    )
+    .await;
+    assert!(response.status().is_success(), "{}", response.status());
+    agent_id
+}
+
 fn run_body(agent_id: AgentId, max_steps: u32, max_model_calls: u32) -> serde_json::Value {
     run_body_with(
         agent_id,
@@ -378,7 +394,6 @@ fn run_body_with(
             "model_name": "gpt-test",
             "credential": credential
         },
-        "capabilities": ["tool.echo"],
         "limits": { "max_steps": max_steps, "max_model_calls": max_model_calls }
     })
 }
@@ -401,7 +416,7 @@ async fn limits_outside_one_to_sixty_four_are_400_and_start_nothing() {
 
     let client = reqwest::Client::new();
     let base = format!("http://{addr}");
-    let agent_id = AgentId::new();
+    let agent_id = registered(&base).await;
     for route in ["/v1/runs", "/v1/coworker/turns"] {
         for (max_steps, max_model_calls) in [(0, 4), (8, 0), (65, 4), (8, 65), (u32::MAX, 4)] {
             let response = post_when_up(
@@ -495,7 +510,7 @@ async fn redis_push_failure_does_not_run_the_harness() {
         &reqwest::Client::new(),
         &format!("http://{addr}/v1/runs"),
         &serde_json::json!({
-            "agent_id": AgentId::new(),
+            "agent_id": registered(&format!("http://{addr}")).await,
             "agent_version": "1",
             "input": "hello",
             "placement": "Local",
@@ -504,7 +519,6 @@ async fn redis_push_failure_does_not_run_the_harness() {
                 "model_name": "gpt-test",
                 "credential": "PlatformGateway"
             },
-            "capabilities": ["tool.echo"],
             "limits": { "max_steps": 8, "max_model_calls": 4 }
         }),
     )
@@ -614,8 +628,12 @@ impl WatchedMemory {
 }
 
 impl RunStore for WatchedMemory {
-    fn put_agent(&self, agent: AgentManifest) {
-        self.inner.put_agent(agent);
+    fn put_agent(&self, agent: server::StoredAgent) -> server::PutAgent {
+        self.inner.put_agent(agent)
+    }
+
+    fn agent(&self, id: protocol::AgentId) -> Option<server::StoredAgent> {
+        self.inner.agent(id)
     }
 
     fn put_run(&self, run: StoredRun) {
@@ -675,7 +693,7 @@ async fn jev_error_leaves_run_failed() {
     let response = post_when_up(
         &reqwest::Client::new(),
         &format!("http://{addr}/v1/runs"),
-        &run_body(AgentId::new(), 8, 4),
+        &run_body(registered(&format!("http://{addr}")).await, 8, 4),
     )
     .await;
     assert_eq!(response.status().as_u16(), 502);

@@ -1,10 +1,10 @@
 use std::sync::Mutex;
 
 use postgres::NoTls;
-use protocol::{AgentId, ArtifactId, Event, RunId};
+use protocol::{AgentId, ArtifactId, Event, Owner, RunId};
 use serde_json::Value;
 
-use crate::store::{AgentManifest, Append, RunStore, StoredArtifact, StoredRun};
+use crate::store::{Append, PutAgent, RunStore, StoredAgent, StoredArtifact, StoredRun};
 
 pub struct PostgresStore {
     client: Mutex<postgres::Client>,
@@ -13,7 +13,10 @@ pub struct PostgresStore {
 const SCHEMA: &str = "
 create table if not exists agents (
     id uuid primary key,
-    manifest jsonb not null
+    manifest jsonb not null,
+    owner_issuer text not null,
+    owner_subject text not null,
+    owner_tenant text not null
 );
 create table if not exists runs (
     id uuid primary key,
@@ -38,6 +41,15 @@ fn ensure_schema(client: &mut postgres::Client) -> Result<(), postgres::Error> {
         let _ = client.batch_execute("rollback");
         return Err(err);
     }
+    // `create table if not exists` leaves a table from an older schema as it
+    // was. Fail here, at connect, rather than on the first write, where the
+    // panic would poison the store for every later request.
+    if let Err(err) =
+        client.batch_execute("select owner_issuer, owner_subject, owner_tenant from agents limit 0")
+    {
+        let _ = client.batch_execute("rollback");
+        return Err(err);
+    }
     client.batch_execute("commit")
 }
 
@@ -52,17 +64,56 @@ impl PostgresStore {
 }
 
 impl RunStore for PostgresStore {
-    fn put_agent(&self, agent: AgentManifest) {
-        let manifest = serde_json::to_value(&agent).expect("agent json");
-        self.client
+    /// One statement: insert, or replace the row only when the same
+    /// principal (issuer and subject) owns it. No row changed means another
+    /// principal owns the id.
+    fn put_agent(&self, agent: StoredAgent) -> PutAgent {
+        let manifest = serde_json::to_value(&agent.manifest).expect("agent json");
+        let changed = self
+            .client
             .lock()
             .expect("postgres")
             .execute(
-                "insert into agents (id, manifest) values ($1, $2)
-                 on conflict (id) do update set manifest = excluded.manifest",
-                &[&agent.id.as_uuid(), &manifest],
+                "insert into agents (id, manifest, owner_issuer, owner_subject, owner_tenant)
+                 values ($1, $2, $3, $4, $5)
+                 on conflict (id) do update
+                 set manifest = excluded.manifest, owner_tenant = excluded.owner_tenant
+                 where agents.owner_issuer = excluded.owner_issuer
+                   and agents.owner_subject = excluded.owner_subject",
+                &[
+                    &agent.manifest.id.as_uuid(),
+                    &manifest,
+                    &agent.owner.issuer,
+                    &agent.owner.subject,
+                    &agent.owner.tenant,
+                ],
             )
             .expect("insert agent");
+        if changed == 1 {
+            PutAgent::Stored
+        } else {
+            PutAgent::OwnedByOther
+        }
+    }
+
+    fn agent(&self, id: AgentId) -> Option<StoredAgent> {
+        let row = self
+            .client
+            .lock()
+            .expect("postgres")
+            .query_opt(
+                "select manifest, owner_issuer, owner_subject, owner_tenant from agents where id = $1",
+                &[&id.as_uuid()],
+            )
+            .expect("select agent")?;
+        Some(StoredAgent {
+            manifest: serde_json::from_value(row.get::<_, Value>(0)).expect("manifest"),
+            owner: Owner::new(
+                row.get::<_, String>(1),
+                row.get::<_, String>(2),
+                row.get::<_, String>(3),
+            ),
+        })
     }
 
     fn put_run(&self, run: StoredRun) {
@@ -156,20 +207,5 @@ impl RunStore for PostgresStore {
             name: row.get(1),
             body: row.get(2),
         })
-    }
-}
-
-impl PostgresStore {
-    pub fn agent(&self, id: AgentId) -> Option<AgentManifest> {
-        let row = self
-            .client
-            .lock()
-            .expect("postgres")
-            .query_opt(
-                "select manifest from agents where id = $1",
-                &[&id.as_uuid()],
-            )
-            .expect("select agent")?;
-        Some(serde_json::from_value(row.get::<_, Value>(0)).expect("agent"))
     }
 }

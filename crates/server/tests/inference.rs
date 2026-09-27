@@ -15,9 +15,9 @@ use protocol::{
 use proxy::GATEWAY_TEXT;
 use server::{
     accept_subscription_completion, box_container_name, box_workspace_volume, computer_plan,
-    ensure_fixture_proxy, fail_turn, open_turn, router_with_gateway, router_with_sandbox,
-    AgentManifest, Append, DockerSandbox, GatewayCall, GatewayPoster, HttpGatewayPoster,
-    InMemoryStore, MemorySandbox, RunStore, SandboxHost, StoredArtifact, StoredRun, TurnError,
+    ensure_fixture_proxy, fail_turn, open_turn, router_with_gateway, router_with_sandbox, Append,
+    DockerSandbox, GatewayCall, GatewayPoster, HttpGatewayPoster, InMemoryStore, MemorySandbox,
+    RunStore, SandboxHost, StoredArtifact, StoredRun, TurnError,
 };
 
 async fn proxy_server() -> (String, Arc<Mutex<Vec<String>>>) {
@@ -478,6 +478,11 @@ fn a_failed_sandbox_destroy_does_not_complete_the_turn() {
     let sandbox = DockerSandbox::from_command(move |args| command.call(args));
     let store = InMemoryStore::default();
     let spec = RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::new(), "1")
         .input("ship the box")
         .placement(ExecutionPlacement::Box)
@@ -511,6 +516,11 @@ fn a_failed_sandbox_destroy_does_not_complete_the_turn() {
 
 fn box_gateway_spec(input: &str) -> RunSpec {
     RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::new(), "1")
         .input(input)
         .placement(ExecutionPlacement::Box)
@@ -774,8 +784,12 @@ impl GatewayPoster for SilentPoster {
 }
 
 impl RunStore for WriteAfterSnapshot {
-    fn put_agent(&self, agent: AgentManifest) {
-        self.inner.put_agent(agent);
+    fn put_agent(&self, agent: server::StoredAgent) -> server::PutAgent {
+        self.inner.put_agent(agent)
+    }
+
+    fn agent(&self, id: protocol::AgentId) -> Option<server::StoredAgent> {
+        self.inner.agent(id)
     }
 
     fn put_run(&self, run: StoredRun) {
@@ -816,6 +830,11 @@ impl RunStore for WriteAfterSnapshot {
 #[test]
 fn an_event_stored_after_run_returns_stays_ahead_of_the_completion() {
     let spec = RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::new(), "1")
         .input("hello from the desktop")
         .placement(ExecutionPlacement::Local)
@@ -918,6 +937,11 @@ fn an_event_stored_after_run_returns_stays_ahead_of_the_completion() {
 
 fn fold_harness(events: &[protocol::Event]) -> HarnessState {
     let spec = RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::new(), "1")
         .input("hello")
         .placement(ExecutionPlacement::Local)
@@ -968,6 +992,11 @@ fn images_share_one_contract_and_name_both_placements() {
 
 fn subscription_spec(placement: ExecutionPlacement) -> RunSpec {
     RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::new(), "1")
         .input("hello from the desktop")
         .placement(placement)
@@ -1246,6 +1275,11 @@ fn terminals(events: &[Event]) -> Vec<String> {
 
 fn gateway_spec(placement: ExecutionPlacement) -> RunSpec {
     RunSpec::builder()
+        .owner(protocol::Owner::new(
+            "https://issuer.test",
+            "user-1",
+            "tenant-1",
+        ))
         .agent(AgentId::new(), "1")
         .input("hello from the gateway")
         .placement(placement)

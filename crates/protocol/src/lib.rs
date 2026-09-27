@@ -21,7 +21,7 @@ pub use phase::{DispatchPhase, FailureClass, HarnessState, MAX_RETRIES};
 pub use policy::PolicyDecision;
 pub use reduce::{applicable, reduce, reduce_dispatch, Effects};
 pub use spec::{
-    Capability, CredentialSource, ExecutionPlacement, Limits, Missing, ModelProvider, RunSpec,
-    RunSpecBuilder, Set, WorkModel,
+    Capability, CredentialSource, ExecutionPlacement, Limits, Missing, ModelProvider, Owner,
+    RunSpec, RunSpecBuilder, Set, WorkModel,
 };
 pub use tool::ToolDescriptor;
