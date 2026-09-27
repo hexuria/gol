@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -138,8 +138,7 @@ pub fn stage(source: &Path) -> Result<Staged, FrontendError> {
     let staged = Staged { dir };
     for name in ["counter.bend", "LAWS.bend", "PROOF.bend"] {
         let bytes = read_source(&source.join(name))?;
-        let dest = staged.dir.join(name);
-        fs::write(&dest, bytes).map_err(|error| io_error("write", &dest, &error))?;
+        write_new(&staged.dir.join(name), bytes.as_bytes())?;
     }
     let counter = fs::read_to_string(staged.dir.join("counter.bend"))
         .map_err(|error| io_error("read", &staged.dir.join("counter.bend"), &error))?;
@@ -150,7 +149,9 @@ pub fn stage(source: &Path) -> Result<Staged, FrontendError> {
 /// Creates a new directory under `parent`, readable only by this user, named
 /// by `name`. The temp dir is shared, so a path that already exists (a
 /// directory or a symlink another user made) is never used: `create_dir`
-/// refuses it and the next name is tried.
+/// refuses it and the next name is tried. This assumes `parent` is sticky or
+/// private, as `/tmp` and macOS's per-user `TMPDIR` are, so no other user can
+/// rename the new directory away.
 pub(crate) fn create_private_dir(
     parent: &Path,
     mut name: impl FnMut() -> Result<String, FrontendError>,
@@ -167,6 +168,18 @@ pub(crate) fn create_private_dir(
         "no free staging directory in {} after {STAGE_ATTEMPTS} tries",
         parent.display()
     )))
+}
+
+/// Writes a new file, mode 0600. It never follows or truncates something
+/// already at `path`.
+pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<(), FrontendError> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut file| file.write_all(bytes))
+        .map_err(|error| io_error("write", path, &error))
 }
 
 fn read_source(path: &Path) -> Result<String, FrontendError> {
@@ -221,6 +234,11 @@ fn assert_string_main(source: &str) -> Result<(), FrontendError> {
             scan.skip_char_lit()?;
             continue;
         }
+        // Whole names and numbers are skipped, so `def` counts only where a
+        // token starts: `xdef` is one name, but `1.5def` is a float and a def.
+        if scan.read_name().is_some() || scan.skip_number() {
+            continue;
+        }
         scan.bump_char()?;
     }
     if mains != 1 {
@@ -264,16 +282,44 @@ impl BendScan<'_> {
         self.src.as_bytes().get(self.i) == Some(&byte)
     }
 
-    /// `word` starts here as a whole token: no name character on either side.
+    /// `word` starts here and is not the head of a longer name. The main loop
+    /// skips whole names and numbers, so a match is always at a token start.
     fn at_word(&self, word: &str) -> bool {
-        let name_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.';
         let rest = &self.src[self.i..];
         rest.starts_with(word)
-            && !self.src[..self.i]
+            && !rest[word.len()..]
                 .chars()
-                .next_back()
-                .is_some_and(name_char)
-            && !rest[word.len()..].chars().next().is_some_and(name_char)
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    }
+
+    /// Skips a Bend 2.0.28 number, `\d+(n|\.\d+([eE][+-]?\d+)?)?`. A float
+    /// ends right before a letter, so what follows starts a new token.
+    fn skip_number(&mut self) -> bool {
+        let bytes = self.src.as_bytes();
+        let digits = |from: usize| {
+            bytes.get(from..).map_or(0, |rest| {
+                rest.iter().take_while(|b| b.is_ascii_digit()).count()
+            })
+        };
+        let mut end = self.i + digits(self.i);
+        if end == self.i {
+            return false;
+        }
+        if bytes.get(end) == Some(&b'n') {
+            end += 1;
+        } else if bytes.get(end) == Some(&b'.') && digits(end + 1) > 0 {
+            end += 1 + digits(end + 1);
+            if matches!(bytes.get(end), Some(b'e' | b'E')) {
+                let sign = usize::from(matches!(bytes.get(end + 1), Some(b'+' | b'-')));
+                let exponent = digits(end + 1 + sign);
+                if exponent > 0 {
+                    end += 1 + sign + exponent;
+                }
+            }
+        }
+        self.i = end;
+        true
     }
 
     fn take(&mut self, text: &str) -> bool {
@@ -607,17 +653,29 @@ mod tests {
     use proptest::prelude::*;
     use workflow_core::{Decision, WorkflowProgram};
 
-    use super::{assert_string_main, create_private_dir, stage, staged_dir, STAGE_ATTEMPTS};
+    use super::{
+        assert_string_main, create_private_dir, stage, staged_dir, write_new, STAGE_ATTEMPTS,
+    };
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "gol-boundary-test-{}-{tag}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A private scratch directory, removed when dropped (also after a failed
+    /// assertion).
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(tag: &str) -> Scratch {
+        let dir = create_private_dir(&std::env::temp_dir(), || {
+            Ok(format!(
+                "gol-boundary-test-{tag}-{:016x}",
+                getrandom::u64().unwrap()
+            ))
+        })
+        .unwrap();
+        Scratch(dir)
     }
 
     fn mode(path: &Path) -> u32 {
@@ -628,51 +686,75 @@ mod tests {
     // staging moves on to the next name.
     #[test]
     fn staging_refuses_existing_dir() {
-        let parent = scratch("refuse");
+        let parent_dir = scratch("refuse");
+        let parent = &parent_dir.0;
         fs::create_dir(parent.join("taken")).unwrap();
         fs::write(parent.join("taken").join("keep"), "keep").unwrap();
-        let elsewhere = scratch("elsewhere");
-        symlink(&elsewhere, parent.join("link")).unwrap();
+        let elsewhere_dir = scratch("elsewhere");
+        let elsewhere = &elsewhere_dir.0;
+        symlink(elsewhere, parent.join("link")).unwrap();
+        // A dangling symlink is refused too.
+        symlink(parent.join("nowhere"), parent.join("dangling")).unwrap();
 
-        let names = ["taken", "link", "fresh"];
+        let names = ["taken", "link", "dangling", "fresh"];
         let calls = Cell::new(0);
-        let dir = create_private_dir(&parent, || {
+        let dir = create_private_dir(parent, || {
             let name = names[calls.get()];
             calls.set(calls.get() + 1);
             Ok(name.to_string())
         })
         .unwrap();
         assert_eq!(dir, parent.join("fresh"));
-        assert_eq!(calls.get(), 3);
+        assert_eq!(calls.get(), 4);
+        assert!(!parent.join("nowhere").exists());
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(
             fs::read_dir(parent.join("taken")).unwrap().count(),
             1,
             "the existing directory was touched"
         );
-        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(elsewhere).unwrap().count(), 0);
 
         // Every name taken: it gives up after STAGE_ATTEMPTS tries.
         let tries = Cell::new(0);
-        let error = create_private_dir(&parent, || {
+        let error = create_private_dir(parent, || {
             tries.set(tries.get() + 1);
             Ok("taken".to_string())
         })
         .unwrap_err();
         assert_eq!(tries.get(), STAGE_ATTEMPTS);
         assert!(error.to_string().contains("staging directory"), "{error}");
-
-        let _ = fs::remove_dir_all(&parent);
-        let _ = fs::remove_dir_all(&elsewhere);
     }
 
     #[test]
-    fn a_staged_dir_is_private_and_unpredictable() {
+    fn a_staged_file_never_replaces_what_is_there() {
+        let dir = scratch("write");
+        let kept = dir.0.join("kept");
+        fs::write(&kept, "kept").unwrap();
+        let target = dir.0.join("target");
+        fs::write(&target, "target").unwrap();
+        let link = dir.0.join("link");
+        symlink(&target, &link).unwrap();
+        assert!(write_new(&kept, b"new").is_err());
+        assert!(write_new(&link, b"new").is_err());
+        assert_eq!(fs::read_to_string(&kept).unwrap(), "kept");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "target");
+        let fresh = dir.0.join("fresh");
+        write_new(&fresh, b"new").unwrap();
+        assert_eq!(fs::read_to_string(&fresh).unwrap(), "new");
+        assert_eq!(mode(&fresh), 0o600);
+    }
+
+    #[test]
+    fn a_staged_dir_is_private_and_uniquely_named() {
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../experiments/bend");
         let first = stage(&source).unwrap();
         let second = stage(&source).unwrap();
         let (a, b) = (staged_dir(&first), staged_dir(&second));
         assert_eq!(mode(a), 0o700);
+        for name in ["counter.bend", "LAWS.bend", "PROOF.bend"] {
+            assert_eq!(mode(&a.join(name)), 0o600, "{name}");
+        }
         assert_ne!(a, b);
         let name = a.file_name().unwrap().to_str().unwrap();
         let prefix = format!("gol-bend-{}-", std::process::id());
@@ -697,6 +779,39 @@ mod tests {
         assert!(assert_string_main(&two).is_err());
         assert!(assert_string_main("xdef main() -> String:\n  \"v1\"\n").is_err());
     }
+
+    // Bend 2.0.28 ends a float literal right before a letter, so `1.5def main`
+    // is a real def. The PR #54 review ran such an IO main on the pinned binary.
+    #[test]
+    fn a_def_after_a_float_literal_is_a_def() {
+        let main = "def main() -> String:\n  \"v1\"\n";
+        for literal in ["1.5", "1.5e3", "0.0E+1"] {
+            let source = format!("{main}def f() -> F32:\n  {literal}def main() -> IO(u24):\n  0\n");
+            assert!(assert_string_main(&source).is_err(), "{literal}");
+        }
+    }
+
+    // Bend source pieces, each with the number of String mains and other mains
+    // it defines. Pieces that only look like a def (a longer name, a string,
+    // a comment, a char) define none.
+    const PIECES: [(&str, usize, usize); 12] = [
+        ("def main() -> String:\n  \"v1\"\n", 1, 0),
+        ("def\tmain()\t->\tString:\r\n  \"v1\"\n", 1, 0),
+        ("def main() -> IO(u24):\n  0\n", 0, 1),
+        ("def f() -> F32:\n  1.5def main() -> IO(u24):\n  0\n", 0, 1),
+        (
+            "def f() -> F32:\n  2.0e1def main() -> String:\n  \"v1\"\n",
+            1,
+            0,
+        ),
+        ("xdef main() -> IO(u24):\n  0\n", 0, 0),
+        ("x.def main() -> IO(u24):\n  0\n", 0, 0),
+        ("# def main() -> IO(u24):\n", 0, 0),
+        ("def s() -> String:\n  \"def main() -> IO(u24):\"\n", 0, 0),
+        ("def c() -> Char:\n  'd'\n", 0, 0),
+        ("def g(x) -> u24:\n  x + 1\n", 0, 0),
+        ("def main2() -> IO(u24):\n  0\n", 0, 0),
+    ];
 
     fn arms() -> [(&'static str, Decision); 3] {
         [
@@ -760,7 +875,25 @@ mod tests {
         prop_oneof![any::<String>(), proptest::sample::select(valid), edited]
     }
 
+    #[test]
+    fn every_v1_line_parses_to_its_program() {
+        for (line, program) in valid_lines() {
+            assert_eq!(crate::parse_encoding(&line).unwrap(), program, "{line}");
+        }
+    }
+
     proptest! {
+        // The guard accepts a source exactly when it defines one main and that
+        // main returns String, over sources built from PIECES.
+        #[test]
+        fn the_main_guard_counts_real_defs(picks in prop::collection::vec(0..PIECES.len(), 0..6)) {
+            let source: String = picks.iter().map(|&pick| PIECES[pick].0).collect();
+            let strings: usize = picks.iter().map(|&pick| PIECES[pick].1).sum();
+            let others: usize = picks.iter().map(|&pick| PIECES[pick].2).sum();
+            let accepted = assert_string_main(&source).is_ok();
+            prop_assert_eq!(accepted, strings == 1 && others == 0, "{:?}", source);
+        }
+
         // Neither hand-written parser panics, and parse_encoding accepts
         // exactly the 27 valid v1 lines, each as the program it names.
         #[test]
