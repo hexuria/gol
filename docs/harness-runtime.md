@@ -47,6 +47,8 @@ Each variant carries only the fields that variant needs.
 
 A denied effect becomes `EffectDenied`. The tool, the gateway, and memory are not called.
 
+A memory store that cannot answer ends the run `Failed { class: Infrastructure }` with the message `memory read: store unavailable` or `memory write: store unavailable`. No `MemoryRead` or `MemoryWritten` is recorded, and the store's detail goes to stderr.
+
 ## Event envelope
 
 Every event has one envelope and one payload.

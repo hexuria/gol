@@ -31,6 +31,7 @@ Runs and agents belong to the caller that created them, by token issuer and subj
 - A desktop turn (`POST /v1/coworker/turns`) needs no stored manifest and names its own capabilities.
 - Reading a run, its events, `ag-ui` or `ui`, and completing or failing a turn, answer 404 unless the caller owns the run.
 - Postgres keeps the owner with each agent. A database created before this version needs its `agents` and `runs` tables dropped.
+- A store that cannot answer gives 503 `{"error":"store unavailable"}`, with the detail on stderr only. A write that fails is not retried, since it may have committed. The Postgres store reconnects on the next request.
 
 `cargo test` does not call a live model and does not need an API key. The local server echoes the run input through one tool, then completes. A run records the user message before that loop.
 

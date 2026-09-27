@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use harness::StoreError;
 use protocol::{AgentId, ArtifactId, Capability, Event, EventPayload, Owner, RunId, RunSpec};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -66,23 +67,29 @@ pub fn is_terminal(payload: &EventPayload) -> bool {
     )
 }
 
+/// Every method can fail with a StoreError: the store is unreachable, or a
+/// write's outcome is unknown. Callers report it and do not retry a write,
+/// which may have committed.
 pub trait RunStore: Send + Sync {
     /// Store a manifest, unless another principal already owns its id. The
     /// check and the write are one atomic step.
-    fn put_agent(&self, agent: StoredAgent) -> PutAgent;
-    fn agent(&self, id: AgentId) -> Option<StoredAgent>;
+    fn put_agent(&self, agent: StoredAgent) -> Result<PutAgent, StoreError>;
+    fn agent(&self, id: AgentId) -> Result<Option<StoredAgent>, StoreError>;
     /// Store a new run. A run already stored under that id keeps its spec and
     /// events, so a redelivered put cannot drop anything appended since.
-    fn put_run(&self, run: StoredRun);
+    fn put_run(&self, run: StoredRun) -> Result<(), StoreError>;
     /// Append `events` onto the stored run in one atomic step, unless the
     /// stored log is already terminal or the run is missing. `spec` and the
     /// events already stored never change.
-    fn append_events(&self, id: RunId, events: Vec<Event>) -> Append;
-    fn run(&self, id: RunId) -> Option<StoredRun>;
-    fn put_artifact(&self, artifact: StoredArtifact);
-    fn artifact(&self, id: ArtifactId) -> Option<StoredArtifact>;
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError>;
+    fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError>;
+    fn put_artifact(&self, artifact: StoredArtifact) -> Result<(), StoreError>;
+    fn artifact(&self, id: ArtifactId) -> Result<Option<StoredArtifact>, StoreError>;
 }
 
+/// The in-memory store. A poisoned lock (a writer panicked holding it) still
+/// serves reads, since every write completes before its guard drops; a write
+/// under a poisoned lock is refused as a StoreError (owner decision 3A).
 #[derive(Default)]
 pub struct InMemoryStore {
     agents: Mutex<HashMap<AgentId, StoredAgent>>,
@@ -90,64 +97,128 @@ pub struct InMemoryStore {
     artifacts: Mutex<HashMap<ArtifactId, StoredArtifact>>,
 }
 
+fn read<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write<'a, T>(lock: &'a Mutex<T>, name: &str) -> Result<MutexGuard<'a, T>, StoreError> {
+    lock.lock()
+        .map_err(|_| StoreError::new(format!("{name} store lock poisoned")))
+}
+
 impl RunStore for InMemoryStore {
-    fn put_agent(&self, agent: StoredAgent) -> PutAgent {
-        let mut agents = self.agents.lock().expect("agent store");
+    fn put_agent(&self, agent: StoredAgent) -> Result<PutAgent, StoreError> {
+        let mut agents = write(&self.agents, "agent")?;
         let id = agent.manifest.id;
         if agents
             .get(&id)
             .is_some_and(|stored| !stored.owner.is(&agent.owner))
         {
-            return PutAgent::OwnedByOther;
+            return Ok(PutAgent::OwnedByOther);
         }
         agents.insert(id, agent);
-        PutAgent::Stored
+        Ok(PutAgent::Stored)
     }
 
-    fn agent(&self, id: AgentId) -> Option<StoredAgent> {
-        self.agents.lock().expect("agent store").get(&id).cloned()
+    fn agent(&self, id: AgentId) -> Result<Option<StoredAgent>, StoreError> {
+        Ok(read(&self.agents).get(&id).cloned())
     }
 
-    fn put_run(&self, run: StoredRun) {
-        self.runs
-            .lock()
-            .expect("run store")
+    fn put_run(&self, run: StoredRun) -> Result<(), StoreError> {
+        write(&self.runs, "run")?
             .entry(run.spec.run_id)
             .or_insert(run);
+        Ok(())
     }
 
-    fn append_events(&self, id: RunId, events: Vec<Event>) -> Append {
-        let mut runs = self.runs.lock().expect("run store");
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
+        let mut runs = write(&self.runs, "run")?;
         let Some(stored) = runs.get_mut(&id) else {
-            return Append::Missing;
+            return Ok(Append::Missing);
         };
         if stored
             .events
             .iter()
             .any(|event| is_terminal(&event.payload))
         {
-            return Append::Terminal;
+            return Ok(Append::Terminal);
         }
         stored.events.extend(events);
-        Append::Appended
+        Ok(Append::Appended)
     }
 
-    fn run(&self, id: RunId) -> Option<StoredRun> {
-        self.runs.lock().expect("run store").get(&id).cloned()
+    fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {
+        Ok(read(&self.runs).get(&id).cloned())
     }
 
-    fn put_artifact(&self, artifact: StoredArtifact) {
-        self.artifacts
-            .lock()
-            .expect("artifact store")
-            .insert(artifact.id, artifact);
+    fn put_artifact(&self, artifact: StoredArtifact) -> Result<(), StoreError> {
+        write(&self.artifacts, "artifact")?.insert(artifact.id, artifact);
+        Ok(())
     }
 
-    fn artifact(&self, id: ArtifactId) -> Option<StoredArtifact> {
-        self.artifacts
-            .lock()
-            .expect("artifact store")
-            .get(&id)
-            .cloned()
+    fn artifact(&self, id: ArtifactId) -> Result<Option<StoredArtifact>, StoreError> {
+        Ok(read(&self.artifacts).get(&id).cloned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{
+        AgentId, CredentialSource, ExecutionPlacement, Limits, ModelProvider, WorkModel,
+    };
+
+    fn spec() -> RunSpec {
+        RunSpec::builder()
+            .owner(Owner::new("https://issuer.test", "user-1", "tenant-1"))
+            .agent(AgentId::new(), "1")
+            .input("hello")
+            .placement(ExecutionPlacement::Local)
+            .work_model(WorkModel {
+                provider: ModelProvider::OpenAI,
+                model_name: "gpt-test".to_string(),
+                credential: CredentialSource::PlatformGateway,
+            })
+            .limits(Limits {
+                max_steps: 4,
+                max_model_calls: 1,
+            })
+            .build()
+    }
+
+    // Owner decision 3A: a writer that panicked holding the lock leaves reads
+    // working and refuses later writes as a StoreError.
+    #[test]
+    fn a_poisoned_lock_serves_reads_and_refuses_writes() {
+        let store = InMemoryStore::default();
+        let first = spec();
+        let run_id = first.run_id;
+        store
+            .put_run(StoredRun {
+                spec: first,
+                events: Vec::new(),
+            })
+            .unwrap();
+        let poisoner = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _held = store.runs.lock().unwrap();
+                    panic!("writer panicked holding the lock");
+                })
+                .join()
+        });
+        assert!(poisoner.is_err());
+        assert!(store.runs.is_poisoned());
+
+        assert_eq!(store.run(run_id).map(|run| run.is_some()), Ok(true));
+        let refused = StoreError::new("run store lock poisoned");
+        assert_eq!(
+            store.put_run(StoredRun {
+                spec: spec(),
+                events: Vec::new(),
+            }),
+            Err(refused.clone())
+        );
+        assert_eq!(store.append_events(run_id, Vec::new()), Err(refused));
     }
 }

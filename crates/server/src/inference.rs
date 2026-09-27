@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use harness::StoreError;
 use protocol::{
     fold, Actor, CredentialSource, Event, EventPayload, EventSource, ExecutionPlacement,
     FailureClass, HarnessState, MessageRole, ModelMessage, RunId, RunSpec, Timestamp,
@@ -369,6 +370,8 @@ pub struct TurnOutcome {
 pub enum TurnError {
     Proxy(String),
     Sandbox(String),
+    /// The run store could not answer (StoreError); nothing is retried.
+    Store(String),
     NotFound,
     Conflict(&'static str),
     BadRequest(&'static str),
@@ -395,10 +398,12 @@ pub fn open_turn(
             text: spec.input.clone(),
         },
     );
-    store.put_run(StoredRun {
-        spec: spec.clone(),
-        events: events.clone(),
-    });
+    store
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: events.clone(),
+        })
+        .map_err(store_error)?;
 
     let box_turn = spec.placement == ExecutionPlacement::Box;
     let name = box_container_name(spec.run_id);
@@ -485,7 +490,10 @@ pub fn accept_subscription_completion(
     if text.is_empty() {
         return Err(TurnError::BadRequest("completion text is empty"));
     }
-    let stored = store.run(run_id).ok_or(TurnError::NotFound)?;
+    let stored = store
+        .run(run_id)
+        .map_err(store_error)?
+        .ok_or(TurnError::NotFound)?;
     if matches!(
         stored.spec.work_model.credential,
         CredentialSource::PlatformGateway
@@ -564,7 +572,10 @@ pub fn fail_turn(
     if message.is_empty() {
         return Err(TurnError::BadRequest("failure message is empty"));
     }
-    let stored = store.run(run_id).ok_or(TurnError::NotFound)?;
+    let stored = store
+        .run(run_id)
+        .map_err(store_error)?
+        .ok_or(TurnError::NotFound)?;
     if matches!(
         stored.spec.work_model.credential,
         CredentialSource::PlatformGateway
@@ -594,7 +605,14 @@ pub fn fail_turn(
 /// Ends a turn that failed before anything else could end it. The store
 /// refuses the append if another writer ended the run first.
 fn end_failed(store: &dyn RunStore, spec: &RunSpec, class: FailureClass, message: String) {
-    store.append_events(spec.run_id, vec![run_failed_event(spec, class, message)]);
+    // Best effort: the caller already reports the failure that led here. A
+    // store that cannot take this append leaves the turn open, as a failed
+    // destroy does, and the operator sees why.
+    if let Err(error) =
+        store.append_events(spec.run_id, vec![run_failed_event(spec, class, message)])
+    {
+        eprintln!("gol: could not end run {}: {error}", spec.run_id);
+    }
 }
 
 /// Append the completion events. Two completions racing on one run get one
@@ -604,11 +622,15 @@ fn record_completion(
     run_id: RunId,
     events: Vec<Event>,
 ) -> Result<(), TurnError> {
-    match store.append_events(run_id, events) {
+    match store.append_events(run_id, events).map_err(store_error)? {
         Append::Appended => Ok(()),
         Append::Terminal => Err(TurnError::Conflict("turn already completed")),
         Append::Missing => Err(TurnError::NotFound),
     }
+}
+
+fn store_error(error: StoreError) -> TurnError {
+    TurnError::Store(error.to_string())
 }
 
 fn sandbox_error(error: SandboxError) -> TurnError {

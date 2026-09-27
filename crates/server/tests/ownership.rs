@@ -202,14 +202,17 @@ async fn other_principal_cannot_complete() {
     let id = turn(&server, ALICE).await;
     let url = format!("{}/v1/coworker/turns/{id}/completion", server.base);
     let text = Some(serde_json::json!({"text": "done"}));
-    let before = server.store.run(id).unwrap().events.len();
+    let before = server.store.run(id).expect("store").unwrap().events.len();
     assert_eq!(
         send(reqwest::Method::POST, url.clone(), BOB, text.clone())
             .await
             .0,
         404
     );
-    assert_eq!(server.store.run(id).unwrap().events.len(), before);
+    assert_eq!(
+        server.store.run(id).expect("store").unwrap().events.len(),
+        before
+    );
     assert_eq!(send(reqwest::Method::POST, url, ALICE, text).await.0, 200);
 }
 
@@ -219,14 +222,17 @@ async fn other_principal_cannot_fail() {
     let id = turn(&server, ALICE).await;
     let url = format!("{}/v1/coworker/turns/{id}/fail", server.base);
     let message = Some(serde_json::json!({"message": "proxy: refused"}));
-    let before = server.store.run(id).unwrap().events.len();
+    let before = server.store.run(id).expect("store").unwrap().events.len();
     assert_eq!(
         send(reqwest::Method::POST, url.clone(), BOB, message.clone())
             .await
             .0,
         404
     );
-    assert_eq!(server.store.run(id).unwrap().events.len(), before);
+    assert_eq!(
+        server.store.run(id).expect("store").unwrap().events.len(),
+        before
+    );
     assert_eq!(
         send(reqwest::Method::POST, url, ALICE, message).await.0,
         200
@@ -247,7 +253,7 @@ async fn capabilities_from_manifest() {
     .await;
     assert_eq!(status, 200, "{body}");
     let id = serde_json::from_value::<RunState>(body).unwrap().run_id;
-    let spec = server.store.run(id).unwrap().spec;
+    let spec = server.store.run(id).expect("store").unwrap().spec;
     assert_eq!(
         spec.capabilities,
         vec![Capability::new("tool.echo"), Capability::new("model.call")]
@@ -338,7 +344,7 @@ async fn only_the_owner_replaces_a_manifest() {
             serde_json::json!({"error": "agent belongs to another principal"})
         )
     );
-    let stored = server.store.agent(id).unwrap();
+    let stored = server.store.agent(id).expect("store").unwrap();
     assert_eq!(
         (
             stored.manifest.version.as_str(),
@@ -354,7 +360,16 @@ async fn only_the_owner_replaces_a_manifest() {
     )
     .await;
     assert_eq!(status, 200);
-    assert_eq!(server.store.agent(id).unwrap().manifest.version, "2");
+    assert_eq!(
+        server
+            .store
+            .agent(id)
+            .expect("store")
+            .unwrap()
+            .manifest
+            .version,
+        "2"
+    );
 }
 
 // Owning a run is the issuer and subject; the same subject in another tenant
@@ -410,14 +425,14 @@ fn first_owner_keeps_the_agent() {
             .into_iter()
             .flat_map(|t| t.join().unwrap())
             .collect();
-        let owner = store.agent(id).unwrap().owner.subject;
+        let owner = store.agent(id).expect("store").unwrap().owner.subject;
         for (subject, put) in puts {
             let expected = if subject == owner {
                 PutAgent::Stored
             } else {
                 PutAgent::OwnedByOther
             };
-            assert_eq!(put, expected, "{subject} with owner {owner}");
+            assert_eq!(put, Ok(expected), "{subject} with owner {owner}");
         }
     }
 }
@@ -470,11 +485,14 @@ fn the_owner_replaces_from_any_tenant_and_no_one_else_does() {
             owner: protocol::Owner::new(common::ISSUER, subject, tenant),
         })
     };
-    assert_eq!(put(ALICE, "tenant-1", "1"), PutAgent::Stored);
-    assert_eq!(put(BOB, "tenant-1", "9"), PutAgent::OwnedByOther);
-    assert_eq!(store.agent(id).unwrap().manifest.version, "1");
-    assert_eq!(put(ALICE, "tenant-2", "2"), PutAgent::Stored);
-    let stored = store.agent(id).unwrap();
+    assert_eq!(put(ALICE, "tenant-1", "1"), Ok(PutAgent::Stored));
+    assert_eq!(put(BOB, "tenant-1", "9"), Ok(PutAgent::OwnedByOther));
+    assert_eq!(
+        store.agent(id).expect("store").unwrap().manifest.version,
+        "1"
+    );
+    assert_eq!(put(ALICE, "tenant-2", "2"), Ok(PutAgent::Stored));
+    let stored = store.agent(id).expect("store").unwrap();
     assert_eq!(stored.manifest.version, "2");
     assert_eq!(stored.owner.subject, ALICE);
     assert_eq!(stored.owner.tenant, "tenant-2");
