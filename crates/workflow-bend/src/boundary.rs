@@ -157,7 +157,18 @@ pub(crate) fn create_private_dir(
     mut name: impl FnMut() -> Result<String, FrontendError>,
 ) -> Result<PathBuf, FrontendError> {
     for _ in 0..STAGE_ATTEMPTS {
-        let dir = parent.join(name()?);
+        let name = name()?;
+        // One plain component, so the directory is always inside `parent`.
+        let mut parts = Path::new(&name).components();
+        if !matches!(
+            (parts.next(), parts.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        ) {
+            return Err(FrontendError::Setup(format!(
+                "staging name {name:?} is not one path component"
+            )));
+        }
+        let dir = parent.join(name);
         match fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => return Ok(dir),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -723,6 +734,16 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(tries.get(), STAGE_ATTEMPTS);
+
+        // A name that would leave `parent` is refused before anything is made.
+        for name in ["/abs", "..", "a/b", "../escape", ""] {
+            let error = create_private_dir(parent, || Ok(name.to_string())).unwrap_err();
+            assert!(
+                error.to_string().contains("one path component"),
+                "{name}: {error}"
+            );
+        }
+        assert!(!parent.parent().unwrap().join("escape").exists());
         assert!(error.to_string().contains("staging directory"), "{error}");
     }
 
@@ -775,6 +796,9 @@ mod tests {
             let source = format!("{main}{before} main() -> IO(u24):\n  0\n");
             assert!(assert_string_main(&source).is_ok(), "{before}");
         }
+        // The right-hand check: `defmain` is a name, not `def main`.
+        let joined = format!("{main}defmain() -> IO(u24):\n  0\n");
+        assert!(assert_string_main(&joined).is_ok());
         let two = format!("{main}def main() -> IO(u24):\n  0\n");
         assert!(assert_string_main(&two).is_err());
         assert!(assert_string_main("xdef main() -> String:\n  \"v1\"\n").is_err());
