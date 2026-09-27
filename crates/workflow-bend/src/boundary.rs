@@ -734,17 +734,19 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(tries.get(), STAGE_ATTEMPTS);
+        assert!(error.to_string().contains("staging directory"), "{error}");
 
         // A name that would leave `parent` is refused before anything is made.
-        for name in ["/abs", "..", "a/b", "../escape", ""] {
+        let escape = format!("gol-escape-{:016x}", getrandom::u64().unwrap());
+        let up = format!("../{escape}");
+        for name in ["/abs", "..", "a/b", up.as_str(), ""] {
             let error = create_private_dir(parent, || Ok(name.to_string())).unwrap_err();
             assert!(
                 error.to_string().contains("one path component"),
                 "{name}: {error}"
             );
         }
-        assert!(!parent.parent().unwrap().join("escape").exists());
-        assert!(error.to_string().contains("staging directory"), "{error}");
+        assert!(!parent.parent().unwrap().join(&escape).exists());
     }
 
     #[test]
@@ -790,7 +792,7 @@ mod tests {
     // `xdef main` is not a definition: an identifier that ends in "def" does
     // not start one.
     #[test]
-    fn at_word_requires_left_boundary() {
+    fn def_inside_a_name_is_not_a_def() {
         let main = "def main() -> String:\n  \"v1\"\n";
         for before in ["xdef", "_def", "x.def", "undef"] {
             let source = format!("{main}{before} main() -> IO(u24):\n  0\n");
