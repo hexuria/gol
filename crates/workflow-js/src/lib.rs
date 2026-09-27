@@ -50,6 +50,9 @@ const ON_COUNTER_ARITY: &str = "onCounter takes exactly three decisions";
 // A tool or agent name is checked against the catalog when the workflow is
 // registered; here it only has to be a short, non-empty string.
 const MAX_NAME_BYTES: usize = 128;
+// The same cap Rhai puts on every string.
+const MAX_INPUT_BYTES: usize = 64 * 1024;
+const INPUT_SIZE: &str = "input must be at most 65536 bytes";
 const TOOL_NAME: &str = "tool name must be 1 to 128 bytes";
 const AGENT_NAME: &str = "agent name must be 1 to 128 bytes";
 const SEQ_EMPTY: &str = "seq takes at least one decision";
@@ -142,6 +145,9 @@ fn tool(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<Js
     if !valid_name(&name) {
         return fault(context, TOOL_NAME);
     }
+    if input.len() > MAX_INPUT_BYTES {
+        return fault(context, INPUT_SIZE);
+    }
     make(context, Decision::Tool { name, input })
 }
 
@@ -154,6 +160,9 @@ fn spawn_agent(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsRe
     };
     if !valid_name(&agent) {
         return fault(context, AGENT_NAME);
+    }
+    if input.len() > MAX_INPUT_BYTES {
+        return fault(context, INPUT_SIZE);
     }
     make(context, Decision::SpawnAgent { agent, input })
 }

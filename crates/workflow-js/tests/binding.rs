@@ -265,3 +265,35 @@ fn seq_longer_than_the_decision_cap_is_rejected() {
         "too many decisions"
     );
 }
+
+// Inputs have the cap Rhai puts on every string: 65536 bytes.
+#[test]
+fn inputs_are_at_most_65536_bytes() {
+    let build = |bytes: usize, call: &str| format!("let s = \"x\".repeat({bytes});\n{call};\n");
+    assert!(compile(&build(65536, "tool(\"a\", s)")).is_ok());
+    assert!(compile(&build(65536, "spawnAgent(\"h\", s)")).is_ok());
+    assert_eq!(
+        invalid(&build(65537, "tool(\"a\", s)")),
+        "input must be at most 65536 bytes"
+    );
+    assert_eq!(
+        invalid(&build(65537, "spawnAgent(\"h\", s)")),
+        "input must be at most 65536 bytes"
+    );
+}
+
+// Reading a seq element can run a getter that calls a builtin. The builder
+// must still be in the context then.
+#[test]
+fn a_getter_in_a_seq_array_can_make_a_decision() {
+    let program = compile(
+        "const a = [complete()];\nObject.defineProperty(a, 1, { get() { return fail(); } });\nseq(a);\n",
+    )
+    .unwrap();
+    assert_eq!(
+        program,
+        WorkflowProgram {
+            root: Decision::Seq(vec![Decision::Complete, Decision::Fail]),
+        }
+    );
+}
