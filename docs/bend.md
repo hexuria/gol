@@ -71,11 +71,11 @@ v1 on_counter execute complete fail
 
 | Token | `WorkflowProgram` |
 | --- | --- |
-| `execute` | `Decision::Tool(ToolName::Counter)` |
+| `execute` | `Decision::Tool { name: "counter", input: "" }` |
 | `complete` | `Decision::Complete` |
 | `fail` | `Decision::Fail` |
 
-`v1` and `on_counter` are required. Each arm is one of those three words. Backslashes, quotes, and whitespace other than a single space are rejected. Rust then builds `Decision::OnCounter` and evaluates it with `evaluate_program`. The same `WorkflowStep` type Rhai and JavaScript already produce.
+`v1` and `on_counter` are required. Each arm is one of those three words. Backslashes, quotes, and whitespace other than a single space are rejected. Rust then builds `Decision::OnCounter` and evaluates it with `evaluate_program`. The same `WorkflowStep` type Rhai and JavaScript already produce. `evaluate_program` walks the program over the run's recorded history. On every history with at most one counter record that a v1 line can produce, it returns the command of the arm Bend selects; `v1_counter_programs_keep_their_meaning_on_reachable_histories` in `crates/workflow-core/tests/sequence.rs` checks all 27 lines. Five lines call the counter again from the zero or other arm, and on their two-record histories Rust follows the cursor and fails where Bend's v1 evaluation picks the arm from the latest counter (`v1_lines_that_call_the_counter_twice_follow_the_cursor`). A8b's v2 laws replace this.
 
 The Bend model of a recorded counter is a sign and a `Nat` magnitude, not an `i64`. Only non-negative zero completes. Every negative sign fails, and every positive magnitude fails. Rust `i64` zero is that non-negative zero. `i64::MIN` is negative. `i64::MAX` is positive. Values that are not zero share one arm, so the static program covers them without a second numeric tower.
 

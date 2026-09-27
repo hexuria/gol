@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use runtime_tokio::Journal;
 use workflow_core::{
-    CounterBranch, ToolSpec, WaitCondition, WorkflowCommand, WorkflowContext, WorkflowDriver,
-    WorkflowStep,
+    CounterBranch, History, Record, WaitCondition, WorkflowCommand, WorkflowContext,
+    WorkflowDriver, WorkflowStep,
 };
 
 fn main() {
@@ -34,7 +34,7 @@ fn after_commit(journal_path: &Path, effect_path: &Path, next_path: &Path) -> st
     create_empty(next_path)?;
     let mut journal = Journal::open(journal_path)?;
     match command(&evaluate(journal_path)?)? {
-        WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" }) => {
+        WorkflowCommand::ExecuteTool(tool) if tool.name == "counter" => {
             let value = stand_in(effect_path)?;
             journal.commit(&value.to_le_bytes())?;
             read_stdin()?;
@@ -52,7 +52,7 @@ fn before_commit(journal_path: &Path, effect_path: &Path, next_path: &Path) -> s
     create_empty(next_path)?;
     let mut journal = Journal::open(journal_path)?;
     match command(&evaluate(journal_path)?)? {
-        WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" }) => {
+        WorkflowCommand::ExecuteTool(tool) if tool.name == "counter" => {
             let value = stand_in(effect_path)?;
             read_stdin()?;
             journal.commit(&value.to_le_bytes())
@@ -65,7 +65,7 @@ fn run(journal_path: &Path, effect_path: &Path, next_path: &Path) -> std::io::Re
     let mut journal = Journal::open(journal_path)?;
     loop {
         match command(&evaluate(journal_path)?)? {
-            WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" }) => {
+            WorkflowCommand::ExecuteTool(tool) if tool.name == "counter" => {
                 let value = stand_in(effect_path)?;
                 journal.commit(&value.to_le_bytes())?;
             }
@@ -75,7 +75,7 @@ fn run(journal_path: &Path, effect_path: &Path, next_path: &Path) -> std::io::Re
             }
             WorkflowCommand::ExecuteTool(_)
             | WorkflowCommand::Fail
-            | WorkflowCommand::SpawnAgent => {
+            | WorkflowCommand::SpawnAgent(_) => {
                 return Err(input("command"));
             }
         }
@@ -92,16 +92,16 @@ fn evaluate(journal_path: &Path) -> std::io::Result<WorkflowStep> {
     Ok(step)
 }
 
-fn history_from_committed(bytes: &[u8]) -> std::io::Result<workflow_core::History> {
+fn history_from_committed(bytes: &[u8]) -> std::io::Result<History> {
     match bytes.len() {
-        0 => Ok(workflow_core::History { counter: None }),
+        0 => Ok(History::default()),
         8 => {
             let array: [u8; 8] = bytes.try_into().map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "journal length")
             })?;
-            Ok(workflow_core::History {
-                counter: Some(i64::from_le_bytes(array)),
-            })
+            Ok(History::new(vec![Record::counter(i64::from_le_bytes(
+                array,
+            ))]))
         }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -112,7 +112,7 @@ fn history_from_committed(bytes: &[u8]) -> std::io::Result<workflow_core::Histor
 
 fn command(step: &WorkflowStep) -> std::io::Result<WorkflowCommand> {
     match step.commands.as_slice() {
-        [command] => Ok(*command),
+        [command] => Ok(command.clone()),
         _ => Err(input("command")),
     }
 }

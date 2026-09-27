@@ -4,8 +4,8 @@
 
 use harness_core::{transition, WorkflowRun};
 use workflow_core::{
-    History, JoinBranch, ToolSpec, WaitCondition, WorkflowCommand, WorkflowContext, WorkflowDriver,
-    WorkflowStep,
+    AgentSpec, History, JoinBranch, ToolSpec, WaitCondition, WorkflowCommand, WorkflowContext,
+    WorkflowDriver, WorkflowStep,
 };
 
 struct Returns(Vec<WorkflowCommand>);
@@ -26,7 +26,13 @@ fn next(commands: Vec<WorkflowCommand>) -> WorkflowRun {
     run
 }
 
-const COUNTER: WorkflowCommand = WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" });
+fn counter() -> WorkflowCommand {
+    WorkflowCommand::ExecuteTool(ToolSpec::new("counter", ""))
+}
+
+fn spawn_agent() -> WorkflowCommand {
+    WorkflowCommand::SpawnAgent(AgentSpec::new("child", ""))
+}
 
 #[test]
 fn empty_command_list_is_invalid() {
@@ -40,14 +46,11 @@ fn two_commands_are_invalid_unless_both_are_tools() {
         WorkflowRun::Invalid
     );
     assert_eq!(
-        next(vec![COUNTER, WorkflowCommand::Complete]),
+        next(vec![counter(), WorkflowCommand::Complete]),
         WorkflowRun::Invalid
     );
     assert_eq!(
-        next(vec![
-            WorkflowCommand::SpawnAgent,
-            WorkflowCommand::SpawnAgent
-        ]),
+        next(vec![spawn_agent(), spawn_agent()]),
         WorkflowRun::Invalid
     );
 }
@@ -56,17 +59,20 @@ fn two_commands_are_invalid_unless_both_are_tools() {
 // run is still open.
 #[test]
 fn a_join_of_tools_is_open() {
-    assert_eq!(next(vec![COUNTER, COUNTER]), WorkflowRun::Open);
-    assert_eq!(next(vec![COUNTER, COUNTER, COUNTER]), WorkflowRun::Open);
+    assert_eq!(next(vec![counter(), counter()]), WorkflowRun::Open);
+    assert_eq!(
+        next(vec![counter(), counter(), counter()]),
+        WorkflowRun::Open
+    );
     let (run, commands) = transition(&JoinBranch, &WorkflowContext, &History::default());
     assert_eq!(run, WorkflowRun::Open);
-    assert_eq!(commands, [COUNTER, COUNTER]);
+    assert_eq!(commands, [counter(), counter()]);
 }
 
 #[test]
 fn each_single_command_has_its_own_next_state() {
-    assert_eq!(next(vec![COUNTER]), WorkflowRun::Open);
-    assert_eq!(next(vec![WorkflowCommand::SpawnAgent]), WorkflowRun::Open);
+    assert_eq!(next(vec![counter()]), WorkflowRun::Open);
+    assert_eq!(next(vec![spawn_agent()]), WorkflowRun::Open);
     assert_eq!(
         next(vec![WorkflowCommand::Complete]),
         WorkflowRun::Completed

@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
+use boa_engine::object::builtins::JsArray;
 use boa_engine::{
     js_string, Context, JsError, JsNativeError, JsObject, JsResult, JsValue, NativeFunction, Source,
 };
-use workflow_core::{Decision, ToolName, WorkflowProgram};
+use workflow_core::{Decision, WorkflowProgram};
 
 #[derive(Debug)]
 pub enum FrontendError {
@@ -46,6 +47,16 @@ const MAX_LOOP_ITERATIONS: u64 = 100_000;
 const MAX_RECURSION: usize = 64;
 const MAX_DECISIONS: usize = 1024;
 const ON_COUNTER_ARITY: &str = "onCounter takes exactly three decisions";
+// A tool or agent name is checked against the catalog when the workflow is
+// registered; here it only has to be a short, non-empty string.
+const MAX_NAME_BYTES: usize = 128;
+// The same cap Rhai puts on every string.
+const MAX_INPUT_BYTES: usize = 64 * 1024;
+const INPUT_SIZE: &str = "input must be at most 65536 bytes";
+const TOOL_NAME: &str = "tool name must be 1 to 128 bytes";
+const AGENT_NAME: &str = "agent name must be 1 to 128 bytes";
+const SEQ_EMPTY: &str = "seq takes at least one decision";
+const SEQ_ITEMS: &str = "seq takes an array of decisions";
 
 pub fn compile(source: &str) -> Result<WorkflowProgram, FrontendError> {
     let mut context = Context::default();
@@ -57,7 +68,9 @@ pub fn compile(source: &str) -> Result<WorkflowProgram, FrontendError> {
         fault: None,
     });
     register(&mut context, "onCounter", 3, on_counter);
-    register(&mut context, "tool", 1, tool);
+    register(&mut context, "tool", 2, tool);
+    register(&mut context, "spawnAgent", 2, spawn_agent);
+    register(&mut context, "seq", 1, seq);
     register(&mut context, "complete", 0, complete);
     register(&mut context, "fail", 0, fail);
 
@@ -97,7 +110,7 @@ fn on_counter(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
         return fault(context, ON_COUNTER_ARITY);
     };
     let mut builder = take(context)?;
-    let branches = [missing, zero, other].map(|arg| builder.consume(arg));
+    let branches = [missing, zero, other].map(|arg| builder.consume(arg, ON_COUNTER_ARITY));
     context.insert_data(builder);
     let [missing, zero, other] = match branches {
         [Ok(missing), Ok(zero), Ok(other)] => [missing, zero, other],
@@ -116,19 +129,87 @@ fn on_counter(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
 }
 
 fn tool(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let [name] = args else {
-        return fault(context, "tool takes exactly one name");
+    let (name, input) = match args {
+        [name] => (name, None),
+        [name, input] => (name, Some(input)),
+        _ => return fault(context, "tool takes a name and an optional input"),
     };
-    let Some(name) = name
-        .as_string()
-        .and_then(|value| value.to_std_string().ok())
-    else {
+    let Some(name) = string(name) else {
         return fault(context, "tool name must be a string");
     };
-    if name != "counter" {
-        return fault(context, "unknown tool");
+    let input = match input.map(string) {
+        None => String::new(),
+        Some(Some(input)) => input,
+        Some(None) => return fault(context, "tool input must be a string"),
+    };
+    if !valid_name(&name) {
+        return fault(context, TOOL_NAME);
     }
-    make(context, Decision::Tool(ToolName::Counter))
+    if input.len() > MAX_INPUT_BYTES {
+        return fault(context, INPUT_SIZE);
+    }
+    make(context, Decision::Tool { name, input })
+}
+
+fn spawn_agent(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let [agent, input] = args else {
+        return fault(context, "spawnAgent takes an agent and an input");
+    };
+    let (Some(agent), Some(input)) = (string(agent), string(input)) else {
+        return fault(context, "spawnAgent takes two strings");
+    };
+    if !valid_name(&agent) {
+        return fault(context, AGENT_NAME);
+    }
+    if input.len() > MAX_INPUT_BYTES {
+        return fault(context, INPUT_SIZE);
+    }
+    make(context, Decision::SpawnAgent { agent, input })
+}
+
+fn seq(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let [items] = args else {
+        return fault(context, SEQ_ITEMS);
+    };
+    let Some(array) = items
+        .as_object()
+        .and_then(|object| JsArray::from_object(object).ok())
+    else {
+        return fault(context, SEQ_ITEMS);
+    };
+    // Reading an element can run script code (a getter), so every element is
+    // read before the builder leaves the context.
+    let length = array.length(context)?;
+    if length == 0 {
+        return fault(context, SEQ_EMPTY);
+    }
+    if length > MAX_DECISIONS as u64 {
+        return fault(context, "too many decisions");
+    }
+    let mut items = Vec::new();
+    for index in 0..length {
+        items.push(array.at(index as i64, context)?);
+    }
+    let mut builder = take(context)?;
+    let decisions: Result<Vec<_>, _> = items
+        .iter()
+        .map(|item| builder.consume(item, SEQ_ITEMS))
+        .collect();
+    context.insert_data(builder);
+    match decisions {
+        Ok(decisions) => make(context, Decision::Seq(decisions)),
+        Err(message) => fault(context, message),
+    }
+}
+
+fn string(value: &JsValue) -> Option<String> {
+    value
+        .as_string()
+        .and_then(|value| value.to_std_string().ok())
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= MAX_NAME_BYTES
 }
 
 fn complete(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
@@ -146,9 +227,14 @@ fn fail(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<Js
 }
 
 impl Builder {
-    /// Moves the decision behind `value` out of the builder. Fails when
-    /// `value` is not an object this compiler handed out, or was used before.
-    fn consume(&mut self, value: &JsValue) -> Result<Decision, &'static str> {
+    /// Moves the decision behind `value` out of the builder. Fails with
+    /// `not_decision` when `value` is not an object this compiler handed out,
+    /// or with "decision used twice" when it was used before.
+    fn consume(
+        &mut self,
+        value: &JsValue,
+        not_decision: &'static str,
+    ) -> Result<Decision, &'static str> {
         let node = value
             .as_object()
             .and_then(|object| {
@@ -156,7 +242,7 @@ impl Builder {
                     .iter_mut()
                     .find(|node| JsObject::equals(&node.handle, &object))
             })
-            .ok_or(ON_COUNTER_ARITY)?;
+            .ok_or(not_decision)?;
         node.decision.take().ok_or("decision used twice")
     }
 }
@@ -202,7 +288,7 @@ fn native(message: &str) -> JsError {
 mod tests {
     use super::compile;
     use workflow_core::{
-        evaluate_program, Decision, History, ToolName, ToolSpec, WaitCondition, WorkflowCommand,
+        evaluate_program, Decision, History, Record, ToolSpec, WaitCondition, WorkflowCommand,
     };
 
     #[test]
@@ -216,24 +302,27 @@ mod tests {
         assert_eq!(
             program.root,
             Decision::OnCounter {
-                missing: Box::new(Decision::Tool(ToolName::Counter)),
+                missing: Box::new(Decision::Tool {
+                    name: "counter".to_string(),
+                    input: String::new(),
+                }),
                 zero: Box::new(Decision::Complete),
                 other: Box::new(Decision::Fail),
             }
         );
 
-        let unrecorded = evaluate_program(&program, &History { counter: None });
+        let unrecorded = evaluate_program(&program, &History::default());
         assert_eq!(
             unrecorded.commands,
-            [WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" })]
+            [WorkflowCommand::ExecuteTool(ToolSpec::new("counter", ""))]
         );
         assert_eq!(unrecorded.wait, WaitCondition::None);
 
-        let zero = evaluate_program(&program, &History { counter: Some(0) });
+        let zero = evaluate_program(&program, &History::new(vec![Record::counter(0)]));
         assert_eq!(zero.commands, [WorkflowCommand::Complete]);
         assert_eq!(zero.wait, WaitCondition::None);
 
-        let other = evaluate_program(&program, &History { counter: Some(1) });
+        let other = evaluate_program(&program, &History::new(vec![Record::counter(1)]));
         assert_eq!(other.commands, [WorkflowCommand::Fail]);
         assert_eq!(other.wait, WaitCondition::None);
 
@@ -241,9 +330,17 @@ mod tests {
             compile("let x = 1;\n").unwrap_err().to_string(),
             "script must record one decision"
         );
+        // Any short, non-empty tool name compiles; the catalog check comes later.
         assert_eq!(
-            compile("tool(\"nope\");\n").unwrap_err().to_string(),
-            "unknown tool"
+            compile("tool(\"nope\");\n").unwrap().root,
+            Decision::Tool {
+                name: "nope".to_string(),
+                input: String::new(),
+            }
+        );
+        assert_eq!(
+            compile("tool(\"\");\n").unwrap_err().to_string(),
+            "tool name must be 1 to 128 bytes"
         );
     }
 }

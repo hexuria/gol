@@ -3,7 +3,7 @@ use std::io::Read;
 use std::path::Path;
 
 use workflow_core::{
-    spawn, History, ToolSpec, WaitCondition, WorkflowCommand, WorkflowContext, WorkflowDriver,
+    spawn, History, Record, WaitCondition, WorkflowCommand, WorkflowContext, WorkflowDriver,
     WorkflowStep,
 };
 
@@ -20,18 +20,20 @@ pub fn replay(
     let history = history_from_committed(&recorded)?;
     let step = driver.evaluate(ctx, &history);
     let harness = match step.commands.as_slice() {
-        [WorkflowCommand::SpawnAgent] if recorded.is_empty() => {
-            let state = on_command(WorkflowCommand::SpawnAgent);
+        [command @ WorkflowCommand::SpawnAgent(_)] if recorded.is_empty() => {
+            let state = on_command(command);
             journal.commit(&0i64.to_le_bytes())?;
             state
         }
-        [WorkflowCommand::SpawnAgent] => None,
-        [command] => on_command(*command),
+        [WorkflowCommand::SpawnAgent(_)] => None,
+        [command] => on_command(command),
         _ => None,
     };
-    if let [WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" })] = step.commands.as_slice() {
-        let value = stand_in();
-        journal.commit(&value.to_le_bytes())?;
+    if let [WorkflowCommand::ExecuteTool(tool)] = step.commands.as_slice() {
+        if tool.name == "counter" {
+            let value = stand_in();
+            journal.commit(&value.to_le_bytes())?;
+        }
     }
     Ok((step, harness))
 }
@@ -45,14 +47,14 @@ fn read_path(path: &Path) -> std::io::Result<Vec<u8>> {
 
 fn history_from_committed(bytes: &[u8]) -> std::io::Result<History> {
     match bytes.len() {
-        0 => Ok(History { counter: None }),
+        0 => Ok(History::default()),
         8 => {
             let array: [u8; 8] = bytes.try_into().map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "journal length")
             })?;
-            Ok(History {
-                counter: Some(i64::from_le_bytes(array)),
-            })
+            Ok(History::new(vec![Record::counter(i64::from_le_bytes(
+                array,
+            ))]))
         }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -68,7 +70,7 @@ pub fn join_all(
     journal: &mut Journal,
     stand_in: &mut dyn FnMut(u32) -> i64,
 ) -> std::io::Result<()> {
-    let step = driver.evaluate(ctx, &History { counter: None });
+    let step = driver.evaluate(ctx, &History::default());
     if step.wait != WaitCondition::None {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -76,8 +78,10 @@ pub fn join_all(
         ));
     }
     let (first_command, second_command) = match step.commands.as_slice() {
-        [first @ WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" }), second @ WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" })] => {
-            (*first, *second)
+        [first @ WorkflowCommand::ExecuteTool(a), second @ WorkflowCommand::ExecuteTool(b)]
+            if a.name == "counter" && b.name == "counter" =>
+        {
+            (first.clone(), second.clone())
         }
         _ => {
             return Err(std::io::Error::new(
@@ -111,9 +115,9 @@ pub fn join_all(
     Ok(())
 }
 
-fn on_command(command: WorkflowCommand) -> Option<protocol::RunState> {
+fn on_command(command: &WorkflowCommand) -> Option<protocol::RunState> {
     match command {
-        WorkflowCommand::SpawnAgent => {
+        WorkflowCommand::SpawnAgent(_) => {
             let mut driver = harness::Driver::boot(
                 protocol::RunSpec::builder()
                     .agent(protocol::AgentId::new(), "1")
@@ -153,7 +157,7 @@ mod tests {
     use std::io::Read;
     use std::path::Path;
     use workflow_core::{
-        CounterBranch, History, JoinBranch, ToolSpec, WaitCondition, WorkflowCommand,
+        AgentSpec, CounterBranch, History, JoinBranch, ToolSpec, WaitCondition, WorkflowCommand,
         WorkflowContext, WorkflowDriver, WorkflowStep,
     };
 
@@ -186,7 +190,7 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert_eq!(
             first.commands,
-            [WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" })]
+            [WorkflowCommand::ExecuteTool(ToolSpec::new("counter", ""))]
         );
         assert_eq!(first.wait, WaitCondition::None);
         assert_eq!(read_path(&path), 0i64.to_le_bytes());
@@ -312,7 +316,7 @@ mod tests {
         impl WorkflowDriver for Fixed {
             fn evaluate(&self, _ctx: &WorkflowContext, _history: &History) -> WorkflowStep {
                 WorkflowStep {
-                    commands: vec![self.command],
+                    commands: vec![self.command.clone()],
                     wait: WaitCondition::None,
                 }
             }
@@ -329,7 +333,7 @@ mod tests {
         };
         let (step, harness) = replay(
             &Fixed {
-                command: WorkflowCommand::SpawnAgent,
+                command: WorkflowCommand::SpawnAgent(AgentSpec::new("child", "")),
             },
             &WorkflowContext,
             &path,
@@ -339,7 +343,10 @@ mod tests {
         .unwrap();
         assert_eq!(calls.get(), 0);
         assert_eq!(read_path(&path), 0i64.to_le_bytes());
-        assert_eq!(step.commands, [WorkflowCommand::SpawnAgent]);
+        assert_eq!(
+            step.commands,
+            [WorkflowCommand::SpawnAgent(AgentSpec::new("child", ""))]
+        );
         assert_eq!(step.wait, WaitCondition::None);
         let state = harness.unwrap();
         // The spawned agent only completes, and Complete is not a step.
@@ -360,7 +367,7 @@ mod tests {
 
         let (again, again_harness) = replay(
             &Fixed {
-                command: WorkflowCommand::SpawnAgent,
+                command: WorkflowCommand::SpawnAgent(AgentSpec::new("child", "")),
             },
             &WorkflowContext,
             &path,
@@ -369,14 +376,17 @@ mod tests {
         )
         .unwrap();
         assert!(again_harness.is_none(), "harness started twice");
-        assert_eq!(again.commands, [WorkflowCommand::SpawnAgent]);
+        assert_eq!(
+            again.commands,
+            [WorkflowCommand::SpawnAgent(AgentSpec::new("child", ""))]
+        );
         assert_eq!(again.wait, WaitCondition::None);
         assert_eq!(calls.get(), 0);
         assert_eq!(read_path(&path), 0i64.to_le_bytes());
 
         for command in [
-            WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" }),
-            WorkflowCommand::ExecuteTool(ToolSpec { name: "other" }),
+            WorkflowCommand::ExecuteTool(ToolSpec::new("counter", "")),
+            WorkflowCommand::ExecuteTool(ToolSpec::new("other", "")),
             WorkflowCommand::Complete,
             WorkflowCommand::Fail,
         ] {
@@ -388,24 +398,26 @@ mod tests {
                 0i64
             };
             let (step, harness) = replay(
-                &Fixed { command },
+                &Fixed {
+                    command: command.clone(),
+                },
                 &WorkflowContext,
                 &case,
                 &mut case_journal,
                 &mut case_stand_in,
             )
             .unwrap();
-            assert_eq!(step.commands, [command]);
+            assert_eq!(step.commands, std::slice::from_ref(&command));
             assert!(harness.is_none());
             match command {
-                WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" }) => {
+                WorkflowCommand::ExecuteTool(tool) if tool.name == "counter" => {
                     assert_eq!(case_calls.get(), 1);
                     assert_eq!(read_path(&case), 0i64.to_le_bytes());
                 }
                 WorkflowCommand::ExecuteTool(_)
                 | WorkflowCommand::Complete
                 | WorkflowCommand::Fail
-                | WorkflowCommand::SpawnAgent => {
+                | WorkflowCommand::SpawnAgent(_) => {
                     assert_eq!(case_calls.get(), 0);
                     assert!(read_path(&case).is_empty());
                 }
@@ -438,7 +450,10 @@ mod tests {
         impl WorkflowDriver for TwoSpawn {
             fn evaluate(&self, _ctx: &WorkflowContext, _history: &History) -> WorkflowStep {
                 WorkflowStep {
-                    commands: vec![WorkflowCommand::SpawnAgent, WorkflowCommand::SpawnAgent],
+                    commands: vec![
+                        WorkflowCommand::SpawnAgent(AgentSpec::new("child", "")),
+                        WorkflowCommand::SpawnAgent(AgentSpec::new("child", "")),
+                    ],
                     wait: WaitCondition::None,
                 }
             }

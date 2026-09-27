@@ -4,8 +4,8 @@ mod boundary;
 use std::path::Path;
 
 use workflow_core::{
-    evaluate_program, Decision, History, ToolName, WorkflowContext, WorkflowDriver,
-    WorkflowProgram, WorkflowStep,
+    evaluate_program, Decision, History, WorkflowContext, WorkflowDriver, WorkflowProgram,
+    WorkflowStep,
 };
 
 use boundary::{
@@ -131,7 +131,10 @@ fn parse_encoding(stdout: &str) -> Result<WorkflowProgram, FrontendError> {
 
 fn parse_arm(token: &str) -> Result<Decision, FrontendError> {
     match token {
-        "execute" => Ok(Decision::Tool(ToolName::Counter)),
+        "execute" => Ok(Decision::Tool {
+            name: "counter".to_string(),
+            input: String::new(),
+        }),
         "complete" => Ok(Decision::Complete),
         "fail" => Ok(Decision::Fail),
         _ => Err(FrontendError::Encoding(format!("unknown command {token}"))),
@@ -146,11 +149,11 @@ mod tests {
 
     use harness_core::transition;
     use workflow_core::{
-        counter_program, evaluate_program, History, ToolSpec, WaitCondition, WorkflowCommand,
-        WorkflowContext, WorkflowStep,
+        counter_program, evaluate_program, Decision, History, Record, ToolSpec, WaitCondition,
+        WorkflowCommand, WorkflowContext, WorkflowProgram, WorkflowStep,
     };
 
-    use super::{compile, BendDriver};
+    use super::{compile, parse_encoding, BendDriver};
     use crate::boundary::{run_sandboxed, Limits};
 
     fn experiment() -> PathBuf {
@@ -170,7 +173,7 @@ mod tests {
 
     fn expected(counter: Option<i64>) -> WorkflowStep {
         let command = match counter {
-            None => WorkflowCommand::ExecuteTool(ToolSpec { name: "counter" }),
+            None => WorkflowCommand::ExecuteTool(ToolSpec::new("counter", "")),
             Some(0) => WorkflowCommand::Complete,
             Some(_) => WorkflowCommand::Fail,
         };
@@ -217,7 +220,10 @@ mod tests {
         let ctx = WorkflowContext;
         let driver = BendDriver::new(bend.clone());
         for counter in histories() {
-            let history = History { counter };
+            let history = match counter {
+                None => History::default(),
+                Some(value) => History::new(vec![Record::counter(value)]),
+            };
             let step = expected(counter);
             assert_eq!(evaluate_program(&counter_program(), &history), step);
             assert_eq!(evaluate_program(&rhai, &history), step);
@@ -230,6 +236,105 @@ mod tests {
                 transition(&workflow_core::CounterBranch, &ctx, &history)
             );
         }
+
+        // Tool calls with input, spawns and sequences. Bend cannot express
+        // them yet (the bend_rejects_* tests). Rhai and JS must build the same
+        // program as Rust; evaluate_program is shared, so equal programs
+        // evaluate alike, and crates/workflow-core/tests/sequence.rs checks
+        // what they evaluate to.
+        for (rust, rhai, js) in new_construct_programs() {
+            assert_eq!(workflow_rhai::compile(rhai).unwrap(), rust);
+            assert_eq!(workflow_js::compile(js).unwrap(), rust);
+        }
+    }
+
+    fn tool(name: &str, input: &str) -> Decision {
+        Decision::Tool {
+            name: name.to_string(),
+            input: input.to_string(),
+        }
+    }
+
+    fn spawn_agent(agent: &str, input: &str) -> Decision {
+        Decision::SpawnAgent {
+            agent: agent.to_string(),
+            input: input.to_string(),
+        }
+    }
+
+    fn new_construct_programs() -> [(WorkflowProgram, &'static str, &'static str); 3] {
+        [
+            (
+                WorkflowProgram {
+                    root: Decision::Seq(vec![
+                        tool("search", "q"),
+                        spawn_agent("helper", "go"),
+                        Decision::Complete,
+                    ]),
+                },
+                "seq([tool(\"search\", \"q\"), spawn_agent(\"helper\", \"go\"), complete()]);\n",
+                "seq([tool(\"search\", \"q\"), spawnAgent(\"helper\", \"go\"), complete()]);\n",
+            ),
+            (
+                WorkflowProgram {
+                    root: Decision::Seq(vec![
+                        tool("counter", ""),
+                        Decision::OnCounter {
+                            missing: Box::new(Decision::Fail),
+                            zero: Box::new(Decision::Seq(vec![
+                                spawn_agent("helper", "zero"),
+                                Decision::Complete,
+                            ])),
+                            other: Box::new(Decision::Fail),
+                        },
+                    ]),
+                },
+                "seq([tool(\"counter\"), on_counter(fail(), seq([spawn_agent(\"helper\", \"zero\"), complete()]), fail())]);\n",
+                "seq([tool(\"counter\"), onCounter(fail(), seq([spawnAgent(\"helper\", \"zero\"), complete()]), fail())]);\n",
+            ),
+            (
+                WorkflowProgram {
+                    root: Decision::OnCounter {
+                        missing: Box::new(Decision::Seq(vec![
+                            tool("counter", "reset"),
+                            tool("search", "q"),
+                        ])),
+                        zero: Box::new(Decision::Complete),
+                        other: Box::new(Decision::Seq(vec![
+                            spawn_agent("helper", "retry"),
+                            Decision::Fail,
+                        ])),
+                    },
+                },
+                "on_counter(seq([tool(\"counter\", \"reset\"), tool(\"search\", \"q\")]), complete(), seq([spawn_agent(\"helper\", \"retry\"), fail()]));\n",
+                "onCounter(seq([tool(\"counter\", \"reset\"), tool(\"search\", \"q\")]), complete(), seq([spawnAgent(\"helper\", \"retry\"), fail()]));\n",
+            ),
+        ]
+    }
+
+    // Bend's encoding is still v1, the counter program only (A8b adds the
+    // rest). Each new construct is rejected by name.
+    #[test]
+    fn bend_rejects_tool_with_input() {
+        let error = parse_encoding("\"v1 on_counter tool complete fail\"\n").unwrap_err();
+        assert_eq!(error.to_string(), "unknown command tool");
+    }
+
+    #[test]
+    fn bend_rejects_spawn_agent() {
+        let error = parse_encoding("\"v1 on_counter spawn_agent complete fail\"\n").unwrap_err();
+        assert_eq!(error.to_string(), "unknown command spawn_agent");
+    }
+
+    #[test]
+    fn bend_rejects_seq() {
+        let error = parse_encoding("\"v1 seq execute complete\"\n").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "expected v1 on_counter <missing> <zero> <other>"
+        );
+        let error = parse_encoding("\"v1 on_counter seq complete fail\"\n").unwrap_err();
+        assert_eq!(error.to_string(), "unknown command seq");
     }
 
     #[test]
