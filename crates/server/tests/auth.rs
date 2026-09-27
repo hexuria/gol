@@ -73,10 +73,10 @@ async fn expired_401() {
     let now = common::now();
     let expired = with(claims("u", "t"), "exp", (now - 120).into());
     assert_eq!(status(&base, &sign(eddsa(), &expired)).await, 401);
-    // The leeway is 60 s: 50 s past exp is accepted, 70 s is not.
-    let recent = with(claims("u", "t"), "exp", (now - 50).into());
+    // The leeway is 60 s: 55 s past exp is accepted, 65 s is not.
+    let recent = with(claims("u", "t"), "exp", (now - 55).into());
     assert_eq!(status(&base, &sign(eddsa(), &recent)).await, 404);
-    let past = with(claims("u", "t"), "exp", (now - 70).into());
+    let past = with(claims("u", "t"), "exp", (now - 65).into());
     assert_eq!(status(&base, &sign(eddsa(), &past)).await, 401);
 }
 

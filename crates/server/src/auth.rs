@@ -292,6 +292,9 @@ impl OidcVerifier {
         // The interval runs from when the fetch ended, so a fetch slower than
         // the interval is not followed at once by another.
         fetches.attempted = Some(Instant::now());
+        if loaded_at.is_some() && found.is_none() {
+            fetches.refreshed = fetches.attempted;
+        }
         match fetched {
             Ok(set) => {
                 fetches.error = None;
