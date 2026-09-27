@@ -1,13 +1,13 @@
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::FrontendError;
 
@@ -126,23 +126,71 @@ impl Drop for Staged {
     }
 }
 
+/// How many random names staging tries before it gives up.
+pub(crate) const STAGE_ATTEMPTS: usize = 8;
+
 pub fn stage(source: &Path) -> Result<Staged, FrontendError> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("gol-bend-{}-{nanos}", std::process::id()));
-    fs::create_dir_all(&dir).map_err(|error| io_error("create", &dir, &error))?;
+    let dir = create_private_dir(&std::env::temp_dir(), || {
+        let suffix = getrandom::u64()
+            .map_err(|error| FrontendError::Setup(format!("no random staging name: {error}")))?;
+        Ok(format!("gol-bend-{}-{suffix:016x}", std::process::id()))
+    })?;
     let staged = Staged { dir };
     for name in ["counter.bend", "LAWS.bend", "PROOF.bend"] {
         let bytes = read_source(&source.join(name))?;
-        let dest = staged.dir.join(name);
-        fs::write(&dest, bytes).map_err(|error| io_error("write", &dest, &error))?;
+        write_new(&staged.dir.join(name), bytes.as_bytes())?;
     }
     let counter = fs::read_to_string(staged.dir.join("counter.bend"))
         .map_err(|error| io_error("read", &staged.dir.join("counter.bend"), &error))?;
     assert_string_main(&counter)?;
     Ok(staged)
+}
+
+/// Creates a new directory under `parent`, readable only by this user, named
+/// by `name`. The temp dir is shared, so a path that already exists (a
+/// directory or a symlink another user made) is never used: `create_dir`
+/// refuses it and the next name is tried. This assumes `parent` is sticky or
+/// private, as `/tmp` and macOS's per-user `TMPDIR` are, so no other user can
+/// rename the new directory away.
+pub(crate) fn create_private_dir(
+    parent: &Path,
+    mut name: impl FnMut() -> Result<String, FrontendError>,
+) -> Result<PathBuf, FrontendError> {
+    for _ in 0..STAGE_ATTEMPTS {
+        let name = name()?;
+        // One plain component, so the directory is always inside `parent`.
+        let mut parts = Path::new(&name).components();
+        if !matches!(
+            (parts.next(), parts.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        ) {
+            return Err(FrontendError::Setup(format!(
+                "staging name {name:?} is not one path component"
+            )));
+        }
+        let dir = parent.join(name);
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(io_error("create", &dir, &error)),
+        }
+    }
+    Err(FrontendError::Setup(format!(
+        "no free staging directory in {} after {STAGE_ATTEMPTS} tries",
+        parent.display()
+    )))
+}
+
+/// Writes a new file, mode 0600. It never follows or truncates something
+/// already at `path`.
+pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<(), FrontendError> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut file| file.write_all(bytes))
+        .map_err(|error| io_error("write", path, &error))
 }
 
 fn read_source(path: &Path) -> Result<String, FrontendError> {
@@ -197,6 +245,11 @@ fn assert_string_main(source: &str) -> Result<(), FrontendError> {
             scan.skip_char_lit()?;
             continue;
         }
+        // Whole names and numbers are skipped, so `def` counts only where a
+        // token starts: `xdef` is one name, but `1.5def` is a float and a def.
+        if scan.read_name().is_some() || scan.skip_number() {
+            continue;
+        }
         scan.bump_char()?;
     }
     if mains != 1 {
@@ -240,6 +293,8 @@ impl BendScan<'_> {
         self.src.as_bytes().get(self.i) == Some(&byte)
     }
 
+    /// `word` starts here and is not the head of a longer name. The main loop
+    /// skips whole names and numbers, so a match is always at a token start.
     fn at_word(&self, word: &str) -> bool {
         let rest = &self.src[self.i..];
         rest.starts_with(word)
@@ -247,6 +302,35 @@ impl BendScan<'_> {
                 .chars()
                 .next()
                 .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    }
+
+    /// Skips a Bend 2.0.28 number, `\d+(n|\.\d+([eE][+-]?\d+)?)?`. A float
+    /// ends right before a letter, so what follows starts a new token.
+    fn skip_number(&mut self) -> bool {
+        let bytes = self.src.as_bytes();
+        let digits = |from: usize| {
+            bytes.get(from..).map_or(0, |rest| {
+                rest.iter().take_while(|b| b.is_ascii_digit()).count()
+            })
+        };
+        let mut end = self.i + digits(self.i);
+        if end == self.i {
+            return false;
+        }
+        if bytes.get(end) == Some(&b'n') {
+            end += 1;
+        } else if bytes.get(end) == Some(&b'.') && digits(end + 1) > 0 {
+            end += 1 + digits(end + 1);
+            if matches!(bytes.get(end), Some(b'e' | b'E')) {
+                let sign = usize::from(matches!(bytes.get(end + 1), Some(b'+' | b'-')));
+                let exponent = digits(end + 1 + sign);
+                if exponent > 0 {
+                    end += 1 + sign + exponent;
+                }
+            }
+        }
+        self.i = end;
+        true
     }
 
     fn take(&mut self, text: &str) -> bool {
@@ -568,4 +652,288 @@ fn io_error(action: &str, path: &Path, error: &io::Error) -> FrontendError {
 
 pub fn staged_dir(staged: &Staged) -> &Path {
     &staged.dir
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::fs;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::{Path, PathBuf};
+
+    use proptest::prelude::*;
+    use workflow_core::{Decision, WorkflowProgram};
+
+    use super::{
+        assert_string_main, create_private_dir, stage, staged_dir, write_new, STAGE_ATTEMPTS,
+    };
+
+    /// A private scratch directory, removed when dropped (also after a failed
+    /// assertion).
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(tag: &str) -> Scratch {
+        let dir = create_private_dir(&std::env::temp_dir(), || {
+            Ok(format!(
+                "gol-boundary-test-{tag}-{:016x}",
+                getrandom::u64().unwrap()
+            ))
+        })
+        .unwrap();
+        Scratch(dir)
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    // A path that already exists, as a directory or a symlink, is never used:
+    // staging moves on to the next name.
+    #[test]
+    fn staging_refuses_existing_dir() {
+        let parent_dir = scratch("refuse");
+        let parent = &parent_dir.0;
+        fs::create_dir(parent.join("taken")).unwrap();
+        fs::write(parent.join("taken").join("keep"), "keep").unwrap();
+        let elsewhere_dir = scratch("elsewhere");
+        let elsewhere = &elsewhere_dir.0;
+        symlink(elsewhere, parent.join("link")).unwrap();
+        // A dangling symlink is refused too.
+        symlink(parent.join("nowhere"), parent.join("dangling")).unwrap();
+
+        let names = ["taken", "link", "dangling", "fresh"];
+        let calls = Cell::new(0);
+        let dir = create_private_dir(parent, || {
+            let name = names[calls.get()];
+            calls.set(calls.get() + 1);
+            Ok(name.to_string())
+        })
+        .unwrap();
+        assert_eq!(dir, parent.join("fresh"));
+        assert_eq!(calls.get(), 4);
+        assert!(!parent.join("nowhere").exists());
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(
+            fs::read_dir(parent.join("taken")).unwrap().count(),
+            1,
+            "the existing directory was touched"
+        );
+        assert_eq!(fs::read_dir(elsewhere).unwrap().count(), 0);
+
+        // Every name taken: it gives up after STAGE_ATTEMPTS tries.
+        let tries = Cell::new(0);
+        let error = create_private_dir(parent, || {
+            tries.set(tries.get() + 1);
+            Ok("taken".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(tries.get(), STAGE_ATTEMPTS);
+        assert!(error.to_string().contains("staging directory"), "{error}");
+
+        // A name that would leave `parent` is refused before anything is made.
+        let escape = format!("gol-escape-{:016x}", getrandom::u64().unwrap());
+        let up = format!("../{escape}");
+        for name in ["/abs", "..", "a/b", up.as_str(), ""] {
+            let error = create_private_dir(parent, || Ok(name.to_string())).unwrap_err();
+            assert!(
+                error.to_string().contains("one path component"),
+                "{name}: {error}"
+            );
+        }
+        assert!(!parent.parent().unwrap().join(&escape).exists());
+    }
+
+    #[test]
+    fn a_staged_file_never_replaces_what_is_there() {
+        let dir = scratch("write");
+        let kept = dir.0.join("kept");
+        fs::write(&kept, "kept").unwrap();
+        let target = dir.0.join("target");
+        fs::write(&target, "target").unwrap();
+        let link = dir.0.join("link");
+        symlink(&target, &link).unwrap();
+        assert!(write_new(&kept, b"new").is_err());
+        assert!(write_new(&link, b"new").is_err());
+        assert_eq!(fs::read_to_string(&kept).unwrap(), "kept");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "target");
+        let fresh = dir.0.join("fresh");
+        write_new(&fresh, b"new").unwrap();
+        assert_eq!(fs::read_to_string(&fresh).unwrap(), "new");
+        assert_eq!(mode(&fresh), 0o600);
+    }
+
+    #[test]
+    fn a_staged_dir_is_private_and_uniquely_named() {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../experiments/bend");
+        let first = stage(&source).unwrap();
+        let second = stage(&source).unwrap();
+        let (a, b) = (staged_dir(&first), staged_dir(&second));
+        assert_eq!(mode(a), 0o700);
+        for name in ["counter.bend", "LAWS.bend", "PROOF.bend"] {
+            assert_eq!(mode(&a.join(name)), 0o600, "{name}");
+        }
+        assert_ne!(a, b);
+        let name = a.file_name().unwrap().to_str().unwrap();
+        let prefix = format!("gol-bend-{}-", std::process::id());
+        let suffix = name.strip_prefix(&prefix).expect("prefix");
+        assert_eq!(suffix.len(), 16, "{name}");
+        assert!(
+            suffix.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{name}"
+        );
+    }
+
+    // `xdef main` is not a definition: an identifier that ends in "def" does
+    // not start one.
+    #[test]
+    fn def_inside_a_name_is_not_a_def() {
+        let main = "def main() -> String:\n  \"v1\"\n";
+        for before in ["xdef", "_def", "x.def", "undef"] {
+            let source = format!("{main}{before} main() -> IO(u24):\n  0\n");
+            assert!(assert_string_main(&source).is_ok(), "{before}");
+        }
+        // The right-hand check: `defmain` is a name, not `def main`.
+        let joined = format!("{main}defmain() -> IO(u24):\n  0\n");
+        assert!(assert_string_main(&joined).is_ok());
+        let two = format!("{main}def main() -> IO(u24):\n  0\n");
+        assert!(assert_string_main(&two).is_err());
+        assert!(assert_string_main("xdef main() -> String:\n  \"v1\"\n").is_err());
+    }
+
+    // Bend 2.0.28 ends a float literal right before a letter, so `1.5def main`
+    // is a real def. The PR #54 review ran such an IO main on the pinned binary.
+    #[test]
+    fn a_def_after_a_float_literal_is_a_def() {
+        let main = "def main() -> String:\n  \"v1\"\n";
+        for literal in ["1.5", "1.5e3", "0.0E+1"] {
+            let source = format!("{main}def f() -> F32:\n  {literal}def main() -> IO(u24):\n  0\n");
+            assert!(assert_string_main(&source).is_err(), "{literal}");
+        }
+    }
+
+    // Bend source pieces, each with the number of String mains and other mains
+    // it defines. Pieces that only look like a def (a longer name, a string,
+    // a comment, a char) define none.
+    const PIECES: [(&str, usize, usize); 12] = [
+        ("def main() -> String:\n  \"v1\"\n", 1, 0),
+        ("def\tmain()\t->\tString:\r\n  \"v1\"\n", 1, 0),
+        ("def main() -> IO(u24):\n  0\n", 0, 1),
+        ("def f() -> F32:\n  1.5def main() -> IO(u24):\n  0\n", 0, 1),
+        (
+            "def f() -> F32:\n  2.0e1def main() -> String:\n  \"v1\"\n",
+            1,
+            0,
+        ),
+        ("xdef main() -> IO(u24):\n  0\n", 0, 0),
+        ("x.def main() -> IO(u24):\n  0\n", 0, 0),
+        ("# def main() -> IO(u24):\n", 0, 0),
+        ("def s() -> String:\n  \"def main() -> IO(u24):\"\n", 0, 0),
+        ("def c() -> Char:\n  'd'\n", 0, 0),
+        ("def g(x) -> u24:\n  x + 1\n", 0, 0),
+        ("def main2() -> IO(u24):\n  0\n", 0, 0),
+    ];
+
+    fn arms() -> [(&'static str, Decision); 3] {
+        [
+            (
+                "execute",
+                Decision::Tool {
+                    name: "counter".to_string(),
+                    input: String::new(),
+                },
+            ),
+            ("complete", Decision::Complete),
+            ("fail", Decision::Fail),
+        ]
+    }
+
+    /// The 27 lines parse_encoding accepts, with the program each one means.
+    fn valid_lines() -> Vec<(String, WorkflowProgram)> {
+        let mut lines = Vec::new();
+        for (missing, on_missing) in arms() {
+            for (zero, on_zero) in arms() {
+                for (other, on_other) in arms() {
+                    lines.push((
+                        format!("\"v1 on_counter {missing} {zero} {other}\"\n"),
+                        WorkflowProgram {
+                            root: Decision::OnCounter {
+                                missing: Box::new(on_missing.clone()),
+                                zero: Box::new(on_zero.clone()),
+                                other: Box::new(on_other.clone()),
+                            },
+                        },
+                    ));
+                }
+            }
+        }
+        lines
+    }
+
+    /// Arbitrary text, and valid lines with one character inserted, removed or
+    /// replaced, so both sides of the oracle are exercised.
+    fn encodings() -> impl Strategy<Value = String> {
+        let valid: Vec<String> = valid_lines().into_iter().map(|(line, _)| line).collect();
+        let edited = (
+            proptest::sample::select(valid.clone()),
+            any::<prop::sample::Index>(),
+            any::<char>(),
+            0u8..4,
+        )
+            .prop_map(|(line, at, ch, edit)| {
+                let mut chars: Vec<char> = line.chars().collect();
+                let at = at.index(chars.len() + 1);
+                match edit {
+                    0 => chars.insert(at, ch),
+                    1 if at < chars.len() => {
+                        chars.remove(at);
+                    }
+                    2 if at < chars.len() => chars[at] = ch,
+                    _ => {}
+                }
+                chars.into_iter().collect()
+            });
+        prop_oneof![any::<String>(), proptest::sample::select(valid), edited]
+    }
+
+    #[test]
+    fn every_v1_line_parses_to_its_program() {
+        for (line, program) in valid_lines() {
+            assert_eq!(crate::parse_encoding(&line).unwrap(), program, "{line}");
+        }
+    }
+
+    proptest! {
+        // The guard accepts a source exactly when it defines one main and that
+        // main returns String, over sources built from PIECES.
+        #[test]
+        fn the_main_guard_counts_real_defs(picks in prop::collection::vec(0..PIECES.len(), 0..6)) {
+            let source: String = picks.iter().map(|&pick| PIECES[pick].0).collect();
+            let strings: usize = picks.iter().map(|&pick| PIECES[pick].1).sum();
+            let others: usize = picks.iter().map(|&pick| PIECES[pick].2).sum();
+            let accepted = assert_string_main(&source).is_ok();
+            prop_assert_eq!(accepted, strings == 1 && others == 0, "{:?}", source);
+        }
+
+        // Neither hand-written parser panics, and parse_encoding accepts
+        // exactly the 27 valid v1 lines, each as the program it names.
+        #[test]
+        fn scanner_and_parse_encoding_never_panic(text in encodings(), source in any::<String>()) {
+            let _ = assert_string_main(&source);
+            let _ = assert_string_main(&text);
+            let expected = valid_lines()
+                .into_iter()
+                .find(|(line, _)| *line == text)
+                .map(|(_, program)| program);
+            match crate::parse_encoding(&text) {
+                Ok(program) => prop_assert_eq!(Some(program), expected),
+                Err(_) => prop_assert_eq!(None, expected),
+            }
+        }
+    }
 }
