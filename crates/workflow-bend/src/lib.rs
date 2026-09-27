@@ -238,17 +238,13 @@ mod tests {
         }
 
         // Tool calls with input, spawns and sequences. Bend cannot express
-        // them yet (the bend_rejects_* tests), so Rust, Rhai and JS agree.
+        // them yet (the bend_rejects_* tests). Rhai and JS must build the same
+        // program as Rust; evaluate_program is shared, so equal programs
+        // evaluate alike, and crates/workflow-core/tests/sequence.rs checks
+        // what they evaluate to.
         for (rust, rhai, js) in new_construct_programs() {
-            let rhai = workflow_rhai::compile(rhai).unwrap();
-            let js = workflow_js::compile(js).unwrap();
-            assert_eq!(rhai, rust);
-            assert_eq!(js, rust);
-            for history in record_histories() {
-                let step = evaluate_program(&rust, &history);
-                assert_eq!(evaluate_program(&rhai, &history), step, "{history:?}");
-                assert_eq!(evaluate_program(&js, &history), step, "{history:?}");
-            }
+            assert_eq!(workflow_rhai::compile(rhai).unwrap(), rust);
+            assert_eq!(workflow_js::compile(js).unwrap(), rust);
         }
     }
 
@@ -314,41 +310,6 @@ mod tests {
                 "onCounter(seq([tool(\"counter\", \"reset\"), tool(\"search\", \"q\")]), complete(), seq([spawnAgent(\"helper\", \"retry\"), fail()]));\n",
             ),
         ]
-    }
-
-    /// Every record list of length 0 to 3 over five records.
-    fn record_histories() -> Vec<History> {
-        let alphabet = [
-            Record::counter(0),
-            Record::counter(1),
-            Record::Tool {
-                name: "search".to_string(),
-                output: "found".to_string(),
-            },
-            Record::Tool {
-                name: "other".to_string(),
-                output: "x".to_string(),
-            },
-            Record::AgentSpawned {
-                agent: "helper".to_string(),
-            },
-        ];
-        let mut histories = vec![Vec::new()];
-        let mut frontier = vec![Vec::new()];
-        for _ in 0..3 {
-            let mut next = Vec::new();
-            for records in &frontier {
-                for record in &alphabet {
-                    let mut longer: Vec<Record> = records.clone();
-                    longer.push(record.clone());
-                    next.push(longer);
-                }
-            }
-            histories.extend(next.iter().cloned());
-            frontier = next;
-        }
-        assert_eq!(histories.len(), 156);
-        histories.into_iter().map(History::new).collect()
     }
 
     // Bend's encoding is still v1, the counter program only (A8b adds the
