@@ -357,6 +357,15 @@ mod tests {
         // Bend emits the reference program; Rhai and JS build the same one.
         let bend = compile(&experiment()).unwrap();
         assert_eq!(bend, search_program());
+        // BendDriver hands the loaded program to harness_core::transition.
+        let driver = BendDriver::new(bend);
+        for history in alphabet_histories() {
+            let (_, commands) = transition(&driver, &WorkflowContext, &history);
+            assert_eq!(
+                commands,
+                evaluate_program(&search_program(), &history).commands
+            );
+        }
         assert_eq!(
             workflow_rhai::compile(include_str!("../../workflow-rhai/search.rhai")).unwrap(),
             search_program()
@@ -467,8 +476,9 @@ mod tests {
         ]
     }
 
-    /// The six records `W.record` in workflow.bend names, in `GolKind` order.
-    fn alphabet() -> [Record; 6] {
+    /// The eight records `W.record` in workflow.bend names, in `GolKind`
+    /// order. "00" and "count" catch a walk that compares text by prefix.
+    fn alphabet() -> [Record; 8] {
         let tool = |name: &str, output: &str| Record::Tool {
             name: name.to_string(),
             output: output.to_string(),
@@ -479,6 +489,8 @@ mod tests {
         [
             tool("counter", "0"),
             tool("counter", "1"),
+            tool("counter", "00"),
+            tool("count", "0"),
             tool("search", "found"),
             tool("other", "x"),
             spawned("helper"),
@@ -507,7 +519,8 @@ mod tests {
         all.into_iter().map(History::new).collect()
     }
 
-    fn token(command: &WorkflowCommand) -> String {
+    /// The code evals.bend prints for a command.
+    fn code(command: &WorkflowCommand) -> String {
         let hex = |text: &str| -> String { text.bytes().map(|b| format!("{b:02x}")).collect() };
         match command {
             WorkflowCommand::ExecuteTool(tool) => {
@@ -516,14 +529,56 @@ mod tests {
             WorkflowCommand::SpawnAgent(spawn) => {
                 format!("spawn.{}.{}", hex(&spawn.agent), hex(&spawn.input))
             }
-            WorkflowCommand::Complete => "complete".to_string(),
-            WorkflowCommand::Fail => "fail".to_string(),
+            WorkflowCommand::Complete => "c".to_string(),
+            WorkflowCommand::Fail => "f".to_string(),
         }
     }
 
-    // Bend evaluates the reference program with its own cursor walk
-    // (evals.bend). On every history of length 0 to 3 over the six records,
-    // its command must be the one Rust's evaluate_program returns.
+    /// The programs evals.bend evaluates, in its order, as Rust builds them.
+    fn eval_programs() -> [WorkflowProgram; 5] {
+        let program = |root| WorkflowProgram { root };
+        [
+            search_program(),
+            counter_program(),
+            // A counter before on_counter's cursor, behind a newer record.
+            program(Decision::Seq(vec![
+                tool("counter", ""),
+                tool("search", "q"),
+                Decision::OnCounter {
+                    missing: Box::new(Decision::Fail),
+                    zero: Box::new(Decision::Complete),
+                    other: Box::new(Decision::Fail),
+                },
+            ])),
+            // A missing arm that records no counter; the sequence goes on.
+            program(Decision::Seq(vec![
+                Decision::OnCounter {
+                    missing: Box::new(tool("search", "q")),
+                    zero: Box::new(Decision::Fail),
+                    other: Box::new(Decision::Fail),
+                },
+                spawn_agent("helper", "zero"),
+            ])),
+            // A missing arm that records the counter and more.
+            program(Decision::OnCounter {
+                missing: Box::new(Decision::Seq(vec![
+                    tool("counter", ""),
+                    tool("search", "q"),
+                ])),
+                zero: Box::new(Decision::Seq(vec![
+                    spawn_agent("helper", "zero"),
+                    Decision::Complete,
+                ])),
+                other: Box::new(Decision::Fail),
+            }),
+        ]
+    }
+
+    // Bend evaluates five programs with its own cursor walk (evals.bend). On
+    // every history of length 0 to 3 over the eight records, its command
+    // must be the one Rust's evaluate_program returns. The programs reach
+    // every frame of Bend's walk: a counter before on_counter's cursor, a
+    // missing arm with and without a counter, and both arms.
     #[test]
     fn bend_agrees_with_rust() {
         let bend = bend_program().unwrap();
@@ -532,7 +587,13 @@ mod tests {
             &bend,
             &["evals.bend"],
             staged_dir(&staged),
-            Limits::default(),
+            // evals.bend normalizes 2925 walks. Under emulation and a
+            // parallel test run that can pass compile's 30 s, so this
+            // test-only run gets longer; compile's own limit is unchanged.
+            Limits {
+                timeout: Duration::from_secs(120),
+                ..Limits::default()
+            },
         )
         .unwrap();
         assert!(
@@ -544,22 +605,91 @@ mod tests {
             .strip_prefix("\"e2 ")
             .and_then(|rest| rest.strip_suffix("\"\n"))
             .expect("an e2 line");
-        let tokens: Vec<&str> = line.split(' ').collect();
+        let codes: Vec<&str> = line.split(' ').collect();
         let histories = alphabet_histories();
-        assert_eq!(tokens.len(), 259);
-        assert_eq!(histories.len(), 259);
-        let ctx = WorkflowContext;
-        let bend_driver = BendDriver::new(compile(&experiment()).unwrap());
-        let rust_driver = BendDriver::new(search_program());
-        for (history, bend_token) in histories.iter().zip(tokens) {
-            let step = evaluate_program(&search_program(), history);
-            assert_eq!(step.commands.len(), 1);
-            assert_eq!(token(&step.commands[0]), bend_token, "{history:?}");
-            assert_eq!(
-                transition(&bend_driver, &ctx, history),
-                transition(&rust_driver, &ctx, history)
-            );
+        assert_eq!(histories.len(), 585);
+        assert_eq!(codes.len(), 5 * 585);
+        let mut codes = codes.into_iter();
+        for program in eval_programs() {
+            for history in &histories {
+                let step = evaluate_program(&program, history);
+                assert_eq!(step.commands.len(), 1);
+                assert_eq!(
+                    code(&step.commands[0]),
+                    codes.next().unwrap(),
+                    "{program:?} on {history:?}"
+                );
+            }
         }
+    }
+
+    fn line(tokens: &str) -> String {
+        format!("\"v2 {tokens}\"\n")
+    }
+
+    fn hex(text: &str) -> String {
+        text.bytes().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    // Every limit and rejection of the v2 parser, at its boundary.
+    #[test]
+    fn parse_encoding_limits() {
+        let reject = |tokens: &str| parse_encoding(&line(tokens)).unwrap_err().to_string();
+        let tool_line = |name: &str, input: &str| format!("tool.{}.{}", hex(name), hex(input));
+
+        // Names are 1 to 128 bytes; inputs at most 65536.
+        assert!(parse_encoding(&line(&tool_line(&"a".repeat(128), ""))).is_ok());
+        let bounds = "a tool or spawn name or input is out of bounds";
+        assert_eq!(reject(&tool_line(&"a".repeat(129), "")), bounds);
+        assert_eq!(reject(&tool_line("", "x")), bounds);
+        assert_eq!(reject(&format!("spawn..{}", hex("x"))), bounds);
+        assert!(parse_encoding(&line(&tool_line("a", &"x".repeat(65536)))).is_ok());
+        assert_eq!(reject(&tool_line("a", &"x".repeat(65537))), bounds);
+
+        // Hex is lowercase, even-length and UTF-8.
+        assert_eq!(reject("tool.4A."), "hex text must be lowercase hex digits");
+        assert_eq!(reject("tool.6."), "hex text must have an even length");
+        assert_eq!(reject("tool.ff."), "hex text must be UTF-8");
+        assert_eq!(
+            reject("tool.61"),
+            "a tool or spawn token needs a name and an input"
+        );
+
+        // Structure.
+        assert_eq!(reject("complete fail seq"), "seq must follow a sequence");
+        assert_eq!(reject("end seq"), "seq is missing a decision");
+        assert_eq!(
+            reject("complete complete on_counter"),
+            "on_counter is missing a decision"
+        );
+        assert_eq!(
+            reject("complete fail"),
+            "bend encoding must leave exactly one program"
+        );
+        assert_eq!(
+            parse_encoding("\"v2\"\n").unwrap_err().to_string(),
+            "bend encoding must leave exactly one program"
+        );
+        assert_eq!(reject("execute"), "unknown token execute");
+        assert_eq!(
+            parse_encoding(&line("end")).unwrap().root,
+            Decision::Seq(Vec::new())
+        );
+
+        // At most 2048 tokens after `v2`: on_counter(complete, complete,
+        // seq of k completes) is 2k + 4 tokens.
+        let tokens = |k: usize| {
+            let mut out = vec!["complete"; 2];
+            out.extend(std::iter::repeat_n("complete", k));
+            out.push("end");
+            out.extend(std::iter::repeat_n("seq", k));
+            out.push("on_counter");
+            out.join(" ")
+        };
+        assert_eq!(tokens(1022).split(' ').count(), 2048);
+        assert!(parse_encoding(&line(&tokens(1022))).is_ok());
+        let over = format!("{} complete", tokens(1022));
+        assert_eq!(reject(&over), "bend encoding has too many tokens");
     }
 
     // v2 replaced v1: no v1 line parses, including the old counter line.

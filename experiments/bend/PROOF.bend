@@ -45,6 +45,10 @@ def Laws.program_agrees(h):
           {==}
         case W.KOne{}:
           {==}
+        case W.KZeroZero{}:
+          {==}
+        case W.KCount{}:
+          {==}
         case W.KSearch{}:
           match t0:
             case Nil{}:
@@ -61,6 +65,10 @@ def Laws.program_agrees(h):
                           {==}
                         case W.KOne{}:
                           {==}
+                        case W.KZeroZero{}:
+                          {==}
+                        case W.KCount{}:
+                          {==}
                         case W.KSearch{}:
                           {==}
                         case W.KOther{}:
@@ -70,6 +78,10 @@ def Laws.program_agrees(h):
                         case W.KStranger{}:
                           {==}
                 case W.KOne{}:
+                  {==}
+                case W.KZeroZero{}:
+                  {==}
+                case W.KCount{}:
                   {==}
                 case W.KSearch{}:
                   {==}

@@ -141,6 +141,12 @@ def t_found() -> GolText:
 def t_other() -> GolText:
   TCon{GolB{N6{}, NF{}}, TCon{GolB{N7{}, N4{}}, TCon{GolB{N6{}, N8{}}, TCon{GolB{N6{}, N5{}}, TCon{GolB{N7{}, N2{}}, TNil{}}}}}}
 
+def t_00() -> GolText:
+  TCon{GolB{N3{}, N0{}}, TCon{GolB{N3{}, N0{}}, TNil{}}}
+
+def t_count() -> GolText:
+  TCon{GolB{N6{}, N3{}}, TCon{GolB{N6{}, NF{}}, TCon{GolB{N7{}, N5{}}, TCon{GolB{N6{}, NE{}}, TCon{GolB{N7{}, N4{}}, TNil{}}}}}}
+
 def t_x() -> GolText:
   TCon{GolB{N7{}, N8{}}, TNil{}}
 
@@ -245,6 +251,9 @@ type GolCmd is Data:
   CSpawn{agent: GolText, input: GolText}
   CComplete{}
   CHalt{}
+  # Fuel ran out. Neither spec nor Rust ever gives this, so a walk that
+  # exhausts its fuel cannot pass for a real fail.
+  CStuck{}
 
 type GolClass is Data:
   GolMissing{}
@@ -296,7 +305,7 @@ type GolFrame is Data:
 def run(f: Nat, d: GolDec, ks: +List<GolFrame>, +before: +List<GolRec>, after: +List<GolRec>) -> GolCmd:
   match f:
     case 0n:
-      CHalt{}
+      CStuck{}
     case 1n+g:
       match d:
         case GolTool{+name, input}:
@@ -368,6 +377,23 @@ def eval_program(p: GolDec, h: +List<GolRec>) -> GolCmd:
 def search_program() -> GolDec:
   GolSeq{GolTool{t_search(), t_q()}, GolSeq{GolOnCounter{GolTool{t_counter(), t_empty()}, GolSeq{GolSpawn{t_helper(), t_zero()}, GolSeq{GolComplete{}, GolEnd{}}}, GolHalt{}}, GolEnd{}}}
 
+# More programs evals.bend runs, each reaching a path of the walk the
+# reference program does not.
+def counter_program() -> GolDec:
+  GolOnCounter{GolTool{t_counter(), t_empty()}, GolComplete{}, GolHalt{}}
+
+# A counter recorded before on_counter's cursor, behind a newer record.
+def counter_first_program() -> GolDec:
+  GolSeq{GolTool{t_counter(), t_empty()}, GolSeq{GolTool{t_search(), t_q()}, GolSeq{GolOnCounter{GolHalt{}, GolComplete{}, GolHalt{}}, GolEnd{}}}}
+
+# A missing arm that records no counter; the sequence then goes on.
+def no_counter_program() -> GolDec:
+  GolSeq{GolOnCounter{GolTool{t_search(), t_q()}, GolHalt{}, GolHalt{}}, GolSeq{GolSpawn{t_helper(), t_zero()}, GolEnd{}}}
+
+# A missing arm that records the counter and more; the zero arm runs after.
+def missing_then_arm_program() -> GolDec:
+  GolOnCounter{GolSeq{GolTool{t_counter(), t_empty()}, GolSeq{GolTool{t_search(), t_q()}, GolEnd{}}}, GolSeq{GolSpawn{t_helper(), t_zero()}, GolSeq{GolComplete{}, GolEnd{}}}, GolHalt{}}
+
 def show_tok(t: GolTok) -> String:
   match t:
     case TokTool{name, input}:
@@ -405,11 +431,15 @@ def show_cmd(c: GolCmd) -> String:
       "complete"
     case CHalt{}:
       "fail"
+    case CStuck{}:
+      "stuck"
 
-# The six records histories are drawn from in the laws and in evals.bend.
+# The eight records histories are drawn from in the laws and in evals.bend.
 type GolKind is Data:
   KZero{}
   KOne{}
+  KZeroZero{}
+  KCount{}
   KSearch{}
   KOther{}
   KHelper{}
@@ -421,6 +451,10 @@ def record(k: GolKind) -> GolRec:
       RTool{t_counter(), t_0()}
     case KOne{}:
       RTool{t_counter(), t_1()}
+    case KZeroZero{}:
+      RTool{t_counter(), t_00()}
+    case KCount{}:
+      RTool{t_count(), t_0()}
     case KSearch{}:
       RTool{t_search(), t_found()}
     case KOther{}:

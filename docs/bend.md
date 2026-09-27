@@ -76,9 +76,9 @@ The encoding is one versioned line inside the Bend string literal: `v2`, then th
 | `end` | an empty sequence |
 | `seq` | the decision before a sequence, put in front of it |
 
-So `seq([a, b])` is `a b end seq seq`. Names are 1 to 128 bytes and inputs at most 65536, as in the Rhai and JS frontends; a line has at most 2048 tokens, which bounds the program's nesting. The line must leave exactly one program. A `v1` line is refused (`bend_v1_line_rejected`). Backslashes, quotes, and any character that is not printable ASCII or a single space are rejected. Rust evaluates the program with `evaluate_program`, as for Rhai and JavaScript.
+So `seq([a, b])` is `a b end seq seq`. Names are 1 to 128 bytes and inputs at most 65536, as in the Rhai and JS frontends, though hex doubles an input, so the 64KiB stdout cap binds first. A line has at most 2048 tokens after `v2`, which bounds nesting to about 1023 levels, looser than the frontends' 1024 decisions and depth 64. The line must leave exactly one program. A `v1` line is refused (`bend_v1_line_rejected`). Backslashes, quotes, and any character that is not printable ASCII or a single space are rejected. Rust evaluates the program with `evaluate_program`, as for Rhai and JavaScript.
 
-Bend's own model mirrors the IR: `GolDec` (with a sequence as a `GolSeq{head, tail}` list ending in `GolEnd`), `GolText` as bytes of two hex nibbles, and `GolRec` records. Bend's `eval_program` is the same cursor walk as Rust: a tool call or spawn whose record is at the cursor is done, the first without one is the command, a mismatch or running out is `fail`, and `on_counter` reads the counter recorded before its cursor, walking `missing` first when there is none. A counter output of `"0"` is zero; any other output is other.
+Bend's own model mirrors the IR: `GolDec` (a sequence is a `GolSeq{head, tail}` list ending in `GolEnd`; `GolDec` also admits a `GolSeq` whose tail is not a sequence, which Rust's parser rejects), `GolText` as bytes of two hex nibbles, and `GolRec` records. Bend's `eval_program` is written as the same cursor walk as Rust, and `bend_agrees_with_rust` checks it against Rust on five programs: a tool call or spawn whose record is at the cursor is done, the first without one is the command, a mismatch or running out is `fail`, and `on_counter` reads the counter recorded before its cursor, walking `missing` first when there is none. A counter output of `"0"` is zero; any other output is other. Running out of fuel returns a separate `stuck` result that neither the spec nor Rust produces.
 
 `LAWS.bend` is not checked alone. An open law is a hole, and `bend LAWS.bend --check-only` reports those holes. That is the intended split: the law file states claims, `PROOF.bend` closes them. `bend PROOF.bend --check-only` checks the law file, `workflow.bend`, and the proofs together because of the imports.
 
@@ -104,7 +104,7 @@ On this machine, five runs of the checker against a one-line string program took
 | `bend_compile` | `compile` of `experiments/bend`, proofs included | 206.35 ms |
 | `loaded_eval` | the same six histories on the program `compile` returned | 95.320 ns |
 
-The intervals were 93.388–93.602 ns, 201.69–212.42 ms, and 94.739–96.208 ns. The two eval rows call the same Rust function. These figures predate the v2 program: `loaded_eval` now evaluates the reference program while `rust_eval` still evaluates `counter_program`, so the two rows no longer time the same program.
+The intervals were 93.388–93.602 ns, 201.69–212.42 ms, and 94.739–96.208 ns. The two eval rows call the same Rust function. All three figures predate the v2 program: `loaded_eval` now evaluates the reference program while `rust_eval` still evaluates `counter_program`, so the two rows no longer time the same program.
 
 The load is the cost. Steady-state evaluation is `evaluate_program` either way. This is not a claim that Bend made the decision faster.
 
@@ -112,13 +112,13 @@ The load is the cost. Steady-state evaluation is `evaluate_program` either way. 
 
 `experiments/bend/LAWS.bend` imports `workflow.bend` and states three laws:
 
-- `round_trip`: for every program `p`, decoding its postfix token list gives back `p`. The proof is by structural induction on `p`, through the lemma `decode_encode` in `PROOF.bend` (decoding a program's tokens pushes that program).
-- `program_agrees`: for every history drawn from six records (a counter record with output `"0"`, one with `"1"`, a `search` record, an `other` record, a `helper` spawn, and an `other` spawn), `eval_program(search_program(), h)` equals `spec(h)`, a table written separately from the walk. The proof splits the history to depth three; past that the program has finished, so the rest of the list is never read.
+- `round_trip`: for every program `p`, decoding its postfix token list gives back `p`. `PROOF.bend` closes it by structural induction on `p`, through the lemma `decode_encode` (decoding a program's tokens pushes that program).
+- `program_agrees`: for every history drawn from eight records (counter records with outputs `"0"`, `"1"` and `"00"`, a `count` record, a `search` record, an `other` record, a `helper` spawn, and an `other` spawn), `eval_program(search_program(), h)` equals `spec(h)`, a table written separately from the walk. `PROOF.bend` splits the history to depth three; past that the program has finished, so the rest of the list is never read.
 - `encoding`: `encode_line(search_program())` is the v2 line above.
 
 `round_trip` covers the token list, not the text rendering; the exact `encoding` law and Rust's parser tests cover the text. Two negative controls fail as expected: a spec that fails after the helper spawn breaks `program_agrees`, and a decoder that swaps the `seq` operands breaks `decode_encode`.
 
-`evals.bend` prints Bend's evaluation of the reference program on every history of length 0 to 3 over the six records, 259 tokens in a fixed order. `bend_agrees_with_rust` runs it and requires each token to be the command Rust's `evaluate_program` returns on the same history. That is the link from the Bend laws to Rust: the laws hold for Bend's walk, and the test shows Rust's walk agrees with it on those 259 histories.
+`evals.bend` prints Bend's evaluation of five programs on every history of length 0 to 3 over the eight records: 2,925 results in a fixed order, with short codes (`c`, `f`, `s`) so the checker can print the line. The five programs are the reference program, `counter_program`, a counter recorded before `on_counter`'s cursor, a missing arm that records no counter, and a missing arm that records the counter and more. Together they reach every frame of the walk. `bend_agrees_with_rust` runs it and requires each result to be the command Rust's `evaluate_program` returns on the same program and history. That is the link from the Bend laws to Rust: the laws hold for Bend's walk, and the test shows Rust's walk agrees with it on those runs. Five wrong walks (swapped arms, a counter lookup that ignores older records, prefix text matching, and others) each fail it.
 
 `./scripts/verify-bend.sh` requires `bend 2.0.28`, checks `workflow.bend` and `evals.bend`, requires `PROOF.bend --check-only` to print `All terms check.`, requires the v2 line, then runs `cargo test -p workflow-bend`. CI runs that script. A failing proof, a drifted encoding, or a Rust disagreement exits non-zero.
 

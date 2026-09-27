@@ -10,7 +10,7 @@ law round_trip:
   {W.decode_program(W.encode(p, [])) == Some{p} : Maybe<W.GolDec>}
 
 # The reference program does what its table says on every history drawn
-# from the six records W.record names: search, then read the counter; on
+# from the eight records W.record names: search, then read the counter; on
 # zero spawn the helper and complete; any other record or counter fails.
 law program_agrees:
   for +h: +List<W.GolKind>
