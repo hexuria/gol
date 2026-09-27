@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::Arc;
 
 use protocol::{
@@ -114,7 +116,12 @@ async fn create_run_writes_postgres_and_enqueues_redis() {
         tokio::task::spawn_blocking(|| PostgresStore::connect(POSTGRES_URL).expect("connect"))
             .await
             .expect("connect thread");
-    let app = router_with_queue(Arc::new(store), jev.uri(), Some(REDIS_URL.to_string()));
+    let app = router_with_queue(
+        Arc::new(store),
+        jev.uri(),
+        Some(REDIS_URL.to_string()),
+        common::authenticator(),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -127,7 +134,7 @@ async fn create_run_writes_postgres_and_enqueues_redis() {
     let agent_id = AgentId::new();
     let agent = client
         .post(format!("http://{addr}/v1/agents"))
-        .header("authorization", "Bearer gol-gateway-local")
+        .header("authorization", common::bearer())
         .json(&AgentManifest {
             id: agent_id,
             version: "1".to_string(),
@@ -142,7 +149,7 @@ async fn create_run_writes_postgres_and_enqueues_redis() {
 
     let created = client
         .post(format!("http://{addr}/v1/runs"))
-        .header("authorization", "Bearer gol-gateway-local")
+        .header("authorization", common::bearer())
         .json(&serde_json::json!({
             "agent_id": agent_id,
             "agent_version": "1",
@@ -421,7 +428,12 @@ async fn post_run(
     jev: &wiremock::MockServer,
     redis: Option<&str>,
 ) -> (u16, StoredRun) {
-    let app = router_with_queue(store.clone(), jev.uri(), redis.map(str::to_string));
+    let app = router_with_queue(
+        store.clone(),
+        jev.uri(),
+        redis.map(str::to_string),
+        common::authenticator(),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -431,7 +443,7 @@ async fn post_run(
     });
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/v1/runs"))
-        .header("authorization", "Bearer gol-gateway-local")
+        .header("authorization", common::bearer())
         .json(&serde_json::json!({
             "agent_id": AgentId::new(),
             "agent_version": "1",

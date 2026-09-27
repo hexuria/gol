@@ -6,12 +6,19 @@ gol is a composable agent runtime. This slice runs one local agent loop. The har
 
 ```bash
 cargo test
-cargo run -p server
+GOL_AUTH=local-dev cargo run -p server
 ```
 
 The toolchain is Rust 1.98.1.
 
 The server listens on `http://127.0.0.1:43123`. Override the port with `GOL_PORT`.
+
+## Authentication
+
+Every route needs `Authorization: Bearer <token>`. The server refuses to start unless one of these is configured:
+
+- **OIDC:** set `GOL_OIDC_ISSUER`, `GOL_OIDC_AUDIENCE`, `GOL_OIDC_JWKS_URL` and `GOL_OIDC_TENANT_CLAIM`. A token must be RS256, ES256 or EdDSA, signed by a key in the issuer's JWKS, with that `iss` and `aud`, a current `exp` and `nbf` (60 s leeway), a `sub`, and a string tenant claim named by `GOL_OIDC_TENANT_CLAIM`. An invalid token is 401. When the JWKS cannot be fetched within 3 s, the answer is 503. An unknown key id refetches the JWKS at most once per 30 s.
+- **Local development only:** `GOL_AUTH=local-dev`, with no `GOL_OIDC_*` set, accepts exactly the desktop's static token `gol-gateway-local` and logs a warning on every request. Never use it in production.
 
 `cargo test` does not call a live model and does not need an API key. The local server echoes the run input through one tool, then completes. A run records the user message before that loop.
 
