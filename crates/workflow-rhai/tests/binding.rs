@@ -284,9 +284,9 @@ fn seq_and_spawn_misuse_is_an_invalid_program() {
 }
 
 // The same budget boundary as the test above, for the builtins with two
-// arguments or an array: at 16665 iterations the budget runs out exactly at
-// the call on the last line. That is the budget, not a misuse. Found the same
-// way; after a rhai upgrade, find it again.
+// arguments or an array: at these counts the budget runs out exactly at the
+// call on the last line. That is the budget, not a misuse. Found the same way
+// (the seq script by the PR #53 review); after a rhai upgrade, find them again.
 #[test]
 fn the_budget_running_out_at_tool_spawn_or_seq_is_not_a_misuse() {
     for (source, line) in [
@@ -299,8 +299,8 @@ fn the_budget_running_out_at_tool_spawn_or_seq_is_not_a_misuse() {
             "line 3",
         ),
         (
-            "let d = complete();\nlet i = 0;\nwhile i < 16665 { i += 1; }\nseq([d]);\n",
-            "line 4",
+            "let d = complete();\nlet e = fail();\nlet a = [d];\nlet i = 0;\nwhile i < 16663 { i += 1; }\n1;\nseq([d, e]);\n",
+            "line 7",
         ),
     ] {
         let outcome = compile(source);

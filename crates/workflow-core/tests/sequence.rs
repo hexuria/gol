@@ -321,10 +321,12 @@ fn a_later_counter_does_not_change_an_earlier_on_counter() {
     );
 }
 
-// Every v1 Bend line, on every history it can produce, means what it meant
-// before records: no counter selects the missing arm, "0" the zero arm, any
-// other value the other arm. Only a missing arm that executes can record the
-// counter.
+// Every v1 Bend line, on every history with at most one counter record it can
+// produce, means what it meant before records: no counter selects the missing
+// arm, "0" the zero arm, any other value the other arm. Only a line whose
+// missing arm executes can record a counter. A line whose zero or other arm
+// also executes can record a second one; that history is walked by the cursor
+// rule instead (v1_lines_that_call_the_counter_twice_follow_the_cursor).
 #[test]
 fn v1_counter_programs_keep_their_meaning_on_reachable_histories() {
     let arms = [
@@ -354,4 +356,27 @@ fn v1_counter_programs_keep_their_meaning_on_reachable_histories() {
             }
         }
     }
+}
+
+// `v1 on_counter execute execute complete` on two counter records: the missing
+// arm consumes the first, the zero arm the second, and the program has no
+// decision left, so it fails. Before records, the latest counter chose the
+// other arm and completed; Bend's v1 evaluation still does.
+#[test]
+fn v1_lines_that_call_the_counter_twice_follow_the_cursor() {
+    let program = WorkflowProgram {
+        root: Decision::OnCounter {
+            missing: Box::new(tool("counter", "")),
+            zero: Box::new(tool("counter", "")),
+            other: Box::new(Decision::Complete),
+        },
+    };
+    assert_eq!(
+        next(&program, vec![Record::counter(0)]),
+        WorkflowCommand::ExecuteTool(ToolSpec::new("counter", ""))
+    );
+    assert_eq!(
+        next(&program, vec![Record::counter(0), Record::counter(1)]),
+        WorkflowCommand::Fail
+    );
 }

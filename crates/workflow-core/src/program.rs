@@ -50,7 +50,8 @@ pub fn counter_program() -> WorkflowProgram {
 /// command. A record that does not match its decision, or a program that runs
 /// out without completing, is `Fail`. `OnCounter` reads only the records
 /// before its cursor: with no counter there it walks `missing`, and once
-/// `missing` has recorded one it walks `zero` or `other` from there.
+/// `missing` has finished and recorded one, it walks `zero` or `other` from
+/// the record after `missing`.
 pub fn evaluate_program(program: &WorkflowProgram, history: &History) -> WorkflowStep {
     let command = match walk(&program.root, history, 0) {
         Walk::Next(command) => command,

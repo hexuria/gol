@@ -264,6 +264,11 @@ fn seq_longer_than_the_decision_cap_is_rejected() {
         invalid("const a = [];\na.length = 1025;\nseq(a);\n"),
         "too many decisions"
     );
+    // At the cap the elements are read: the first hole is not a decision.
+    assert_eq!(
+        invalid("const a = [];\na.length = 1024;\nseq(a);\n"),
+        "seq takes an array of decisions"
+    );
 }
 
 // Inputs have the cap Rhai puts on every string: 65536 bytes.
