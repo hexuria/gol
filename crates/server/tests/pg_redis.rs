@@ -967,3 +967,53 @@ async fn a_killed_backend_is_503_then_the_next_request_reconnects() {
     );
     assert_eq!(get().await.0, 200, "after reconnect");
 }
+
+/// Waits until the backend of `application` is waiting on a lock.
+fn wait_for_lock_wait(application: &str) {
+    let mut admin = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("admin");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let waiting: i64 = admin
+            .query_one(
+                "select count(*) from pg_stat_activity
+                 where application_name = $1 and wait_event_type = 'Lock'",
+                &[&application],
+            )
+            .expect("activity")
+            .get(0);
+        if waiting == 1 {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "put never waited");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+// A backend killed while a statement runs reports a database error, not a
+// closed connection. The call that saw it fails, and the next call still
+// reconnects (owner decision 1A).
+#[test]
+fn a_backend_killed_mid_statement_is_replaced_on_the_next_call() {
+    let application = format!("gol_c1_{}", uuid::Uuid::new_v4().simple());
+    let url = format!("{POSTGRES_URL}?application_name={application}");
+    let store = Arc::new(PostgresStore::connect(&url).expect("connect"));
+    let id = AgentId::new();
+    let mut alice = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("connect");
+    let mut tx = alice.transaction().expect("begin");
+    let manifest = serde_json::to_value(agent_for(id, "alice", "tenant-1", "1").manifest).unwrap();
+    tx.execute(
+        "insert into agents (id, manifest, owner_issuer, owner_subject, owner_tenant)
+         values ($1, $2, 'https://issuer.test', 'alice', 'tenant-1')",
+        &[&id.as_uuid(), &manifest],
+    )
+    .expect("insert");
+    let blocked = {
+        let store = store.clone();
+        std::thread::spawn(move || store.put_agent(agent_for(id, "bob", "tenant-1", "9")))
+    };
+    wait_for_lock_wait(&application);
+    assert_eq!(terminate_backends(&application), 1);
+    assert!(blocked.join().unwrap().is_err(), "the killed put");
+    tx.rollback().expect("rollback");
+    assert_eq!(store.run(RunId::new()).map(|run| run.is_none()), Ok(true));
+}

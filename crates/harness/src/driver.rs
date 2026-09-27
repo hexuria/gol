@@ -5,7 +5,8 @@ use protocol::{
 };
 
 use crate::{
-    Decider, DeciderError, DecisionView, LoadedCatalog, Memory, ModelCompletion, Skill, Tool,
+    Decider, DeciderError, DecisionView, LoadedCatalog, Memory, ModelCompletion, Skill, StoreError,
+    Tool,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,7 +293,8 @@ impl Driver {
                 }
                 // A memory store that cannot answer ends the run: the effect
                 // is not recorded as done, and nothing retries a write whose
-                // outcome is unknown.
+                // outcome is unknown. The run log, which clients read, gets a
+                // fixed message; the store's detail goes to stderr only.
                 Effect::MemoryRead { scope, key } => match memory.read(*scope, key) {
                     Ok(value) => self.push(
                         EventPayload::MemoryRead {
@@ -302,13 +304,10 @@ impl Driver {
                         },
                         Actor::System,
                     ),
-                    Err(error) => self.push(
-                        EventPayload::RunFailed {
-                            class: FailureClass::Infrastructure,
-                            message: format!("memory read: {error}"),
-                        },
-                        Actor::System,
-                    ),
+                    Err(error) => {
+                        self.fail_memory("read", &error);
+                        return;
+                    }
                 },
                 Effect::MemoryWrite { scope, key, value } => {
                     match memory.write(*scope, key, value) {
@@ -320,13 +319,10 @@ impl Driver {
                             },
                             Actor::System,
                         ),
-                        Err(error) => self.push(
-                            EventPayload::RunFailed {
-                                class: FailureClass::Infrastructure,
-                                message: format!("memory write: {error}"),
-                            },
-                            Actor::System,
-                        ),
+                        Err(error) => {
+                            self.fail_memory("write", &error);
+                            return;
+                        }
                     }
                 }
                 Effect::Complete { .. }
@@ -353,6 +349,20 @@ impl Driver {
             return;
         }
         self.push(EventPayload::StepAdvanced, Actor::System);
+    }
+
+    fn fail_memory(&mut self, operation: &str, error: &StoreError) {
+        eprintln!(
+            "gol: run {}: memory {operation} failed: {error}",
+            self.spec.run_id
+        );
+        self.push(
+            EventPayload::RunFailed {
+                class: FailureClass::Infrastructure,
+                message: format!("memory {operation}: store unavailable"),
+            },
+            Actor::System,
+        );
     }
 
     fn push(&mut self, payload: EventPayload, actor: Actor) {

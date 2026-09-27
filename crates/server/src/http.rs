@@ -337,9 +337,10 @@ async fn create_run(
                 RunStartError::Decider(message) => {
                     (FailureClass::Dependency, format!("decider: {message}"))
                 }
-                RunStartError::Store(error) => {
-                    (FailureClass::Infrastructure, format!("store: {error}"))
-                }
+                RunStartError::Store(_) => (
+                    FailureClass::Infrastructure,
+                    "store unavailable".to_string(),
+                ),
             };
             events.push(run_failed_event(&spec_for_run, class, message));
         }

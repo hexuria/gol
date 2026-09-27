@@ -85,7 +85,7 @@ fn a_memory_read_error_fails_the_run() {
         driver.state().harness,
         HarnessState::Failed {
             class: FailureClass::Infrastructure,
-            message: "memory read: connection refused".to_string(),
+            message: "memory read: store unavailable".to_string(),
         }
     );
     assert_eq!(memory_events(&driver), 0);
@@ -98,7 +98,7 @@ fn a_memory_write_error_fails_the_run() {
         driver.state().harness,
         HarnessState::Failed {
             class: FailureClass::Infrastructure,
-            message: "memory write: connection refused".to_string(),
+            message: "memory write: store unavailable".to_string(),
         }
     );
     assert_eq!(memory_events(&driver), 0);

@@ -1,4 +1,6 @@
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use postgres::NoTls;
 use protocol::{AgentId, ArtifactId, Event, Owner, RunId};
@@ -49,8 +51,7 @@ fn ensure_schema(client: &mut postgres::Client) -> Result<(), postgres::Error> {
         return Err(err);
     }
     // `create table if not exists` leaves a table from an older schema as it
-    // was. Fail here, at connect, rather than on the first write, where the
-    // panic would poison the store for every later request.
+    // was. Fail here, at connect, rather than on the first write.
     if let Err(err) =
         client.batch_execute("select owner_issuer, owner_subject, owner_tenant from agents limit 0")
     {
@@ -69,40 +70,72 @@ impl PostgresStore {
         })
     }
 
-    /// Runs `op` on the connection, opening a new one first when the last
-    /// died. A poisoned lock or a failed statement is a StoreError, and a
-    /// closed connection is dropped so the next call reconnects.
+    /// Runs `op` on the connection, opening a new one first when there is
+    /// none. Any failed call drops the connection, so the next call
+    /// reconnects: a backend killed mid-statement reports a database error,
+    /// not a closed connection, and its client still looks open.
     fn with_client<T>(
         &self,
         op: impl FnOnce(&mut postgres::Client) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        let mut slot = self
-            .client
-            .lock()
-            .map_err(|_| StoreError::new("postgres store lock poisoned"))?;
+        // A panic while the lock was held leaves the connection in an unknown
+        // state. Drop it and keep serving, rather than refuse every later call.
+        let mut slot = self.client.lock().unwrap_or_else(|poisoned| {
+            self.client.clear_poison();
+            let mut slot = poisoned.into_inner();
+            *slot = None;
+            slot
+        });
         if slot.as_ref().is_none_or(postgres::Client::is_closed) {
             *slot = None;
-            *slot = Some(open(&self.url).map_err(sql)?);
+            *slot = Some(reconnect(&self.url)?);
         }
         let Some(client) = slot.as_mut() else {
             return Err(StoreError::new("postgres connection missing"));
         };
         let result = op(client);
-        if client.is_closed() {
+        if result.is_err() {
             *slot = None;
         }
         result
     }
 }
 
+/// How long a connect may take when the URL sets no `connect_timeout`.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn open(url: &str) -> Result<postgres::Client, postgres::Error> {
-    let mut client = postgres::Client::connect(url, NoTls)?;
+    let mut config: postgres::Config = url.parse()?;
+    if config.get_connect_timeout().is_none() {
+        config.connect_timeout(CONNECT_TIMEOUT);
+    }
+    let mut client = config.connect(NoTls)?;
     ensure_schema(&mut client)?;
     Ok(client)
 }
 
+/// `open` for a running store. `postgres::Config::connect` unwraps building
+/// its runtime, which panics when the process is out of file descriptors;
+/// that is a StoreError here, not a panic in the request.
+fn reconnect(url: &str) -> Result<postgres::Client, StoreError> {
+    catch_unwind(AssertUnwindSafe(|| open(url)))
+        .map_err(|_| StoreError::new("postgres connect panicked"))?
+        .map_err(sql)
+}
+
+/// The full error for stderr: `postgres::Error` displays only its kind.
 fn sql(error: postgres::Error) -> StoreError {
-    StoreError::new(error.to_string())
+    let detail = match (error.as_db_error(), std::error::Error::source(&error)) {
+        (Some(db), _) => format!(
+            "{error}: {} {}: {}",
+            db.severity(),
+            db.code().code(),
+            db.message()
+        ),
+        (None, Some(source)) => format!("{error}: {source}"),
+        (None, None) => error.to_string(),
+    };
+    StoreError::new(detail)
 }
 
 fn json(error: serde_json::Error) -> StoreError {
@@ -154,11 +187,12 @@ impl RunStore for PostgresStore {
             return Ok(None);
         };
         Ok(Some(StoredAgent {
-            manifest: serde_json::from_value(row.get::<_, Value>(0)).map_err(json)?,
+            manifest: serde_json::from_value(row.try_get::<_, Value>(0).map_err(sql)?)
+                .map_err(json)?,
             owner: Owner::new(
-                row.get::<_, String>(1),
-                row.get::<_, String>(2),
-                row.get::<_, String>(3),
+                row.try_get::<_, String>(1).map_err(sql)?,
+                row.try_get::<_, String>(2).map_err(sql)?,
+                row.try_get::<_, String>(3).map_err(sql)?,
             ),
         }))
     }
@@ -220,8 +254,10 @@ impl RunStore for PostgresStore {
         else {
             return Ok(None);
         };
-        let spec = serde_json::from_value(row.get::<_, Value>(0)).map_err(json)?;
-        let events = serde_json::from_value(row.get::<_, Value>(1)).map_err(json)?;
+        let spec =
+            serde_json::from_value(row.try_get::<_, Value>(0).map_err(sql)?).map_err(json)?;
+        let events =
+            serde_json::from_value(row.try_get::<_, Value>(1).map_err(sql)?).map_err(json)?;
         Ok(Some(StoredRun { spec, events }))
     }
 
@@ -257,9 +293,9 @@ impl RunStore for PostgresStore {
         };
         Ok(Some(StoredArtifact {
             id,
-            run_id: RunId::from_uuid(row.get(0)),
-            name: row.get(1),
-            body: row.get(2),
+            run_id: RunId::from_uuid(row.try_get(0).map_err(sql)?),
+            name: row.try_get(1).map_err(sql)?,
+            body: row.try_get(2).map_err(sql)?,
         }))
     }
 }

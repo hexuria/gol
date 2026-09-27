@@ -160,3 +160,65 @@ impl RunStore for InMemoryStore {
         Ok(read(&self.artifacts).get(&id).cloned())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{
+        AgentId, CredentialSource, ExecutionPlacement, Limits, ModelProvider, WorkModel,
+    };
+
+    fn spec() -> RunSpec {
+        RunSpec::builder()
+            .owner(Owner::new("https://issuer.test", "user-1", "tenant-1"))
+            .agent(AgentId::new(), "1")
+            .input("hello")
+            .placement(ExecutionPlacement::Local)
+            .work_model(WorkModel {
+                provider: ModelProvider::OpenAI,
+                model_name: "gpt-test".to_string(),
+                credential: CredentialSource::PlatformGateway,
+            })
+            .limits(Limits {
+                max_steps: 4,
+                max_model_calls: 1,
+            })
+            .build()
+    }
+
+    // Owner decision 3A: a writer that panicked holding the lock leaves reads
+    // working and refuses later writes as a StoreError.
+    #[test]
+    fn a_poisoned_lock_serves_reads_and_refuses_writes() {
+        let store = InMemoryStore::default();
+        let first = spec();
+        let run_id = first.run_id;
+        store
+            .put_run(StoredRun {
+                spec: first,
+                events: Vec::new(),
+            })
+            .unwrap();
+        let poisoner = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _held = store.runs.lock().unwrap();
+                    panic!("writer panicked holding the lock");
+                })
+                .join()
+        });
+        assert!(poisoner.is_err());
+        assert!(store.runs.is_poisoned());
+
+        assert_eq!(store.run(run_id).map(|run| run.is_some()), Ok(true));
+        let refused = StoreError::new("run store lock poisoned");
+        assert_eq!(
+            store.put_run(StoredRun {
+                spec: spec(),
+                events: Vec::new(),
+            }),
+            Err(refused.clone())
+        );
+        assert_eq!(store.append_events(run_id, Vec::new()), Err(refused));
+    }
+}
