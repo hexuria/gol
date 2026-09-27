@@ -108,7 +108,8 @@ test("gateway sends the user message to the server and does not call the proxy",
   proxy.server.close();
 });
 
-test("the desktop refuses a vendor host for the subscription proxy", async () => {
+test("the desktop refuses a vendor host before it opens a turn", async () => {
+  const fetched = [];
   await assert.rejects(
     () =>
       sendTurn({
@@ -118,20 +119,76 @@ test("the desktop refuses a vendor host for the subscription proxy", async () =>
         computer: "local",
         credential: "subscription",
         fetchImpl: async (url) => {
-          if (String(url).includes("coworker/turns") && !String(url).includes("completion")) {
-            return {
-              ok: true,
-              async json() {
-                return { run_id: "run-3", completion: null, computer: {} };
-              },
-              async text() {
-                return "";
-              },
-            };
-          }
+          fetched.push(String(url));
           throw new Error(`unexpected fetch ${url}`);
         },
       }),
     /anthropic\.com/,
   );
+  // Nothing was opened on the server, so no turn is left open.
+  assert.deepEqual(fetched, []);
+});
+
+async function failingProxyTurn(proxyReply) {
+  const calls = [];
+  const gol = await listen(async (request, response) => {
+    calls.push(`server ${request.url}`);
+    const body = await readJson(request);
+    if (request.url === "/v1/coworker/turns") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ run_id: "run-4", completion: null, computer: {} }));
+      return;
+    }
+    calls.push(`message ${body.message}`);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ run_id: "run-4", completion: null }));
+  });
+  const proxy = await listen(async (request, response) => {
+    calls.push(`proxy ${request.url}`);
+    proxyReply(response);
+  });
+  let error;
+  try {
+    await sendTurn({
+      serverUrl: gol.url,
+      proxyUrl: proxy.url,
+      text: "hello",
+      computer: "local",
+      credential: "subscription",
+      agentId: "44444444-4444-4444-8444-444444444444",
+    });
+  } catch (caught) {
+    error = caught;
+  }
+  gol.server.close();
+  proxy.server.close();
+  return { calls, error };
+}
+
+test("a proxy error ends the turn on the server", async () => {
+  const { calls, error } = await failingProxyTurn((response) => {
+    response.writeHead(502);
+    response.end("upstream down");
+  });
+  assert.match(String(error), /502 .* upstream down/);
+  assert.deepEqual(calls.slice(0, 3), [
+    "server /v1/coworker/turns",
+    "proxy /v1/messages?beta=true",
+    "server /v1/coworker/turns/run-4/fail",
+  ]);
+  assert.match(calls[3], /^message 502 .* upstream down$/);
+});
+
+test("a proxy reply without assistant text ends the turn on the server", async () => {
+  const { calls, error } = await failingProxyTurn((response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ content: [] }));
+  });
+  assert.match(String(error), /proxy fixture missing assistant text/);
+  assert.deepEqual(calls, [
+    "server /v1/coworker/turns",
+    "proxy /v1/messages?beta=true",
+    "server /v1/coworker/turns/run-4/fail",
+    "message proxy fixture missing assistant text",
+  ]);
 });

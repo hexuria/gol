@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use protocol::{
@@ -148,7 +148,15 @@ pub enum SandboxError {
 pub trait SandboxHost: Send + Sync {
     fn provision(&self, name: &str) -> Result<(), SandboxError>;
     fn destroy(&self, name: &str) -> Result<(), SandboxError>;
+    /// Whether the host reports sandbox `name`. A host that cannot be asked
+    /// answers `false`, so this is not a safety answer: deciding whether a turn
+    /// may end without removing its sandbox goes through `absent`.
     fn exists(&self, name: &str) -> bool;
+    /// `Ok(true)` when the host confirms no sandbox `name` is left, `Ok(false)`
+    /// when one is, and an error when the host cannot tell. Only a confirmed
+    /// absence lets a turn end without removing its sandbox. Every host answers
+    /// it itself: `exists` cannot tell "gone" from "cannot ask".
+    fn absent(&self, name: &str) -> Result<bool, SandboxError>;
     fn launches_docker(&self) -> bool;
 }
 
@@ -189,6 +197,10 @@ impl SandboxHost for MemorySandbox {
 
     fn exists(&self, name: &str) -> bool {
         self.live.lock().expect("sandbox").contains(name)
+    }
+
+    fn absent(&self, name: &str) -> Result<bool, SandboxError> {
+        Ok(!self.exists(name))
     }
 
     fn launches_docker(&self) -> bool {
@@ -234,8 +246,13 @@ impl DockerSandbox {
     }
 
     fn command(&self, args: &[&str]) -> Result<(), SandboxError> {
+        self.run(args)
+            .map_err(|message| SandboxError::Host(last_line(&message)))
+    }
+
+    fn run(&self, args: &[&str]) -> Result<(), String> {
         let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-        self.command.run(&owned).map_err(SandboxError::Host)
+        self.command.run(&owned)
     }
 }
 
@@ -280,20 +297,54 @@ impl SandboxHost for DockerSandbox {
             .is_ok()
     }
 
+    /// Absent only when Docker answers that there is no such container. Any
+    /// other failure (the daemon is unreachable, say) says nothing about it.
+    fn absent(&self, name: &str) -> Result<bool, SandboxError> {
+        match self.run(&["inspect", "--type", "container", name]) {
+            Ok(()) => Ok(false),
+            Err(message) if message.contains("No such container") => Ok(true),
+            Err(message) => Err(SandboxError::Host(last_line(&message))),
+        }
+    }
+
     fn launches_docker(&self) -> bool {
         true
     }
 }
 
+/// The longest Docker error, in characters, a failure keeps.
+const MAX_DOCKER_ERROR: usize = 512;
+
+/// The last non-empty line of a Docker error, cut to `MAX_DOCKER_ERROR`
+/// characters. Docker's stderr can carry a whole image pull before the error,
+/// and the error ends up in the run's log.
+fn last_line(message: &str) -> String {
+    let line = message
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or("");
+    if line.chars().count() <= MAX_DOCKER_ERROR {
+        return line.to_string();
+    }
+    let kept: String = line.chars().take(MAX_DOCKER_ERROR).collect();
+    format!("{kept}…")
+}
+
 fn docker(args: &[String]) -> Result<(), String> {
-    let status = Command::new("docker")
+    let output = Command::new("docker")
         .args(args)
-        .status()
+        .stdin(Stdio::null())
+        .output()
         .map_err(|error| error.to_string())?;
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
-        Err(format!("docker {args:?} exited {status}"))
+        Err(format!(
+            "docker {args:?} exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     }
 }
 
@@ -352,7 +403,21 @@ pub fn open_turn(
     let box_turn = spec.placement == ExecutionPlacement::Box;
     let name = box_container_name(spec.run_id);
     if box_turn {
-        sandbox.provision(&name).map_err(sandbox_error)?;
+        if let Err(SandboxError::Host(message)) = sandbox.provision(&name) {
+            // The turn is over. It ends only if the host confirms no sandbox
+            // was left behind (a failed start whose cleanup also failed leaves
+            // one, and an unreachable host cannot say): a turn never ends with
+            // its sandbox running.
+            if matches!(sandbox.absent(&name), Ok(true)) {
+                end_failed(
+                    store,
+                    &spec,
+                    FailureClass::Environment,
+                    format!("provision: {message}"),
+                );
+            }
+            return Err(TurnError::Sandbox(message));
+        }
     }
     let completion = match &spec.work_model.credential {
         CredentialSource::PlatformGateway => {
@@ -364,8 +429,16 @@ pub fn open_turn(
             }) {
                 Ok(text) => Some(text),
                 Err(message) => {
-                    if box_turn {
-                        let _ = sandbox.destroy(&name);
+                    // The sandbox goes first. A turn whose sandbox could not be
+                    // removed stays open: it never ends with a sandbox running.
+                    let removed = !box_turn || sandbox.destroy(&name).is_ok();
+                    if removed {
+                        end_failed(
+                            store,
+                            &spec,
+                            FailureClass::Dependency,
+                            format!("proxy: {message}"),
+                        );
                     }
                     return Err(TurnError::Proxy(message));
                 }
@@ -421,35 +494,10 @@ pub fn accept_subscription_completion(
             "gateway completions come from the server",
         ));
     }
-    if stored
-        .events
-        .iter()
-        .any(|event| is_terminal(&event.payload))
-    {
-        return Err(TurnError::Conflict("turn already completed"));
-    }
-    // A completion answers an open turn: `open_turn` leaves the harness running and
-    // unanswered. A queued run from `create_run` is idle, and a run waiting on a tool
-    // has an answer outstanding; completing either would end a run this turn never owned.
-    if !matches!(
-        fold(&stored.spec, &stored.events).harness,
-        HarnessState::Running {
-            answered: false,
-            ..
-        }
-    ) {
-        return Err(TurnError::Conflict("turn is not open"));
-    }
-    if !stored
-        .events
-        .iter()
-        .any(|event| matches!(event.payload, EventPayload::UserMessage { .. }))
-    {
-        return Err(TurnError::Conflict("user message is not recorded"));
-    }
+    check_open_turn(&stored)?;
     let box_turn = stored.spec.placement == ExecutionPlacement::Box;
     let name = box_container_name(stored.spec.run_id);
-    if box_turn && !sandbox.exists(&name) {
+    if box_turn && sandbox.absent(&name).map_err(sandbox_error)? {
         return Err(TurnError::Sandbox(
             "box sandbox is gone before the turn completed".to_string(),
         ));
@@ -469,6 +517,84 @@ pub fn accept_subscription_completion(
         credential_mode: "subscription",
         computer: computer_plan(stored.spec.placement, stored.spec.run_id),
     })
+}
+
+/// A subscription turn is open when nothing has ended it and `open_turn` left the
+/// harness running and unanswered. A queued run from `create_run` is idle, and a
+/// run waiting on a tool has an answer outstanding; ending either would end a run
+/// this turn never owned.
+fn check_open_turn(stored: &StoredRun) -> Result<(), TurnError> {
+    if stored
+        .events
+        .iter()
+        .any(|event| is_terminal(&event.payload))
+    {
+        return Err(TurnError::Conflict("turn already completed"));
+    }
+    if !matches!(
+        fold(&stored.spec, &stored.events).harness,
+        HarnessState::Running {
+            answered: false,
+            ..
+        }
+    ) {
+        return Err(TurnError::Conflict("turn is not open"));
+    }
+    if !stored
+        .events
+        .iter()
+        .any(|event| matches!(event.payload, EventPayload::UserMessage { .. }))
+    {
+        return Err(TurnError::Conflict("user message is not recorded"));
+    }
+    Ok(())
+}
+
+/// The desktop reports that its turn failed (its model call through the
+/// subscription proxy did not answer). Same order as a completion: check the
+/// turn is open, remove its sandbox, then append `RunFailed`. A turn another
+/// writer ended first is a conflict.
+pub fn fail_turn(
+    store: &dyn RunStore,
+    run_id: RunId,
+    message: &str,
+    sandbox: &dyn SandboxHost,
+) -> Result<TurnOutcome, TurnError> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err(TurnError::BadRequest("failure message is empty"));
+    }
+    let stored = store.run(run_id).ok_or(TurnError::NotFound)?;
+    if matches!(
+        stored.spec.work_model.credential,
+        CredentialSource::PlatformGateway
+    ) {
+        return Err(TurnError::Conflict("gateway turns end on the server"));
+    }
+    check_open_turn(&stored)?;
+    let name = box_container_name(stored.spec.run_id);
+    if stored.spec.placement == ExecutionPlacement::Box
+        && !sandbox.absent(&name).map_err(sandbox_error)?
+    {
+        sandbox.destroy(&name).map_err(sandbox_error)?;
+    }
+    let failed = run_failed_event(&stored.spec, FailureClass::Dependency, message.to_string());
+    record_completion(store, run_id, vec![failed.clone()])?;
+    let mut events = stored.events;
+    events.push(failed);
+    Ok(TurnOutcome {
+        spec: stored.spec.clone(),
+        events,
+        completion: None,
+        credential_mode: "subscription",
+        computer: computer_plan(stored.spec.placement, stored.spec.run_id),
+    })
+}
+
+/// Ends a turn that failed before anything else could end it. The store
+/// refuses the append if another writer ended the run first.
+fn end_failed(store: &dyn RunStore, spec: &RunSpec, class: FailureClass, message: String) {
+    store.append_events(spec.run_id, vec![run_failed_event(spec, class, message)]);
 }
 
 /// Append the completion events. Two completions racing on one run get one
