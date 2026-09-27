@@ -236,8 +236,14 @@ async fn create_run(
     State(state): State<AppState>,
     body: Result<Json<RunBody>, JsonRejection>,
 ) -> Result<Json<RunState>, ApiError> {
-    // An unknown field (such as `capabilities`) or a bad value is a 400.
-    let Json(body) = body.map_err(|rejection| ApiError::InvalidBody(rejection.body_text()))?;
+    // An unknown field (such as `capabilities`), a bad value or bad JSON is a
+    // 400; any other rejection (content type, size) keeps its own status.
+    let Json(body) = body.map_err(|rejection| match rejection {
+        JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_) => {
+            ApiError::InvalidBody(rejection.body_text())
+        }
+        other => ApiError::Rejected(other),
+    })?;
     let owner = owner_of(&principal);
     let store = state.store.clone();
     let agent_id = body.agent_id;
@@ -618,6 +624,7 @@ enum ApiError {
     Conflict(&'static str),
     BadRequest(&'static str),
     InvalidBody(String),
+    Rejected(JsonRejection),
     Unauthorized,
     AuthUnavailable(String),
 }
@@ -685,6 +692,7 @@ impl axum::response::IntoResponse for ApiError {
                 Json(serde_json::json!({ "error": message })),
             )
                 .into_response(),
+            Self::Rejected(rejection) => rejection.into_response(),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({ "error": "unauthorized" })),

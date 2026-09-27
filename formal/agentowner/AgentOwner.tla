@@ -44,7 +44,8 @@ Done ==
 
 Next == (\E p \in Principals : Put(p)) \/ Done
 
-\* Each principal keeps calling until its puts are made.
+\* Fairness makes WritersFinish a check that no put is ever refused forever
+\* by a stuck state; it is not a claim that clients keep calling.
 Spec == Init /\ [][Next]_vars /\ \A p \in Principals : WF_vars(Put(p))
 
 \* The principal that first stored the agent owns it for good.

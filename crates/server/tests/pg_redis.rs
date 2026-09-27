@@ -733,3 +733,108 @@ fn first_owner_keeps_the_agent_in_postgres() {
         assert_eq!(put, expected, "{subject} with owner {owner}");
     }
 }
+
+fn agent_for(id: AgentId, subject: &str, tenant: &str, version: &str) -> server::StoredAgent {
+    server::StoredAgent {
+        manifest: AgentManifest {
+            id,
+            version: version.to_string(),
+            instructions: "owner".to_string(),
+            tools: Vec::new(),
+            required_capabilities: Vec::new(),
+        },
+        owner: protocol::Owner::new("https://issuer.test", subject, tenant),
+    }
+}
+
+// The owner is issuer and subject in Postgres too: the same subject from
+// another tenant replaces the manifest, and no one else can.
+#[test]
+fn the_owner_replaces_from_any_tenant_in_postgres() {
+    use server::PutAgent;
+    let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    let id = AgentId::new();
+    assert_eq!(
+        store.put_agent(agent_for(id, "alice", "tenant-1", "1")),
+        PutAgent::Stored
+    );
+    assert_eq!(
+        store.put_agent(agent_for(id, "bob", "tenant-1", "9")),
+        PutAgent::OwnedByOther
+    );
+    assert_eq!(store.agent(id).expect("stored").manifest.version, "1");
+    assert_eq!(
+        store.put_agent(agent_for(id, "alice", "tenant-2", "2")),
+        PutAgent::Stored
+    );
+    let stored = PostgresStore::connect(POSTGRES_URL)
+        .expect("connect")
+        .agent(id)
+        .expect("stored");
+    assert_eq!(stored.manifest.version, "2");
+    assert_eq!(stored.owner.tenant, "tenant-2");
+    assert_eq!(stored.owner.subject, "alice");
+}
+
+// The model's one environment assumption, forced: while alice's insert of a
+// new id is uncommitted, bob's put waits on it, and once alice commits bob is
+// told the agent is hers.
+#[test]
+fn a_put_waits_for_a_concurrent_insert_of_the_same_id() {
+    use server::PutAgent;
+    let id = AgentId::new();
+    PostgresStore::connect(POSTGRES_URL).expect("schema");
+    let mut alice = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("connect");
+    let mut tx = alice.transaction().expect("begin");
+    let manifest = serde_json::to_value(agent_for(id, "alice", "tenant-1", "1").manifest).unwrap();
+    tx.execute(
+        "insert into agents (id, manifest, owner_issuer, owner_subject, owner_tenant)
+         values ($1, $2, 'https://issuer.test', 'alice', 'tenant-1')",
+        &[&id.as_uuid(), &manifest],
+    )
+    .expect("insert");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let bob = std::thread::spawn(move || {
+        let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+        sender
+            .send(store.put_agent(agent_for(id, "bob", "tenant-1", "9")))
+            .unwrap();
+    });
+    assert!(
+        receiver
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_err(),
+        "bob's put finished while alice's insert was uncommitted"
+    );
+    tx.commit().expect("commit");
+    assert_eq!(receiver.recv().unwrap(), PutAgent::OwnedByOther);
+    bob.join().unwrap();
+    let stored = PostgresStore::connect(POSTGRES_URL)
+        .expect("connect")
+        .agent(id)
+        .expect("stored");
+    assert_eq!(stored.owner.subject, "alice");
+}
+
+// A database whose agents table predates owners is refused at connect,
+// instead of failing on the first write.
+#[test]
+fn an_old_agents_table_is_refused_at_connect() {
+    let mut admin = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("connect");
+    let schema = format!("b2_old_{}", std::process::id());
+    admin
+        .batch_execute(&format!(
+            "drop schema if exists {schema} cascade;
+             create schema {schema};
+             create table {schema}.agents (id uuid primary key, manifest jsonb not null);"
+        ))
+        .expect("old schema");
+    let url = format!("{POSTGRES_URL}?options=-csearch_path%3D{schema}");
+    let error = PostgresStore::connect(&url)
+        .err()
+        .expect("connect must fail");
+    admin
+        .batch_execute(&format!("drop schema {schema} cascade"))
+        .expect("drop");
+    assert!(format!("{error:?}").contains("owner_issuer"), "{error:?}");
+}

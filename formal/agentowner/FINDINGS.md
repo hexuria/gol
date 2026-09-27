@@ -4,7 +4,7 @@ Checked on 2026-09-27. `AgentOwner.tla` is one stored agent manifest and the pri
 
 ## Model
 
-Writers: `put_agent` in `PostgresStore` and `InMemoryStore` (`crates/server/src/{postgres,store}.rs`), called by `POST /v1/agents` (`create_agent` in `crates/server/src/http.rs`), one per principal. Each put is one atomic step. In Postgres it is one statement: an insert that, on a conflicting id, replaces the row only when the stored owner has the same issuer and subject. In memory it is one lock.
+Writers: `put_agent` in `PostgresStore` (`crates/server/src/postgres.rs`) and `InMemoryStore` (`crates/server/src/store.rs`), called by `POST /v1/agents` (`create_agent` in `crates/server/src/http.rs`), one per principal. Each put is one atomic step. In Postgres it is one statement: an insert that, on a conflicting id, replaces the row only when the stored owner has the same issuer and subject. In memory it is one lock.
 
 `Design = "old"` is the unconditional upsert before B2: any principal's put replaced the row. `Design = "new"` is the conditional put.
 
@@ -34,7 +34,9 @@ Negative controls, each on a copy of the config with `-workers 1`:
 
 ## Mapping
 
-- `FirstOwnerKeeps` and `OnlyOwnerStores`: `first_owner_keeps_the_agent` (`crates/server/tests/ownership.rs`, in-memory store, three racing threads, 20 rounds) and `first_owner_keeps_the_agent_in_postgres` (`crates/server/tests/pg_redis.rs`, three connections racing). The Postgres test is also the check of the model's one environment assumption: that the conditional upsert is atomic.
+- `FirstOwnerKeeps` and `OnlyOwnerStores`: `first_owner_keeps_the_agent` (`crates/server/tests/ownership.rs`, in-memory store, three racing threads, 20 rounds) and `first_owner_keeps_the_agent_in_postgres` (`crates/server/tests/pg_redis.rs`, three connections racing). Racing threads only sometimes hit a bad interleaving, so they are evidence, not a forcing test.
+- The model's one environment assumption is that each put is atomic. In Postgres it is forced by `a_put_waits_for_a_concurrent_insert_of_the_same_id`: bob's put blocks on alice's uncommitted insert of the same id, then is refused. In memory it rests on reading the code: the check and the insert are one lock scope in `InMemoryStore::put_agent`.
+- Replacement by the owner, from any tenant: `the_owner_replaces_from_any_tenant_and_no_one_else_does` and `the_owner_replaces_from_any_tenant_in_postgres`.
 - The HTTP behaviour, a 409 for another principal and replacement for the owner: `only_the_owner_replaces_a_manifest`.
 - `WritersFinish`: unlinked. Each put is one call that returns.
 

@@ -41,6 +41,15 @@ fn ensure_schema(client: &mut postgres::Client) -> Result<(), postgres::Error> {
         let _ = client.batch_execute("rollback");
         return Err(err);
     }
+    // `create table if not exists` leaves a table from an older schema as it
+    // was. Fail here, at connect, rather than on the first write, where the
+    // panic would poison the store for every later request.
+    if let Err(err) =
+        client.batch_execute("select owner_issuer, owner_subject, owner_tenant from agents limit 0")
+    {
+        let _ = client.batch_execute("rollback");
+        return Err(err);
+    }
     client.batch_execute("commit")
 }
 

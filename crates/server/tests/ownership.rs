@@ -202,16 +202,14 @@ async fn other_principal_cannot_complete() {
     let id = turn(&server, ALICE).await;
     let url = format!("{}/v1/coworker/turns/{id}/completion", server.base);
     let text = Some(serde_json::json!({"text": "done"}));
+    let before = server.store.run(id).unwrap().events.len();
     assert_eq!(
         send(reqwest::Method::POST, url.clone(), BOB, text.clone())
             .await
             .0,
         404
     );
-    assert!(
-        server.store.run(id).unwrap().events.len() < 5,
-        "bob's completion was stored"
-    );
+    assert_eq!(server.store.run(id).unwrap().events.len(), before);
     assert_eq!(send(reqwest::Method::POST, url, ALICE, text).await.0, 200);
 }
 
@@ -422,4 +420,62 @@ fn first_owner_keeps_the_agent() {
             assert_eq!(put, expected, "{subject} with owner {owner}");
         }
     }
+}
+
+// Another principal's run answers exactly as a run that does not exist: the
+// same status and the same body, on every route.
+#[tokio::test]
+async fn another_principals_run_looks_missing() {
+    let server = serve().await;
+    let run_id = run(&server, ALICE).await;
+    let turn_id = turn(&server, ALICE).await;
+    let missing = RunId::new();
+    for suffix in ["", "/events", "/ag-ui", "/ui"] {
+        let get = |id: RunId| {
+            send(
+                reqwest::Method::GET,
+                format!("{}/v1/runs/{id}{suffix}", server.base),
+                BOB,
+                None,
+            )
+        };
+        assert_eq!(get(run_id).await, get(missing).await, "{suffix}");
+    }
+    for (route, body) in [
+        ("completion", serde_json::json!({"text": "done"})),
+        ("fail", serde_json::json!({"message": "x"})),
+    ] {
+        let post = |id: RunId| {
+            send(
+                reqwest::Method::POST,
+                format!("{}/v1/coworker/turns/{id}/{route}", server.base),
+                BOB,
+                Some(body.clone()),
+            )
+        };
+        assert_eq!(post(turn_id).await, post(missing).await, "{route}");
+    }
+}
+
+// The owner is issuer and subject on the store too: the same subject from
+// another tenant replaces the manifest, and the replacement is stored.
+#[test]
+fn the_owner_replaces_from_any_tenant_and_no_one_else_does() {
+    use server::{PutAgent, StoredAgent};
+    let store = InMemoryStore::default();
+    let id = AgentId::new();
+    let put = |subject: &str, tenant: &str, version: &str| {
+        store.put_agent(StoredAgent {
+            manifest: serde_json::from_value(manifest(id, version, &[])).unwrap(),
+            owner: protocol::Owner::new(common::ISSUER, subject, tenant),
+        })
+    };
+    assert_eq!(put(ALICE, "tenant-1", "1"), PutAgent::Stored);
+    assert_eq!(put(BOB, "tenant-1", "9"), PutAgent::OwnedByOther);
+    assert_eq!(store.agent(id).unwrap().manifest.version, "1");
+    assert_eq!(put(ALICE, "tenant-2", "2"), PutAgent::Stored);
+    let stored = store.agent(id).unwrap();
+    assert_eq!(stored.manifest.version, "2");
+    assert_eq!(stored.owner.subject, ALICE);
+    assert_eq!(stored.owner.tenant, "tenant-2");
 }
