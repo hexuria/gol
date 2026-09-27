@@ -680,6 +680,10 @@ fn the_jwks_url_must_be_https_or_loopback() {
         "https://",
         "http://localhost.evil.test/jwks",
         "ftp://127.0.0.1/jwks",
+        "http://127.0.0.2/jwks",
+        "https://user:pw@idp.example.com/jwks",
+        "http://user@localhost/jwks",
+        "https://[/jwks",
     ] {
         let error = with_url(url).err().unwrap();
         assert!(error.contains("GOL_OIDC_JWKS_URL"), "{url}: {error}");
@@ -702,7 +706,12 @@ async fn a_jwks_redirect_is_not_followed() {
     let issuer = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/jwks"))
-        .respond_with(ResponseTemplate::new(302).insert_header("location", "/moved"))
+        // A redirect whose body is itself a valid key set is still refused.
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", "/moved")
+                .set_body_json(jwks(&[eddsa()])),
+        )
         .mount(&issuer)
         .await;
     Mock::given(method("GET"))
@@ -716,32 +725,110 @@ async fn a_jwks_redirect_is_not_followed() {
 }
 
 proptest::proptest! {
-    // The JWKS URL check never panics, and it accepts a URL only when it is
-    // https with a host, or http on 127.0.0.1, localhost or [::1].
+    // The JWKS URL check never panics, and every URL it accepts parses as
+    // https, or as http on a loopback host, with no credentials. The explicit
+    // lists in the_jwks_url_must_be_https_or_loopback cover what it refuses.
     #[test]
     fn the_jwks_url_check_accepts_only_https_or_loopback(
         url in proptest::prop_oneof![
             proptest::arbitrary::any::<String>(),
-            "(https?|ftp)://[a-z0-9.:\\[\\]/ -]{0,24}",
-            "http://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]{0,6})?[/?#a-z]{0,8}",
+            "(https?|HTTPS?|ftp)://[a-zA-Z0-9.:@%\\[\\]/ -]{0,24}",
+            "http://(127\\.0\\.0\\.1|localhost|LOCALHOST|\\[::1\\]|127\\.0\\.0\\.2|127\\.1)(:[0-9]{0,6})?[/?#a-z]{0,8}",
         ]
     ) {
         let mut vars: Vec<(&str, &str)> =
             OIDC.iter().copied().filter(|(k, _)| *k != "GOL_OIDC_JWKS_URL").collect();
         vars.push(("GOL_OIDC_JWKS_URL", &url));
-        let accepted = auth_from_env(&env(&vars)).is_ok();
-        let host = |rest: &str| rest.split(['/', '?', '#']).next().unwrap_or_default().to_string();
-        let https = url
-            .strip_prefix("https://")
-            .map(host)
-            .is_some_and(|h| !h.is_empty() && !h.contains(char::is_whitespace));
-        let loopback = url.strip_prefix("http://").map(host).is_some_and(|h| {
-            let name = h
-                .rsplit_once(':')
-                .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
-                .map_or(h.as_str(), |(name, _)| name);
-            matches!(name, "127.0.0.1" | "localhost" | "[::1]")
-        });
-        proptest::prop_assert_eq!(accepted, https || loopback, "{:?}", url);
+        if auth_from_env(&env(&vars)).is_ok() {
+            let parsed = url::Url::parse(&url);
+            proptest::prop_assert!(parsed.is_ok(), "{:?}", url);
+            let parsed = parsed.unwrap();
+            proptest::prop_assert!(parsed.username().is_empty() && parsed.password().is_none(), "{:?}", url);
+            let loopback = match parsed.host() {
+                Some(url::Host::Domain(name)) => name == "localhost",
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback() && ip == std::net::Ipv4Addr::LOCALHOST,
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                None => false,
+            };
+            proptest::prop_assert!(
+                (parsed.scheme() == "https" && parsed.host().is_some())
+                    || (parsed.scheme() == "http" && loopback),
+                "{:?}",
+                url
+            );
+        }
     }
+}
+
+// Past max age, one request refetches; the others keep using the stale key
+// set instead of waiting for that fetch.
+#[tokio::test]
+async fn a_stale_key_set_serves_while_one_request_refetches() {
+    let issuer = jwks_server(jwks(&[eddsa()])).await;
+    let url = format!("{}/jwks", issuer.uri());
+    let base = serve(remote_with(
+        url,
+        Duration::from_millis(100),
+        Duration::from_millis(300),
+    ))
+    .await;
+    let known = sign(eddsa(), &claims("u", "t"));
+    assert_eq!(status(&base, &known).await, 404);
+    replace_jwks(
+        &issuer,
+        ResponseTemplate::new(200)
+            .set_body_json(jwks(&[eddsa()]))
+            .set_delay(Duration::from_secs(2)),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let refetching = {
+        let (base, known) = (base.clone(), known.clone());
+        tokio::spawn(async move { status(&base, &known).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = Instant::now();
+    assert_eq!(status(&base, &known).await, 404);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(refetching.await.unwrap(), 404);
+}
+
+// While the issuer fails, a stale set is refetched at most once per refresh
+// interval, its keys keep verifying, and an unknown kid does not refetch.
+#[tokio::test]
+async fn a_failing_issuer_is_refetched_once_per_interval() {
+    let issuer = jwks_server(jwks(&[eddsa()])).await;
+    let url = format!("{}/jwks", issuer.uri());
+    let base = serve(remote_with(
+        url,
+        Duration::from_millis(500),
+        Duration::from_millis(100),
+    ))
+    .await;
+    let known = sign(eddsa(), &claims("u", "t"));
+    assert_eq!(status(&base, &known).await, 404);
+    replace_jwks(&issuer, ResponseTemplate::new(500)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    for _ in 0..4 {
+        assert_eq!(status(&base, &known).await, 404);
+    }
+    assert_eq!(status(&base, &sign(es256(), &claims("u", "t"))).await, 503);
+    assert_eq!(fetches(&issuer).await, 1);
+}
+
+#[test]
+fn an_empty_oidc_variable_counts_as_unset() {
+    let mut vars: Vec<_> = OIDC
+        .iter()
+        .copied()
+        .filter(|(k, _)| *k != "GOL_OIDC_ISSUER")
+        .collect();
+    vars.push(("GOL_OIDC_ISSUER", ""));
+    let error = auth_from_env(&env(&vars)).err().unwrap();
+    assert!(error.contains("GOL_OIDC_ISSUER"), "{error}");
+    assert!(auth_from_env(&env(&[("GOL_AUTH", "local-dev"), ("GOL_OIDC_ISSUER", "")])).is_ok());
 }

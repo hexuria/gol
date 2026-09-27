@@ -10,11 +10,6 @@ async fn main() {
     let env: std::collections::BTreeMap<String, String> = std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .collect();
-    if env.get("GOL_AUTH").map(String::as_str) == Some("local-dev") {
-        eprintln!(
-            "gol: WARNING: GOL_AUTH=local-dev accepts a static token; never use it in production"
-        );
-    }
     let auth = match auth_from_env(&env) {
         Ok(auth) => auth,
         Err(message) => {
@@ -22,6 +17,11 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    if env.get("GOL_AUTH").map(String::as_str) == Some("local-dev") {
+        eprintln!(
+            "gol: WARNING: GOL_AUTH=local-dev accepts a static token; never use it in production"
+        );
+    }
     let port = std::env::var("GOL_PORT")
         .ok()
         .and_then(|value| value.parse().ok())

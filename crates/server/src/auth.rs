@@ -247,12 +247,20 @@ impl OidcVerifier {
             let keys = self.keys.read().unwrap_or_else(PoisonError::into_inner);
             (keys.loaded_at, find(&keys.keys, kid))
         };
-        if let (loaded_at, Some(key)) = lookup() {
-            if fresh(loaded_at) {
-                return Ok(key);
+        let stale_key = match lookup() {
+            (loaded_at, Some(key)) if fresh(loaded_at) => return Ok(key),
+            (_, found) => found,
+        };
+        // A stale set that still has the kid serves it while another request
+        // refetches, rather than waiting for that fetch.
+        let mut fetches = match (stale_key, self.fetches.try_lock()) {
+            (_, Ok(fetches)) => fetches,
+            (_, Err(std::sync::TryLockError::Poisoned(poisoned))) => poisoned.into_inner(),
+            (Some(key), Err(std::sync::TryLockError::WouldBlock)) => return Ok(key),
+            (None, Err(std::sync::TryLockError::WouldBlock)) => {
+                self.fetches.lock().unwrap_or_else(PoisonError::into_inner)
             }
-        }
-        let mut fetches = self.fetches.lock().unwrap_or_else(PoisonError::into_inner);
+        };
         // Another request may have fetched while this one waited.
         let (loaded_at, found) = lookup();
         if let (true, Some(key)) = (fresh(loaded_at), &found) {
@@ -280,7 +288,11 @@ impl OidcVerifier {
         if loaded_at.is_some() && found.is_none() {
             fetches.refreshed = Some(Instant::now());
         }
-        match fetch(agent, url) {
+        let fetched = fetch(agent, url);
+        // The interval runs from when the fetch ended, so a fetch slower than
+        // the interval is not followed at once by another.
+        fetches.attempted = Some(Instant::now());
+        match fetched {
             Ok(set) => {
                 fetches.error = None;
                 let mut keys = self.keys.write().unwrap_or_else(PoisonError::into_inner);
@@ -338,6 +350,10 @@ fn fetch(agent: &ureq::Agent, url: &str) -> Result<Vec<Jwk>, String> {
         .get(url)
         .call()
         .map_err(|error| format!("jwks fetch: {error}"))?;
+    // Only a 200 is a key set; a redirect, which is not followed, is not.
+    if response.status() != 200 {
+        return Err(format!("jwks fetch: status {}", response.status()));
+    }
     let mut body = Vec::new();
     response
         .into_reader()
@@ -478,29 +494,40 @@ pub fn auth_from_env(vars: &BTreeMap<String, String>) -> Result<Arc<dyn Authenti
     }
 }
 
-/// A JWKS URL must be https, or http on a loopback host, so the key set
-/// cannot be swapped in transit.
+/// A JWKS URL must be https with a host, or http on 127.0.0.1, localhost or
+/// [::1], so the key set cannot be swapped in transit.
 fn check_jwks_url(url: &str) -> Result<(), String> {
-    let host_start = |rest: &str| {
-        let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-        !host.is_empty() && !host.contains(char::is_whitespace)
+    let refused = || {
+        format!(
+            "GOL_OIDC_JWKS_URL must be an https URL, or http on 127.0.0.1, localhost or [::1], not {url:?}"
+        )
     };
-    if let Some(rest) = url.strip_prefix("https://") {
-        if host_start(rest) {
-            return Ok(());
-        }
+    let parsed = url::Url::parse(url).map_err(|_| refused())?;
+    let loopback = matches!(
+        parsed.host(),
+        Some(url::Host::Domain("localhost"))
+            | Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST))
+            | Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))
+    );
+    let credentials = !parsed.username().is_empty() || parsed.password().is_some();
+    match parsed.scheme() {
+        "https" if parsed.host().is_some() && !credentials => Ok(()),
+        "http" if loopback && !credentials => Ok(()),
+        _ => Err(refused()),
     }
-    if let Some(rest) = url.strip_prefix("http://") {
-        let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-        let name = host
-            .rsplit_once(':')
-            .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
-            .map_or(host, |(name, _)| name);
-        if matches!(name, "127.0.0.1" | "localhost" | "[::1]") {
-            return Ok(());
-        }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    // The defaults the README documents.
+    #[test]
+    fn the_documented_defaults() {
+        assert_eq!(super::LEEWAY_SECS, 60);
+        assert_eq!(super::JWKS_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(super::REFRESH_INTERVAL, Duration::from_secs(30));
+        assert_eq!(super::MAX_AGE, Duration::from_secs(600));
+        assert_eq!(super::MAX_JWKS_BYTES, 1024 * 1024);
     }
-    Err(format!(
-        "GOL_OIDC_JWKS_URL must be an https URL, or http on a loopback host, not {url:?}"
-    ))
 }

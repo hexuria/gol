@@ -2959,6 +2959,7 @@ dependencies = [
  "tokio",
  "typesafe-sdk",
  "ureq",
+ "url",
  "uuid",
  "wiremock",
 ]

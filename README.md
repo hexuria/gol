@@ -18,10 +18,10 @@ The server listens on `http://127.0.0.1:43123`. Override the port with `GOL_PORT
 Every route needs `Authorization: Bearer <token>`. The server refuses to start unless one of these is configured:
 
 - **OIDC:** set `GOL_OIDC_ISSUER`, `GOL_OIDC_AUDIENCE`, `GOL_OIDC_JWKS_URL` and `GOL_OIDC_TENANT_CLAIM`.
-  - A token must be RS256, ES256 or EdDSA with a `kid` naming a signing key in the issuer's JWKS. Its `iss` must equal `GOL_OIDC_ISSUER` exactly (a trailing slash differs), its `aud` must include `GOL_OIDC_AUDIENCE`, and it needs a current `exp`, a non-empty `sub`, and a non-empty string tenant claim named by `GOL_OIDC_TENANT_CLAIM`. `nbf` is optional and checked when present. Both have 60 s leeway. An invalid token is 401.
-  - `GOL_OIDC_JWKS_URL` must be https, or http on a loopback host. Redirects are not followed.
+  - A token must be RS256, ES256 or EdDSA with a `kid` naming a signing key in the issuer's JWKS. Its `iss` must equal `GOL_OIDC_ISSUER` exactly (a trailing slash differs; an `iss` array containing it is also accepted), its `aud` must include `GOL_OIDC_AUDIENCE`, and it needs a current `exp`, a non-empty `sub`, and a non-empty string tenant claim named by `GOL_OIDC_TENANT_CLAIM`. `nbf` is optional and checked when present. Both have 60 s leeway. An invalid token is 401.
+  - `GOL_OIDC_JWKS_URL` must be an https URL, or http on `127.0.0.1`, `localhost` or `[::1]`, without credentials. Redirects are not followed, and only a 200 response is read.
   - The JWKS is fetched on first use and refetched after 10 minutes, so a removed key stops verifying. An unknown `kid` refetches it at most once per 30 s. Keys the server cannot read, or marked for encryption, are skipped.
-  - When the JWKS cannot be fetched within 3 s, the answer is 503, and the next fetch waits 30 s. A refetch that fails keeps using the keys already loaded.
+  - When the JWKS cannot be fetched within 3 s, the answer is 503, and the next fetch waits 30 s. A refetch that fails keeps using the keys already loaded, for as long as the issuer stays unreachable.
 - **Local development only:** `GOL_AUTH=local-dev`, with no `GOL_OIDC_*` set, accepts exactly the desktop's static token `gol-gateway-local` and logs a warning on every request. Never use it in production.
 
 `cargo test` does not call a live model and does not need an API key. The local server echoes the run input through one tool, then completes. A run records the user message before that loop.
