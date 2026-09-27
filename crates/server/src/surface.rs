@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use protocol::{Effect, Event, EventPayload, InvocationId, MessageRole, RunId};
 use serde_json::{json, Value};
 
+/// Map a run's events to AG-UI events. A tool call's `toolCallId` is its invocation id,
+/// which is unique only if the decider mints a fresh id per call (not enforced).
+/// `RunCompleted` sends its outcome as an assistant message unless it is empty or
+/// repeats the reply sent just before it.
 pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
     let run = run_id.to_string();
     let mut out = vec![json!({
@@ -23,8 +27,14 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
             _ => None,
         })
         .collect();
+    // The assistant reply, while it is the last thing emitted. A coworker turn records
+    // its reply and then completes with the same text, so RunCompleted skips an
+    // outcome that repeats it. Events that emit nothing leave it in place.
+    let mut last_reply: Option<&str> = None;
     for event in events {
         let id = event.envelope.event_id.to_string();
+        let emitted = out.len();
+        let mut reply = None;
         match &event.payload {
             EventPayload::ToolResult {
                 name,
@@ -33,24 +43,25 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
                 ..
             } => {
                 let delta = inputs.get(invocation).copied().unwrap_or("");
+                let call = invocation.to_string();
                 out.push(json!({
                     "type": "TOOL_CALL_START",
-                    "toolCallId": id,
+                    "toolCallId": call,
                     "toolCallName": name,
                 }));
                 out.push(json!({
                     "type": "TOOL_CALL_ARGS",
-                    "toolCallId": id,
+                    "toolCallId": call,
                     "delta": delta,
                 }));
                 out.push(json!({
                     "type": "TOOL_CALL_END",
-                    "toolCallId": id,
+                    "toolCallId": call,
                 }));
                 out.push(json!({
                     "type": "TOOL_CALL_RESULT",
                     "messageId": format!("result-{id}"),
-                    "toolCallId": id,
+                    "toolCallId": call,
                     "content": output,
                 }));
             }
@@ -70,12 +81,17 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
                     json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": id, "delta": message.text}),
                 );
                 out.push(json!({"type": "TEXT_MESSAGE_END", "messageId": id}));
+                if message.role == MessageRole::Assistant {
+                    reply = Some(message.text.as_str());
+                }
             }
             EventPayload::RunCompleted { outcome } => {
-                let message_id = format!("outcome-{run}");
-                out.push(json!({"type": "TEXT_MESSAGE_START", "messageId": message_id, "role": "assistant"}));
-                out.push(json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": message_id, "delta": outcome}));
-                out.push(json!({"type": "TEXT_MESSAGE_END", "messageId": message_id}));
+                if !outcome.is_empty() && last_reply != Some(outcome.as_str()) {
+                    let message_id = format!("outcome-{run}");
+                    out.push(json!({"type": "TEXT_MESSAGE_START", "messageId": message_id, "role": "assistant"}));
+                    out.push(json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": message_id, "delta": outcome}));
+                    out.push(json!({"type": "TEXT_MESSAGE_END", "messageId": message_id}));
+                }
                 out.push(json!({"type": "RUN_FINISHED", "threadId": run, "runId": run}));
             }
             EventPayload::RunFailed { message, .. } => {
@@ -84,7 +100,13 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
             EventPayload::RunCancelled => {
                 out.push(json!({"type": "RUN_ERROR", "message": "cancelled"}));
             }
+            EventPayload::RunExpired => {
+                out.push(json!({"type": "RUN_ERROR", "message": "expired"}));
+            }
             _ => {}
+        }
+        if out.len() != emitted {
+            last_reply = reply;
         }
     }
     out
