@@ -1,13 +1,13 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::FrontendError;
 
@@ -126,13 +126,15 @@ impl Drop for Staged {
     }
 }
 
+/// How many random names staging tries before it gives up.
+pub(crate) const STAGE_ATTEMPTS: usize = 8;
+
 pub fn stage(source: &Path) -> Result<Staged, FrontendError> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("gol-bend-{}-{nanos}", std::process::id()));
-    fs::create_dir_all(&dir).map_err(|error| io_error("create", &dir, &error))?;
+    let dir = create_private_dir(&std::env::temp_dir(), || {
+        let suffix = getrandom::u64()
+            .map_err(|error| FrontendError::Setup(format!("no random staging name: {error}")))?;
+        Ok(format!("gol-bend-{}-{suffix:016x}", std::process::id()))
+    })?;
     let staged = Staged { dir };
     for name in ["counter.bend", "LAWS.bend", "PROOF.bend"] {
         let bytes = read_source(&source.join(name))?;
@@ -143,6 +145,28 @@ pub fn stage(source: &Path) -> Result<Staged, FrontendError> {
         .map_err(|error| io_error("read", &staged.dir.join("counter.bend"), &error))?;
     assert_string_main(&counter)?;
     Ok(staged)
+}
+
+/// Creates a new directory under `parent`, readable only by this user, named
+/// by `name`. The temp dir is shared, so a path that already exists (a
+/// directory or a symlink another user made) is never used: `create_dir`
+/// refuses it and the next name is tried.
+pub(crate) fn create_private_dir(
+    parent: &Path,
+    mut name: impl FnMut() -> Result<String, FrontendError>,
+) -> Result<PathBuf, FrontendError> {
+    for _ in 0..STAGE_ATTEMPTS {
+        let dir = parent.join(name()?);
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(io_error("create", &dir, &error)),
+        }
+    }
+    Err(FrontendError::Setup(format!(
+        "no free staging directory in {} after {STAGE_ATTEMPTS} tries",
+        parent.display()
+    )))
 }
 
 fn read_source(path: &Path) -> Result<String, FrontendError> {
@@ -240,13 +264,16 @@ impl BendScan<'_> {
         self.src.as_bytes().get(self.i) == Some(&byte)
     }
 
+    /// `word` starts here as a whole token: no name character on either side.
     fn at_word(&self, word: &str) -> bool {
+        let name_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.';
         let rest = &self.src[self.i..];
         rest.starts_with(word)
-            && !rest[word.len()..]
+            && !self.src[..self.i]
                 .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                .next_back()
+                .is_some_and(name_char)
+            && !rest[word.len()..].chars().next().is_some_and(name_char)
     }
 
     fn take(&mut self, text: &str) -> bool {
@@ -568,4 +595,186 @@ fn io_error(action: &str, path: &Path, error: &io::Error) -> FrontendError {
 
 pub fn staged_dir(staged: &Staged) -> &Path {
     &staged.dir
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::fs;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::{Path, PathBuf};
+
+    use proptest::prelude::*;
+    use workflow_core::{Decision, WorkflowProgram};
+
+    use super::{assert_string_main, create_private_dir, stage, staged_dir, STAGE_ATTEMPTS};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "gol-boundary-test-{}-{tag}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    // A path that already exists, as a directory or a symlink, is never used:
+    // staging moves on to the next name.
+    #[test]
+    fn staging_refuses_existing_dir() {
+        let parent = scratch("refuse");
+        fs::create_dir(parent.join("taken")).unwrap();
+        fs::write(parent.join("taken").join("keep"), "keep").unwrap();
+        let elsewhere = scratch("elsewhere");
+        symlink(&elsewhere, parent.join("link")).unwrap();
+
+        let names = ["taken", "link", "fresh"];
+        let calls = Cell::new(0);
+        let dir = create_private_dir(&parent, || {
+            let name = names[calls.get()];
+            calls.set(calls.get() + 1);
+            Ok(name.to_string())
+        })
+        .unwrap();
+        assert_eq!(dir, parent.join("fresh"));
+        assert_eq!(calls.get(), 3);
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(
+            fs::read_dir(parent.join("taken")).unwrap().count(),
+            1,
+            "the existing directory was touched"
+        );
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+
+        // Every name taken: it gives up after STAGE_ATTEMPTS tries.
+        let tries = Cell::new(0);
+        let error = create_private_dir(&parent, || {
+            tries.set(tries.get() + 1);
+            Ok("taken".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(tries.get(), STAGE_ATTEMPTS);
+        assert!(error.to_string().contains("staging directory"), "{error}");
+
+        let _ = fs::remove_dir_all(&parent);
+        let _ = fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn a_staged_dir_is_private_and_unpredictable() {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../experiments/bend");
+        let first = stage(&source).unwrap();
+        let second = stage(&source).unwrap();
+        let (a, b) = (staged_dir(&first), staged_dir(&second));
+        assert_eq!(mode(a), 0o700);
+        assert_ne!(a, b);
+        let name = a.file_name().unwrap().to_str().unwrap();
+        let prefix = format!("gol-bend-{}-", std::process::id());
+        let suffix = name.strip_prefix(&prefix).expect("prefix");
+        assert_eq!(suffix.len(), 16, "{name}");
+        assert!(
+            suffix.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{name}"
+        );
+    }
+
+    // `xdef main` is not a definition: an identifier that ends in "def" does
+    // not start one.
+    #[test]
+    fn at_word_requires_left_boundary() {
+        let main = "def main() -> String:\n  \"v1\"\n";
+        for before in ["xdef", "_def", "x.def", "undef"] {
+            let source = format!("{main}{before} main() -> IO(u24):\n  0\n");
+            assert!(assert_string_main(&source).is_ok(), "{before}");
+        }
+        let two = format!("{main}def main() -> IO(u24):\n  0\n");
+        assert!(assert_string_main(&two).is_err());
+        assert!(assert_string_main("xdef main() -> String:\n  \"v1\"\n").is_err());
+    }
+
+    fn arms() -> [(&'static str, Decision); 3] {
+        [
+            (
+                "execute",
+                Decision::Tool {
+                    name: "counter".to_string(),
+                    input: String::new(),
+                },
+            ),
+            ("complete", Decision::Complete),
+            ("fail", Decision::Fail),
+        ]
+    }
+
+    /// The 27 lines parse_encoding accepts, with the program each one means.
+    fn valid_lines() -> Vec<(String, WorkflowProgram)> {
+        let mut lines = Vec::new();
+        for (missing, on_missing) in arms() {
+            for (zero, on_zero) in arms() {
+                for (other, on_other) in arms() {
+                    lines.push((
+                        format!("\"v1 on_counter {missing} {zero} {other}\"\n"),
+                        WorkflowProgram {
+                            root: Decision::OnCounter {
+                                missing: Box::new(on_missing.clone()),
+                                zero: Box::new(on_zero.clone()),
+                                other: Box::new(on_other.clone()),
+                            },
+                        },
+                    ));
+                }
+            }
+        }
+        lines
+    }
+
+    /// Arbitrary text, and valid lines with one character inserted, removed or
+    /// replaced, so both sides of the oracle are exercised.
+    fn encodings() -> impl Strategy<Value = String> {
+        let valid: Vec<String> = valid_lines().into_iter().map(|(line, _)| line).collect();
+        let edited = (
+            proptest::sample::select(valid.clone()),
+            any::<prop::sample::Index>(),
+            any::<char>(),
+            0u8..4,
+        )
+            .prop_map(|(line, at, ch, edit)| {
+                let mut chars: Vec<char> = line.chars().collect();
+                let at = at.index(chars.len() + 1);
+                match edit {
+                    0 => chars.insert(at, ch),
+                    1 if at < chars.len() => {
+                        chars.remove(at);
+                    }
+                    2 if at < chars.len() => chars[at] = ch,
+                    _ => {}
+                }
+                chars.into_iter().collect()
+            });
+        prop_oneof![any::<String>(), proptest::sample::select(valid), edited]
+    }
+
+    proptest! {
+        // Neither hand-written parser panics, and parse_encoding accepts
+        // exactly the 27 valid v1 lines, each as the program it names.
+        #[test]
+        fn scanner_and_parse_encoding_never_panic(text in encodings(), source in any::<String>()) {
+            let _ = assert_string_main(&source);
+            let _ = assert_string_main(&text);
+            let expected = valid_lines()
+                .into_iter()
+                .find(|(line, _)| *line == text)
+                .map(|(_, program)| program);
+            match crate::parse_encoding(&text) {
+                Ok(program) => prop_assert_eq!(Some(program), expected),
+                Err(_) => prop_assert_eq!(None, expected),
+            }
+        }
+    }
 }

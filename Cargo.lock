@@ -4073,8 +4073,10 @@ name = "workflow-bend"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "getrandom 0.3.4",
  "harness-core",
  "libc",
+ "proptest",
  "workflow-core",
  "workflow-js",
  "workflow-rhai",
