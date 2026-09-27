@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+/// Bearer-token authentication; its builder state markers live here.
+pub mod auth;
 mod http;
 mod inference;
 mod local;
@@ -7,6 +9,10 @@ mod queue;
 mod store;
 mod surface;
 
+pub use auth::{
+    auth_from_env, AuthError, Authenticator, LocalDevAuthenticator, OidcConfig, OidcConfigBuilder,
+    OidcVerifier, Principal, LOCAL_DEV_TOKEN,
+};
 pub use http::{router, router_with_gateway, router_with_queue, router_with_sandbox};
 pub use inference::{
     accept_subscription_completion, box_container_name, box_workspace_volume, computer_plan,

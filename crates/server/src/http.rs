@@ -15,6 +15,7 @@ use protocol::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::auth::{AuthError, Authenticator, Principal};
 use crate::inference::{
     accept_subscription_completion, fail_turn, open_turn, run_failed_event, sandbox_from_env,
     ComputerPlan, GatewayPoster, HttpGatewayPoster, SandboxHost, SharedPoster, TurnError,
@@ -31,6 +32,7 @@ struct AppState {
     redis_url: Option<String>,
     poster: SharedPoster,
     sandbox: Arc<dyn SandboxHost>,
+    auth: Arc<dyn Authenticator>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,14 +49,19 @@ struct RunBody {
     metadata: BTreeMap<String, String>,
 }
 
-pub fn router(store: Arc<dyn RunStore>, jev_base_url: impl Into<String>) -> Router {
-    router_with_queue(store, jev_base_url, None)
+pub fn router(
+    store: Arc<dyn RunStore>,
+    jev_base_url: impl Into<String>,
+    auth: Arc<dyn Authenticator>,
+) -> Router {
+    router_with_queue(store, jev_base_url, None, auth)
 }
 
 pub fn router_with_queue(
     store: Arc<dyn RunStore>,
     jev_base_url: impl Into<String>,
     redis_url: Option<String>,
+    auth: Arc<dyn Authenticator>,
 ) -> Router {
     router_with_parts(
         store,
@@ -62,6 +69,7 @@ pub fn router_with_queue(
         redis_url,
         Arc::new(HttpGatewayPoster::from_env()),
         sandbox_from_env(),
+        auth,
     )
 }
 
@@ -69,8 +77,9 @@ pub fn router_with_gateway(
     store: Arc<dyn RunStore>,
     jev_base_url: impl Into<String>,
     poster: Arc<dyn GatewayPoster>,
+    auth: Arc<dyn Authenticator>,
 ) -> Router {
-    router_with_sandbox(store, jev_base_url, poster, sandbox_from_env())
+    router_with_sandbox(store, jev_base_url, poster, sandbox_from_env(), auth)
 }
 
 pub fn router_with_sandbox(
@@ -78,8 +87,9 @@ pub fn router_with_sandbox(
     jev_base_url: impl Into<String>,
     poster: Arc<dyn GatewayPoster>,
     sandbox: Arc<dyn SandboxHost>,
+    auth: Arc<dyn Authenticator>,
 ) -> Router {
-    router_with_parts(store, jev_base_url, None, poster, sandbox)
+    router_with_parts(store, jev_base_url, None, poster, sandbox, auth)
 }
 
 fn router_with_parts(
@@ -88,6 +98,7 @@ fn router_with_parts(
     redis_url: Option<String>,
     poster: SharedPoster,
     sandbox: Arc<dyn SandboxHost>,
+    auth: Arc<dyn Authenticator>,
 ) -> Router {
     Router::new()
         .route("/v1/agents", post(create_agent))
@@ -108,21 +119,31 @@ fn router_with_parts(
             redis_url,
             poster,
             sandbox,
+            auth,
         })
 }
 
-struct Bearer(String);
+/// The caller, from a bearer token the server's authenticator accepted.
+struct Authenticated(Principal);
 
-impl<S> FromRequestParts<S> for Bearer
-where
-    S: Send + Sync,
-{
+impl FromRequestParts<AppState> for Authenticated {
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        bearer(&parts.headers)
-            .map(Self)
-            .ok_or(ApiError::Unauthorized)
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = bearer(&parts.headers).ok_or(ApiError::Unauthorized)?;
+        let auth = state.auth.clone();
+        // The authenticator may fetch the issuer's keys, which blocks.
+        let checked = tokio::task::spawn_blocking(move || auth.authenticate(&token))
+            .await
+            .map_err(|error| ApiError::AuthUnavailable(error.to_string()))?;
+        match checked {
+            Ok(principal) => Ok(Self(principal)),
+            Err(AuthError::Unauthorized) => Err(ApiError::Unauthorized),
+            Err(AuthError::Unavailable(message)) => Err(ApiError::AuthUnavailable(message)),
+        }
     }
 }
 
@@ -149,7 +170,7 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 async fn create_agent(
-    Bearer(_principal): Bearer,
+    Authenticated(_principal): Authenticated,
     State(state): State<AppState>,
     Json(agent): Json<AgentManifest>,
 ) -> Result<Json<AgentManifest>, ApiError> {
@@ -162,7 +183,7 @@ async fn create_agent(
 }
 
 async fn create_run(
-    Bearer(_principal): Bearer,
+    Authenticated(_principal): Authenticated,
     State(state): State<AppState>,
     Json(body): Json<RunBody>,
 ) -> Result<Json<RunState>, ApiError> {
@@ -249,7 +270,7 @@ async fn create_run(
 }
 
 async fn create_coworker_turn(
-    Bearer(_principal): Bearer,
+    Authenticated(_principal): Authenticated,
     State(state): State<AppState>,
     Json(body): Json<RunBody>,
 ) -> Result<Json<TurnBody>, ApiError> {
@@ -267,7 +288,7 @@ async fn create_coworker_turn(
 }
 
 async fn complete_coworker_turn(
-    Bearer(_principal): Bearer,
+    Authenticated(_principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
     Json(body): Json<CompletionBody>,
@@ -289,7 +310,7 @@ struct CompletionBody {
 }
 
 async fn fail_coworker_turn(
-    Bearer(_principal): Bearer,
+    Authenticated(_principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
     Json(body): Json<FailBody>,
@@ -363,7 +384,7 @@ impl ComputerBody {
 }
 
 async fn get_run(
-    Bearer(_principal): Bearer,
+    Authenticated(_principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
 ) -> Result<Json<RunState>, ApiError> {
@@ -376,7 +397,7 @@ async fn get_run(
 }
 
 async fn get_events(
-    Bearer(_principal): Bearer,
+    Authenticated(_principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
 ) -> Result<Json<Vec<Event>>, ApiError> {
@@ -389,7 +410,7 @@ async fn get_events(
 }
 
 async fn get_ag_ui(
-    Bearer(_principal): Bearer,
+    Authenticated(_principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -405,7 +426,7 @@ async fn get_ag_ui(
 }
 
 async fn get_ui(
-    Bearer(_principal): Bearer,
+    Authenticated(_principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -505,6 +526,7 @@ enum ApiError {
     Conflict(&'static str),
     BadRequest(&'static str),
     Unauthorized,
+    AuthUnavailable(String),
 }
 
 impl From<TurnError> for ApiError {
@@ -565,6 +587,15 @@ impl axum::response::IntoResponse for ApiError {
                 Json(serde_json::json!({ "error": "unauthorized" })),
             )
                 .into_response(),
+            Self::AuthUnavailable(message) => {
+                // The detail is for the operator, not the caller.
+                eprintln!("gol: identity provider unavailable: {message}");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": "identity provider unavailable" })),
+                )
+                    .into_response()
+            }
         }
     }
 }

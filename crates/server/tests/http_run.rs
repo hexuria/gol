@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -47,7 +49,11 @@ async fn jev_mock() -> MockServer {
 #[tokio::test]
 async fn post_run_reads_completed_and_events() {
     let jev = jev_mock().await;
-    let app = router(Arc::new(InMemoryStore::default()), jev.uri());
+    let app = router(
+        Arc::new(InMemoryStore::default()),
+        jev.uri(),
+        common::authenticator(),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -100,7 +106,7 @@ async fn post_run_reads_completed_and_events() {
 
     let fetched = client
         .get(format!("{base}/v1/runs/{}", created.run_id))
-        .header("authorization", "Bearer gol-gateway-local")
+        .header("authorization", common::bearer())
         .send()
         .await
         .expect("get run")
@@ -113,7 +119,7 @@ async fn post_run_reads_completed_and_events() {
 
     let events = client
         .get(format!("{base}/v1/runs/{}/events", created.run_id))
-        .header("authorization", "Bearer gol-gateway-local")
+        .header("authorization", common::bearer())
         .send()
         .await
         .expect("get events")
@@ -133,7 +139,7 @@ async fn post_run_reads_completed_and_events() {
 
     let ag_ui = client
         .get(format!("{base}/v1/runs/{}/ag-ui", created.run_id))
-        .header("authorization", "Bearer gol-gateway-local")
+        .header("authorization", common::bearer())
         .send()
         .await
         .expect("ag-ui")
@@ -156,7 +162,7 @@ async fn post_run_reads_completed_and_events() {
 
     let ui = client
         .get(format!("{base}/v1/runs/{}/ui", created.run_id))
-        .header("authorization", "Bearer gol-gateway-local")
+        .header("authorization", common::bearer())
         .send()
         .await
         .expect("ui")
@@ -180,7 +186,11 @@ async fn post_run_reads_completed_and_events() {
 async fn reverse_and_box_placements_complete() {
     for placement in ["Reverse", "Box"] {
         let jev = jev_mock().await;
-        let app = router(Arc::new(InMemoryStore::default()), jev.uri());
+        let app = router(
+            Arc::new(InMemoryStore::default()),
+            jev.uri(),
+            common::authenticator(),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -221,7 +231,11 @@ async fn reverse_and_box_placements_complete() {
 #[tokio::test]
 async fn run_calls_jev_system_one() {
     let jev = jev_mock().await;
-    let app = router(Arc::new(InMemoryStore::default()), jev.uri());
+    let app = router(
+        Arc::new(InMemoryStore::default()),
+        jev.uri(),
+        common::authenticator(),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -267,7 +281,7 @@ async fn post_when_up(
     for _ in 0..20 {
         match client
             .post(url)
-            .header("authorization", "Bearer gol-gateway-local")
+            .header("authorization", common::bearer())
             .json(body)
             .send()
             .await
@@ -285,7 +299,11 @@ async fn post_when_up(
 #[tokio::test]
 async fn missing_bearer_is_401_and_does_not_start_the_run() {
     let jev = jev_mock().await;
-    let app = router(Arc::new(InMemoryStore::default()), jev.uri());
+    let app = router(
+        Arc::new(InMemoryStore::default()),
+        jev.uri(),
+        common::authenticator(),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -372,7 +390,7 @@ fn run_body_with(
 async fn limits_outside_one_to_sixty_four_are_400_and_start_nothing() {
     let jev = jev_mock().await;
     let store = Arc::new(WatchedMemory::new());
-    let app = router(store.clone(), jev.uri());
+    let app = router(store.clone(), jev.uri(), common::authenticator());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -463,6 +481,7 @@ async fn redis_push_failure_does_not_run_the_harness() {
         store.clone(),
         jev.uri(),
         Some("redis://127.0.0.1:6390".to_string()),
+        common::authenticator(),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -524,7 +543,7 @@ async fn redis_push_failure_does_not_run_the_harness() {
     // A client polling the run sees it failed, not running forever.
     let ui: serde_json::Value = reqwest::Client::new()
         .get(format!("http://{addr}/v1/runs/{}/ui", ids[0]))
-        .header("authorization", "Bearer gol-gateway-local")
+        .header("authorization", common::bearer())
         .send()
         .await
         .expect("ui")
@@ -644,7 +663,7 @@ async fn failing_jev_mock() -> MockServer {
 async fn jev_error_leaves_run_failed() {
     let jev = failing_jev_mock().await;
     let store = Arc::new(WatchedMemory::new());
-    let app = router(store.clone(), jev.uri());
+    let app = router(store.clone(), jev.uri(), common::authenticator());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");

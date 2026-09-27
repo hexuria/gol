@@ -1,3 +1,5 @@
+mod common;
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -73,7 +75,7 @@ async fn post_when_up(
     for _ in 0..30 {
         match client
             .post(url)
-            .header("authorization", "Bearer gol-gateway-local")
+            .header("authorization", common::bearer())
             .json(body)
             .send()
             .await
@@ -137,6 +139,7 @@ async fn gateway_records_the_user_message_before_it_posts_to_the_proxy() {
             store: store.clone(),
             called: called.clone(),
         }),
+        common::authenticator(),
     );
     let base = listen(app).await;
     let response = post_when_up(
@@ -202,6 +205,7 @@ async fn a_second_box_run_does_not_reuse_the_container_name() {
         "http://127.0.0.1:9",
         Arc::new(OkPoster),
         sandbox.clone(),
+        common::authenticator(),
     );
     let base = listen(app).await;
     let client = reqwest::Client::new();
@@ -260,6 +264,7 @@ async fn the_box_sandbox_is_gone_after_the_run() {
             saw_live: saw_live.clone(),
         }),
         sandbox.clone(),
+        common::authenticator(),
     );
     let base = listen(app).await;
     let body = post_when_up(
@@ -328,6 +333,7 @@ async fn subscription_box_keeps_the_sandbox_until_the_turn_completes() {
         "http://127.0.0.1:9",
         Arc::new(OkPoster),
         sandbox.clone(),
+        common::authenticator(),
     );
     let base = listen(app).await;
     let client = reqwest::Client::new();
@@ -593,7 +599,7 @@ fn two_box_runs_do_not_share_a_workspace_volume() {
 async fn events_of(client: &reqwest::Client, base: &str, run_id: &str) -> Vec<protocol::Event> {
     client
         .get(format!("{base}/v1/runs/{run_id}/events"))
-        .header("authorization", "Bearer gol-gateway-local")
+        .header("authorization", common::bearer())
         .send()
         .await
         .expect("events")
@@ -623,6 +629,7 @@ async fn four_modes_only_let_the_server_post_in_gateway_mode() {
                 url: proxy_url.clone(),
                 token: "gol-gateway-local".to_string(),
             }),
+            common::authenticator(),
         );
         let base = listen(app).await;
         let created = post_when_up(
@@ -641,7 +648,7 @@ async fn four_modes_only_let_the_server_post_in_gateway_mode() {
         let run_id = created["run_id"].as_str().expect("run id");
         let events: Vec<protocol::Event> = client
             .get(format!("{base}/v1/runs/{run_id}/events"))
-            .header("authorization", "Bearer gol-gateway-local")
+            .header("authorization", common::bearer())
             .send()
             .await
             .expect("events")
@@ -673,7 +680,7 @@ async fn four_modes_only_let_the_server_post_in_gateway_mode() {
             ));
             let rejected = client
                 .post(format!("{base}/v1/coworker/turns/{run_id}/completion"))
-                .header("authorization", "Bearer gol-gateway-local")
+                .header("authorization", common::bearer())
                 .json(&serde_json::json!({"text": "desktop tried"}))
                 .send()
                 .await
@@ -688,7 +695,7 @@ async fn four_modes_only_let_the_server_post_in_gateway_mode() {
             assert!(created["completion"].is_null());
             let accepted = client
                 .post(format!("{base}/v1/coworker/turns/{run_id}/completion"))
-                .header("authorization", "Bearer gol-gateway-local")
+                .header("authorization", common::bearer())
                 .json(&serde_json::json!({"text": "fixture assistant text"}))
                 .send()
                 .await
@@ -702,7 +709,7 @@ async fn four_modes_only_let_the_server_post_in_gateway_mode() {
             assert!(paths.lock().expect("paths").is_empty());
             let after: Vec<protocol::Event> = client
                 .get(format!("{base}/v1/runs/{run_id}/events"))
-                .header("authorization", "Bearer gol-gateway-local")
+                .header("authorization", common::bearer())
                 .send()
                 .await
                 .expect("events")
@@ -1422,6 +1429,7 @@ async fn fail_endpoint_is_terminal_and_destroys_sandbox() {
         "http://127.0.0.1:9",
         Arc::new(OkPoster),
         sandbox.clone(),
+        common::authenticator(),
     );
     let base = listen(app).await;
     let client = reqwest::Client::new();
