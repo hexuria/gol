@@ -142,7 +142,7 @@ Every crate root has `#![forbid(unsafe_code)]`. The one exception is `workflow-b
 
 # Bend
 
-Bend is an optional frontend for the counter workflow, pinned by `scripts/install-bend.sh`. `./scripts/verify-bend.sh` is the gate. A failing proof means stop, and a law is never weakened to make a proof pass. Everything else about Bend (its boundary, laws, claims and upgrades) is in `.claude/skills/gol-bend/SKILL.md`.
+Bend is an optional frontend that expresses the full workflow IR in the v2 encoding (owner decision 8), pinned by `scripts/install-bend.sh`. `./scripts/verify-bend.sh` is the gate. A failing proof means stop, and a law is never weakened to make a proof pass. Everything else about Bend (its boundary, laws, claims and upgrades) is in `.claude/skills/gol-bend/SKILL.md`.
 
 # Lock Files
 

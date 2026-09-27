@@ -77,7 +77,7 @@ pub fn compile(source: &Path) -> Result<WorkflowProgram, FrontendError> {
             "proof check did not report All terms check.".to_string(),
         ));
     }
-    let encoded = run_sandboxed(&bend, &["counter.bend"], dir, Limits::default())?;
+    let encoded = run_sandboxed(&bend, &["workflow.bend"], dir, Limits::default())?;
     if !encoded.status.success() {
         return Err(FrontendError::Encoding(failure_text(&encoded)));
     }
@@ -87,58 +87,193 @@ pub fn compile(source: &Path) -> Result<WorkflowProgram, FrontendError> {
     parse_encoding(&encoded.stdout)
 }
 
+/// The most tokens a v2 line may have. It bounds the program's nesting, and so
+/// the depth `evaluate_program` recurses to.
+const MAX_TOKENS: usize = 2048;
+const MAX_NAME_BYTES: usize = 128;
+const MAX_INPUT_BYTES: usize = 64 * 1024;
+
+/// A value on the v2 decoder's stack: a decision, or the items of a sequence
+/// still being built (`end` starts one, each `seq` puts one item in front).
+enum Item {
+    Decision(Decision),
+    Items(Vec<Decision>),
+}
+
+impl Item {
+    fn into_decision(self) -> Decision {
+        match self {
+            Item::Decision(decision) => decision,
+            Item::Items(items) => Decision::Seq(items),
+        }
+    }
+}
+
+/// Parses Bend's v2 line: `v2`, then the program in postfix. Leaves are
+/// `tool.<name>.<input>` and `spawn.<agent>.<input>`, with each text as
+/// lowercase hex of its UTF-8, and `complete` and `fail`. `on_counter` takes
+/// the three decisions before it. `end` is an empty sequence, and `seq` puts
+/// the decision before a sequence in front of it. The line must leave exactly
+/// one value.
 fn parse_encoding(stdout: &str) -> Result<WorkflowProgram, FrontendError> {
     let Some(line) = stdout.strip_suffix('\n') else {
-        return Err(FrontendError::Encoding(
-            "bend encoding is missing its trailing newline".to_string(),
-        ));
+        return Err(encoding("bend encoding is missing its trailing newline"));
     };
     if line.contains('\n') {
-        return Err(FrontendError::Encoding(
-            "bend encoding must be one line".to_string(),
-        ));
+        return Err(encoding("bend encoding must be one line"));
     }
     let Some(inner) = line
         .strip_prefix('"')
         .and_then(|text| text.strip_suffix('"'))
     else {
-        return Err(FrontendError::Encoding(
-            "bend encoding must be a quoted token line".to_string(),
-        ));
+        return Err(encoding("bend encoding must be a quoted token line"));
     };
-    if inner
-        .chars()
-        .any(|ch| ch == '\\' || ch == '"' || (ch.is_whitespace() && ch != ' '))
+    if !inner
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+        || inner.contains(['\\', '"'])
     {
-        return Err(FrontendError::Encoding(
-            "bend encoding has an unsupported character".to_string(),
-        ));
+        return Err(encoding("bend encoding has an unsupported character"));
     }
-    let parts: Vec<&str> = inner.split(' ').collect();
-    if parts.len() != 5 || parts[0] != "v1" || parts[1] != "on_counter" {
-        return Err(FrontendError::Encoding(
-            "expected v1 on_counter <missing> <zero> <other>".to_string(),
-        ));
+    let mut tokens = inner.split(' ');
+    if tokens.next() != Some("v2") {
+        return Err(encoding("expected a v2 token line"));
     }
-    Ok(WorkflowProgram {
-        root: Decision::OnCounter {
-            missing: Box::new(parse_arm(parts[2])?),
-            zero: Box::new(parse_arm(parts[3])?),
-            other: Box::new(parse_arm(parts[4])?),
-        },
-    })
+    let mut stack: Vec<Item> = Vec::new();
+    for (count, token) in tokens.enumerate() {
+        if count >= MAX_TOKENS {
+            return Err(encoding("bend encoding has too many tokens"));
+        }
+        let item = match token {
+            "complete" => Item::Decision(Decision::Complete),
+            "fail" => Item::Decision(Decision::Fail),
+            "end" => Item::Items(Vec::new()),
+            "seq" => {
+                let Some(Item::Items(mut items)) = stack.pop() else {
+                    return Err(encoding("seq must follow a sequence"));
+                };
+                let head = pop_decision(&mut stack, "seq")?;
+                items.insert(0, head);
+                Item::Items(items)
+            }
+            "on_counter" => {
+                let other = pop_decision(&mut stack, "on_counter")?;
+                let zero = pop_decision(&mut stack, "on_counter")?;
+                let missing = pop_decision(&mut stack, "on_counter")?;
+                Item::Decision(Decision::OnCounter {
+                    missing: Box::new(missing),
+                    zero: Box::new(zero),
+                    other: Box::new(other),
+                })
+            }
+            _ => {
+                if let Some(texts) = token.strip_prefix("tool.") {
+                    let (name, input) = texts_of(texts)?;
+                    Item::Decision(Decision::Tool { name, input })
+                } else if let Some(texts) = token.strip_prefix("spawn.") {
+                    let (agent, input) = texts_of(texts)?;
+                    Item::Decision(Decision::SpawnAgent { agent, input })
+                } else {
+                    return Err(FrontendError::Encoding(format!("unknown token {token}")));
+                }
+            }
+        };
+        stack.push(item);
+    }
+    match (stack.pop(), stack.is_empty()) {
+        (Some(root), true) => Ok(WorkflowProgram {
+            root: root.into_decision(),
+        }),
+        _ => Err(encoding("bend encoding must leave exactly one program")),
+    }
 }
 
-fn parse_arm(token: &str) -> Result<Decision, FrontendError> {
-    match token {
-        "execute" => Ok(Decision::Tool {
-            name: "counter".to_string(),
-            input: String::new(),
-        }),
-        "complete" => Ok(Decision::Complete),
-        "fail" => Ok(Decision::Fail),
-        _ => Err(FrontendError::Encoding(format!("unknown command {token}"))),
+fn encoding(message: &str) -> FrontendError {
+    FrontendError::Encoding(message.to_string())
+}
+
+fn pop_decision(stack: &mut Vec<Item>, token: &str) -> Result<Decision, FrontendError> {
+    stack
+        .pop()
+        .map(Item::into_decision)
+        .ok_or_else(|| FrontendError::Encoding(format!("{token} is missing a decision")))
+}
+
+/// `<name>.<input>`: a name of 1 to 128 bytes and an input of at most 65536,
+/// the limits the Rhai and JS frontends apply.
+fn texts_of(texts: &str) -> Result<(String, String), FrontendError> {
+    let Some((name, input)) = texts.split_once('.') else {
+        return Err(encoding("a tool or spawn token needs a name and an input"));
+    };
+    let (name, input) = (unhex(name)?, unhex(input)?);
+    if name.is_empty() || name.len() > MAX_NAME_BYTES || input.len() > MAX_INPUT_BYTES {
+        return Err(encoding("a tool or spawn name or input is out of bounds"));
     }
+    Ok((name, input))
+}
+
+/// Lowercase hex of UTF-8 text.
+fn unhex(hex: &str) -> Result<String, FrontendError> {
+    let digit = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    if !hex.len().is_multiple_of(2) {
+        return Err(encoding("hex text must have an even length"));
+    }
+    let bytes = hex
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?))
+        .collect::<Option<Vec<u8>>>()
+        .ok_or_else(|| encoding("hex text must be lowercase hex digits"))?;
+    String::from_utf8(bytes).map_err(|_| encoding("hex text must be UTF-8"))
+}
+
+/// The v2 line a program encodes to, as Bend prints it: the reference
+/// encoder the parser is tested against.
+#[cfg(test)]
+pub(crate) fn encode_line(program: &WorkflowProgram) -> String {
+    fn hex(text: &str) -> String {
+        text.bytes().map(|byte| format!("{byte:02x}")).collect()
+    }
+    fn sequence(list: &[Decision], out: &mut Vec<String>) {
+        match list.split_first() {
+            None => out.push("end".to_string()),
+            Some((head, rest)) => {
+                decision(head, out);
+                sequence(rest, out);
+                out.push("seq".to_string());
+            }
+        }
+    }
+    fn decision(decision_: &Decision, out: &mut Vec<String>) {
+        match decision_ {
+            Decision::Tool { name, input } => {
+                out.push(format!("tool.{}.{}", hex(name), hex(input)))
+            }
+            Decision::SpawnAgent { agent, input } => {
+                out.push(format!("spawn.{}.{}", hex(agent), hex(input)))
+            }
+            Decision::Complete => out.push("complete".to_string()),
+            Decision::Fail => out.push("fail".to_string()),
+            Decision::OnCounter {
+                missing,
+                zero,
+                other,
+            } => {
+                decision(missing, out);
+                decision(zero, out);
+                decision(other, out);
+                out.push("on_counter".to_string());
+            }
+            Decision::Seq(list) => sequence(list, out),
+        }
+    }
+    let mut out = vec!["v2".to_string()];
+    decision(&program.root, &mut out);
+    format!("\"{}\"\n", out.join(" "))
 }
 
 #[cfg(test)]
@@ -154,7 +289,7 @@ mod tests {
     };
 
     use super::{compile, parse_encoding, BendDriver};
-    use crate::boundary::{run_sandboxed, Limits};
+    use crate::boundary::{bend_program, run_sandboxed, stage, staged_dir, Limits, STAGED_FILES};
 
     fn experiment() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../experiments/bend")
@@ -195,15 +330,43 @@ mod tests {
     }
 
     fn copy_experiment(dir: &Path) {
-        for name in ["counter.bend", "LAWS.bend", "PROOF.bend"] {
+        for name in STAGED_FILES {
             fs::copy(experiment().join(name), dir.join(name)).unwrap();
+        }
+    }
+
+    /// The reference program `experiments/bend/workflow.bend` emits.
+    fn search_program() -> WorkflowProgram {
+        WorkflowProgram {
+            root: Decision::Seq(vec![
+                tool("search", "q"),
+                Decision::OnCounter {
+                    missing: Box::new(tool("counter", "")),
+                    zero: Box::new(Decision::Seq(vec![
+                        spawn_agent("helper", "zero"),
+                        Decision::Complete,
+                    ])),
+                    other: Box::new(Decision::Fail),
+                },
+            ]),
         }
     }
 
     #[test]
     fn histories_agree_across_rust_rhai_js_and_bend() {
+        // Bend emits the reference program; Rhai and JS build the same one.
         let bend = compile(&experiment()).unwrap();
-        assert_eq!(bend, counter_program());
+        assert_eq!(bend, search_program());
+        assert_eq!(
+            workflow_rhai::compile(include_str!("../../workflow-rhai/search.rhai")).unwrap(),
+            search_program()
+        );
+        assert_eq!(
+            workflow_js::compile(include_str!("../../workflow-js/search.js")).unwrap(),
+            search_program()
+        );
+
+        // The counter program across Rust, Rhai and JS.
         let rhai =
             workflow_rhai::compile(include_str!("../../workflow-rhai/counter.rhai")).unwrap();
         let js = workflow_js::compile(include_str!("../../workflow-js/counter.js")).unwrap();
@@ -217,8 +380,6 @@ mod tests {
             "const a = complete();\nconst b = fail();\nonCounter(tool(\"counter\"), a, b);\n",
         )
         .unwrap();
-        let ctx = WorkflowContext;
-        let driver = BendDriver::new(bend.clone());
         for counter in histories() {
             let history = match counter {
                 None => History::default(),
@@ -230,16 +391,10 @@ mod tests {
             assert_eq!(evaluate_program(&js, &history), step);
             assert_eq!(evaluate_program(&rhai_bound, &history), step);
             assert_eq!(evaluate_program(&js_bound, &history), step);
-            assert_eq!(evaluate_program(&bend, &history), step);
-            assert_eq!(
-                transition(&driver, &ctx, &history),
-                transition(&workflow_core::CounterBranch, &ctx, &history)
-            );
         }
 
-        // Tool calls with input, spawns and sequences. Bend cannot express
-        // them yet (the bend_rejects_* tests). Rhai and JS must build the same
-        // program as Rust; evaluate_program is shared, so equal programs
+        // More tool, spawn and sequence programs. Rhai and JS must build the
+        // same program as Rust; evaluate_program is shared, so equal programs
         // evaluate alike, and crates/workflow-core/tests/sequence.rs checks
         // what they evaluate to.
         for (rust, rhai, js) in new_construct_programs() {
@@ -312,29 +467,123 @@ mod tests {
         ]
     }
 
-    // Bend's encoding is still v1, the counter program only (A8b adds the
-    // rest). Each new construct is rejected by name.
-    #[test]
-    fn bend_rejects_tool_with_input() {
-        let error = parse_encoding("\"v1 on_counter tool complete fail\"\n").unwrap_err();
-        assert_eq!(error.to_string(), "unknown command tool");
+    /// The six records `W.record` in workflow.bend names, in `GolKind` order.
+    fn alphabet() -> [Record; 6] {
+        let tool = |name: &str, output: &str| Record::Tool {
+            name: name.to_string(),
+            output: output.to_string(),
+        };
+        let spawned = |agent: &str| Record::AgentSpawned {
+            agent: agent.to_string(),
+        };
+        [
+            tool("counter", "0"),
+            tool("counter", "1"),
+            tool("search", "found"),
+            tool("other", "x"),
+            spawned("helper"),
+            spawned("other"),
+        ]
     }
 
-    #[test]
-    fn bend_rejects_spawn_agent() {
-        let error = parse_encoding("\"v1 on_counter spawn_agent complete fail\"\n").unwrap_err();
-        assert_eq!(error.to_string(), "unknown command spawn_agent");
+    /// Every history of length 0 to 3 over the alphabet, in evals.bend's
+    /// order: length first; the first record varies slowest.
+    fn alphabet_histories() -> Vec<History> {
+        let mut all = Vec::new();
+        let mut level: Vec<Vec<Record>> = vec![Vec::new()];
+        all.extend(level.clone());
+        for _ in 0..3 {
+            let mut next = Vec::new();
+            for record in alphabet() {
+                for history in &level {
+                    let mut longer = vec![record.clone()];
+                    longer.extend(history.iter().cloned());
+                    next.push(longer);
+                }
+            }
+            all.extend(next.iter().cloned());
+            level = next;
+        }
+        all.into_iter().map(History::new).collect()
     }
 
+    fn token(command: &WorkflowCommand) -> String {
+        let hex = |text: &str| -> String { text.bytes().map(|b| format!("{b:02x}")).collect() };
+        match command {
+            WorkflowCommand::ExecuteTool(tool) => {
+                format!("tool.{}.{}", hex(&tool.name), hex(&tool.input))
+            }
+            WorkflowCommand::SpawnAgent(spawn) => {
+                format!("spawn.{}.{}", hex(&spawn.agent), hex(&spawn.input))
+            }
+            WorkflowCommand::Complete => "complete".to_string(),
+            WorkflowCommand::Fail => "fail".to_string(),
+        }
+    }
+
+    // Bend evaluates the reference program with its own cursor walk
+    // (evals.bend). On every history of length 0 to 3 over the six records,
+    // its command must be the one Rust's evaluate_program returns.
     #[test]
-    fn bend_rejects_seq() {
-        let error = parse_encoding("\"v1 seq execute complete\"\n").unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "expected v1 on_counter <missing> <zero> <other>"
+    fn bend_agrees_with_rust() {
+        let bend = bend_program().unwrap();
+        let staged = stage(&experiment()).unwrap();
+        let output = run_sandboxed(
+            &bend,
+            &["evals.bend"],
+            staged_dir(&staged),
+            Limits::default(),
+        )
+        .unwrap();
+        assert!(
+            output.status.success() && output.stderr.is_empty(),
+            "{output:?}"
         );
-        let error = parse_encoding("\"v1 on_counter seq complete fail\"\n").unwrap_err();
-        assert_eq!(error.to_string(), "unknown command seq");
+        let line = output
+            .stdout
+            .strip_prefix("\"e2 ")
+            .and_then(|rest| rest.strip_suffix("\"\n"))
+            .expect("an e2 line");
+        let tokens: Vec<&str> = line.split(' ').collect();
+        let histories = alphabet_histories();
+        assert_eq!(tokens.len(), 259);
+        assert_eq!(histories.len(), 259);
+        let ctx = WorkflowContext;
+        let bend_driver = BendDriver::new(compile(&experiment()).unwrap());
+        let rust_driver = BendDriver::new(search_program());
+        for (history, bend_token) in histories.iter().zip(tokens) {
+            let step = evaluate_program(&search_program(), history);
+            assert_eq!(step.commands.len(), 1);
+            assert_eq!(token(&step.commands[0]), bend_token, "{history:?}");
+            assert_eq!(
+                transition(&bend_driver, &ctx, history),
+                transition(&rust_driver, &ctx, history)
+            );
+        }
+    }
+
+    // v2 replaced v1: no v1 line parses, including the old counter line.
+    #[test]
+    fn bend_v1_line_rejected() {
+        for missing in ["execute", "complete", "fail"] {
+            for zero in ["execute", "complete", "fail"] {
+                for other in ["execute", "complete", "fail"] {
+                    let line = format!("\"v1 on_counter {missing} {zero} {other}\"\n");
+                    assert_eq!(
+                        parse_encoding(&line).unwrap_err().to_string(),
+                        "expected a v2 token line",
+                        "{line}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_reference_line_parses_to_the_reference_program() {
+        let line = "\"v2 tool.736561726368.71 tool.636f756e746572. spawn.68656c706572.7a65726f complete end seq seq fail on_counter end seq seq\"\n";
+        assert_eq!(parse_encoding(line).unwrap(), search_program());
+        assert_eq!(super::encode_line(&search_program()), line);
     }
 
     #[test]
@@ -356,8 +605,8 @@ mod tests {
         let dir = scratch();
         copy_experiment(&dir);
         let marker = dir.join("owned");
-        let counter = fs::read_to_string(dir.join("counter.bend")).unwrap();
-        let head = counter.rsplit_once("def main() -> String:\n").unwrap().0;
+        let workflow = fs::read_to_string(dir.join("workflow.bend")).unwrap();
+        let head = workflow.rsplit_once("def main() -> String:\n").unwrap().0;
         let mut source = head.to_string();
         source.push_str("def helper() -> String:\n  \"x\ndef main() -> String:\ny\"\r");
         source.push_str(
@@ -370,7 +619,7 @@ mod tests {
             !source.lines().any(|line| line == "def main() -> IO(Unit):"),
             "the IO main must stay hidden from a newline split"
         );
-        fs::write(dir.join("counter.bend"), &source).unwrap();
+        fs::write(dir.join("workflow.bend"), &source).unwrap();
         let error = compile(&dir).unwrap_err();
         assert!(
             error.to_string().contains("main must return String"),
@@ -380,36 +629,40 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // An IO main in either file whose main is run is refused before bend
+    // starts.
     #[test]
     fn io_main_is_not_executed() {
-        let dir = scratch();
-        copy_experiment(&dir);
-        fs::write(
-            dir.join("counter.bend"),
-            "import Base\ndef main() -> IO(Unit):\n  do IO<Unit>:\n    IO.print(\"EXECUTED\")\n",
-        )
-        .unwrap();
-        let error = compile(&dir).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "counter.bend main must return String; IO is not executed"
-        );
-        let _ = fs::remove_dir_all(dir);
+        for file in ["workflow.bend", "evals.bend"] {
+            let dir = scratch();
+            copy_experiment(&dir);
+            fs::write(
+                dir.join(file),
+                "import Base\ndef main() -> IO(Unit):\n  do IO<Unit>:\n    IO.print(\"EXECUTED\")\n",
+            )
+            .unwrap();
+            let error = compile(&dir).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("{file} main must return String; IO is not executed")
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
     fn encoding_must_match_the_versioned_line() {
         let dir = scratch();
         copy_experiment(&dir);
-        let counter = fs::read_to_string(dir.join("counter.bend")).unwrap();
-        let replaced = counter.replace(
-            "def main() -> String:\n  encode(counter_program())\n",
+        let workflow = fs::read_to_string(dir.join("workflow.bend")).unwrap();
+        let replaced = workflow.replace(
+            "def main() -> String:\n  encode_line(search_program())\n",
             "def main() -> String:\n  \"nope\"\n",
         );
-        assert_ne!(replaced, counter);
-        fs::write(dir.join("counter.bend"), replaced).unwrap();
+        assert_ne!(replaced, workflow);
+        fs::write(dir.join("workflow.bend"), replaced).unwrap();
         let error = compile(&dir).unwrap_err();
-        assert!(error.to_string().contains("v1 on_counter"), "{}", error);
+        assert_eq!(error.to_string(), "expected a v2 token line");
         let _ = fs::remove_dir_all(dir);
     }
 

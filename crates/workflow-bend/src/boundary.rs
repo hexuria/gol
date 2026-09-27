@@ -13,7 +13,9 @@ use crate::FrontendError;
 
 pub const BEND_VERSION: &str = "bend 2.0.28";
 const SOURCE_LIMIT: u64 = 64 * 1024;
-const STDOUT_LIMIT: usize = 4 * 1024;
+// The v2 line and evals.bend output both fit well under this; it matches the
+// source cap.
+const STDOUT_LIMIT: usize = 64 * 1024;
 const STDERR_LIMIT: usize = 16 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -129,6 +131,11 @@ impl Drop for Staged {
 /// How many random names staging tries before it gives up.
 pub(crate) const STAGE_ATTEMPTS: usize = 8;
 
+/// The files staged for Bend, and the ones whose main is run.
+pub(crate) const STAGED_FILES: [&str; 4] =
+    ["workflow.bend", "evals.bend", "LAWS.bend", "PROOF.bend"];
+pub(crate) const RUN_FILES: [&str; 2] = ["workflow.bend", "evals.bend"];
+
 pub fn stage(source: &Path) -> Result<Staged, FrontendError> {
     let dir = create_private_dir(&std::env::temp_dir(), || {
         let suffix = getrandom::u64()
@@ -136,13 +143,19 @@ pub fn stage(source: &Path) -> Result<Staged, FrontendError> {
         Ok(format!("gol-bend-{}-{suffix:016x}", std::process::id()))
     })?;
     let staged = Staged { dir };
-    for name in ["counter.bend", "LAWS.bend", "PROOF.bend"] {
-        let bytes = read_source(&source.join(name))?;
-        write_new(&staged.dir.join(name), bytes.as_bytes())?;
+    for name in STAGED_FILES {
+        let text = read_source(&source.join(name))?;
+        // Every file whose main is run must have one String main.
+        if RUN_FILES.contains(&name) {
+            assert_string_main(&text).map_err(|error| match error {
+                FrontendError::Encoding(message) => {
+                    FrontendError::Encoding(format!("{name} {message}"))
+                }
+                other => other,
+            })?;
+        }
+        write_new(&staged.dir.join(name), text.as_bytes())?;
     }
-    let counter = fs::read_to_string(staged.dir.join("counter.bend"))
-        .map_err(|error| io_error("read", &staged.dir.join("counter.bend"), &error))?;
-    assert_string_main(&counter)?;
     Ok(staged)
 }
 
@@ -254,14 +267,14 @@ fn assert_string_main(source: &str) -> Result<(), FrontendError> {
     }
     if mains != 1 {
         return Err(FrontendError::Encoding(
-            "counter.bend needs one def main() -> String:".to_string(),
+            "needs one def main() -> String:".to_string(),
         ));
     }
     Ok(())
 }
 
 fn main_must_be_string() -> FrontendError {
-    FrontendError::Encoding("counter.bend main must return String; IO is not executed".to_string())
+    FrontendError::Encoding("main must return String; IO is not executed".to_string())
 }
 
 // Bend 2.0.28 lexing for the main guard. Whitespace is space, tab, `\n`, and a
@@ -775,7 +788,7 @@ mod tests {
         let second = stage(&source).unwrap();
         let (a, b) = (staged_dir(&first), staged_dir(&second));
         assert_eq!(mode(a), 0o700);
-        for name in ["counter.bend", "LAWS.bend", "PROOF.bend"] {
+        for name in super::STAGED_FILES {
             assert_eq!(mode(&a.join(name)), 0o600, "{name}");
         }
         assert_ne!(a, b);
@@ -839,54 +852,46 @@ mod tests {
         ("def main2() -> IO(u24):\n  0\n", 0, 0),
     ];
 
-    fn arms() -> [(&'static str, Decision); 3] {
-        [
-            (
-                "execute",
-                Decision::Tool {
-                    name: "counter".to_string(),
-                    input: String::new(),
-                },
-            ),
-            ("complete", Decision::Complete),
-            ("fail", Decision::Fail),
-        ]
+    /// Programs over every decision kind, with names of 1 to 8 characters
+    /// and inputs of up to 8, any Unicode.
+    fn programs() -> impl Strategy<Value = WorkflowProgram> {
+        let text = |min: usize| {
+            prop::collection::vec(any::<char>(), min..=8)
+                .prop_map(|chars| chars.into_iter().collect::<String>())
+        };
+        let leaf = prop_oneof![
+            (text(1), text(0)).prop_map(|(name, input)| Decision::Tool { name, input }),
+            (text(1), text(0)).prop_map(|(agent, input)| Decision::SpawnAgent { agent, input }),
+            Just(Decision::Complete),
+            Just(Decision::Fail),
+        ];
+        leaf.prop_recursive(4, 32, 4, |inner| {
+            prop_oneof![
+                (inner.clone(), inner.clone(), inner.clone()).prop_map(|(missing, zero, other)| {
+                    Decision::OnCounter {
+                        missing: Box::new(missing),
+                        zero: Box::new(zero),
+                        other: Box::new(other),
+                    }
+                }),
+                prop::collection::vec(inner, 0..4).prop_map(Decision::Seq),
+            ]
+        })
+        .prop_map(|root| WorkflowProgram { root })
     }
 
-    /// The 27 lines parse_encoding accepts, with the program each one means.
-    fn valid_lines() -> Vec<(String, WorkflowProgram)> {
-        let mut lines = Vec::new();
-        for (missing, on_missing) in arms() {
-            for (zero, on_zero) in arms() {
-                for (other, on_other) in arms() {
-                    lines.push((
-                        format!("\"v1 on_counter {missing} {zero} {other}\"\n"),
-                        WorkflowProgram {
-                            root: Decision::OnCounter {
-                                missing: Box::new(on_missing.clone()),
-                                zero: Box::new(on_zero.clone()),
-                                other: Box::new(on_other.clone()),
-                            },
-                        },
-                    ));
-                }
-            }
-        }
-        lines
-    }
-
-    /// Arbitrary text, and valid lines with one character inserted, removed or
-    /// replaced, so both sides of the oracle are exercised.
+    /// Arbitrary text, encoded programs, and encoded programs with one
+    /// character inserted, removed or replaced.
     fn encodings() -> impl Strategy<Value = String> {
-        let valid: Vec<String> = valid_lines().into_iter().map(|(line, _)| line).collect();
+        let encoded = programs().prop_map(|program| crate::encode_line(&program));
         let edited = (
-            proptest::sample::select(valid.clone()),
+            programs(),
             any::<prop::sample::Index>(),
             any::<char>(),
             0u8..4,
         )
-            .prop_map(|(line, at, ch, edit)| {
-                let mut chars: Vec<char> = line.chars().collect();
+            .prop_map(|(program, at, ch, edit)| {
+                let mut chars: Vec<char> = crate::encode_line(&program).chars().collect();
                 let at = at.index(chars.len() + 1);
                 match edit {
                     0 => chars.insert(at, ch),
@@ -898,14 +903,7 @@ mod tests {
                 }
                 chars.into_iter().collect()
             });
-        prop_oneof![any::<String>(), proptest::sample::select(valid), edited]
-    }
-
-    #[test]
-    fn every_v1_line_parses_to_its_program() {
-        for (line, program) in valid_lines() {
-            assert_eq!(crate::parse_encoding(&line).unwrap(), program, "{line}");
-        }
+        prop_oneof![any::<String>(), encoded, edited]
     }
 
     proptest! {
@@ -920,19 +918,22 @@ mod tests {
             prop_assert_eq!(accepted, strings == 1 && others == 0, "{:?}", source);
         }
 
-        // Neither hand-written parser panics, and parse_encoding accepts
-        // exactly the 27 valid v1 lines, each as the program it names.
+
+        // Every program comes back from its v2 line.
+        #[test]
+        fn parse_encoding_round_trips(program in programs()) {
+            let line = crate::encode_line(&program);
+            prop_assert_eq!(crate::parse_encoding(&line).unwrap(), program);
+        }
+
+        // Neither hand-written parser panics, and parse_encoding accepts a
+        // line only in the exact form the program it names encodes to.
         #[test]
         fn scanner_and_parse_encoding_never_panic(text in encodings(), source in any::<String>()) {
             let _ = assert_string_main(&source);
             let _ = assert_string_main(&text);
-            let expected = valid_lines()
-                .into_iter()
-                .find(|(line, _)| *line == text)
-                .map(|(_, program)| program);
-            match crate::parse_encoding(&text) {
-                Ok(program) => prop_assert_eq!(Some(program), expected),
-                Err(_) => prop_assert_eq!(None, expected),
+            if let Ok(program) = crate::parse_encoding(&text) {
+                prop_assert_eq!(crate::encode_line(&program), text);
             }
         }
     }

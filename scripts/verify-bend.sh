@@ -46,12 +46,14 @@ run_bend() {
   /usr/bin/unshare "${unshare_net[@]}" -- env -i BEND_NO_TELEMETRY=1 "${bend_bin}" "$@"
 }
 
-counter_check="$(run_bend "${src}/counter.bend" --check-only)"
-if [ "${counter_check}" != "All terms check." ]; then
-  echo "counter.bend failed the checker:" >&2
-  printf '%s\n' "${counter_check}" >&2
-  exit 1
-fi
+for file in workflow.bend evals.bend; do
+  file_check="$(run_bend "${src}/${file}" --check-only)"
+  if [ "${file_check}" != "All terms check." ]; then
+    echo "${file} failed the checker:" >&2
+    printf '%s\n' "${file_check}" >&2
+    exit 1
+  fi
+done
 
 proof_check="$(run_bend "${src}/PROOF.bend" --check-only)"
 if [ "${proof_check}" != "All terms check." ]; then
@@ -60,9 +62,9 @@ if [ "${proof_check}" != "All terms check." ]; then
   exit 1
 fi
 
-encoding="$(run_bend "${src}/counter.bend")"
-if [ "${encoding}" != '"v1 on_counter execute complete fail"' ]; then
-  echo "counter encoding changed:" >&2
+encoding="$(run_bend "${src}/workflow.bend")"
+if [ "${encoding}" != '"v2 tool.736561726368.71 tool.636f756e746572. spawn.68656c706572.7a65726f complete end seq seq fail on_counter end seq seq"' ]; then
+  echo "workflow encoding changed:" >&2
   printf '%s\n' "${encoding}" >&2
   exit 1
 fi
