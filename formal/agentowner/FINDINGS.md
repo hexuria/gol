@@ -4,7 +4,7 @@ Checked on 2026-09-27. `AgentOwner.tla` is one stored agent manifest and the pri
 
 ## Model
 
-Writers: `put_agent` in `PostgresStore` (`crates/server/src/postgres.rs`) and `InMemoryStore` (`crates/server/src/store.rs`), called by `POST /v1/agents` (`create_agent` in `crates/server/src/http.rs`), one per principal. Each put is one atomic step. In Postgres it is one statement: an insert that, on a conflicting id, replaces the row only when the stored owner has the same issuer and subject. In memory it is one lock.
+Writers: `put_agent` in `PostgresStore` (`crates/server/src/postgres.rs:70`) and `InMemoryStore` (`crates/server/src/store.rs:94`), called by `POST /v1/agents` (`create_agent`, `crates/server/src/http.rs:215`), one per principal. Each put is one atomic step. In Postgres it is one statement: an insert that, on a conflicting id, replaces the row only when the stored owner has the same issuer and subject. In memory it is one lock.
 
 `Design = "old"` is the unconditional upsert before B2: any principal's put replaced the row. `Design = "new"` is the conditional put.
 

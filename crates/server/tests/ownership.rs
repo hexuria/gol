@@ -479,3 +479,26 @@ fn the_owner_replaces_from_any_tenant_and_no_one_else_does() {
     assert_eq!(stored.owner.subject, ALICE);
     assert_eq!(stored.owner.tenant, "tenant-2");
 }
+
+// Only a bad body is a 400; a request without a JSON content type keeps its
+// own 415.
+#[tokio::test]
+async fn only_a_bad_run_body_is_400() {
+    let server = serve().await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/runs", server.base))
+        .header("authorization", common::bearer_for(ALICE))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 415);
+    let (status, _) = send(
+        reqwest::Method::POST,
+        format!("{}/v1/runs", server.base),
+        ALICE,
+        Some(serde_json::json!({"agent_id": 7})),
+    )
+    .await;
+    assert_eq!(status, 400);
+}

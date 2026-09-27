@@ -830,11 +830,11 @@ fn an_old_agents_table_is_refused_at_connect() {
         ))
         .expect("old schema");
     let url = format!("{POSTGRES_URL}?options=-csearch_path%3D{schema}");
-    let error = PostgresStore::connect(&url)
-        .err()
-        .expect("connect must fail");
+    let connected = PostgresStore::connect(&url).map(|_| ());
+    // Drop the schema before asserting, so a failure leaves nothing behind.
     admin
         .batch_execute(&format!("drop schema {schema} cascade"))
         .expect("drop");
+    let error = connected.expect_err("connect must fail");
     assert!(format!("{error:?}").contains("owner_issuer"), "{error:?}");
 }
