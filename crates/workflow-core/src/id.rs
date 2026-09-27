@@ -17,10 +17,10 @@ pub enum Path {
     Nonzero,
 }
 
-/// Which `on_counter` arm the history selects. An output other than "0",
-/// even one that is not a number, is `Nonzero`.
-pub fn path(history: &History) -> Path {
-    match history.counter() {
+/// Which `on_counter` arm a counter output selects. An output other than
+/// "0", even one that is not a number, is `Nonzero`.
+pub(crate) fn path(counter: Option<&str>) -> Path {
+    match counter {
         None => Path::Unrecorded,
         Some("0") => Path::Zero,
         Some(_) => Path::Nonzero,
@@ -30,7 +30,7 @@ pub fn path(history: &History) -> Path {
 pub fn effect_id(workflow: WorkflowRunId, history: &History, sequence: u32) -> EffectId {
     EffectId {
         workflow,
-        path: path(history),
+        path: path(history.counter()),
         sequence,
     }
 }

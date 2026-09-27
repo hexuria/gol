@@ -36,9 +36,14 @@ impl History {
 
     /// The output of the last `counter` tool record, if there is one.
     pub fn counter(&self) -> Option<&str> {
-        self.records.iter().rev().find_map(|record| match record {
-            Record::Tool { name, output } if name == "counter" => Some(output.as_str()),
-            _ => None,
-        })
+        counter_in(&self.records)
     }
+}
+
+/// The output of the last `counter` tool record in `records`.
+pub(crate) fn counter_in(records: &[Record]) -> Option<&str> {
+    records.iter().rev().find_map(|record| match record {
+        Record::Tool { name, output } if name == "counter" => Some(output.as_str()),
+        _ => None,
+    })
 }

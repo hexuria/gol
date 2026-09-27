@@ -1,4 +1,4 @@
-use crate::driver::{History, Record, WorkflowContext, WorkflowDriver};
+use crate::driver::{counter_in, History, Record, WorkflowContext, WorkflowDriver};
 use crate::step::{AgentSpec, ToolSpec, WaitCondition, WorkflowCommand, WorkflowStep};
 
 #[path = "id.rs"]
@@ -48,7 +48,9 @@ pub fn counter_program() -> WorkflowProgram {
 /// into the records: a tool call or spawn whose record is at the cursor is
 /// done and moves the cursor on, and the first one without a record is the
 /// command. A record that does not match its decision, or a program that runs
-/// out without completing, is `Fail`.
+/// out without completing, is `Fail`. `OnCounter` reads only the records
+/// before its cursor: with no counter there it walks `missing`, and once
+/// `missing` has recorded one it walks `zero` or `other` from there.
 pub fn evaluate_program(program: &WorkflowProgram, history: &History) -> WorkflowStep {
     let command = match walk(&program.root, history, 0) {
         Walk::Next(command) => command,
@@ -104,12 +106,21 @@ fn walk(decision: &Decision, history: &History, cursor: usize) -> Walk {
             zero,
             other,
         } => {
-            let arm = match id::path(history) {
-                id::Path::Unrecorded => missing,
-                id::Path::Zero => zero,
-                id::Path::Nonzero => other,
+            let recorded = |cursor: usize| match id::path(counter_in(&history.records[..cursor])) {
+                id::Path::Unrecorded => None,
+                id::Path::Zero => Some(zero),
+                id::Path::Nonzero => Some(other),
             };
-            walk(arm, history, cursor)
+            if let Some(arm) = recorded(cursor) {
+                return walk(arm, history, cursor);
+            }
+            match walk(missing, history, cursor) {
+                Walk::Done(after) => match recorded(after) {
+                    Some(arm) => walk(arm, history, after),
+                    None => Walk::Done(after),
+                },
+                next => next,
+            }
         }
     }
 }
