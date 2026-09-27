@@ -832,3 +832,35 @@ fn an_empty_oidc_variable_counts_as_unset() {
     assert!(error.contains("GOL_OIDC_ISSUER"), "{error}");
     assert!(auth_from_env(&env(&[("GOL_AUTH", "local-dev"), ("GOL_OIDC_ISSUER", "")])).is_ok());
 }
+
+// The refresh interval runs from when a fetch ends: with a fetch slower
+// than the interval, a second unknown kid queued behind the first refetch
+// does not refetch again at once.
+#[tokio::test]
+async fn the_refresh_interval_runs_from_the_end_of_a_fetch() {
+    let issuer = jwks_server(jwks(&[eddsa()])).await;
+    let url = format!("{}/jwks", issuer.uri());
+    let base = serve(remote_with(
+        url,
+        Duration::from_millis(300),
+        Duration::from_secs(600),
+    ))
+    .await;
+    assert_eq!(status(&base, &sign(eddsa(), &claims("u", "t"))).await, 404);
+    replace_jwks(
+        &issuer,
+        ResponseTemplate::new(200)
+            .set_body_json(jwks(&[eddsa()]))
+            .set_delay(Duration::from_millis(800)),
+    )
+    .await;
+    let unknown = sign(es256(), &claims("u", "t"));
+    let first = {
+        let (base, unknown) = (base.clone(), unknown.clone());
+        tokio::spawn(async move { status(&base, &unknown).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(status(&base, &unknown).await, 401);
+    assert_eq!(first.await.unwrap(), 401);
+    assert_eq!(fetches(&issuer).await, 1);
+}
