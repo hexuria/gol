@@ -6,7 +6,7 @@ const POSTGRES_URL: &str = "postgres://gol:gol@127.0.0.1/gol";
 
 #[test]
 fn postgres_recalls_a_value_on_a_new_connection() {
-    let key = format!("topic-{}", uuid_key());
+    let key = format!("topic-recall-{}", uuid_key());
     {
         let mut store = PostgresMemory::connect(POSTGRES_URL).expect("connect");
         assert_eq!(store.read(MemoryScope::Run, &key), Ok(None));
@@ -24,7 +24,7 @@ fn postgres_recalls_a_value_on_a_new_connection() {
 // reconnects (owner decision 1A).
 #[test]
 fn a_killed_backend_fails_one_read_then_reconnects() {
-    let key = format!("topic-{}", uuid_key());
+    let key = format!("topic-idle-kill-{}", uuid_key());
     let application = format!("gol_c1_memory_{key}").replace('-', "_");
     let mut store =
         PostgresMemory::connect(&format!("{POSTGRES_URL}?application_name={application}"))
@@ -67,7 +67,7 @@ fn a_killed_backend_fails_one_read_then_reconnects() {
 // reconnects (owner decision 1A).
 #[test]
 fn a_backend_killed_mid_statement_is_replaced_on_the_next_call() {
-    let key = format!("topic-{}", uuid_key());
+    let key = format!("topic-mid-kill-{}", uuid_key());
     let application = format!("gol_c1_mid_{key}").replace('-', "_");
     let url = format!("{POSTGRES_URL}?application_name={application}");
     let scope = serde_json::to_string(&MemoryScope::Run).unwrap();
@@ -80,10 +80,12 @@ fn a_backend_killed_mid_statement_is_replaced_on_the_next_call() {
         &[&scope, &key],
     )
     .expect("insert");
+    // Connect first: connect waits on the schema lock too, and the kill must
+    // land in the write.
+    let mut store = PostgresMemory::connect(&url).expect("connect");
     let blocked = {
         let key = key.clone();
         std::thread::spawn(move || {
-            let mut store = PostgresMemory::connect(&url).expect("connect");
             let result = store.write(MemoryScope::Run, &key, "rust");
             (store, result)
         })
@@ -117,6 +119,7 @@ fn a_backend_killed_mid_statement_is_replaced_on_the_next_call() {
     assert_eq!(store.read(MemoryScope::Run, &key), Ok(None));
 }
 
+/// Coarse on macOS, so each test also names its own key prefix.
 fn uuid_key() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

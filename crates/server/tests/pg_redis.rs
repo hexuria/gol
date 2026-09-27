@@ -1017,3 +1017,48 @@ fn a_backend_killed_mid_statement_is_replaced_on_the_next_call() {
     tx.rollback().expect("rollback");
     assert_eq!(store.run(RunId::new()).map(|run| run.is_none()), Ok(true));
 }
+
+/// Runs `call` inside a Tokio runtime, where the blocking Postgres client
+/// panics, and returns what it returned, or None when it panicked.
+fn in_a_runtime<T: Send + 'static>(call: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    std::thread::spawn(move || {
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async { call() })
+    })
+    .join()
+    .ok()
+}
+
+// A call that panics while it holds the connection leaves the store usable:
+// the next call reconnects instead of reporting a poisoned lock forever.
+#[test]
+fn a_call_that_panics_holding_the_connection_does_not_lock_the_store_out() {
+    let store = Arc::new(PostgresStore::connect(POSTGRES_URL).expect("connect"));
+    let inner = store.clone();
+    assert!(
+        in_a_runtime(move || inner.run(RunId::new())).is_none(),
+        "the call panicked"
+    );
+    assert_eq!(store.run(RunId::new()).map(|run| run.is_none()), Ok(true));
+}
+
+// A reconnect that panics is a StoreError, not a panic in the caller, and the
+// next call reconnects.
+#[test]
+fn a_reconnect_that_panics_is_a_store_error() {
+    let application = format!("gol_c1_{}", uuid::Uuid::new_v4().simple());
+    let url = format!("{POSTGRES_URL}?application_name={application}");
+    let store = Arc::new(PostgresStore::connect(&url).expect("connect"));
+    assert_eq!(terminate_backends(&application), 1);
+    assert!(
+        store.run(RunId::new()).is_err(),
+        "the call on the dead connection"
+    );
+    let inner = store.clone();
+    assert_eq!(
+        in_a_runtime(move || inner.run(RunId::new()).map(|run| run.is_none())),
+        Some(Err(server::StoreError::new("postgres connect panicked")))
+    );
+    assert_eq!(store.run(RunId::new()).map(|run| run.is_none()), Ok(true));
+}
