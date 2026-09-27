@@ -28,7 +28,7 @@ The v2 program is admitted by owner decision 8, not by these conditions: its law
 ## Boundary (Rust owns it)
 
 - Only `workflow_bend::compile` evaluates a Bend `main`, plus the `bend_agrees_with_rust` test, which runs `evals.bend` in the same sandbox. `verify-bend.sh` also runs `workflow.bend` on the repo tree, without the main guard.
-- Every Bend process runs under `unshare -r -n` (fallback `-n`, never the host network) and `env -i BEND_NO_TELEMETRY=1`, in its own process group, with a 64 KiB stdout cap, a 16 KiB stderr cap and a 30 s limit, then SIGKILL to the group.
+- Every Bend process runs under `unshare -r -n` (fallback `-n`, never the host network) and `env -i BEND_NO_TELEMETRY=1`, in its own process group, with a 64 KiB stdout cap, a 16 KiB stderr cap and a 30 s limit (120 s for the test-only `evals.bend` run), then SIGKILL to the group. `verify-bend.sh` sets no limit.
 - Staging copies a fixed list of regular files of at most 64 KiB (`STAGED_FILES`) into a new private directory, and every file whose `main` runs (`RUN_FILES`) must have one `String` main.
 - The output is one ASCII line: `v<N>` plus tokens from a fixed grammar (`docs/bend.md`). Any `Decision` change bumps `N`.
 

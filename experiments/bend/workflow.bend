@@ -382,9 +382,9 @@ def search_program() -> GolDec:
 def counter_program() -> GolDec:
   GolOnCounter{GolTool{t_counter(), t_empty()}, GolComplete{}, GolHalt{}}
 
-# A counter recorded before on_counter's cursor, behind a newer record.
+# A counter recorded before on_counter's cursor, behind a newer spawn record.
 def counter_first_program() -> GolDec:
-  GolSeq{GolTool{t_counter(), t_empty()}, GolSeq{GolTool{t_search(), t_q()}, GolSeq{GolOnCounter{GolHalt{}, GolComplete{}, GolHalt{}}, GolEnd{}}}}
+  GolSeq{GolTool{t_counter(), t_empty()}, GolSeq{GolSpawn{t_helper(), t_zero()}, GolSeq{GolOnCounter{GolHalt{}, GolComplete{}, GolHalt{}}, GolEnd{}}}}
 
 # A missing arm that records no counter; the sequence then goes on.
 def no_counter_program() -> GolDec:

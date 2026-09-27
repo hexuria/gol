@@ -282,7 +282,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use harness_core::transition;
+    use harness_core::{transition, WorkflowRun};
     use workflow_core::{
         counter_program, evaluate_program, Decision, History, Record, ToolSpec, WaitCondition,
         WorkflowCommand, WorkflowContext, WorkflowProgram, WorkflowStep,
@@ -357,14 +357,18 @@ mod tests {
         // Bend emits the reference program; Rhai and JS build the same one.
         let bend = compile(&experiment()).unwrap();
         assert_eq!(bend, search_program());
-        // BendDriver hands the loaded program to harness_core::transition.
+        // BendDriver hands the loaded program to harness_core::transition,
+        // which names the run's next state from the command.
         let driver = BendDriver::new(bend);
         for history in alphabet_histories() {
-            let (_, commands) = transition(&driver, &WorkflowContext, &history);
-            assert_eq!(
-                commands,
-                evaluate_program(&search_program(), &history).commands
-            );
+            let (run, commands) = transition(&driver, &WorkflowContext, &history);
+            let expected = evaluate_program(&search_program(), &history).commands;
+            let state = match expected.as_slice() {
+                [WorkflowCommand::Complete] => WorkflowRun::Completed,
+                [WorkflowCommand::Fail] => WorkflowRun::Failed,
+                _ => WorkflowRun::Open,
+            };
+            assert_eq!((run, commands), (state, expected), "{history:?}");
         }
         assert_eq!(
             workflow_rhai::compile(include_str!("../../workflow-rhai/search.rhai")).unwrap(),
@@ -540,10 +544,10 @@ mod tests {
         [
             search_program(),
             counter_program(),
-            // A counter before on_counter's cursor, behind a newer record.
+            // A counter before on_counter's cursor, behind a newer spawn.
             program(Decision::Seq(vec![
                 tool("counter", ""),
-                tool("search", "q"),
+                spawn_agent("helper", "zero"),
                 Decision::OnCounter {
                     missing: Box::new(Decision::Fail),
                     zero: Box::new(Decision::Complete),
@@ -645,6 +649,30 @@ mod tests {
         assert_eq!(reject(&format!("spawn..{}", hex("x"))), bounds);
         assert!(parse_encoding(&line(&tool_line("a", &"x".repeat(65536)))).is_ok());
         assert_eq!(reject(&tool_line("a", &"x".repeat(65537))), bounds);
+
+        // The line itself: quoted, one line, a trailing newline.
+        assert_eq!(
+            parse_encoding("\"v2 complete\"").unwrap_err().to_string(),
+            "bend encoding is missing its trailing newline"
+        );
+        assert_eq!(
+            parse_encoding("\"v2 complete\n").unwrap_err().to_string(),
+            "bend encoding must be a quoted token line"
+        );
+        assert_eq!(
+            parse_encoding("v2 complete\"\n").unwrap_err().to_string(),
+            "bend encoding must be a quoted token line"
+        );
+        assert_eq!(
+            parse_encoding("\"v2\ncomplete\"\n")
+                .unwrap_err()
+                .to_string(),
+            "bend encoding must be one line"
+        );
+        assert_eq!(
+            reject("complete\tfail"),
+            "bend encoding has an unsupported character"
+        );
 
         // Hex is lowercase, even-length and UTF-8.
         assert_eq!(reject("tool.4A."), "hex text must be lowercase hex digits");
