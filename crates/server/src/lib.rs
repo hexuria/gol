@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
-mod auth;
+/// Bearer-token authentication; its builder state markers live here.
+pub mod auth;
 mod http;
 mod inference;
 mod local;

@@ -5,7 +5,16 @@ use server::{auth_from_env, router_with_gateway, HttpGatewayPoster, InMemoryStor
 
 #[tokio::main]
 async fn main() {
-    let env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    // A variable that is not valid UTF-8 cannot configure gol; skip it rather
+    // than panic.
+    let env: std::collections::BTreeMap<String, String> = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
+    if env.get("GOL_AUTH").map(String::as_str) == Some("local-dev") {
+        eprintln!(
+            "gol: WARNING: GOL_AUTH=local-dev accepts a static token; never use it in production"
+        );
+    }
     let auth = match auth_from_env(&env) {
         Ok(auth) => auth,
         Err(message) => {

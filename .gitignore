@@ -1,3 +1,5 @@
 /target
 coworker/node_modules
 formal/**/*_TTrace_*
+# Test-only keys the server tests read; a global *.pem rule must not drop them.
+!crates/server/tests/fixtures/*.pem

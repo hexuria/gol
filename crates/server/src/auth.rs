@@ -4,10 +4,12 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::marker::PhantomData;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, Jwk, JwkSet, KeyAlgorithm};
+use jsonwebtoken::jwk::{
+    AlgorithmParameters, EllipticCurve, Jwk, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse,
+};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 
 /// The caller a token names.
@@ -34,8 +36,12 @@ pub trait Authenticator: Send + Sync {
 
 const LEEWAY_SECS: u64 = 60;
 const JWKS_TIMEOUT: Duration = Duration::from_secs(3);
-/// An unknown kid refetches the key set at most once per interval.
+/// An unknown kid, or a failed fetch, refetches the key set at most once per
+/// interval.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// A fetched key set is used for at most this long before it is refetched,
+/// so a key the issuer removed stops verifying.
+const MAX_AGE: Duration = Duration::from_secs(600);
 const MAX_JWKS_BYTES: u64 = 1024 * 1024;
 /// The static token the coworker desktop sends in local development.
 pub const LOCAL_DEV_TOKEN: &str = "gol-gateway-local";
@@ -48,12 +54,13 @@ enum KeySource {
     Static(JwkSet),
 }
 
-#[derive(Default)]
 struct Draft {
     issuer: Option<String>,
     audience: Option<String>,
     tenant_claim: Option<String>,
     keys: Option<KeySource>,
+    refresh_interval: Duration,
+    max_age: Duration,
 }
 
 /// The issuer, audience, tenant claim and key source. Each is required, and
@@ -68,7 +75,14 @@ pub struct OidcConfigBuilder<I, A, T, K> {
 impl OidcConfig {
     pub fn builder() -> OidcConfigBuilder<Missing, Missing, Missing, Missing> {
         OidcConfigBuilder {
-            draft: Draft::default(),
+            draft: Draft {
+                issuer: None,
+                audience: None,
+                tenant_claim: None,
+                keys: None,
+                refresh_interval: REFRESH_INTERVAL,
+                max_age: MAX_AGE,
+            },
             _state: PhantomData,
         }
     }
@@ -80,6 +94,20 @@ impl<I, A, T, K> OidcConfigBuilder<I, A, T, K> {
             draft: self.draft,
             _state: PhantomData,
         }
+    }
+
+    /// How often an unknown kid, or a failed fetch, may refetch the key set
+    /// (default 30 s).
+    pub fn refresh_interval(mut self, interval: Duration) -> Self {
+        self.draft.refresh_interval = interval;
+        self
+    }
+
+    /// How long a fetched key set is used before it is refetched (default
+    /// 10 min).
+    pub fn max_age(mut self, age: Duration) -> Self {
+        self.draft.max_age = age;
+        self
     }
 }
 
@@ -106,7 +134,8 @@ impl<I, A, K> OidcConfigBuilder<I, A, Missing, K> {
 }
 
 impl<I, A, T> OidcConfigBuilder<I, A, T, Missing> {
-    /// Read the key set from the issuer's JWKS URL.
+    /// Read the key set from the issuer's JWKS URL. Redirects are not
+    /// followed; `auth_from_env` also requires https except on loopback.
     pub fn jwks_url(mut self, url: impl Into<String>) -> OidcConfigBuilder<I, A, T, Set> {
         self.draft.keys = Some(KeySource::Url(url.into()));
         self.retag()
@@ -126,21 +155,33 @@ impl OidcConfigBuilder<Set, Set, Set, Set> {
             KeySource::Url(url) => (
                 Source::Url {
                     url,
-                    agent: ureq::AgentBuilder::new().timeout(JWKS_TIMEOUT).build(),
+                    agent: ureq::AgentBuilder::new()
+                        .timeout(JWKS_TIMEOUT)
+                        .redirects(0)
+                        .build(),
                 },
-                Vec::new(),
+                Keys {
+                    keys: Vec::new(),
+                    loaded_at: None,
+                },
             ),
-            KeySource::Static(set) => (Source::Static, set.keys),
+            KeySource::Static(set) => (
+                Source::Static,
+                Keys {
+                    keys: set.keys.into_iter().filter(usable).collect(),
+                    loaded_at: None,
+                },
+            ),
         };
-        let loaded = matches!(source, Source::Static);
         OidcVerifier {
             issuer: draft.issuer.expect("typestate recorded the issuer"),
             audience: draft.audience.expect("typestate recorded the audience"),
             tenant_claim: draft.tenant_claim.expect("typestate recorded the claim"),
+            refresh_interval: draft.refresh_interval,
+            max_age: draft.max_age,
             source,
-            cache: Mutex::new(Cache {
-                loaded,
-                keys,
+            keys: RwLock::new(keys),
+            fetches: Mutex::new(Fetches {
                 attempted: None,
                 error: None,
                 refreshed: None,
@@ -154,14 +195,21 @@ enum Source {
     Static,
 }
 
-struct Cache {
+struct Keys {
     keys: Vec<Jwk>,
-    /// Whether a fetch has succeeded; a static key set starts loaded.
-    loaded: bool,
+    /// When the key set was fetched; `None` before the first fetch, and
+    /// always for a static set.
+    loaded_at: Option<Instant>,
+}
+
+/// Fetch bookkeeping. Its mutex is also the gate that lets one fetch run at
+/// a time; lookups of a known kid never wait on it.
+struct Fetches {
     /// When the last fetch was made, and why it failed, if it did.
     attempted: Option<Instant>,
     error: Option<String>,
-    /// When an unknown kid last refetched a loaded key set.
+    /// When an unknown kid last refetched a loaded key set. The first load
+    /// does not count, so a kid published just after it is still found.
     refreshed: Option<Instant>,
 }
 
@@ -171,49 +219,78 @@ pub struct OidcVerifier {
     issuer: String,
     audience: String,
     tenant_claim: String,
+    refresh_interval: Duration,
+    max_age: Duration,
     source: Source,
-    cache: Mutex<Cache>,
+    keys: RwLock<Keys>,
+    fetches: Mutex<Fetches>,
 }
 
 impl OidcVerifier {
-    /// The key for `kid`. The key set is loaded on first use; after a failed
-    /// fetch the next one waits a refresh interval, so a down issuer is not
-    /// hammered. Once loaded, an unknown kid refetches the set at most once
-    /// per interval (for a rotated key). The lock is held across the fetch,
-    /// so concurrent requests wait for one fetch instead of each starting
-    /// their own.
+    /// The key for `kid`.
+    ///
+    /// A fresh key set that has the kid answers at once, without waiting on
+    /// a fetch. Otherwise one fetch runs at a time: the first load; a
+    /// refetch of a set older than `max_age`; or, for a kid the set lacks,
+    /// a refetch at most once per `refresh_interval` (a rotated key). After
+    /// a failed fetch the next waits `refresh_interval`, and a failed
+    /// refetch keeps using the set already loaded.
     fn key(&self, kid: &str) -> Result<Jwk, AuthError> {
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| AuthError::Unavailable("key cache poisoned".to_string()))?;
-        if let Some(key) = find(&cache.keys, kid) {
-            return Ok(key);
-        }
         let Source::Url { url, agent } = &self.source else {
-            return Err(AuthError::Unauthorized);
+            let keys = self.keys.read().unwrap_or_else(PoisonError::into_inner);
+            return find(&keys.keys, kid).ok_or(AuthError::Unauthorized);
         };
-        let recent = |at: Option<Instant>| at.is_some_and(|at| at.elapsed() < REFRESH_INTERVAL);
-        if let (Some(error), true) = (&cache.error, recent(cache.attempted)) {
-            return Err(AuthError::Unavailable(error.clone()));
-        }
-        if cache.loaded {
-            if recent(cache.refreshed) {
-                return Err(AuthError::Unauthorized);
+        let fresh = |at: Option<Instant>| at.is_some_and(|at| at.elapsed() < self.max_age);
+        let recent =
+            |at: Option<Instant>| at.is_some_and(|at| at.elapsed() < self.refresh_interval);
+        let lookup = || {
+            let keys = self.keys.read().unwrap_or_else(PoisonError::into_inner);
+            (keys.loaded_at, find(&keys.keys, kid))
+        };
+        if let (loaded_at, Some(key)) = lookup() {
+            if fresh(loaded_at) {
+                return Ok(key);
             }
-            cache.refreshed = Some(Instant::now());
         }
-        cache.attempted = Some(Instant::now());
+        let mut fetches = self.fetches.lock().unwrap_or_else(PoisonError::into_inner);
+        // Another request may have fetched while this one waited.
+        let (loaded_at, found) = lookup();
+        if let (true, Some(key)) = (fresh(loaded_at), &found) {
+            return Ok(key.clone());
+        }
+        let failing = fetches.error.is_some() && recent(fetches.attempted);
+        // The first load waits only after a failure. A stale set waits a
+        // refresh interval after any fetch; an unknown kid waits one after
+        // the last unknown-kid refetch, and after a failure.
+        let due = match (loaded_at, &found) {
+            (None, _) => !failing,
+            (Some(_), Some(_)) => !recent(fetches.attempted),
+            (Some(_), None) => !failing && !recent(fetches.refreshed),
+        };
+        if !due {
+            return match (found, failing) {
+                (Some(key), _) => Ok(key),
+                (None, true) => Err(AuthError::Unavailable(
+                    fetches.error.clone().unwrap_or_default(),
+                )),
+                (None, false) => Err(AuthError::Unauthorized),
+            };
+        }
+        fetches.attempted = Some(Instant::now());
+        if loaded_at.is_some() && found.is_none() {
+            fetches.refreshed = Some(Instant::now());
+        }
         match fetch(agent, url) {
             Ok(set) => {
-                cache.keys = set.keys;
-                cache.loaded = true;
-                cache.error = None;
-                find(&cache.keys, kid).ok_or(AuthError::Unauthorized)
+                fetches.error = None;
+                let mut keys = self.keys.write().unwrap_or_else(PoisonError::into_inner);
+                keys.keys = set;
+                keys.loaded_at = Some(Instant::now());
+                find(&keys.keys, kid).ok_or(AuthError::Unauthorized)
             }
             Err(error) => {
-                cache.error = Some(error.clone());
-                Err(AuthError::Unavailable(error))
+                fetches.error = Some(error.clone());
+                found.ok_or(AuthError::Unavailable(error))
             }
         }
     }
@@ -225,7 +302,38 @@ fn find(keys: &[Jwk], kid: &str) -> Option<Jwk> {
         .cloned()
 }
 
-fn fetch(agent: &ureq::Agent, url: &str) -> Result<JwkSet, String> {
+/// A key may verify signatures: its `use`, if any, is `sig`, and its
+/// `key_ops`, if any, include `verify`.
+fn usable(key: &Jwk) -> bool {
+    let for_signing = match &key.common.public_key_use {
+        None | Some(PublicKeyUse::Signature) => true,
+        Some(_) => false,
+    };
+    let verifies = match &key.common.key_operations {
+        None => true,
+        Some(ops) => ops.iter().any(|op| matches!(op, KeyOperations::Verify)),
+    };
+    for_signing && verifies
+}
+
+/// The usable keys of a JWKS. A key this library cannot read (another curve
+/// or algorithm) is skipped rather than failing the whole set.
+fn parse_keys(body: &[u8]) -> Result<Vec<Jwk>, String> {
+    #[derive(serde::Deserialize)]
+    struct RawSet {
+        keys: Vec<serde_json::Value>,
+    }
+    let raw: RawSet =
+        serde_json::from_slice(body).map_err(|error| format!("jwks decode: {error}"))?;
+    Ok(raw
+        .keys
+        .into_iter()
+        .filter_map(|key| serde_json::from_value::<Jwk>(key).ok())
+        .filter(usable)
+        .collect())
+}
+
+fn fetch(agent: &ureq::Agent, url: &str) -> Result<Vec<Jwk>, String> {
     let response = agent
         .get(url)
         .call()
@@ -236,7 +344,7 @@ fn fetch(agent: &ureq::Agent, url: &str) -> Result<JwkSet, String> {
         .take(MAX_JWKS_BYTES)
         .read_to_end(&mut body)
         .map_err(|error| format!("jwks read: {error}"))?;
-    serde_json::from_slice(&body).map_err(|error| format!("jwks decode: {error}"))
+    parse_keys(&body)
 }
 
 /// Whether `key` may verify `alg`: its type and curve must match, and its
@@ -266,7 +374,7 @@ fn claim(claims: &serde_json::Map<String, serde_json::Value>, name: &str) -> Opt
     claims
         .get(name)
         .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
 }
 
@@ -357,6 +465,7 @@ pub fn auth_from_env(vars: &BTreeMap<String, String>) -> Result<Arc<dyn Authenti
                 ));
             }
             let value = |name: &str| get(name).cloned().unwrap_or_default();
+            check_jwks_url(&value("GOL_OIDC_JWKS_URL"))?;
             Ok(Arc::new(
                 OidcConfig::builder()
                     .issuer(value("GOL_OIDC_ISSUER"))
@@ -367,4 +476,31 @@ pub fn auth_from_env(vars: &BTreeMap<String, String>) -> Result<Arc<dyn Authenti
             ))
         }
     }
+}
+
+/// A JWKS URL must be https, or http on a loopback host, so the key set
+/// cannot be swapped in transit.
+fn check_jwks_url(url: &str) -> Result<(), String> {
+    let host_start = |rest: &str| {
+        let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        !host.is_empty() && !host.contains(char::is_whitespace)
+    };
+    if let Some(rest) = url.strip_prefix("https://") {
+        if host_start(rest) {
+            return Ok(());
+        }
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let name = host
+            .rsplit_once(':')
+            .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+            .map_or(host, |(name, _)| name);
+        if matches!(name, "127.0.0.1" | "localhost" | "[::1]") {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "GOL_OIDC_JWKS_URL must be an https URL, or http on a loopback host, not {url:?}"
+    ))
 }
