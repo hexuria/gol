@@ -1,7 +1,3 @@
-use std::fs::OpenOptions;
-use std::io::Read;
-use std::path::Path;
-
 use workflow_core::{
     spawn, History, Record, WaitCondition, WorkflowCommand, WorkflowContext, WorkflowDriver,
     WorkflowStep,
@@ -12,17 +8,17 @@ use crate::Journal;
 pub fn replay(
     driver: &impl WorkflowDriver,
     ctx: &WorkflowContext,
-    path: &Path,
     journal: &mut Journal,
     stand_in: &mut dyn FnMut() -> i64,
 ) -> std::io::Result<(WorkflowStep, Option<protocol::RunState>)> {
-    let recorded = read_path(path)?;
-    let history = history_from_committed(&recorded)?;
+    let history = journal.history()?;
     let step = driver.evaluate(ctx, &history);
     let harness = match step.commands.as_slice() {
-        [command @ WorkflowCommand::SpawnAgent(_)] if recorded.is_empty() => {
+        [command @ WorkflowCommand::SpawnAgent(spec)] if history.records.is_empty() => {
             let state = on_command(command);
-            journal.commit(&0i64.to_le_bytes())?;
+            journal.commit(&Record::AgentSpawned {
+                agent: spec.agent.clone(),
+            })?;
             state
         }
         [WorkflowCommand::SpawnAgent(_)] => None,
@@ -32,41 +28,15 @@ pub fn replay(
     if let [WorkflowCommand::ExecuteTool(tool)] = step.commands.as_slice() {
         if tool.name == "counter" {
             let value = stand_in();
-            journal.commit(&value.to_le_bytes())?;
+            journal.commit(&Record::counter(value))?;
         }
     }
     Ok((step, harness))
 }
 
-fn read_path(path: &Path) -> std::io::Result<Vec<u8>> {
-    let mut file = OpenOptions::new().read(true).open(path)?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
-fn history_from_committed(bytes: &[u8]) -> std::io::Result<History> {
-    match bytes.len() {
-        0 => Ok(History::default()),
-        8 => {
-            let array: [u8; 8] = bytes.try_into().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "journal length")
-            })?;
-            Ok(History::new(vec![Record::counter(i64::from_le_bytes(
-                array,
-            ))]))
-        }
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "journal length",
-        )),
-    }
-}
-
 pub fn join_all(
     driver: &impl WorkflowDriver,
     ctx: &WorkflowContext,
-    path: &Path,
     journal: &mut Journal,
     stand_in: &mut dyn FnMut(u32) -> i64,
 ) -> std::io::Result<()> {
@@ -92,19 +62,18 @@ pub fn join_all(
     };
     let first = spawn(0, first_command);
     let second = spawn(1, second_command);
-    let length = std::fs::metadata(path)?.len();
-    match length {
+    match journal.history()?.records.len() {
         0 => {
             let value = stand_in(first.sequence);
-            journal.commit(&value.to_le_bytes())?;
+            journal.commit(&Record::counter(value))?;
             let value = stand_in(second.sequence);
-            journal.commit(&value.to_le_bytes())?;
+            journal.commit(&Record::counter(value))?;
         }
-        8 => {
+        1 => {
             let value = stand_in(second.sequence);
-            journal.commit(&value.to_le_bytes())?;
+            journal.commit(&Record::counter(value))?;
         }
-        16 => {}
+        2 => {}
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -152,14 +121,14 @@ fn on_command(command: &WorkflowCommand) -> Option<protocol::RunState> {
 #[cfg(test)]
 mod tests {
     use super::{join_all, replay};
-    use crate::Journal;
+    use crate::{frame, start_frame, Journal};
     use std::cell::{Cell, RefCell};
     use std::fs::{self, OpenOptions};
     use std::io::Read;
     use std::path::Path;
     use workflow_core::{
-        AgentSpec, CounterBranch, History, JoinBranch, ToolSpec, WaitCondition, WorkflowCommand,
-        WorkflowContext, WorkflowDriver, WorkflowStep,
+        AgentSpec, CounterBranch, History, JoinBranch, Record, ToolSpec, WaitCondition,
+        WorkflowCommand, WorkflowContext, WorkflowDriver, WorkflowStep,
     };
 
     fn read_path(path: &Path) -> Vec<u8> {
@@ -169,13 +138,22 @@ mod tests {
         buf
     }
 
+    /// The bytes of a journal holding `records`.
+    fn journal_bytes(records: &[Record]) -> Vec<u8> {
+        let mut bytes = start_frame();
+        for record in records {
+            bytes.extend(frame(record).unwrap());
+        }
+        bytes
+    }
+
     #[test]
     fn second_pass_makes_zero_repeat_calls() {
         let dir = std::env::temp_dir().join(format!("gol-host-{}-replay", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("log");
         let mut journal = Journal::open(&path).unwrap();
-        assert!(read_path(&path).is_empty());
+        assert_eq!(read_path(&path), start_frame());
 
         let calls = Cell::new(0u32);
         let mut stand_in = || {
@@ -185,8 +163,7 @@ mod tests {
         let driver = CounterBranch;
         let ctx = WorkflowContext;
 
-        let (first, first_harness) =
-            replay(&driver, &ctx, &path, &mut journal, &mut stand_in).unwrap();
+        let (first, first_harness) = replay(&driver, &ctx, &mut journal, &mut stand_in).unwrap();
         assert!(first_harness.is_none());
         assert_eq!(calls.get(), 1);
         assert_eq!(
@@ -194,15 +171,14 @@ mod tests {
             [WorkflowCommand::ExecuteTool(ToolSpec::new("counter", ""))]
         );
         assert_eq!(first.wait, WaitCondition::None);
-        assert_eq!(read_path(&path), 0i64.to_le_bytes());
+        assert_eq!(read_path(&path), journal_bytes(&[Record::counter(0)]));
 
-        let (second, second_harness) =
-            replay(&driver, &ctx, &path, &mut journal, &mut stand_in).unwrap();
+        let (second, second_harness) = replay(&driver, &ctx, &mut journal, &mut stand_in).unwrap();
         assert!(second_harness.is_none());
         assert_eq!(calls.get(), 1);
         assert_eq!(second.commands, [WorkflowCommand::Complete]);
         assert_eq!(second.wait, WaitCondition::None);
-        assert_eq!(read_path(&path), 0i64.to_le_bytes());
+        assert_eq!(read_path(&path), journal_bytes(&[Record::counter(0)]));
     }
 
     #[test]
@@ -211,7 +187,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("log");
         let mut journal = Journal::open(&path).unwrap();
-        assert!(read_path(&path).is_empty());
+        assert_eq!(read_path(&path), start_frame());
 
         let calls = RefCell::new(Vec::new());
         let mut stand_in = |sequence: u32| {
@@ -223,8 +199,7 @@ mod tests {
                     7i64
                 }
                 1 => {
-                    assert_eq!(bytes.len(), 8);
-                    assert_eq!(bytes, 7i64.to_le_bytes());
+                    assert_eq!(bytes, journal_bytes(&[Record::counter(7)]));
                     assert_eq!(calls.borrow().as_slice(), &[0]);
                     calls.borrow_mut().push(sequence);
                     9i64
@@ -235,20 +210,17 @@ mod tests {
         let driver = JoinBranch;
         let ctx = WorkflowContext;
 
-        join_all(&driver, &ctx, &path, &mut journal, &mut stand_in).unwrap();
+        join_all(&driver, &ctx, &mut journal, &mut stand_in).unwrap();
         assert_eq!(calls.borrow().as_slice(), &[0, 1]);
-        let mut expected = 7i64.to_le_bytes().to_vec();
-        expected.extend_from_slice(&9i64.to_le_bytes());
+        let expected = journal_bytes(&[Record::counter(7), Record::counter(9)]);
         assert_eq!(read_path(&path), expected);
-        assert_eq!(read_path(&path).len(), 16);
 
-        join_all(&driver, &ctx, &path, &mut journal, &mut stand_in).unwrap();
+        join_all(&driver, &ctx, &mut journal, &mut stand_in).unwrap();
         assert_eq!(calls.borrow().as_slice(), &[0, 1]);
-        assert_eq!(read_path(&path).len(), 16);
         assert_eq!(read_path(&path), expected);
 
         let partial = dir.join("partial");
-        fs::write(&partial, 7i64.to_le_bytes()).unwrap();
+        fs::write(&partial, journal_bytes(&[Record::counter(7)])).unwrap();
         let mut partial_journal = Journal::open(&partial).unwrap();
         let partial_calls = RefCell::new(Vec::new());
         let mut partial_stand_in = |sequence: u32| {
@@ -259,17 +231,9 @@ mod tests {
                 _ => panic!("unexpected sequence"),
             }
         };
-        join_all(
-            &driver,
-            &ctx,
-            &partial,
-            &mut partial_journal,
-            &mut partial_stand_in,
-        )
-        .unwrap();
+        join_all(&driver, &ctx, &mut partial_journal, &mut partial_stand_in).unwrap();
         assert_eq!(partial_calls.borrow().as_slice(), &[1]);
         assert_eq!(read_path(&partial), expected);
-        assert_eq!(read_path(&partial).len(), 16);
     }
 
     #[test]
@@ -328,6 +292,9 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("log");
         let mut journal = Journal::open(&path).unwrap();
+        let spawned = Record::AgentSpawned {
+            agent: "child".to_string(),
+        };
         let calls = Cell::new(0u32);
         let mut stand_in = || {
             calls.set(calls.get() + 1);
@@ -338,13 +305,15 @@ mod tests {
                 command: WorkflowCommand::SpawnAgent(AgentSpec::new("child", "")),
             },
             &WorkflowContext,
-            &path,
             &mut journal,
             &mut stand_in,
         )
         .unwrap();
         assert_eq!(calls.get(), 0);
-        assert_eq!(read_path(&path), 0i64.to_le_bytes());
+        assert_eq!(
+            read_path(&path),
+            journal_bytes(std::slice::from_ref(&spawned))
+        );
         assert_eq!(
             step.commands,
             [WorkflowCommand::SpawnAgent(AgentSpec::new("child", ""))]
@@ -372,7 +341,6 @@ mod tests {
                 command: WorkflowCommand::SpawnAgent(AgentSpec::new("child", "")),
             },
             &WorkflowContext,
-            &path,
             &mut journal,
             &mut stand_in,
         )
@@ -384,7 +352,7 @@ mod tests {
         );
         assert_eq!(again.wait, WaitCondition::None);
         assert_eq!(calls.get(), 0);
-        assert_eq!(read_path(&path), 0i64.to_le_bytes());
+        assert_eq!(read_path(&path), journal_bytes(&[spawned]));
 
         for command in [
             WorkflowCommand::ExecuteTool(ToolSpec::new("counter", "")),
@@ -404,7 +372,6 @@ mod tests {
                     command: command.clone(),
                 },
                 &WorkflowContext,
-                &case,
                 &mut case_journal,
                 &mut case_stand_in,
             )
@@ -414,20 +381,20 @@ mod tests {
             match command {
                 WorkflowCommand::ExecuteTool(tool) if tool.name == "counter" => {
                     assert_eq!(case_calls.get(), 1);
-                    assert_eq!(read_path(&case), 0i64.to_le_bytes());
+                    assert_eq!(read_path(&case), journal_bytes(&[Record::counter(0)]));
                 }
                 WorkflowCommand::ExecuteTool(_)
                 | WorkflowCommand::Complete
                 | WorkflowCommand::Fail
                 | WorkflowCommand::SpawnAgent(_) => {
                     assert_eq!(case_calls.get(), 0);
-                    assert!(read_path(&case).is_empty());
+                    assert_eq!(read_path(&case), start_frame());
                 }
             }
         }
 
         let failed = dir.join("failed");
-        fs::write(&failed, 1i64.to_le_bytes()).unwrap();
+        fs::write(&failed, journal_bytes(&[Record::counter(1)])).unwrap();
         let mut failed_journal = Journal::open(&failed).unwrap();
         let fail_calls = Cell::new(0u32);
         let mut fail_stand_in = || {
@@ -437,7 +404,6 @@ mod tests {
         let (step, harness) = replay(
             &CounterBranch,
             &WorkflowContext,
-            &failed,
             &mut failed_journal,
             &mut fail_stand_in,
         )
@@ -445,7 +411,7 @@ mod tests {
         assert_eq!(step.commands, [WorkflowCommand::Fail]);
         assert!(harness.is_none());
         assert_eq!(fail_calls.get(), 0);
-        assert_eq!(read_path(&failed).len(), 8);
+        assert_eq!(read_path(&failed), journal_bytes(&[Record::counter(1)]));
 
         struct TwoSpawn;
 
@@ -471,7 +437,6 @@ mod tests {
         let error = join_all(
             &TwoSpawn,
             &WorkflowContext,
-            &joined,
             &mut joined_journal,
             &mut join_stand_in,
         )
@@ -479,6 +444,6 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(error.to_string(), "command");
         assert!(join_calls.borrow().is_empty());
-        assert!(read_path(&joined).is_empty());
+        assert_eq!(read_path(&joined), start_frame());
     }
 }

@@ -3,10 +3,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use runtime_tokio::Journal;
+use runtime_tokio::{frame, start_frame, Journal};
 use workflow_core::{
-    CounterBranch, History, Record, WaitCondition, WorkflowCommand, WorkflowContext,
-    WorkflowDriver, WorkflowStep,
+    CounterBranch, Record, WaitCondition, WorkflowCommand, WorkflowContext, WorkflowDriver,
+    WorkflowStep,
 };
 
 fn main() {
@@ -24,6 +24,8 @@ fn entry() -> std::io::Result<()> {
     match arg(&mut args)?.as_str() {
         "after-commit" => after_commit(&journal_path, &effect_path, &next_path),
         "before-commit" => before_commit(&journal_path, &effect_path, &next_path),
+        "tear-at" => tear_at(&journal_path, &effect_path, &next_path, cut(&mut args)?),
+        "tear-start-at" => tear_start_at(&journal_path, &effect_path, &next_path, cut(&mut args)?),
         "run" => run(&journal_path, &effect_path, &next_path),
         _ => Err(input("mode")),
     }
@@ -33,12 +35,12 @@ fn after_commit(journal_path: &Path, effect_path: &Path, next_path: &Path) -> st
     create_empty(effect_path)?;
     create_empty(next_path)?;
     let mut journal = Journal::open(journal_path)?;
-    match command(&evaluate(journal_path)?)? {
+    match command(&evaluate(&journal)?)? {
         WorkflowCommand::ExecuteTool(tool) if tool.name == "counter" => {
             let value = stand_in(effect_path)?;
-            journal.commit(&value.to_le_bytes())?;
+            journal.commit(&Record::counter(value))?;
             read_stdin()?;
-            match command(&evaluate(journal_path)?)? {
+            match command(&evaluate(&journal)?)? {
                 WorkflowCommand::Complete => append_one(next_path),
                 _ => Err(input("command")),
             }
@@ -51,23 +53,66 @@ fn before_commit(journal_path: &Path, effect_path: &Path, next_path: &Path) -> s
     create_empty(effect_path)?;
     create_empty(next_path)?;
     let mut journal = Journal::open(journal_path)?;
-    match command(&evaluate(journal_path)?)? {
+    match command(&evaluate(&journal)?)? {
         WorkflowCommand::ExecuteTool(tool) if tool.name == "counter" => {
             let value = stand_in(effect_path)?;
             read_stdin()?;
-            journal.commit(&value.to_le_bytes())
+            journal.commit(&Record::counter(value))
         }
         _ => Err(input("command")),
+    }
+}
+
+/// Runs the counter, then writes the first `cut` bytes of its record, as a
+/// commit killed part way leaves them, and waits to be killed.
+fn tear_at(
+    journal_path: &Path,
+    effect_path: &Path,
+    next_path: &Path,
+    cut: usize,
+) -> std::io::Result<()> {
+    create_empty(effect_path)?;
+    create_empty(next_path)?;
+    let journal = Journal::open(journal_path)?;
+    match command(&evaluate(&journal)?)? {
+        WorkflowCommand::ExecuteTool(tool) if tool.name == "counter" => {
+            let value = stand_in(effect_path)?;
+            append(journal_path, torn(&frame(&Record::counter(value))?, cut)?)?;
+            read_stdin()
+        }
+        _ => Err(input("command")),
+    }
+}
+
+/// Writes the first `cut` bytes of a new journal's `Start` frame, as a first
+/// open killed part way leaves them, and waits to be killed.
+fn tear_start_at(
+    journal_path: &Path,
+    effect_path: &Path,
+    next_path: &Path,
+    cut: usize,
+) -> std::io::Result<()> {
+    create_empty(effect_path)?;
+    create_empty(next_path)?;
+    std::fs::write(journal_path, torn(&start_frame(), cut)?)?;
+    read_stdin()
+}
+
+/// The first `cut` bytes of `frame`, when they are some but not all of it.
+fn torn(frame: &[u8], cut: usize) -> std::io::Result<&[u8]> {
+    match frame.get(..cut) {
+        Some(prefix) if cut > 0 && cut < frame.len() => Ok(prefix),
+        _ => Err(input("cut")),
     }
 }
 
 fn run(journal_path: &Path, effect_path: &Path, next_path: &Path) -> std::io::Result<()> {
     let mut journal = Journal::open(journal_path)?;
     loop {
-        match command(&evaluate(journal_path)?)? {
+        match command(&evaluate(&journal)?)? {
             WorkflowCommand::ExecuteTool(tool) if tool.name == "counter" => {
                 let value = stand_in(effect_path)?;
-                journal.commit(&value.to_le_bytes())?;
+                journal.commit(&Record::counter(value))?;
             }
             WorkflowCommand::Complete => {
                 append_one(next_path)?;
@@ -82,32 +127,12 @@ fn run(journal_path: &Path, effect_path: &Path, next_path: &Path) -> std::io::Re
     }
 }
 
-fn evaluate(journal_path: &Path) -> std::io::Result<WorkflowStep> {
-    let recorded = read_committed(journal_path)?;
-    let history = history_from_committed(&recorded)?;
-    let step = CounterBranch.evaluate(&WorkflowContext, &history);
+fn evaluate(journal: &Journal) -> std::io::Result<WorkflowStep> {
+    let step = CounterBranch.evaluate(&WorkflowContext, &journal.history()?);
     if step.wait != WaitCondition::None {
         return Err(input("wait"));
     }
     Ok(step)
-}
-
-fn history_from_committed(bytes: &[u8]) -> std::io::Result<History> {
-    match bytes.len() {
-        0 => Ok(History::default()),
-        8 => {
-            let array: [u8; 8] = bytes.try_into().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "journal length")
-            })?;
-            Ok(History::new(vec![Record::counter(i64::from_le_bytes(
-                array,
-            ))]))
-        }
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "journal length",
-        )),
-    }
 }
 
 fn command(step: &WorkflowStep) -> std::io::Result<WorkflowCommand> {
@@ -127,21 +152,17 @@ fn stand_in(effect_path: &Path) -> std::io::Result<i64> {
 }
 
 fn append_one(path: &Path) -> std::io::Result<()> {
+    append(path, &[1])
+}
+
+fn append(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(&[1])?;
-    Ok(())
+    file.write_all(bytes)
 }
 
 fn create_empty(path: &Path) -> std::io::Result<()> {
     File::create(path)?;
     Ok(())
-}
-
-fn read_committed(path: &Path) -> std::io::Result<Vec<u8>> {
-    let mut file = OpenOptions::new().read(true).open(path)?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    Ok(buf)
 }
 
 fn read_stdin() -> std::io::Result<()> {
@@ -152,6 +173,10 @@ fn read_stdin() -> std::io::Result<()> {
 
 fn arg(args: &mut impl Iterator<Item = String>) -> std::io::Result<String> {
     args.next().ok_or_else(|| input("args"))
+}
+
+fn cut(args: &mut impl Iterator<Item = String>) -> std::io::Result<usize> {
+    arg(args)?.parse().map_err(|_| input("cut"))
 }
 
 fn input(message: &str) -> std::io::Error {
