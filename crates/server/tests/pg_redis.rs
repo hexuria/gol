@@ -1311,7 +1311,8 @@ fn a_pool_of_no_connections_is_refused() {
 // error.
 #[test]
 fn a_failed_connect_names_its_cause() {
-    let url = POSTGRES_URL.replace("/gol", "/gol_no_such_database");
+    let url = POSTGRES_URL.replace("127.0.0.1/gol", "127.0.0.1/gol_no_such_database");
+    assert_ne!(url, POSTGRES_URL);
     let error = PostgresStore::connect(&url)
         .map(|_| ())
         .expect_err("no database");
