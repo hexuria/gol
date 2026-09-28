@@ -68,7 +68,7 @@ Negative controls for the failer, each on a copy of the model with `RunLogFail.c
 
 | Model | Rust |
 | --- | --- |
-| `Appends(id)` | `RunStore::append_events -> Append`. `InMemoryStore` does it under its lock. `PostgresStore` (C2) does it in one transaction on a pooled connection: `select ... for update` on the `runs` row, then the terminal check over `run_events`, then the insert. The row lock makes concurrent appends to one run take turns, and a partial unique index keeps one terminal row per run. Test: `sixteen_racing_terminal_appends_one_wins` in `crates/server/tests/pg_redis.rs`. |
+| `Appends(id)` | `RunStore::append_events -> Append`. `InMemoryStore` does it under its lock. `PostgresStore` (C2) does it in one transaction on a pooled connection: `select ... for update` on the `runs` row, then the terminal check over `run_events`, then the insert. The row lock makes concurrent appends to one run take turns: the transaction is read committed whatever the session default, so each statement after the lock sees what the lock's last holder committed. A partial unique index keeps one terminal row per run. Tests: `sixteen_racing_terminal_appends_one_wins` and `a_waiting_append_sees_what_the_lock_holder_committed` (both orders forced, also under a serializable default) in `crates/server/tests/pg_redis.rs`. |
 | `Terminal` | `store::is_terminal`: `RunCompleted`, `RunFailed`, `RunCancelled`, `RunExpired`, the terminal `DispatchPhase`s |
 | `Reput` | `put_run`, insert-once in both stores (in Postgres, the `runs` row and its first `run_events` rows in one transaction, written only when the row is new) |
 | `JevReturns` | `create_run` appends the driver's events, then folds the stored log |

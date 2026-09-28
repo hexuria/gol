@@ -67,6 +67,22 @@ pub fn is_terminal(payload: &EventPayload) -> bool {
     )
 }
 
+/// A batch of events, as `put_run` and `append_events` take it, holds at most
+/// one terminal event: the log ends at the first.
+pub(crate) fn check_one_terminal(events: &[Event]) -> Result<(), StoreError> {
+    if events
+        .iter()
+        .filter(|event| is_terminal(&event.payload))
+        .count()
+        > 1
+    {
+        return Err(StoreError::new(
+            "a batch holds more than one terminal event",
+        ));
+    }
+    Ok(())
+}
+
 /// Every method can fail with a StoreError: the store is unreachable, or a
 /// write's outcome is unknown. Callers report it and do not retry a write,
 /// which may have committed.
@@ -76,11 +92,13 @@ pub trait RunStore: Send + Sync {
     fn put_agent(&self, agent: StoredAgent) -> Result<PutAgent, StoreError>;
     fn agent(&self, id: AgentId) -> Result<Option<StoredAgent>, StoreError>;
     /// Store a new run. A run already stored under that id keeps its spec and
-    /// events, so a redelivered put cannot drop anything appended since.
+    /// events, so a redelivered put cannot drop anything appended since. A
+    /// batch with more than one terminal event is refused.
     fn put_run(&self, run: StoredRun) -> Result<(), StoreError>;
     /// Append `events` onto the stored run in one atomic step, unless the
     /// stored log is already terminal or the run is missing. `spec` and the
-    /// events already stored never change.
+    /// events already stored never change. A batch with more than one
+    /// terminal event is refused.
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError>;
     fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError>;
     /// The run with at most `limit` of its events: those after the first
@@ -139,6 +157,7 @@ impl RunStore for InMemoryStore {
     }
 
     fn put_run(&self, run: StoredRun) -> Result<(), StoreError> {
+        check_one_terminal(&run.events)?;
         write(&self.runs, "run")?
             .entry(run.spec.run_id)
             .or_insert(run);
@@ -146,6 +165,7 @@ impl RunStore for InMemoryStore {
     }
 
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
+        check_one_terminal(&events)?;
         let mut runs = write(&self.runs, "run")?;
         let Some(stored) = runs.get_mut(&id) else {
             return Ok(Append::Missing);
@@ -234,5 +254,48 @@ mod tests {
             Err(refused.clone())
         );
         assert_eq!(store.append_events(run_id, Vec::new()), Err(refused));
+    }
+
+    fn completed(spec: &RunSpec, outcome: &str) -> Event {
+        Event::record(
+            protocol::EventSource::new(
+                spec.run_id,
+                spec.agent_id,
+                &spec.agent_version,
+                protocol::Actor::System,
+                protocol::Timestamp::now(),
+            ),
+            EventPayload::RunCompleted {
+                outcome: outcome.to_string(),
+            },
+        )
+    }
+
+    // A batch may hold one terminal event: the log ends at it.
+    #[test]
+    fn a_batch_with_two_terminal_events_is_refused() {
+        let store = InMemoryStore::default();
+        let spec = spec();
+        let two = vec![completed(&spec, "a"), completed(&spec, "b")];
+        assert!(store
+            .put_run(StoredRun {
+                spec: spec.clone(),
+                events: two.clone(),
+            })
+            .is_err());
+        assert!(store.run(spec.run_id).unwrap().is_none(), "nothing stored");
+        store
+            .put_run(StoredRun {
+                spec: spec.clone(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        assert!(store.append_events(spec.run_id, two).is_err());
+        assert_eq!(
+            store
+                .run(spec.run_id)
+                .map(|run| run.map(|run| run.events.len())),
+            Ok(Some(0))
+        );
     }
 }

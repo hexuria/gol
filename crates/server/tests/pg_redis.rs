@@ -1197,3 +1197,148 @@ fn an_old_runs_table_is_refused_at_connect() {
     );
     assert_eq!(created, 1, "connect created tables before refusing");
 }
+
+/// While an outside session holds the run row with an uncommitted event at
+/// seq 2, the store appends; the session then commits. Returns the append's
+/// outcome and how many events the run holds after.
+fn forced_append_after_a_holder(
+    extra: &str,
+    held_terminal: bool,
+) -> (Result<Append, server::StoreError>, usize) {
+    let application = format!("gol_c2_{}", uuid::Uuid::new_v4().simple());
+    let url = format!("{POSTGRES_URL}?application_name={application}{extra}");
+    let store = Arc::new(PostgresStore::connect(&url).expect("connect"));
+    let spec = spec();
+    store
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: vec![user_message(&spec, 1)],
+        })
+        .expect("put run");
+    let mut holder = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("holder");
+    let mut tx = holder.transaction().expect("begin");
+    tx.query_one(
+        "select 1 from runs where id = $1 for update",
+        &[&spec.run_id.as_uuid()],
+    )
+    .expect("lock");
+    let held = if held_terminal {
+        completed(&spec, 2, "held".to_string())
+    } else {
+        user_message(&spec, 2)
+    };
+    tx.execute(
+        "insert into run_events (run_id, seq, body, terminal) values ($1, 2, $2, $3)",
+        &[
+            &spec.run_id.as_uuid(),
+            &serde_json::to_value(&held).unwrap(),
+            &held_terminal,
+        ],
+    )
+    .expect("held event");
+    let waiter = {
+        let (store, spec) = (store.clone(), spec.clone());
+        std::thread::spawn(move || store.append_events(spec.run_id, vec![user_message(&spec, 3)]))
+    };
+    wait_for_lock_wait(&application);
+    tx.commit().expect("commit");
+    let outcome = waiter.join().unwrap();
+    let len = reconnect(spec.run_id).events.len();
+    (outcome, len)
+}
+
+// Forced interleavings of the run row lock (T2). The waiting append sees what
+// the holder committed, whatever the session's default isolation: it is
+// refused after a terminal event and numbered after a plain one.
+#[test]
+fn a_waiting_append_sees_what_the_lock_holder_committed() {
+    for extra in [
+        "",
+        "&options=-cdefault_transaction_isolation%3Dserializable",
+    ] {
+        assert_eq!(
+            forced_append_after_a_holder(extra, true),
+            (Ok(Append::Terminal), 2),
+            "terminal held{extra}"
+        );
+        assert_eq!(
+            forced_append_after_a_holder(extra, false),
+            (Ok(Append::Appended), 3),
+            "message held{extra}"
+        );
+    }
+}
+
+// Connecting does not wait on a writer stalled mid-append: an existing schema
+// takes no lock that an uncommitted insert into run_events holds up.
+#[test]
+fn a_connect_does_not_wait_on_a_stalled_append() {
+    let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    let spec = spec();
+    store
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: vec![user_message(&spec, 1)],
+        })
+        .expect("put run");
+    let mut stalled = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("stalled");
+    let mut tx = stalled.transaction().expect("begin");
+    tx.execute(
+        "insert into run_events (run_id, seq, body, terminal) values ($1, 2, $2, false)",
+        &[
+            &spec.run_id.as_uuid(),
+            &serde_json::to_value(user_message(&spec, 2)).unwrap(),
+        ],
+    )
+    .expect("stalled insert");
+    let started = std::time::Instant::now();
+    let connected = std::thread::spawn(|| PostgresStore::connect(POSTGRES_URL).map(|_| ()));
+    while !connected.is_finished() && started.elapsed() < std::time::Duration::from_secs(3) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let finished = connected.is_finished();
+    tx.rollback().expect("rollback");
+    assert!(finished, "connect waited on the stalled insert");
+    assert_eq!(connected.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn a_pool_of_no_connections_is_refused() {
+    assert!(PostgresStore::connect_with_pool_size(POSTGRES_URL, 0).is_err());
+}
+
+// A connect that cannot reach its database says why, not only the kind of
+// error.
+#[test]
+fn a_failed_connect_names_its_cause() {
+    let url = POSTGRES_URL.replace("/gol", "/gol_no_such_database");
+    let error = PostgresStore::connect(&url)
+        .map(|_| ())
+        .expect_err("no database");
+    assert!(error.to_string().contains("does not exist"), "{error}");
+}
+
+// A batch may hold one terminal event, in either store: the log ends at it.
+#[test]
+fn a_batch_with_two_terminal_events_is_refused_in_postgres() {
+    let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    let spec = spec();
+    let two = vec![
+        completed(&spec, 2, "a".to_string()),
+        completed(&spec, 3, "b".to_string()),
+    ];
+    assert!(store
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: two.clone(),
+        })
+        .is_err());
+    store
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: vec![user_message(&spec, 1)],
+        })
+        .expect("put run");
+    assert!(store.append_events(spec.run_id, two).is_err());
+    assert_eq!(reconnect(spec.run_id).events.len(), 1);
+}
