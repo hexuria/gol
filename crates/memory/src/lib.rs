@@ -38,7 +38,7 @@ fn ensure_schema(client: &mut postgres::Client) -> Result<(), StoreError> {
     let keyed_by_owner = tx
         .query_opt(
             "select 1 from pg_index
-             where indrelid = to_regclass('memories') and indisprimary
+             where indrelid = to_regclass('memories') and indisprimary and indimmediate
                and (select array_agg(attname::text order by attname::text)
                     from pg_attribute
                     where attrelid = indrelid and attnum = any(indkey))
@@ -105,10 +105,19 @@ fn open(url: &str) -> Result<postgres::Client, StoreError> {
     }
     let mut client = config.connect(NoTls).map_err(sql)?;
     // Every run shares this one connection, and a call holds it for its
-    // statement: bound how long a statement or its locks can keep the rest
-    // waiting.
+    // statement: bound how long a lock wait (5 s) or a statement (10 s) can
+    // keep the rest waiting, unless the URL already sets a bound.
     client
-        .batch_execute("set statement_timeout = '5s'; set lock_timeout = '5s'")
+        .batch_execute(
+            "do $$ begin
+               if current_setting('lock_timeout') = '0' then
+                 perform set_config('lock_timeout', '5s', false);
+               end if;
+               if current_setting('statement_timeout') = '0' then
+                 perform set_config('statement_timeout', '10s', false);
+               end if;
+             end $$",
+        )
         .map_err(sql)?;
     ensure_schema(&mut client)?;
     Ok(client)

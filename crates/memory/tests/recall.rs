@@ -73,7 +73,12 @@ fn a_killed_backend_fails_one_read_then_reconnects() {
 fn a_backend_killed_mid_statement_is_replaced_on_the_next_call() {
     let key = format!("topic-mid-kill-{}", uuid_key());
     let application = format!("gol_c1_mid_{key}").replace('-', "_");
-    let url = format!("{POSTGRES_URL}?application_name={application}");
+    // Timeouts long enough that the kill, not the lock timeout, ends the
+    // write.
+    let url = format!(
+        "{POSTGRES_URL}?application_name={application}\
+         &options=-clock_timeout%3D60s%20-cstatement_timeout%3D60s"
+    );
     let scope = serde_json::to_string(&MemoryScope::Run).unwrap();
     let mut admin = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("admin");
     PostgresMemory::connect(POSTGRES_URL).expect("schema");
@@ -233,11 +238,12 @@ fn a_memories_table_with_the_old_key_is_refused_at_connect() {
 }
 
 // Every run shares one connection, so a write stuck behind a row lock gives
-// up after the lock timeout instead of holding the rest up without end.
+// up at the lock timeout (SQLSTATE 55P03) instead of holding the rest up. The
+// write runs on its own thread, so a missing timeout fails the test instead
+// of hanging it.
 #[test]
 fn a_write_waiting_on_a_lock_gives_up() {
     let key = format!("topic-locked-{}", uuid_key());
-    let store = connect();
     let scope = serde_json::to_string(&MemoryScope::Run).unwrap();
     let mut holder = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("holder");
     let mut tx = holder.transaction().expect("begin");
@@ -246,15 +252,24 @@ fn a_write_waiting_on_a_lock_gives_up() {
         &[&scope, &key],
     )
     .expect("insert");
-    let started = std::time::Instant::now();
-    let result = store.write(&owner(MemoryScope::Run), &key, "rust");
-    let waited = started.elapsed();
+    let writer = {
+        let key = key.clone();
+        std::thread::spawn(move || {
+            let store = connect();
+            let result = store.write(&owner(MemoryScope::Run), &key, "rust");
+            (store, result)
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !writer.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let gave_up = writer.is_finished();
     tx.rollback().expect("rollback");
-    assert!(result.is_err(), "the write waited out the lock");
-    assert!(
-        waited < std::time::Duration::from_secs(10),
-        "waited {waited:?}"
-    );
+    let (store, result) = writer.join().unwrap();
+    assert!(gave_up, "the write still waited on the lock after 15 s");
+    let error = result.expect_err("the write waited out the lock");
+    assert!(error.to_string().contains("55P03"), "{error}");
     assert_eq!(
         store.write(&owner(MemoryScope::Run), &key, "rust"),
         Ok(()),

@@ -70,6 +70,10 @@ impl Memory for InMemory {
 
 /// One run's memory: run and step memory kept with the run, so it is freed
 /// when the run ends, and every other scope in `shared`, which outlives it.
+///
+/// Run and step memory live only as long as this value: one call that
+/// drives the run to its end. A run resumed in a later call or another
+/// process (a queue consumer, an approval) starts them empty.
 pub struct RunMemory<'a> {
     shared: &'a dyn Memory,
     own: InMemory,
@@ -112,23 +116,35 @@ mod tests {
         }
     }
 
-    // Run and step memory stay with the run; the other scopes reach the
+    // Run and step memory stay with the run; every other scope reaches the
     // shared memory.
     #[test]
     fn a_run_keeps_only_its_run_and_step_memory() {
         let shared = InMemory::default();
+        let every = [
+            MemoryScope::Step,
+            MemoryScope::Run,
+            MemoryScope::Session,
+            MemoryScope::Agent,
+            MemoryScope::Workspace,
+            MemoryScope::User,
+            MemoryScope::Organization,
+            MemoryScope::Global,
+        ];
         {
             let run = RunMemory::new(&shared);
-            for scope in [MemoryScope::Run, MemoryScope::Step, MemoryScope::Agent] {
+            for scope in every {
                 run.write(&key(scope), "k", "v").unwrap();
                 assert_eq!(run.read(&key(scope), "k"), Ok(Some("v".to_string())));
             }
         }
-        assert_eq!(shared.read(&key(MemoryScope::Run), "k"), Ok(None));
-        assert_eq!(shared.read(&key(MemoryScope::Step), "k"), Ok(None));
-        assert_eq!(
-            shared.read(&key(MemoryScope::Agent), "k"),
-            Ok(Some("v".to_string()))
-        );
+        for scope in every {
+            let kept = !matches!(scope, MemoryScope::Run | MemoryScope::Step);
+            assert_eq!(
+                shared.read(&key(scope), "k"),
+                Ok(kept.then(|| "v".to_string())),
+                "{scope:?}"
+            );
+        }
     }
 }

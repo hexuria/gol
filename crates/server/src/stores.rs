@@ -26,7 +26,10 @@ pub fn stores_from_env(env: &BTreeMap<String, String>) -> Result<Stores, String>
             memory: Arc::new(InMemory::default()),
         });
     };
-    let max_size = match env.get("GOL_DATABASE_POOL_SIZE") {
+    let max_size = match env
+        .get("GOL_DATABASE_POOL_SIZE")
+        .filter(|size| !size.is_empty())
+    {
         None => PoolOptions::default().max_size,
         Some(size) => size
             .parse::<u32>()

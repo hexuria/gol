@@ -362,7 +362,7 @@ impl Driver {
     }
 
     /// Whose memory `scope` is for this run at its current harness step
-    /// (`Running.step`, which advances after a tool or model result).
+    /// (`Running.step`, which advances once a tool result answers the step).
     fn memory_key(&self, scope: MemoryScope) -> Option<MemoryKey> {
         let step = match self.state().harness {
             HarnessState::Running { step, .. } | HarnessState::WaitingForTool { step, .. } => step,

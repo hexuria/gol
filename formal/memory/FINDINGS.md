@@ -13,7 +13,7 @@ Writers: runs of different owners. Each has a driver that performs `MemoryWrite`
 `Design = "old"` keys an entry by its scope alone, as before C3. `Design = "new"` also keys it by its owner.
 
 The model checks the organization scope, owned by the run's tenant, so `NoCrossScopeRead` means no run reads another tenant's organization memory. The other scopes are not all tenant-bound:
-- User, agent and session memory follow their principal (issuer and subject) across that principal's tenants, by design. Session memory is also keyed by the tenant.
+- User and agent memory follow their principal (issuer and subject) across that principal's tenants, by design. Session memory is keyed by the tenant too, so it does not.
 - Global memory is denied by the authorizer.
 - Each scope's key is checked in Rust (Mapping).
 
@@ -47,16 +47,18 @@ Negative controls, each on a copy of the config with `-workers 1`:
 ## Mapping
 
 - `NoCrossScopeRead`: `no_cross_scope_read` (`harness::memory_scenarios`). Sixteen runs of two tenants write and read organization memory on concurrent threads, against `InMemory` (`crates/harness/tests/memory_scopes.rs`) and `PostgresMemory` (`crates/memory/tests/recall.rs`). Racing threads are evidence, not a forcing test.
-- The other scopes' keys are tested through the same scenarios on both memories:
+- The other scopes' keys are tested through the same scenarios on both memories, each run with its own `RunMemory` as on the server:
   - `run_memory_isolated_between_runs`
   - `step_memory_isolated_between_steps`
   - `agent_memory_survives_across_runs`
   - `user_memory_isolated_between_tenants`
   - `session_memory_belongs_to_its_user`
+  - `workspace_memory_belongs_to_its_organization`
+  - `global_memory_is_denied`
 - The key itself is tested by the `memory_owner_tests` unit tests in `crates/protocol/src/effect.rs`, which build each scope's id and check that no two owners' ids run together.
 - The counterexample trace for the unscoped design, forced: `no_cross_scope_read_in_the_model_trace` (run 1 writes, run 2 of another tenant writes, run 1 reads its own value), on both memories.
 - The model's environment assumption is that each call is atomic. In Postgres, each call is one SQL statement. In memory, it is one lock scope.
-- `EveryRunReads` assumes each call returns. In Postgres, a statement or lock wait is bounded by `statement_timeout` and `lock_timeout` of 5 s: `a_write_waiting_on_a_lock_gives_up` (`crates/memory/tests/recall.rs`).
+- `EveryRunReads` assumes each call returns. In Postgres, a lock wait is bounded at 5 s and a statement at 10 s, unless the URL sets its own bounds. `a_write_waiting_on_a_lock_gives_up` (`crates/memory/tests/recall.rs`) checks the lock timeout (SQLSTATE 55P03).
 - `ReadsFindAValue`: unlinked.
 - Not modelled: a crash between a Postgres write and the run's `MemoryWritten` event leaves a row that no run log records.
 

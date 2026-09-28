@@ -2,7 +2,9 @@
 //! the shared contract that `InMemory` and `memory::PostgresMemory` both
 //! pass (owner decision 10 for C3). Each scenario panics when a scope leaks
 //! or loses what it should keep. Every principal and tenant is new, so a
-//! persistent store's earlier rows cannot answer for them.
+//! persistent store's earlier rows cannot answer for them. Each run gets its
+//! own `RunMemory` over the memory under test, as a server run does, so run
+//! and step memory stay with the run and the other scopes reach the store.
 use std::collections::BTreeMap;
 
 use protocol::{
@@ -10,7 +12,9 @@ use protocol::{
     InvocationId, MemoryScope, ModelProvider, Owner, RunSpec, WorkModel, SESSION_ID, WORKSPACE_ID,
 };
 
-use crate::{run_to_completion, Driver, EchoTool, Memory, ScriptedDecider, UnavailableModel};
+use crate::{
+    run_to_completion, Driver, EchoTool, Memory, RunMemory, ScriptedDecider, UnavailableModel,
+};
 
 const ISSUER: &str = "https://issuer.test";
 
@@ -93,12 +97,13 @@ fn run(spec: RunSpec, effects: Vec<Effect>, memory: &dyn Memory) -> Vec<Event> {
         outcome: "done".to_string(),
     });
     let mut decider = ScriptedDecider::new(script);
+    let run_memory = RunMemory::new(memory);
     run_to_completion(
         &mut driver,
         &mut decider,
         &[&EchoTool],
         &UnavailableModel,
-        memory,
+        &run_memory,
     )
     .expect("run");
     driver.events().to_vec()
@@ -361,12 +366,13 @@ pub fn no_cross_scope_read_in_the_model_trace(memory: &dyn Memory) {
     let (first, second) = (fresh("tenant"), fresh("tenant"));
     let mut one = Driver::boot(spec(&who(&alice, &first))).expect("boot");
     let mut two = Driver::boot(spec(&who(&bob, &second))).expect("boot");
-    let perform = |driver: &mut Driver, effect: Effect| {
+    let (one_memory, two_memory) = (RunMemory::new(memory), RunMemory::new(memory));
+    let perform = |driver: &mut Driver, effect: Effect, memory: &RunMemory<'_>| {
         driver.perform(&[effect], &[], &UnavailableModel, memory);
     };
-    perform(&mut one, write(MemoryScope::Organization, "A"));
-    perform(&mut two, write(MemoryScope::Organization, "B"));
-    perform(&mut one, read(MemoryScope::Organization));
+    perform(&mut one, write(MemoryScope::Organization, "A"), &one_memory);
+    perform(&mut two, write(MemoryScope::Organization, "B"), &two_memory);
+    perform(&mut one, read(MemoryScope::Organization), &one_memory);
     assert_eq!(found(one.events()), [value("A")]);
 }
 

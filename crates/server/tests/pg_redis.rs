@@ -1580,6 +1580,12 @@ fn the_database_url_selects_postgres() {
     stores.memory.write(&owner, "topic", "kept").expect("write");
     let fresh = memory::PostgresMemory::connect(POSTGRES_URL).expect("connect");
     assert_eq!(fresh.read(&owner, "topic"), Ok(Some("kept".to_string())));
+    // An empty pool size, like an empty URL, counts as unset.
+    assert!(server::stores_from_env(&env(&[
+        ("GOL_DATABASE_URL", POSTGRES_URL),
+        ("GOL_DATABASE_POOL_SIZE", ""),
+    ]))
+    .is_ok());
 }
 
 // A pool size that is not a positive count, or a database the server cannot

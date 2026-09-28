@@ -76,8 +76,9 @@ pub const WORKSPACE_ID: &str = "workspace_id";
 /// caller's metadata, so a session belongs to its user in its tenant and a
 /// workspace to its organization. Parts are length-prefixed, so no two
 /// different owners share an id. `None` when the metadata names no session or
-/// workspace (the authorizer denies those effects, decision 2B). Global
-/// memory has no owner; the authorizer denies it.
+/// workspace (the authorizer denies those effects, decision 2B), and for
+/// global memory, which would be every tenant's: it has no owner, and the
+/// authorizer denies it.
 pub fn memory_owner_id(spec: &RunSpec, scope: MemoryScope, step: u32) -> Option<String> {
     let owner = &spec.owner;
     let user = || joined(&[&owner.issuer, &owner.subject]);
@@ -96,7 +97,7 @@ pub fn memory_owner_id(spec: &RunSpec, scope: MemoryScope, step: u32) -> Option<
         MemoryScope::Organization => organization(),
         MemoryScope::Session => user() + &joined(&[&owner.tenant]) + &named(SESSION_ID)?,
         MemoryScope::Workspace => organization() + &named(WORKSPACE_ID)?,
-        MemoryScope::Global => String::new(),
+        MemoryScope::Global => return None,
     })
 }
 
@@ -146,7 +147,7 @@ mod memory_owner_tests {
             owner(MemoryScope::Workspace),
             Some(format!("{organization}3:w-1"))
         );
-        assert_eq!(owner(MemoryScope::Global), Some(String::new()));
+        assert_eq!(owner(MemoryScope::Global), None);
     }
 
     // Session and workspace ids come from the caller's metadata, so they are
