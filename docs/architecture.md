@@ -6,7 +6,7 @@ The control plane accepts a run and records dispatch. Dispatch has its own reduc
 
 The harness plane owns the loop. `reduce` is pure. The driver performs an effect only after `reduce` emits it. The checked phases are `Idle`, `Running`, `WaitingForTool`, `Completed`, `Failed`, and `Cancelled`. `Running` stores the step, the attempt, and whether the current step has been answered. A tool result is an event.
 
-The execution plane runs `Local`, `Reverse`, and `Box`. Reverse and box run on a worker thread with the echo tool. Memory is an in-memory map. The gateway turns one provider payload into `ModelMessage`. The harness does not read provider JSON.
+The execution plane runs `Local`, `Reverse`, and `Box`. Reverse and box run on a worker thread with the echo tool. Memory is keyed by scope and owner, in an in-memory map or Postgres (`GOL_DATABASE_URL`); a server's runs share it, and run and step memory stay with their run. The gateway turns one provider payload into `ModelMessage`. The harness does not read provider JSON.
 
 The coworker desktop picks the computer and the credential. Subscription model HTTP is made by the desktop against the local proxy. Platform gateway model HTTP is made by the server. The message record stays on the server either way. The agent container does not make the model call. The desktop is the gpuix app in `coworker/`.
 

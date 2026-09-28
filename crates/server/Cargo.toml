@@ -19,6 +19,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 jsonwebtoken = { version = "9.3.1", default-features = false }
 url = "2.5"
 r2d2 = "0.8"
+memory = { path = "../memory" }
 
 [dev-dependencies]
 jsonwebtoken = { version = "9.3.1", features = ["use_pem"] }

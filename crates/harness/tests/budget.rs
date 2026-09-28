@@ -71,7 +71,7 @@ fn run_with(limits: Limits, effects: Vec<Effect>, models: &dyn ModelCompletion) 
         &mut decider,
         &tools,
         models,
-        &mut InMemory::default(),
+        &InMemory::default(),
     )
     .unwrap();
     driver
@@ -287,7 +287,7 @@ fn a_complete_that_cannot_finish_the_run_costs_a_step() {
         &mut decider,
         &tools,
         &UnavailableModel,
-        &mut InMemory::default(),
+        &InMemory::default(),
     );
     assert!(ended.is_ok(), "{ended:?}");
     assert!(failed_on_budget(&driver), "{:?}", driver.state().harness);
@@ -362,7 +362,7 @@ fn a_decider_sees_which_budget_is_spent() {
         &mut decider,
         &tools,
         &Answering,
-        &mut InMemory::default(),
+        &InMemory::default(),
     )
     .unwrap();
     assert!(completed(&driver), "{:?}", driver.state().harness);

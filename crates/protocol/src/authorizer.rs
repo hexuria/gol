@@ -1,5 +1,5 @@
 use crate::policy::PolicyDecision;
-use crate::{Capability, Effect, RunSpec, ToolDescriptor};
+use crate::{memory_owner_id, Capability, Effect, MemoryScope, RunSpec, ToolDescriptor};
 
 const MODEL_CALL: &str = "model.call";
 const MEMORY_READ: &str = "memory.read";
@@ -14,8 +14,8 @@ pub fn authorize(spec: &RunSpec, effect: &Effect, tools: &[ToolDescriptor]) -> P
         // complete_is_allowed_without_capabilities.
         Effect::Complete { .. } => PolicyDecision::Allow,
         Effect::ModelCall { .. } => allow_capability(spec, MODEL_CALL),
-        Effect::MemoryRead { .. } => allow_capability(spec, MEMORY_READ),
-        Effect::MemoryWrite { .. } => allow_capability(spec, MEMORY_WRITE),
+        Effect::MemoryRead { scope, .. } => allow_memory(spec, MEMORY_READ, *scope),
+        Effect::MemoryWrite { scope, .. } => allow_memory(spec, MEMORY_WRITE, *scope),
         Effect::ToolCall { name, .. } => match tools.iter().find(|tool| tool.name == *name) {
             Some(tool) => allow_capability(spec, tool.required_capability.as_str()),
             None => PolicyDecision::Deny {
@@ -30,6 +30,31 @@ pub fn authorize(spec: &RunSpec, effect: &Effect, tools: &[ToolDescriptor]) -> P
         | Effect::PublishArtifact { .. } => PolicyDecision::Deny {
             reason: "effect is not implemented in this slice".to_string(),
         },
+    }
+}
+
+/// The capability, and for session and workspace memory the id that names
+/// whose memory it is (owner decision 2B for C3). Global memory is denied:
+/// every tenant would share it, and a manifest grants its own capabilities.
+fn allow_memory(spec: &RunSpec, capability: &str, scope: MemoryScope) -> PolicyDecision {
+    let decision = allow_capability(spec, capability);
+    if decision != PolicyDecision::Allow {
+        return decision;
+    }
+    if scope == MemoryScope::Global {
+        return PolicyDecision::Deny {
+            reason: "global memory is shared by every tenant and is not offered".to_string(),
+        };
+    }
+    if memory_owner_id(spec, scope, 0).is_some() {
+        return decision;
+    }
+    let key = match scope {
+        MemoryScope::Workspace => crate::WORKSPACE_ID,
+        _ => crate::SESSION_ID,
+    };
+    PolicyDecision::Deny {
+        reason: format!("no {key} in the run's metadata"),
     }
 }
 
@@ -89,5 +114,99 @@ mod tests {
             outcome: "done".to_string(),
         };
         assert_eq!(authorize(&spec, &effect, &[]), PolicyDecision::Allow);
+    }
+
+    fn memory_spec(metadata: &[(&str, &str)]) -> crate::RunSpec {
+        let mut spec = sample_spec();
+        spec.capabilities = vec![
+            Capability::new("memory.read"),
+            Capability::new("memory.write"),
+        ];
+        for (key, value) in metadata {
+            spec.metadata.insert(key.to_string(), value.to_string());
+        }
+        spec
+    }
+
+    fn read(scope: crate::MemoryScope) -> Effect {
+        Effect::MemoryRead {
+            scope,
+            key: "k".to_string(),
+        }
+    }
+
+    fn write(scope: crate::MemoryScope) -> Effect {
+        Effect::MemoryWrite {
+            scope,
+            key: "k".to_string(),
+            value: "v".to_string(),
+        }
+    }
+
+    // Owner decision 2B for C3: session and workspace memory need their id in
+    // the spec's metadata; without it the effect is denied, and the run goes on.
+    #[test]
+    fn session_memory_needs_a_session_id() {
+        use crate::MemoryScope::Session;
+        let denied = PolicyDecision::Deny {
+            reason: "no session_id in the run's metadata".to_string(),
+        };
+        let without = memory_spec(&[]);
+        let with = memory_spec(&[("session_id", "s-1")]);
+        for effect in [read(Session), write(Session)] {
+            assert_eq!(authorize(&without, &effect, &[]), denied, "{effect:?}");
+            assert_eq!(
+                authorize(&with, &effect, &[]),
+                PolicyDecision::Allow,
+                "{effect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_memory_needs_a_workspace_id() {
+        use crate::MemoryScope::Workspace;
+        let denied = PolicyDecision::Deny {
+            reason: "no workspace_id in the run's metadata".to_string(),
+        };
+        let without = memory_spec(&[("workspace_id", "")]);
+        let with = memory_spec(&[("workspace_id", "w-1")]);
+        for effect in [read(Workspace), write(Workspace)] {
+            assert_eq!(authorize(&without, &effect, &[]), denied, "{effect:?}");
+            assert_eq!(
+                authorize(&with, &effect, &[]),
+                PolicyDecision::Allow,
+                "{effect:?}"
+            );
+        }
+    }
+
+    // Global memory would be shared by every tenant, so it is denied even
+    // with both capabilities.
+    #[test]
+    fn global_memory_is_denied() {
+        let spec = memory_spec(&[]);
+        let denied = PolicyDecision::Deny {
+            reason: "global memory is shared by every tenant and is not offered".to_string(),
+        };
+        for effect in [
+            read(crate::MemoryScope::Global),
+            write(crate::MemoryScope::Global),
+        ] {
+            assert_eq!(authorize(&spec, &effect, &[]), denied, "{effect:?}");
+        }
+    }
+
+    // The capability check still comes first.
+    #[test]
+    fn a_memory_effect_without_its_capability_is_denied_first() {
+        let mut spec = memory_spec(&[("session_id", "s-1")]);
+        spec.capabilities.clear();
+        assert_eq!(
+            authorize(&spec, &read(crate::MemoryScope::Session), &[]),
+            PolicyDecision::Deny {
+                reason: "missing capability: memory.read".to_string()
+            }
+        );
     }
 }

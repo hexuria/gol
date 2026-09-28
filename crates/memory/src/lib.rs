@@ -3,7 +3,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use harness::{Memory, StoreError};
+use harness::{Memory, MemoryKey, StoreError};
 use postgres::NoTls;
 use protocol::MemoryScope;
 
@@ -18,27 +18,45 @@ pub struct PostgresMemory {
 const SCHEMA: &str = "
 create table if not exists memories (
     scope text not null,
+    owner_id text not null,
     key text not null,
     value text not null,
-    primary key (scope, key)
+    primary key (scope, owner_id, key)
 );
 ";
 
-fn ensure_schema(client: &mut postgres::Client) -> Result<(), postgres::Error> {
-    client.batch_execute("begin")?;
-    if let Err(err) = client.query_one("select pg_advisory_xact_lock(872347)", &[]) {
-        let _ = client.batch_execute("rollback");
-        return Err(err);
+fn ensure_schema(client: &mut postgres::Client) -> Result<(), StoreError> {
+    let mut tx = client.transaction().map_err(sql)?;
+    tx.query_one("select pg_advisory_xact_lock(872347)", &[])
+        .map_err(sql)?;
+    tx.batch_execute(SCHEMA).map_err(sql)?;
+    // A table from before owners keeps `create table if not exists` from
+    // adding the column or the key. Its rows have no owner, so it is refused
+    // (owner decision 4A for C3), and so is one given the column but not the
+    // key, whose writes would all fail; dropping the transaction rolls back
+    // anything created above.
+    let keyed_by_owner = tx
+        .query_opt(
+            "select 1 from pg_index
+             where indrelid = to_regclass('memories') and indisprimary and indimmediate
+               and (select array_agg(attname::text order by attname::text)
+                    from pg_attribute
+                    where attrelid = indrelid and attnum = any(indkey))
+                   = array['key', 'owner_id', 'scope']",
+            &[],
+        )
+        .map_err(sql)?;
+    if keyed_by_owner.is_none() {
+        return Err(StoreError::new(
+            "memories is not keyed by (scope, owner_id, key), from before scoped memory: \
+             drop table memories",
+        ));
     }
-    if let Err(err) = client.batch_execute(SCHEMA) {
-        let _ = client.batch_execute("rollback");
-        return Err(err);
-    }
-    client.batch_execute("commit")
+    tx.commit().map_err(sql)
 }
 
 impl PostgresMemory {
-    pub fn connect(url: &str) -> Result<Self, postgres::Error> {
+    pub fn connect(url: &str) -> Result<Self, StoreError> {
         let client = open(url)?;
         Ok(Self {
             url: url.to_string(),
@@ -80,12 +98,29 @@ impl PostgresMemory {
 /// How long a connect may take when the URL sets no `connect_timeout`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn open(url: &str) -> Result<postgres::Client, postgres::Error> {
-    let mut config: postgres::Config = url.parse()?;
+fn open(url: &str) -> Result<postgres::Client, StoreError> {
+    let mut config: postgres::Config = url.parse().map_err(sql)?;
     if config.get_connect_timeout().is_none() {
         config.connect_timeout(CONNECT_TIMEOUT);
     }
-    let mut client = config.connect(NoTls)?;
+    let mut client = config.connect(NoTls).map_err(sql)?;
+    // Every run shares this one connection, and a call holds it for its
+    // statement: bound how long a lock wait (5 s) or a statement (10 s) can
+    // keep the rest waiting, unless the URL, role or database already sets a
+    // non-zero bound. Qualified, so no function on the search path answers
+    // for them.
+    client
+        .batch_execute(
+            "do $$ begin
+               if pg_catalog.current_setting('lock_timeout') = '0' then
+                 perform pg_catalog.set_config('lock_timeout', '5s', false);
+               end if;
+               if pg_catalog.current_setting('statement_timeout') = '0' then
+                 perform pg_catalog.set_config('statement_timeout', '10s', false);
+               end if;
+             end $$",
+        )
+        .map_err(sql)?;
     ensure_schema(&mut client)?;
     Ok(client)
 }
@@ -96,7 +131,6 @@ fn open(url: &str) -> Result<postgres::Client, postgres::Error> {
 fn reconnect(url: &str) -> Result<postgres::Client, StoreError> {
     catch_unwind(AssertUnwindSafe(|| open(url)))
         .map_err(|_| StoreError::new("memory connect panicked"))?
-        .map_err(sql)
 }
 
 /// The full error for stderr: `postgres::Error` displays only its kind.
@@ -119,24 +153,24 @@ fn scope_name(scope: MemoryScope) -> Result<String, StoreError> {
 }
 
 impl Memory for PostgresMemory {
-    fn read(&self, scope: MemoryScope, key: &str) -> Result<Option<String>, StoreError> {
-        let scope = scope_name(scope)?;
+    fn read(&self, owner: &MemoryKey, key: &str) -> Result<Option<String>, StoreError> {
+        let scope = scope_name(owner.scope)?;
         let row = self.with_client(|client| {
             client.query_opt(
-                "select value from memories where scope = $1 and key = $2",
-                &[&scope, &key],
+                "select value from memories where scope = $1 and owner_id = $2 and key = $3",
+                &[&scope, &owner.owner_id, &key],
             )
         })?;
         row.map(|row| row.try_get(0).map_err(sql)).transpose()
     }
 
-    fn write(&mut self, scope: MemoryScope, key: &str, value: &str) -> Result<(), StoreError> {
-        let scope = scope_name(scope)?;
+    fn write(&self, owner: &MemoryKey, key: &str, value: &str) -> Result<(), StoreError> {
+        let scope = scope_name(owner.scope)?;
         self.with_client(|client| {
             client.execute(
-                "insert into memories (scope, key, value) values ($1, $2, $3)
-                 on conflict (scope, key) do update set value = excluded.value",
-                &[&scope, &key, &value],
+                "insert into memories (scope, owner_id, key, value) values ($1, $2, $3, $4)
+                 on conflict (scope, owner_id, key) do update set value = excluded.value",
+                &[&scope, &owner.owner_id, &key, &value],
             )
         })
         .map(|_| ())

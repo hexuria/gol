@@ -13,6 +13,12 @@ The toolchain is Rust 1.98.1.
 
 The server listens on `http://127.0.0.1:43123`. Override the port with `GOL_PORT`.
 
+Runs and memory are kept in the process unless `GOL_DATABASE_URL` names a Postgres database, for example `postgres://gol:gol@127.0.0.1/gol`. The server then keeps runs, and every memory scope but run and step memory, there. Run and step memory stay in the process with their run.
+- It uses a pool of `GOL_DATABASE_POOL_SIZE` connections (default 8) for runs, keeps one idle, and opens one more connection for memory.
+- It refuses to start, saying why, when it cannot reach the database, the pool size is not a positive count, or a table predates the current schema (drop it).
+- It connects without TLS, so keep the database on a private network.
+- Memory bounds a lock wait at 5 s and a statement at 10 s unless the URL, role or database sets its own. Behind a transaction-mode pooler, set them on the role.
+
 ## Authentication
 
 Every route needs `Authorization: Bearer <token>`. The server refuses to start unless one of these is configured:
@@ -110,7 +116,7 @@ export BEND_NO_TELEMETRY=1
 
 ## Formal model
 
-`formal/runlog/RunLog.tla` models the writers of a run's event log. Its findings are in `formal/runlog/FINDINGS.md`. `formal/agentowner/AgentOwner.tla` models principals racing to store one agent manifest; its findings are in `formal/agentowner/FINDINGS.md`. `formal/RETIRED.md` records retired checks and what owns their properties now. The reducers themselves are checked in Rust: `crates/protocol/tests/reduce_bounded.rs` enumerates every bounded (state, event) pair of production `reduce` and `reduce_dispatch`.
+`formal/runlog/RunLog.tla` models the writers of a run's event log. Its findings are in `formal/runlog/FINDINGS.md`. `formal/agentowner/AgentOwner.tla` models principals racing to store one agent manifest; its findings are in `formal/agentowner/FINDINGS.md`. `formal/memory/Memory.tla` models runs of different tenants writing and reading memory at the same time; its findings are in `formal/memory/FINDINGS.md`. `formal/RETIRED.md` records retired checks and what owns their properties now. The reducers themselves are checked in Rust: `crates/protocol/tests/reduce_bounded.rs` enumerates every bounded (state, event) pair of production `reduce` and `reduce_dispatch`.
 
 `./scripts/install-tla.sh` installs the pinned TLA+ tools, v1.7.4 (TLC 2.19), at `~/.local/tla/tla2tools.jar` and checks its sha256. `./scripts/verify-tla.sh` runs TLC on every `formal/**/*.cfg` with `-workers auto -lncheck final`. TLC checks deadlock on every config; AGENTS.md forbids turning it off. The script reads the jar from `TLA_JAR`, then `~/.local/tla/tla2tools.jar`, then `/usr/share/java/tla2tools.jar`.
 

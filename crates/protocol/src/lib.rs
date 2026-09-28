@@ -12,7 +12,7 @@ mod spec;
 mod tool;
 
 pub use authorizer::authorize;
-pub use effect::{Effect, MemoryScope};
+pub use effect::{memory_owner_id, Effect, MemoryScope, SESSION_ID, WORKSPACE_ID};
 pub use event::{Actor, Event, EventEnvelope, EventPayload, EventSource, Timestamp};
 pub use fold::{fold, RunState};
 pub use id::{AgentId, ApprovalId, ArtifactId, EventId, InvocationId, RunId, StepId, ToolId};

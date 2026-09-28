@@ -1,7 +1,8 @@
 //! A memory store that fails ends the run with RunFailed{Infrastructure}; the
 //! memory effect is not recorded as done.
 use harness::{
-    run_to_completion, Driver, InMemory, Memory, ScriptedDecider, StoreError, UnavailableModel,
+    run_to_completion, Driver, InMemory, Memory, MemoryKey, ScriptedDecider, StoreError,
+    UnavailableModel,
 };
 use protocol::{
     AgentId, Capability, CredentialSource, Effect, EventPayload, ExecutionPlacement, FailureClass,
@@ -11,11 +12,11 @@ use protocol::{
 struct Down;
 
 impl Memory for Down {
-    fn read(&self, _scope: MemoryScope, _key: &str) -> Result<Option<String>, StoreError> {
+    fn read(&self, _owner: &MemoryKey, _key: &str) -> Result<Option<String>, StoreError> {
         Err(StoreError::new("connection refused"))
     }
 
-    fn write(&mut self, _scope: MemoryScope, _key: &str, _value: &str) -> Result<(), StoreError> {
+    fn write(&self, _owner: &MemoryKey, _key: &str, _value: &str) -> Result<(), StoreError> {
         Err(StoreError::new("connection refused"))
     }
 }
@@ -38,7 +39,7 @@ fn spec() -> RunSpec {
         .build()
 }
 
-fn run(effect: Effect, memory: &mut dyn Memory) -> Driver {
+fn run(effect: Effect, memory: &dyn Memory) -> Driver {
     let mut driver = Driver::boot(spec()).unwrap();
     let mut decider = ScriptedDecider::new([
         effect,
@@ -80,7 +81,7 @@ fn memory_events(driver: &Driver) -> usize {
 
 #[test]
 fn a_memory_read_error_fails_the_run() {
-    let driver = run(read(), &mut Down);
+    let driver = run(read(), &Down);
     assert_eq!(
         driver.state().harness,
         HarnessState::Failed {
@@ -93,7 +94,7 @@ fn a_memory_read_error_fails_the_run() {
 
 #[test]
 fn a_memory_write_error_fails_the_run() {
-    let driver = run(write(), &mut Down);
+    let driver = run(write(), &Down);
     assert_eq!(
         driver.state().harness,
         HarnessState::Failed {
@@ -106,8 +107,8 @@ fn a_memory_write_error_fails_the_run() {
 
 #[test]
 fn a_working_memory_records_the_effect_and_completes() {
-    let mut memory = InMemory::default();
-    let driver = run(write(), &mut memory);
+    let memory = InMemory::default();
+    let driver = run(write(), &memory);
     assert_eq!(memory_events(&driver), 1);
     assert_eq!(
         driver.state().harness,
@@ -116,7 +117,13 @@ fn a_working_memory_records_the_effect_and_completes() {
         }
     );
     assert_eq!(
-        memory.read(MemoryScope::Run, "k"),
+        memory.read(
+            &MemoryKey {
+                scope: MemoryScope::Run,
+                owner_id: driver.events()[0].envelope.run_id.to_string(),
+            },
+            "k"
+        ),
         Ok(Some("v".to_string()))
     );
 }

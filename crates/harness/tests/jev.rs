@@ -131,7 +131,7 @@ async fn try_run(base_url: String, limits: Limits, input: &str) -> (Result<(), D
             &mut decider,
             &tools,
             &Answering,
-            &mut InMemory::default(),
+            &InMemory::default(),
         );
         let ran = Ran {
             events: driver.events().to_vec(),

@@ -1545,3 +1545,84 @@ async fn the_events_route_pages_a_postgres_log() {
     assert_eq!(page("?after=3").await, expected[3..5]);
     assert_eq!(page("").await, expected);
 }
+
+fn env(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+// GOL_DATABASE_URL puts the server's runs and memory in Postgres: what it
+// stores, a fresh connection finds.
+#[test]
+fn the_database_url_selects_postgres() {
+    use harness::{Memory, MemoryKey};
+    let stores = server::stores_from_env(&env(&[
+        ("GOL_DATABASE_URL", POSTGRES_URL),
+        ("GOL_DATABASE_POOL_SIZE", "2"),
+    ]))
+    .expect("stores");
+    let spec = spec();
+    let run_id = spec.run_id;
+    stores
+        .runs
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: vec![user_message(&spec, 1)],
+        })
+        .expect("put run");
+    assert_eq!(reconnect(run_id).events.len(), 1);
+    let owner = MemoryKey {
+        scope: protocol::MemoryScope::Run,
+        owner_id: run_id.to_string(),
+    };
+    stores.memory.write(&owner, "topic", "kept").expect("write");
+    let fresh = memory::PostgresMemory::connect(POSTGRES_URL).expect("connect");
+    assert_eq!(fresh.read(&owner, "topic"), Ok(Some("kept".to_string())));
+    // An empty pool size, like an empty URL, counts as unset.
+    assert!(server::stores_from_env(&env(&[
+        ("GOL_DATABASE_URL", POSTGRES_URL),
+        ("GOL_DATABASE_POOL_SIZE", ""),
+    ]))
+    .is_ok());
+}
+
+// A pool size that is not a positive count, or a database the server cannot
+// reach, refuses to start, saying why.
+#[test]
+fn a_bad_database_setting_refuses_to_start() {
+    for size in ["0", "x", "-1"] {
+        let error = server::stores_from_env(&env(&[
+            ("GOL_DATABASE_URL", POSTGRES_URL),
+            ("GOL_DATABASE_POOL_SIZE", size),
+        ]))
+        .map(|_| ())
+        .expect_err(size);
+        assert!(error.contains("GOL_DATABASE_POOL_SIZE"), "{error}");
+    }
+    let missing = POSTGRES_URL.replace("127.0.0.1/gol", "127.0.0.1/gol_no_such_database");
+    let error = server::stores_from_env(&env(&[("GOL_DATABASE_URL", &missing)]))
+        .map(|_| ())
+        .expect_err("no database");
+    assert!(error.contains("does not exist"), "{error}");
+}
+
+// Without GOL_DATABASE_URL, what the server stores stays in the process: a
+// Postgres connection does not find it.
+#[test]
+fn no_database_url_keeps_runs_out_of_postgres() {
+    let stores = server::stores_from_env(&env(&[("GOL_DATABASE_URL", "")])).expect("stores");
+    let spec = spec();
+    let run_id = spec.run_id;
+    stores
+        .runs
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: vec![user_message(&spec, 1)],
+        })
+        .expect("put run");
+    assert!(stores.runs.run(run_id).expect("store").is_some());
+    let postgres = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    assert!(postgres.run(run_id).expect("store").is_none());
+}

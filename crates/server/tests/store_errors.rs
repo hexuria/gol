@@ -368,3 +368,21 @@ async fn a_failed_turn_reports_its_own_error_when_the_store_cannot_end_it() {
         (502, r#"{"error":"gateway down"}"#)
     );
 }
+
+// Without GOL_DATABASE_URL, or with it empty, the server starts without a
+// database and does not read the pool size. crates/server/tests/pg_redis.rs
+// checks that those stores are not Postgres.
+#[test]
+fn no_database_url_does_not_read_the_pool_size() {
+    for url in [None, Some("")] {
+        let mut env: std::collections::BTreeMap<String, String> =
+            [("GOL_DATABASE_POOL_SIZE".to_string(), "x".to_string())]
+                .into_iter()
+                .collect();
+        if let Some(url) = url {
+            env.insert("GOL_DATABASE_URL".to_string(), url.to_string());
+        }
+        let stores = server::stores_from_env(&env).expect("stores");
+        assert!(stores.runs.run(RunId::new()).expect("store").is_none());
+    }
+}

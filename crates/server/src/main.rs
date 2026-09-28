@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 use std::sync::Arc;
 
-use server::{auth_from_env, router_with_gateway, HttpGatewayPoster, InMemoryStore};
+use server::{auth_from_env, router_with_memory, stores_from_env, HttpGatewayPoster};
 
 #[tokio::main]
 async fn main() {
@@ -22,14 +22,28 @@ async fn main() {
             "gol: WARNING: GOL_AUTH=local-dev accepts a static token; never use it in production"
         );
     }
+    // Postgres when GOL_DATABASE_URL is set. Connecting blocks, so it runs
+    // off the async runtime.
+    let stores = match tokio::task::spawn_blocking(move || stores_from_env(&env)).await {
+        Ok(Ok(stores)) => stores,
+        Ok(Err(message)) => {
+            eprintln!("gol: refusing to start: {message}");
+            std::process::exit(2);
+        }
+        Err(error) => {
+            eprintln!("gol: refusing to start: {error}");
+            std::process::exit(2);
+        }
+    };
     let port = std::env::var("GOL_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(43123);
     let jev_base_url = std::env::var("TYPESAFE_BASE_URL")
         .unwrap_or_else(|_| "https://api.typesafe.ai".to_string());
-    let app = router_with_gateway(
-        Arc::new(InMemoryStore::default()),
+    let app = router_with_memory(
+        stores.runs,
+        stores.memory,
         jev_base_url,
         Arc::new(HttpGatewayPoster::from_env()),
         auth,
