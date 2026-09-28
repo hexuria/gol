@@ -116,6 +116,11 @@ fn kill_mid_start_header_rewrites_it() {
     }
 }
 
+/// How long a child may take to reach its window or to finish. A first run
+/// of a freshly linked binary can be slow (macOS scans it), so this is a
+/// ceiling for a stuck child, not the expected time.
+const DEADLINE: Duration = Duration::from_secs(30);
+
 fn proof_dir(case: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("gol-proof-{}-{}", std::process::id(), case));
     let _ = fs::remove_dir_all(&dir);
@@ -141,7 +146,7 @@ where
         .spawn()
         .unwrap();
     let stdin = child.stdin.take().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + DEADLINE;
     loop {
         assert_running(&mut child);
         if let Some((log_bytes, effect_bytes, next_bytes)) = published(&log, &effect, &next) {
@@ -180,7 +185,7 @@ fn run_again(dir: &Path) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + DEADLINE;
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             let mut err = String::new();
