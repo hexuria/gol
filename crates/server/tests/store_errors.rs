@@ -29,6 +29,9 @@ impl RunStore for DownStore {
     fn agent(&self, _id: AgentId) -> Result<Option<StoredAgent>, StoreError> {
         down()
     }
+    fn agents_of(&self, _owner: &protocol::Owner) -> Result<Vec<StoredAgent>, StoreError> {
+        down()
+    }
 
     fn put_run(&self, _run: StoredRun) -> Result<server::PutRun, StoreError> {
         down()
@@ -188,6 +191,10 @@ impl RunStore for PartlyDown {
     fn agent(&self, id: AgentId) -> Result<Option<StoredAgent>, StoreError> {
         self.check("agent")?;
         self.inner.agent(id)
+    }
+    fn agents_of(&self, owner: &protocol::Owner) -> Result<Vec<StoredAgent>, StoreError> {
+        self.check("agents_of")?;
+        self.inner.agents_of(owner)
     }
 
     fn put_run(&self, run: StoredRun) -> Result<server::PutRun, StoreError> {

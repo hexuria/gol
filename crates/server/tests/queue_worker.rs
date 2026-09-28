@@ -313,6 +313,9 @@ impl RunStore for AppendsFail {
     fn agent(&self, id: AgentId) -> Result<Option<server::StoredAgent>, StoreError> {
         self.0.agent(id)
     }
+    fn agents_of(&self, owner: &Owner) -> Result<Vec<server::StoredAgent>, StoreError> {
+        self.0.agents_of(owner)
+    }
     fn put_run(&self, run: StoredRun) -> Result<server::PutRun, StoreError> {
         self.0.put_run(run)
     }
@@ -411,6 +414,9 @@ impl RunStore for ReadsFail {
     fn agent(&self, id: AgentId) -> Result<Option<server::StoredAgent>, StoreError> {
         self.0.agent(id)
     }
+    fn agents_of(&self, owner: &Owner) -> Result<Vec<server::StoredAgent>, StoreError> {
+        self.0.agents_of(owner)
+    }
     fn put_run(&self, run: StoredRun) -> Result<server::PutRun, StoreError> {
         self.0.put_run(run)
     }
@@ -507,6 +513,9 @@ impl RunStore for FirstLoadHangsThenFails {
     fn agent(&self, id: AgentId) -> Result<Option<server::StoredAgent>, StoreError> {
         self.inner.agent(id)
     }
+    fn agents_of(&self, owner: &Owner) -> Result<Vec<server::StoredAgent>, StoreError> {
+        self.inner.agents_of(owner)
+    }
     fn put_run(&self, run: StoredRun) -> Result<server::PutRun, StoreError> {
         self.inner.put_run(run)
     }
@@ -588,6 +597,9 @@ impl RunStore for OneUnloadable {
     }
     fn agent(&self, id: AgentId) -> Result<Option<server::StoredAgent>, StoreError> {
         self.inner.agent(id)
+    }
+    fn agents_of(&self, owner: &Owner) -> Result<Vec<server::StoredAgent>, StoreError> {
+        self.inner.agents_of(owner)
     }
     fn put_run(&self, run: StoredRun) -> Result<server::PutRun, StoreError> {
         self.inner.put_run(run)
@@ -793,6 +805,9 @@ impl RunStore for CutsRedis {
     }
     fn agent(&self, id: AgentId) -> Result<Option<server::StoredAgent>, StoreError> {
         self.inner.agent(id)
+    }
+    fn agents_of(&self, owner: &Owner) -> Result<Vec<server::StoredAgent>, StoreError> {
+        self.inner.agents_of(owner)
     }
     fn put_run(&self, run: StoredRun) -> Result<server::PutRun, StoreError> {
         self.inner.put_run(run)

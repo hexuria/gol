@@ -14,17 +14,19 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::Duration;
 
-use harness::Memory;
-use protocol::{Event, EventPayload, FailureClass, RunId};
+use harness::{DelegateTarget, Memory};
+use protocol::{Capability, Event, EventPayload, FailureClass, RunId, RunSpec};
 
-use crate::http::harness_events;
+use crate::http::{harness_events, Delegation};
 use crate::inference::{dispatch_events, run_failed_event};
 use crate::queue::{QueueTiming, RedisRunQueue};
+use crate::spawner::OwnedSpawner;
 use crate::store::{is_terminal, Append, RunStore, StoredRun};
 
 /// Takes runs off the queue and runs them to their end.
 pub struct Worker {
-    queue: RedisRunQueue,
+    /// Shared with the spawner that queues a run's children.
+    queue: Arc<RedisRunQueue>,
     store: Arc<dyn RunStore>,
     memory: Arc<dyn Memory>,
     jev_base_url: String,
@@ -114,7 +116,7 @@ impl WorkerBuilder<Given, Given, Given, Given> {
             unreachable!("every required input is given in this state")
         };
         Worker {
-            queue,
+            queue: Arc::new(queue),
             store,
             memory,
             jev_base_url,
@@ -164,6 +166,37 @@ pub struct Done<'a> {
 }
 
 impl Worker {
+    /// What `spec`'s run may delegate with: an owned spawner on this worker's
+    /// queue, and its owner's agents when it holds `agent.delegate`. A store
+    /// that cannot list them offers none.
+    fn delegation(&self, spec: &RunSpec) -> Delegation {
+        let spawner = Arc::new(OwnedSpawner::new(
+            self.store.clone(),
+            Some(self.queue.clone()),
+        ));
+        if !spec
+            .capabilities
+            .contains(&Capability::new("agent.delegate"))
+        {
+            return (spawner, Vec::new());
+        }
+        let targets = match self.store.agents_of(&spec.owner) {
+            Ok(agents) => agents
+                .into_iter()
+                .map(|agent| DelegateTarget {
+                    agent_id: agent.manifest.id,
+                    name: agent.manifest.name,
+                    description: agent.manifest.description,
+                })
+                .collect(),
+            Err(error) => {
+                eprintln!("gol: queue worker: agents for run {}: {error}", spec.run_id);
+                Vec::new()
+            }
+        };
+        (spawner, targets)
+    }
+
     /// Claims the oldest queued run, with its lease, or nothing when the
     /// queue is empty.
     pub fn claim(&self) -> Result<Option<Claim<'_>>, String> {
@@ -318,8 +351,12 @@ impl<'a> Open<'a> {
                 .spawn_scoped(scope, move || claim.heartbeat(&stopped))
                 .expect("spawn the heartbeat thread");
             let mut events = dispatch_events(spec);
-            let (harness, _outcome) =
-                harness_events(&worker.jev_base_url, spec, worker.memory.as_ref());
+            let (harness, _outcome) = harness_events(
+                &worker.jev_base_url,
+                spec,
+                worker.memory.as_ref(),
+                Some(worker.delegation(spec)),
+            );
             events.extend(harness);
             drop(stop);
             events

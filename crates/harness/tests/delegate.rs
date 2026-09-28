@@ -162,7 +162,9 @@ impl AgentSpawner for Fake {
 }
 
 fn run_with(spec: RunSpec, spawner: Arc<Fake>, effects: Vec<Effect>) -> Driver {
-    let mut driver = Driver::boot(spec).unwrap().with_spawner(spawner);
+    let mut driver = Driver::boot(spec)
+        .unwrap()
+        .with_spawner(spawner, Vec::new());
     let mut decider = ScriptedDecider::new(effects);
     run_to_completion(
         &mut driver,
@@ -346,7 +348,9 @@ fn a_parent_keeps_only_the_model_calls_it_did_not_give() {
     };
     let mut effects = vec![delegate(AgentId::new())];
     effects.extend(std::iter::repeat_n(model.clone(), 5));
-    let mut driver = Driver::boot(spec).unwrap().with_spawner(Fake::new(Ok(())));
+    let mut driver = Driver::boot(spec)
+        .unwrap()
+        .with_spawner(Fake::new(Ok(())), Vec::new());
     let mut decider = ScriptedDecider::new(effects);
     run_to_completion(
         &mut driver,
@@ -400,7 +404,7 @@ fn the_same_child_twice_is_counted_once() {
     let agent = AgentId::new();
     let mut driver = Driver::boot(limited(8, 4))
         .unwrap()
-        .with_spawner(SameChild::new());
+        .with_spawner(SameChild::new(), Vec::new());
     let mut decider = ScriptedDecider::new(vec![delegate(agent), delegate(agent), complete()]);
     run_to_completion(
         &mut driver,
@@ -422,7 +426,7 @@ fn a_delegate_performed_while_not_running_is_refused() {
     let fake = Fake::new(Ok(()));
     let mut driver = Driver::boot(limited(8, 4))
         .unwrap()
-        .with_spawner(fake.clone());
+        .with_spawner(fake.clone(), Vec::new());
     driver.cancel();
     driver.perform(
         &[delegate(AgentId::new())],
@@ -451,7 +455,7 @@ fn a_replayed_parent_records_the_stored_childs_limits() {
     let first = {
         let mut driver = Driver::boot(limited(8, 4))
             .unwrap()
-            .with_spawner(spawner.clone());
+            .with_spawner(spawner.clone(), Vec::new());
         let mut decider = ScriptedDecider::new(vec![delegate(agent), complete()]);
         run_to_completion(
             &mut driver,
@@ -464,7 +468,9 @@ fn a_replayed_parent_records_the_stored_childs_limits() {
         driver.state().given_steps
     };
     assert_eq!(first, 3);
-    let mut again = Driver::boot(limited(8, 4)).unwrap().with_spawner(spawner);
+    let mut again = Driver::boot(limited(8, 4))
+        .unwrap()
+        .with_spawner(spawner, Vec::new());
     let mut decider = ScriptedDecider::new(vec![
         wait.clone(),
         wait.clone(),

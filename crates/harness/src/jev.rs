@@ -1,9 +1,11 @@
-use protocol::{Effect, InvocationId};
+use protocol::{
+    AgentId, Capability, Effect, HarnessState, InvocationId, MAX_CHILDREN, MAX_DELEGATION_HOPS,
+};
 use serde_json::{json, Value};
 use typesafe_sdk::blocking::Client;
 use typesafe_sdk::Question;
 
-use crate::{Decider, DeciderError, DecisionView};
+use crate::{Decider, DeciderError, DecisionView, DelegateTarget};
 
 /// How many of the latest events `jev_state` shows Jev.
 pub const RECENT_EVENTS: usize = 16;
@@ -13,6 +15,7 @@ pub const MAX_EVENT_TEXT: usize = 2048;
 
 const MODEL: &str = "model";
 const COMPLETE: &str = "complete";
+const DELEGATE: &str = "delegate:";
 
 pub struct JevDecider {
     client: Client,
@@ -88,9 +91,10 @@ fn capped(value: Value) -> Value {
 /// The choices Jev is offered, as (label, description). Once the step budget
 /// is spent only `complete` is offered: while the harness is running it is the
 /// one decision that is still free.
-/// Otherwise each catalog tool is offered under its own name, then `model`
-/// while model calls remain, then `complete`. A tool named `model` or
-/// `complete` is left out, since its label would be ambiguous.
+/// Otherwise each catalog tool is offered under its own name, then each
+/// delegation `delegate_choices` allows, then `model` while model calls
+/// remain, then `complete`. A tool named `model` or `complete`, or starting
+/// with `delegate:`, is left out, since its label would be ambiguous.
 pub fn jev_choices(view: &DecisionView<'_>) -> Vec<(String, Option<String>)> {
     let complete = (COMPLETE.to_string(), Some("Finish the run.".to_string()));
     if view.steps_exhausted {
@@ -99,9 +103,16 @@ pub fn jev_choices(view: &DecisionView<'_>) -> Vec<(String, Option<String>)> {
     let mut choices: Vec<(String, Option<String>)> = view
         .tools
         .iter()
-        .filter(|tool| tool.name != MODEL && tool.name != COMPLETE)
+        .filter(|tool| {
+            tool.name != MODEL && tool.name != COMPLETE && !tool.name.starts_with(DELEGATE)
+        })
         .map(|tool| (tool.name.clone(), Some(tool.description.clone())))
         .collect();
+    choices.extend(
+        delegate_choices(view)
+            .into_iter()
+            .map(|(label, description, _)| (label, Some(description))),
+    );
     if !view.model_calls_exhausted {
         choices.push((
             MODEL.to_string(),
@@ -110,6 +121,79 @@ pub fn jev_choices(view: &DecisionView<'_>) -> Vec<(String, Option<String>)> {
     }
     choices.push(complete);
     choices
+}
+
+/// The `delegate:<name>` choices, as (label, description, agent): one per
+/// target other than the run's own agent, and none unless a delegation could
+/// start a child. The driver refuses a delegation from a run that is not
+/// running, has 10 children, or has fewer than 2 steps or 2 model calls left
+/// to give once this decision has taken its step; the authorizer refuses one
+/// without `agent.delegate` or 8 hops deep. A name several targets share gets
+/// the first 8 characters of each id; an empty name is the id. The chosen
+/// label is looked up exactly, so a label that still names more than one
+/// target is not offered at all.
+fn delegate_choices(view: &DecisionView<'_>) -> Vec<(String, String, AgentId)> {
+    let (spec, state) = (view.spec, view.state);
+    let left = |max: u32, used: u32, given: u32| max.saturating_sub(used.saturating_add(given));
+    let steps_left = left(spec.limits.max_steps, state.steps, state.given_steps);
+    let model_calls_left = left(
+        spec.limits.max_model_calls,
+        state.model_calls,
+        state.given_model_calls,
+    );
+    let open = matches!(state.harness, HarnessState::Running { .. })
+        && spec
+            .capabilities
+            .contains(&Capability::new("agent.delegate"))
+        && spec.lineage.hop < MAX_DELEGATION_HOPS
+        && state.children < MAX_CHILDREN
+        && steps_left > 2
+        && model_calls_left >= 2;
+    if !open {
+        return Vec::new();
+    }
+    let name = |target: &DelegateTarget| {
+        if target.name.is_empty() {
+            target.agent_id.to_string()
+        } else {
+            target.name.clone()
+        }
+    };
+    let targets: Vec<&DelegateTarget> = view
+        .agents
+        .iter()
+        .filter(|target| target.agent_id != spec.agent_id)
+        .collect();
+    let choices: Vec<(String, String, AgentId)> = targets
+        .iter()
+        .map(|target| {
+            let named = name(target);
+            let shared = targets.iter().filter(|other| name(other) == named).count() > 1;
+            let label = if shared {
+                let id = target.agent_id.to_string();
+                format!("{DELEGATE}{named}-{}", &id[..8])
+            } else {
+                format!("{DELEGATE}{named}")
+            };
+            let description = if target.description.is_empty() {
+                format!("Hand the input to agent {named}.")
+            } else {
+                target.description.clone()
+            };
+            (label, description, target.agent_id)
+        })
+        .collect();
+    choices
+        .iter()
+        .filter(|(label, _, _)| {
+            choices
+                .iter()
+                .filter(|(other, _, _)| other == label)
+                .count()
+                == 1
+        })
+        .cloned()
+        .collect()
 }
 
 impl Decider for JevDecider {
@@ -140,6 +224,15 @@ impl Decider for JevDecider {
         if !choices.iter().any(|(label, _)| *label == choice) {
             return Err(DeciderError {
                 message: format!("unknown effect choice: {choice}"),
+            });
+        }
+        if let Some((_, _, agent_id)) = delegate_choices(view)
+            .into_iter()
+            .find(|(label, _, _)| *label == choice)
+        {
+            return Ok(Effect::Delegate {
+                agent_id,
+                input: view.spec.input.clone(),
             });
         }
         Ok(match choice.as_str() {

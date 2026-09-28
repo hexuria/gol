@@ -193,6 +193,10 @@ impl AgentSpawner for OwnedSpawner {
             // run, so it is not reported as started.
             Ok(PutRun::Existed) => match self.store.run(spec.run_id) {
                 Ok(Some(child)) if never_ran(&child.events) => {
+                    // Asking put it back on pending; it will never run.
+                    if let Err(error) = queue.unpend(spec.run_id) {
+                        eprintln!("gol: delegate from run {}: {error}", parent.run_id);
+                    }
                     Err("the child could not be started".to_string())
                 }
                 Ok(Some(child)) => {

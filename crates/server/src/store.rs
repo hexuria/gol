@@ -8,6 +8,12 @@ use protocol::{AgentId, ArtifactId, Capability, Event, EventPayload, Owner, RunI
 pub struct AgentManifest {
     pub id: AgentId,
     pub version: String,
+    /// What a delegating run's decider calls this agent. Manifests stored
+    /// before names existed have none.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
     pub instructions: String,
     pub tools: Vec<String>,
     pub required_capabilities: Vec<Capability>,
@@ -99,6 +105,8 @@ pub trait RunStore: Send + Sync {
     /// check and the write are one atomic step.
     fn put_agent(&self, agent: StoredAgent) -> Result<PutAgent, StoreError>;
     fn agent(&self, id: AgentId) -> Result<Option<StoredAgent>, StoreError>;
+    /// The agents `owner` holds (`Owner::is`), in id order.
+    fn agents_of(&self, owner: &Owner) -> Result<Vec<StoredAgent>, StoreError>;
     /// Store a new run. A run already stored under that id keeps its spec and
     /// events, so a redelivered put cannot drop anything appended since. A
     /// batch with an event after its terminal event is refused.
@@ -162,6 +170,16 @@ impl RunStore for InMemoryStore {
 
     fn agent(&self, id: AgentId) -> Result<Option<StoredAgent>, StoreError> {
         Ok(read(&self.agents).get(&id).cloned())
+    }
+
+    fn agents_of(&self, owner: &Owner) -> Result<Vec<StoredAgent>, StoreError> {
+        let mut agents: Vec<StoredAgent> = read(&self.agents)
+            .values()
+            .filter(|agent| agent.owner.is(owner))
+            .cloned()
+            .collect();
+        agents.sort_by_key(|agent| agent.manifest.id.as_uuid());
+        Ok(agents)
     }
 
     fn put_run(&self, run: StoredRun) -> Result<PutRun, StoreError> {
