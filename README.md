@@ -17,6 +17,7 @@ Runs and memory are kept in the process unless `GOL_DATABASE_URL` names a Postgr
 - It uses a pool of `GOL_DATABASE_POOL_SIZE` connections (default 8) for runs, keeps one idle, and opens one more connection for memory.
 - It refuses to start, saying why, when it cannot reach the database, the pool size is not a positive count, or a table predates the current schema (drop it).
 - It connects without TLS, so keep the database on a private network.
+- Memory bounds a lock wait at 5 s and a statement at 10 s unless the URL, role or database sets its own. Behind a transaction-mode pooler, set them on the role.
 
 ## Authentication
 

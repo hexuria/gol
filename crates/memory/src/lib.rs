@@ -106,15 +106,17 @@ fn open(url: &str) -> Result<postgres::Client, StoreError> {
     let mut client = config.connect(NoTls).map_err(sql)?;
     // Every run shares this one connection, and a call holds it for its
     // statement: bound how long a lock wait (5 s) or a statement (10 s) can
-    // keep the rest waiting, unless the URL already sets a bound.
+    // keep the rest waiting, unless the URL, role or database already sets a
+    // non-zero bound. Qualified, so no function on the search path answers
+    // for them.
     client
         .batch_execute(
             "do $$ begin
-               if current_setting('lock_timeout') = '0' then
-                 perform set_config('lock_timeout', '5s', false);
+               if pg_catalog.current_setting('lock_timeout') = '0' then
+                 perform pg_catalog.set_config('lock_timeout', '5s', false);
                end if;
-               if current_setting('statement_timeout') = '0' then
-                 perform set_config('statement_timeout', '10s', false);
+               if pg_catalog.current_setting('statement_timeout') = '0' then
+                 perform pg_catalog.set_config('statement_timeout', '10s', false);
                end if;
              end $$",
         )

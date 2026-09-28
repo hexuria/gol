@@ -58,7 +58,7 @@ Negative controls, each on a copy of the config with `-workers 1`:
 - The key itself is tested by the `memory_owner_tests` unit tests in `crates/protocol/src/effect.rs`, which build each scope's id and check that no two owners' ids run together.
 - The counterexample trace for the unscoped design, forced: `no_cross_scope_read_in_the_model_trace` (run 1 writes, run 2 of another tenant writes, run 1 reads its own value), on both memories.
 - The model's environment assumption is that each call is atomic. In Postgres, each call is one SQL statement. In memory, it is one lock scope.
-- `EveryRunReads` assumes each call returns. In Postgres, a lock wait is bounded at 5 s and a statement at 10 s, unless the URL sets its own bounds. `a_write_waiting_on_a_lock_gives_up` (`crates/memory/tests/recall.rs`) checks the lock timeout (SQLSTATE 55P03).
+- `EveryRunReads` assumes each call returns. In Postgres, a lock wait is bounded at 5 s and a statement at 10 s, unless the URL, role or database sets a non-zero bound. `a_write_waiting_on_a_lock_gives_up` (`crates/memory/tests/recall.rs`) checks the lock timeout (SQLSTATE 55P03).
 - `ReadsFindAValue`: unlinked.
 - Not modelled: a crash between a Postgres write and the run's `MemoryWritten` event leaves a row that no run log records.
 
