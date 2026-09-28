@@ -24,7 +24,7 @@ HasTerminal(s) == Range(s) \cap Terminal # {}
 IsPrefix(s, t) == Len(s) <= Len(t) /\ SubSeq(t, 1, Len(s)) = s
 
 \* The store's append. "old" always appends. "new" refuses once the log is terminal
-\* and reports whether it appended, in one step (one lock, one SQL statement).
+\* and reports whether it appended, in one step (one lock: a transaction holding the run row).
 Appends(id) == Design = "old" \/ ~HasTerminal(log)
 
 TypeOK ==

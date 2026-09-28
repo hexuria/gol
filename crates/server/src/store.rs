@@ -67,6 +67,21 @@ pub fn is_terminal(payload: &EventPayload) -> bool {
     )
 }
 
+/// A batch of events, as `put_run` and `append_events` take it, ends at its
+/// terminal event, if it has one: the log ends at the first.
+pub(crate) fn check_one_terminal(events: &[Event]) -> Result<(), StoreError> {
+    let after_terminal = events
+        .iter()
+        .position(|event| is_terminal(&event.payload))
+        .is_some_and(|at| at + 1 < events.len());
+    if after_terminal {
+        return Err(StoreError::new(
+            "a batch holds an event after its terminal event",
+        ));
+    }
+    Ok(())
+}
+
 /// Every method can fail with a StoreError: the store is unreachable, or a
 /// write's outcome is unknown. Callers report it and do not retry a write,
 /// which may have committed.
@@ -76,13 +91,29 @@ pub trait RunStore: Send + Sync {
     fn put_agent(&self, agent: StoredAgent) -> Result<PutAgent, StoreError>;
     fn agent(&self, id: AgentId) -> Result<Option<StoredAgent>, StoreError>;
     /// Store a new run. A run already stored under that id keeps its spec and
-    /// events, so a redelivered put cannot drop anything appended since.
+    /// events, so a redelivered put cannot drop anything appended since. A
+    /// batch with an event after its terminal event is refused.
     fn put_run(&self, run: StoredRun) -> Result<(), StoreError>;
     /// Append `events` onto the stored run in one atomic step, unless the
     /// stored log is already terminal or the run is missing. `spec` and the
-    /// events already stored never change.
+    /// events already stored never change. A batch with an event after its
+    /// terminal event is refused.
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError>;
     fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError>;
+    /// The run with at most `limit` of its events: those after the first
+    /// `after`. A store that keeps events in order by row overrides this to
+    /// read only the page.
+    fn run_page(
+        &self,
+        id: RunId,
+        after: usize,
+        limit: usize,
+    ) -> Result<Option<StoredRun>, StoreError> {
+        Ok(self.run(id)?.map(|mut run| {
+            run.events = run.events.into_iter().skip(after).take(limit).collect();
+            run
+        }))
+    }
     fn put_artifact(&self, artifact: StoredArtifact) -> Result<(), StoreError>;
     fn artifact(&self, id: ArtifactId) -> Result<Option<StoredArtifact>, StoreError>;
 }
@@ -125,6 +156,7 @@ impl RunStore for InMemoryStore {
     }
 
     fn put_run(&self, run: StoredRun) -> Result<(), StoreError> {
+        check_one_terminal(&run.events)?;
         write(&self.runs, "run")?
             .entry(run.spec.run_id)
             .or_insert(run);
@@ -132,6 +164,7 @@ impl RunStore for InMemoryStore {
     }
 
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
+        check_one_terminal(&events)?;
         let mut runs = write(&self.runs, "run")?;
         let Some(stored) = runs.get_mut(&id) else {
             return Ok(Append::Missing);
@@ -220,5 +253,87 @@ mod tests {
             Err(refused.clone())
         );
         assert_eq!(store.append_events(run_id, Vec::new()), Err(refused));
+    }
+
+    fn completed(spec: &RunSpec, outcome: &str) -> Event {
+        Event::record(
+            protocol::EventSource::new(
+                spec.run_id,
+                spec.agent_id,
+                &spec.agent_version,
+                protocol::Actor::System,
+                protocol::Timestamp::now(),
+            ),
+            EventPayload::RunCompleted {
+                outcome: outcome.to_string(),
+            },
+        )
+    }
+
+    // A batch ends at its terminal event: one after it is refused.
+    #[test]
+    fn an_event_after_a_terminal_in_one_batch_is_refused() {
+        let store = InMemoryStore::default();
+        let spec = spec();
+        let message = Event::record(
+            protocol::EventSource::new(
+                spec.run_id,
+                spec.agent_id,
+                &spec.agent_version,
+                protocol::Actor::System,
+                protocol::Timestamp::now(),
+            ),
+            EventPayload::UserMessage {
+                text: "late".to_string(),
+            },
+        );
+        let batch = vec![completed(&spec, "done"), message];
+        assert!(store
+            .put_run(StoredRun {
+                spec: spec.clone(),
+                events: batch.clone(),
+            })
+            .is_err());
+        store
+            .put_run(StoredRun {
+                spec: spec.clone(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        assert!(store.append_events(spec.run_id, batch).is_err());
+        assert_eq!(
+            store
+                .run(spec.run_id)
+                .map(|run| run.map(|run| run.events.len())),
+            Ok(Some(0))
+        );
+    }
+
+    // A batch may hold one terminal event: the log ends at it.
+    #[test]
+    fn a_batch_with_two_terminal_events_is_refused() {
+        let store = InMemoryStore::default();
+        let spec = spec();
+        let two = vec![completed(&spec, "a"), completed(&spec, "b")];
+        assert!(store
+            .put_run(StoredRun {
+                spec: spec.clone(),
+                events: two.clone(),
+            })
+            .is_err());
+        assert!(store.run(spec.run_id).unwrap().is_none(), "nothing stored");
+        store
+            .put_run(StoredRun {
+                spec: spec.clone(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        assert!(store.append_events(spec.run_id, two).is_err());
+        assert_eq!(
+            store
+                .run(spec.run_id)
+                .map(|run| run.map(|run| run.events.len())),
+            Ok(Some(0))
+        );
     }
 }
