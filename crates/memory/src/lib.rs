@@ -37,10 +37,10 @@ fn ensure_schema(client: &mut postgres::Client) -> Result<(), StoreError> {
     // anything created above.
     let keyed_by_owner = tx
         .query_opt(
-            "select 1 from pg_index
-             where indrelid = to_regclass('memories') and indisprimary and indimmediate
-               and (select array_agg(attname::text order by attname::text)
-                    from pg_attribute
+            "select 1 from pg_catalog.pg_index
+             where indrelid = pg_catalog.to_regclass('memories') and indisprimary and indimmediate
+               and (select pg_catalog.array_agg(attname::text order by attname::text)
+                    from pg_catalog.pg_attribute
                     where attrelid = indrelid and attnum = any(indkey))
                    = array['key', 'owner_id', 'scope']",
             &[],

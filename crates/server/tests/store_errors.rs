@@ -386,3 +386,43 @@ fn no_database_url_does_not_read_the_pool_size() {
         assert!(stores.runs.run(RunId::new()).expect("store").is_none());
     }
 }
+
+fn env_of(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+// GOL_REDIS_URL turns the queue on, with GOL_WORKERS workers (2 by default);
+// unset or empty, there is no queue; a worker count that is not a positive
+// count refuses to start.
+#[test]
+fn the_queue_comes_from_the_environment() {
+    use server::{queue_from_env, QueueSettings};
+    assert_eq!(queue_from_env(&env_of(&[])), Ok(None));
+    assert_eq!(queue_from_env(&env_of(&[("GOL_REDIS_URL", "")])), Ok(None));
+    assert_eq!(
+        queue_from_env(&env_of(&[("GOL_REDIS_URL", "redis://127.0.0.1/")])),
+        Ok(Some(QueueSettings {
+            redis_url: "redis://127.0.0.1/".to_string(),
+            workers: 2
+        }))
+    );
+    assert_eq!(
+        queue_from_env(&env_of(&[
+            ("GOL_REDIS_URL", "redis://127.0.0.1/"),
+            ("GOL_WORKERS", "5")
+        ]))
+        .map(|queue| queue.map(|queue| queue.workers)),
+        Ok(Some(5))
+    );
+    for count in ["0", "x", "-1"] {
+        let error = queue_from_env(&env_of(&[
+            ("GOL_REDIS_URL", "redis://127.0.0.1/"),
+            ("GOL_WORKERS", count),
+        ]))
+        .expect_err(count);
+        assert!(error.contains("GOL_WORKERS"), "{error}");
+    }
+}

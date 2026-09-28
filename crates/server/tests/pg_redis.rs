@@ -188,7 +188,7 @@ async fn create_run_writes_postgres_and_enqueues_redis() {
         .await
         .expect("run json");
     assert_eq!(created.harness, HarnessState::Idle);
-    assert_eq!(created.dispatch, DispatchPhase::Created);
+    assert_eq!(created.dispatch, DispatchPhase::Queued);
     assert_eq!(created.steps, 0);
     assert_eq!(created.model_calls, 0);
 
@@ -202,12 +202,15 @@ async fn create_run_writes_postgres_and_enqueues_redis() {
     .await
     .expect("reconnect thread")
     .expect("stored run");
+    // redis_run_records_created_and_queued: the run is on the record as
+    // created and queued, with its message, before the push.
     assert!(matches!(
         stored.events.as_slice(),
-        [Event {
-            payload: EventPayload::UserMessage { text },
-            ..
-        }] if text == "hello"
+        [
+            Event { payload: EventPayload::RunCreated, .. },
+            Event { payload: EventPayload::RunQueued, .. },
+            Event { payload: EventPayload::UserMessage { text }, .. },
+        ] if text == "hello"
     ));
     assert!(!stored
         .events
@@ -586,6 +589,14 @@ async fn redis_push_failure_leaves_run_failed_in_postgres() {
         matches!(
             stored.events.as_slice(),
             [
+                Event {
+                    payload: EventPayload::RunCreated,
+                    ..
+                },
+                Event {
+                    payload: EventPayload::RunQueued,
+                    ..
+                },
                 Event {
                     payload: EventPayload::UserMessage { .. },
                     ..
