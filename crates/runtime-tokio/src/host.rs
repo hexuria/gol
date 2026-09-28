@@ -259,8 +259,9 @@ mod tests {
                 reason: "missing capability: agent.delegate".to_string(),
             }
         );
-        // With no spawner, a performed delegation is recorded as refused and
-        // starts nothing.
+        // `perform` does not authorize (the decide step does). Performing a
+        // delegation directly, with no spawner configured, records it as
+        // refused and starts nothing.
         let mut denied = harness::Driver::boot(spec).unwrap();
         let events_before = denied.events().len();
         let harness_before = denied.state().harness.clone();

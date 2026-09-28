@@ -257,9 +257,13 @@ impl RunSpecBuilder<Set, Set, Set, Set, Set> {
     }
 
     /// Makes this a child of `parent`, started by the parent's `step`. The
-    /// child's id is derived from its root, parent, step, agent and input, so
-    /// the same request always names the same run (a parent that is run again
-    /// does not start a second child), and any other request names another.
+    /// child's id is derived from its root, parent, step, agent and input
+    /// alone: the same five name the same run (a parent that is run again
+    /// does not start a second child), and a change in any of them names
+    /// another. Nothing else in the spec takes part, so the caller must set
+    /// the rest from the parent and the target agent, the same way every
+    /// time. Two identical delegations in one step name one child; a fan-out
+    /// gives each child its own input.
     pub fn child_of(mut self, parent: &RunSpec, step: u32) -> Self {
         self.draft.child_of = Some(ChildOf {
             parent: parent.run_id,
