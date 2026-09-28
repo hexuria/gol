@@ -26,7 +26,9 @@ A worker's load may fail, at most `MaxReleases` times; it then releases its clai
 `Design = "new"` is C4. The negative controls:
 - `Design = "rpop"` pops the run, with no processing list and no lease: the control for `NoOrphan`.
 - `Design = "early"` acknowledges before recording: the control for `AckAfterTerminal`.
-- `Design = "loose"` releases without holding the lease, as the second commit's release script did: a second control for `NoOrphan`.
+- `Design = "loose"` releases without holding the lease, as the release script of 9511c0e did: a second control for `NoOrphan`.
+
+In `Design = "new"` no queued run holds a lease, so the `SET NX` branch of `Claim` is only taken in `loose`. The code needs it for an id queued twice, which a model of lists as sets cannot express; `a_run_queued_twice_is_claimed_once` tests it.
 
 `RunQueue.cfg` checks `Design = "new"` with `Workers = {"w1", "w2"}`, `Runs = {"r1"}`, `MaxCrashes = 1`, `MaxSlow = 1` and `MaxReleases = 1`.
 

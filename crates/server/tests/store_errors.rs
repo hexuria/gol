@@ -445,3 +445,40 @@ fn a_silent_redis_fails_instead_of_hanging() {
     );
     drop(held);
 }
+
+// Concurrent calls on one queue against a Redis that accepts and never
+// answers each fail within about one connect deadline: none waits behind
+// another's connect.
+#[test]
+fn concurrent_calls_to_a_silent_redis_do_not_queue_up() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            held.push(stream);
+        }
+    });
+    let queue = std::sync::Arc::new(server::RedisRunQueue::open(format!(
+        "redis://127.0.0.1:{port}/"
+    )));
+    let started = std::time::Instant::now();
+    let calls: Vec<_> = (0..4)
+        .map(|_| {
+            let queue = queue.clone();
+            std::thread::spawn(move || (queue.push(protocol::RunId::new()), started.elapsed()))
+        })
+        .collect();
+    for call in calls {
+        let (pushed, waited) = call.join().expect("call");
+        assert!(pushed.is_err(), "{pushed:?}");
+        assert!(
+            waited < std::time::Duration::from_secs(8),
+            "waited {waited:?}"
+        );
+    }
+    // Right after, a call fails at once.
+    let again = std::time::Instant::now();
+    assert!(queue.ping().is_err());
+    assert!(again.elapsed() < std::time::Duration::from_secs(1));
+}

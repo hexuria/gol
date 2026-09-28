@@ -11,7 +11,7 @@
 //! build from their arguments. Redis must keep what it is given:
 //! `noeviction`, and AOF persistence so a restart does not drop the lists.
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use protocol::RunId;
 use redis::{Commands, Script};
@@ -126,8 +126,16 @@ pub struct RedisRunQueue {
     processing: String,
     deliveries: String,
     lease_prefix: String,
-    /// One connection, opened on first use and dropped after any error.
-    connection: Mutex<Option<redis::Connection>>,
+    /// A connection for the next caller, and when a connect last failed.
+    slot: Mutex<Slot>,
+}
+
+/// The queue's idle connection. A caller takes it out while it works, so no
+/// caller waits on another's command or connect.
+#[derive(Default)]
+struct Slot {
+    idle: Option<redis::Connection>,
+    failed_at: Option<Instant>,
 }
 
 impl RedisRunQueue {
@@ -146,7 +154,7 @@ impl RedisRunQueue {
             deliveries: format!("{tag}:deliveries"),
             lease_prefix: format!("{tag}:lease:"),
             runs: tag,
-            connection: Mutex::new(None),
+            slot: Mutex::new(Slot::default()),
         }
     }
 
@@ -296,29 +304,52 @@ impl RedisRunQueue {
         Ok(values.iter().filter_map(|text| parse(text).ok()).collect())
     }
 
-    /// Runs `op` on the queue's connection, opening one first when there is
-    /// none. Any error drops the connection, so the next call reconnects.
+    /// Runs `op` on the queue's idle connection, or on a new one. The lock is
+    /// held only to take or return the idle connection, never across a
+    /// command or a connect. For `REDIS_TIMEOUT` after a failed connect, calls
+    /// fail at once instead of each waiting out a connect of their own. A
+    /// connection that errs is dropped; one that works goes back for the next
+    /// call.
     fn with_connection<T>(
         &self,
         op: impl FnOnce(&mut redis::Connection) -> redis::RedisResult<T>,
     ) -> Result<T, String> {
-        let mut slot = self.connection.lock().unwrap_or_else(|poisoned| {
-            self.connection.clear_poison();
-            let mut slot = poisoned.into_inner();
-            *slot = None;
-            slot
-        });
-        if slot.is_none() {
-            *slot = Some(connect(&self.url).map_err(|error| error.to_string())?);
-        }
-        let Some(connection) = slot.as_mut() else {
-            return Err("redis connection missing".to_string());
+        let taken = {
+            let mut slot = self.lock_slot();
+            if slot
+                .failed_at
+                .is_some_and(|failed| failed.elapsed() < REDIS_TIMEOUT)
+            {
+                return Err("redis is unavailable: a connect failed moments ago".to_string());
+            }
+            slot.idle.take()
         };
-        let result = op(connection);
-        if result.is_err() {
-            *slot = None;
+        let mut connection = match taken {
+            Some(connection) => connection,
+            None => match connect(&self.url) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    self.lock_slot().failed_at = Some(Instant::now());
+                    return Err(error.to_string());
+                }
+            },
+        };
+        let result = op(&mut connection);
+        if result.is_ok() {
+            let mut slot = self.lock_slot();
+            slot.failed_at = None;
+            slot.idle.get_or_insert(connection);
         }
         result.map_err(|error| error.to_string())
+    }
+
+    fn lock_slot(&self) -> std::sync::MutexGuard<'_, Slot> {
+        self.slot.lock().unwrap_or_else(|poisoned| {
+            self.slot.clear_poison();
+            let mut slot = poisoned.into_inner();
+            slot.idle = None;
+            slot
+        })
     }
 }
 
