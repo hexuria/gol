@@ -22,9 +22,11 @@ Runs and memory are kept in the process unless `GOL_DATABASE_URL` names a Postgr
 `GOL_REDIS_URL` queues runs instead of running them inside `POST /v1/runs`:
 - The server stores a run as created and queued and pushes it onto `gol:runs`, and `GOL_WORKERS` worker threads (default 2) in the same process run it.
 - A worker claims a run and its 30 s lease in one step, renews the lease every 10 s, records the run's events, and only then acknowledges it.
-- A reaper hands back, every 15 s, a run whose lease ran out, so a crashed worker's run is redelivered.
-- A redelivered run that already ended is acknowledged without running again.
-- Run it with `GOL_DATABASE_URL` too: the workers read the runs the server stored.
+- A reaper puts a run whose lease ran out back at the front of the queue, every 15 s, so a crashed worker's run is redelivered.
+- A redelivered run that already ended is acknowledged without running again, and one delivered more than five times without ending is failed.
+- Delivery is at least once: a redelivered run starts over and repeats its Jev calls.
+- The queue needs `GOL_DATABASE_URL`, since queued run ids outlive the process. One Redis serves one deployment. Configure it with `noeviction` and AOF persistence.
+- The server refuses to start if Redis does not answer, and starts the workers only once its port is bound.
 
 ## Authentication
 

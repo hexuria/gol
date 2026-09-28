@@ -394,35 +394,35 @@ fn env_of(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> 
         .collect()
 }
 
-// GOL_REDIS_URL turns the queue on, with GOL_WORKERS workers (2 by default);
-// unset or empty, there is no queue; a worker count that is not a positive
-// count refuses to start.
+// GOL_REDIS_URL turns the queue on, with GOL_WORKERS workers (2 by default,
+// at most 256); unset or empty, there is no queue. The queue needs
+// GOL_DATABASE_URL, and a worker count out of range refuses to start.
 #[test]
 fn the_queue_comes_from_the_environment() {
     use server::{queue_from_env, QueueSettings};
+    let redis = ("GOL_REDIS_URL", "redis://127.0.0.1/");
+    let database = ("GOL_DATABASE_URL", "postgres://gol:gol@127.0.0.1/gol");
     assert_eq!(queue_from_env(&env_of(&[])), Ok(None));
     assert_eq!(queue_from_env(&env_of(&[("GOL_REDIS_URL", "")])), Ok(None));
     assert_eq!(
-        queue_from_env(&env_of(&[("GOL_REDIS_URL", "redis://127.0.0.1/")])),
+        queue_from_env(&env_of(&[redis, database])),
         Ok(Some(QueueSettings {
             redis_url: "redis://127.0.0.1/".to_string(),
             workers: 2
         }))
     );
     assert_eq!(
-        queue_from_env(&env_of(&[
-            ("GOL_REDIS_URL", "redis://127.0.0.1/"),
-            ("GOL_WORKERS", "5")
-        ]))
-        .map(|queue| queue.map(|queue| queue.workers)),
+        queue_from_env(&env_of(&[redis, database, ("GOL_WORKERS", "5")]))
+            .map(|queue| queue.map(|queue| queue.workers)),
         Ok(Some(5))
     );
-    for count in ["0", "x", "-1"] {
-        let error = queue_from_env(&env_of(&[
-            ("GOL_REDIS_URL", "redis://127.0.0.1/"),
-            ("GOL_WORKERS", count),
-        ]))
-        .expect_err(count);
+    for count in ["0", "x", "-1", "257"] {
+        let error =
+            queue_from_env(&env_of(&[redis, database, ("GOL_WORKERS", count)])).expect_err(count);
         assert!(error.contains("GOL_WORKERS"), "{error}");
+    }
+    for without in [vec![redis], vec![redis, ("GOL_DATABASE_URL", "")]] {
+        let error = queue_from_env(&env_of(&without)).expect_err("no database");
+        assert!(error.contains("GOL_DATABASE_URL"), "{error}");
     }
 }

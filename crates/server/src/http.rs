@@ -333,24 +333,22 @@ async fn create_run(
     )?;
     if let Some(url) = state.redis_url.clone() {
         // Created and queued are on the record before the push, so a worker
-        // that takes the run finds them (C4).
+        // that takes the run finds them (C4). The store, the push and a
+        // failed push's RunFailed are one blocking task: it runs to its end
+        // even if the client goes away, so no run is stored and left
+        // unqueued.
         let queued = crate::inference::queued_events(&spec);
         let store = state.store.clone();
-        let spec_for_store = spec.clone();
+        let spec_for_queue = spec.clone();
         let queued_for_store = queued.clone();
         tokio::task::spawn_blocking(move || {
-            store.put_run(StoredRun {
-                spec: spec_for_store,
-                events: queued_for_store,
-            })
-        })
-        .await
-        .map_err(|error| ApiError::Decider(error.to_string()))?
-        .map_err(ApiError::from)?;
-        let run_id = spec.run_id;
-        let store = state.store.clone();
-        let spec_for_queue = spec.clone();
-        tokio::task::spawn_blocking(move || {
+            let run_id = spec_for_queue.run_id;
+            store
+                .put_run(StoredRun {
+                    spec: spec_for_queue.clone(),
+                    events: queued_for_store,
+                })
+                .map_err(ApiError::from)?;
             RedisRunQueue::open(url).push(run_id).map_err(|error| {
                 // The run is stored but will never be picked up: end it, so it is
                 // not left open.
@@ -362,12 +360,11 @@ async fn create_run(
                 if let Err(store_error) = store.append_events(run_id, vec![failed]) {
                     eprintln!("gol: could not end run {run_id}: {store_error}");
                 }
-                error
+                ApiError::Decider(error)
             })
         })
         .await
-        .map_err(|error| ApiError::Decider(error.to_string()))?
-        .map_err(ApiError::Decider)?;
+        .map_err(|error| ApiError::Decider(error.to_string()))??;
         return Ok(Json(fold(&spec, &queued)));
     }
 
@@ -611,9 +608,6 @@ async fn get_ui(
     Ok(Json(json_render_spec(&stored.spec.input, &outcome)))
 }
 
-/// Runs the harness with Jev and returns every event it recorded, with how the
-/// run ended. On an error the events are still returned: they are what the
-/// harness did before it stopped.
 /// Runs the harness with Jev and returns the events to record: what the
 /// harness did, and when it could not finish, the `RunFailed` that ends the
 /// run instead of leaving it open.
@@ -642,6 +636,9 @@ pub(crate) fn harness_events(
     (events, outcome)
 }
 
+/// Runs the harness with Jev and returns every event it recorded, with how the
+/// run ended. On an error the events are still returned: they are what the
+/// harness did before it stopped.
 fn run_with_jev(
     jev_base_url: &str,
     spec: RunSpec,

@@ -45,7 +45,7 @@ One owner per failure class. A new check on a property that already has an owner
 | Late tool result vs cancel | `reduce.rs` | unit tests of both orders | `reduce_bounded` covers every other order; the Loom test around the pure reducer was retired (`formal/RETIRED.md`) |
 | Run never ends | `harness/src/driver.rs` budget | `harness/tests/budget.rs` | covers `EventuallyDone` for real runs |
 | Effect without authorization | `authorizer.rs`, `driver.rs` | unit tests | thin: 2 authorizer tests |
-| Concurrent run-log writers | `server/src/{store,postgres,inference,http}.rs` | `formal/runlog` + `server/tests/{inference,pg_redis}.rs` | linked: each counterexample is a Rust test |
+| Concurrent run-log writers | `server/src/{store,postgres,inference,http,worker}.rs` | `formal/runlog` + `server/tests/{inference,pg_redis,queue_worker}.rs` | linked: each counterexample is a Rust test |
 | Stores disagree | `store.rs` vs `postgres.rs` | tests on both stores | no shared contract suite yet |
 | Duplicate effect after a crash | `runtime-tokio/src/{journal,host}.rs` | `replay_proof.rs` (SIGKILL at each commit window); `journal.rs` and `program.rs` unit tests | `Replay.tla` and its Lean restatement were retired; `formal/RETIRED.md` maps each property to its Rust test |
 | Frontends disagree | `workflow-*` | `histories_agree_across_rust_rhai_js_and_bend` | runs in more than one CI job |
@@ -54,7 +54,7 @@ One owner per failure class. A new check on a property that already has an owner
 | Dependency UB | rhai, smartstring | nightly Miri on `workflow-rhai` | boa_engine excluded after Miri found UB |
 | Known-vulnerable dependencies | `Cargo.lock` | `cargo deny` (advisories: vulnerable, unmaintained, unsound, yanked) | the only advisory gate; `cargo audit` was retired as a subset |
 | Crate layering | crate graph | `check-architecture.sh` | keep |
-| Worker ownership, leases, queue ack | not built (`execution/src/lib.rs` joins one thread; `queue.rs` pops without ack) | T3 when built | no model: the `HarnessCore.tla` sketch was retired (`formal/RETIRED.md`); a new model of the real writers when T3 fires |
+| Worker ownership, leases, queue ack | `server/src/{queue,worker}.rs` | `formal/runqueue` + `server/tests/queue_worker.rs` | linked: each counterexample is a Rust test; `AtMostOneTerminal` is `formal/runlog`'s |
 
 ## 3. Vocabulary
 

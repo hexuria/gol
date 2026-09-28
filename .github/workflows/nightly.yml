@@ -38,10 +38,12 @@ jobs:
   tlc-large:
     # formal/runqueue at constants past the PR budget (AGENTS.md: TLC at PR
     # constants runs on every PR, larger constants run nightly). The config is
-    # made here so verify-tla.sh, which checks every formal/**/*.cfg, does not
-    # pick it up. One worker: TLC 2.19 finishes this check with more, then throws
-    # a division by zero in its closing statistics.
+    # written here, not kept under formal/, so verify-tla.sh, which checks
+    # every formal/**/*.cfg, does not pick it up. TLC 2.19's default
+    # fingerprint set throws a division by zero while it estimates collisions
+    # after the check at these constants; the off-heap disk set does not.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - name: Install TLA+ tools
@@ -49,11 +51,20 @@ jobs:
       - name: RunQueue with three workers, two runs, two crashes and two slow leases
         working-directory: formal/runqueue
         run: |
-          sed -e 's/Workers = {"w1", "w2"}/Workers = {"w1", "w2", "w3"}/' \
-              -e 's/Runs = {"r1"}/Runs = {"r1", "r2"}/' \
-              -e 's/MaxCrashes = 1/MaxCrashes = 2/' \
-              -e 's/MaxSlow = 1/MaxSlow = 2/' \
-              RunQueue.cfg > "$RUNNER_TEMP/RunQueueNightly.cfg"
-          grep -q 'Runs = {"r1", "r2"}' "$RUNNER_TEMP/RunQueueNightly.cfg"
-          java -XX:+UseParallelGC -jar "$HOME/.local/tla/tla2tools.jar" -workers 1 -lncheck final \
+          cat > "$RUNNER_TEMP/RunQueueNightly.cfg" <<'CFG'
+          SPECIFICATION Spec
+          CONSTANTS
+            Design = "new"
+            Workers = {"w1", "w2", "w3"}
+            Runs = {"r1", "r2"}
+            MaxCrashes = 2
+            MaxSlow = 2
+          INVARIANT TypeOK
+          INVARIANT NoOrphan
+          INVARIANT AckAfterTerminal
+          INVARIANT AtMostOneTerminal
+          PROPERTY EveryRunEnds
+          CFG
+          java -XX:+UseParallelGC -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \
+            -jar "$HOME/.local/tla/tla2tools.jar" -workers auto -lncheck final \
             -config "$RUNNER_TEMP/RunQueueNightly.cfg" RunQueue.tla

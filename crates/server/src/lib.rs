@@ -26,14 +26,17 @@ pub use inference::{
 };
 pub use local::LocalEchoFactory;
 pub use postgres::{PoolOptions, PostgresStore};
-pub use queue::{QueueTiming, RedisRunQueue};
+pub use queue::{Delivery, QueueTiming, RedisRunQueue};
 pub use store::{
     is_terminal, AgentManifest, Append, InMemoryStore, PutAgent, RunStore, StoredAgent,
     StoredArtifact, StoredRun,
 };
 pub use stores::{stores_from_env, Stores};
 pub use surface::{ag_ui_events, json_render_spec};
-pub use worker::{queue_from_env, reap_forever, start_queue, Claim, QueueSettings, Worker};
+pub use worker::{
+    queue_from_env, reap_forever, start_queue, Claim, Done, Executed, Given, Missing, Open,
+    Prepared, QueueSettings, Worker, WorkerBuilder,
+};
 
 /// Returned by every `RunStore` method.
 pub use harness::StoreError;

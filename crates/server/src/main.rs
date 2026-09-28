@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use server::{
     auth_from_env, queue_from_env, router_with_memory, start_queue, stores_from_env,
-    HttpGatewayPoster,
+    HttpGatewayPoster, RedisRunQueue,
 };
 
 #[tokio::main]
@@ -52,26 +52,38 @@ async fn main() {
     let jev_base_url = std::env::var("TYPESAFE_BASE_URL")
         .unwrap_or_else(|_| "https://api.typesafe.ai".to_string());
     // GOL_REDIS_URL queues runs, and worker threads in this process run
-    // them (owner decision 1A for C4).
+    // them (owner decision 1A for C4). Redis must answer before the server
+    // takes a run.
     if let Some(queue) = &queue {
-        start_queue(
-            queue,
-            stores.runs.clone(),
-            stores.memory.clone(),
-            &jev_base_url,
-        );
+        let url = queue.redis_url.clone();
+        let answered = tokio::task::spawn_blocking(move || RedisRunQueue::open(url).ping()).await;
+        if let Err(message) = answered
+            .map_err(|error| error.to_string())
+            .and_then(|ping| ping)
+        {
+            eprintln!("gol: refusing to start: GOL_REDIS_URL: {message}");
+            std::process::exit(2);
+        }
     }
     let app = router_with_memory(
-        stores.runs,
-        stores.memory,
-        jev_base_url,
-        queue.map(|queue| queue.redis_url),
+        stores.runs.clone(),
+        stores.memory.clone(),
+        jev_base_url.clone(),
+        queue.as_ref().map(|queue| queue.redis_url.clone()),
         Arc::new(HttpGatewayPoster::from_env()),
         auth,
     );
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .expect("bind");
+    // Workers start once the port is ours, so a server that cannot bind
+    // claims no runs.
+    if let Some(queue) = &queue {
+        if let Err(message) = start_queue(queue, stores.runs, stores.memory, &jev_base_url) {
+            eprintln!("gol: refusing to start: queue workers: {message}");
+            std::process::exit(2);
+        }
+    }
     println!("gol listening on http://127.0.0.1:{port}");
     axum::serve(listener, app).await.expect("serve");
 }

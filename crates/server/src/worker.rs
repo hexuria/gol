@@ -1,15 +1,25 @@
 //! Queue workers and the reaper (C4): threads in the server process, started
 //! when `GOL_REDIS_URL` is set (owner decision 1A).
+//!
+//! A claim moves through types: `Claim::prepare` gives `Prepared::Open` (a
+//! run to execute) or `Prepared::Done` (nothing to run); `Open::execute`
+//! gives `Executed`, and `Executed::record` gives `Done`. Only `Done` can
+//! acknowledge, so a run leaves the queue only after its record or a finding
+//! that it already ended. Delivery is at least once: a redelivered run starts
+//! over, and repeats its Jev calls.
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
+use std::time::Duration;
 
-use harness::{Memory, RunMemory};
-use protocol::{Event, RunId};
+use harness::Memory;
+use protocol::{Event, FailureClass, RunId};
 
 use crate::http::harness_events;
-use crate::inference::dispatch_events;
-use crate::queue::{QueueTiming, RedisRunQueue};
+use crate::inference::{dispatch_events, run_failed_event};
+use crate::queue::{Delivery, QueueTiming, RedisRunQueue};
 use crate::store::{is_terminal, Append, RunStore, StoredRun};
 
 /// Takes runs off the queue and runs them to their end.
@@ -21,30 +31,134 @@ pub struct Worker {
     timing: QueueTiming,
 }
 
-/// A run this worker claimed, with the token its lease holds.
-pub struct Claim<'a> {
-    worker: &'a Worker,
-    run_id: RunId,
-    token: String,
+/// Builder state: a required input not given yet.
+pub struct Missing;
+/// Builder state: a required input given.
+pub struct Given;
+
+/// A `Worker` whose queue, store, memory and Jev address are each required
+/// before `build` exists; the timing is optional.
+pub struct WorkerBuilder<Q, S, M, J> {
+    queue: Option<RedisRunQueue>,
+    store: Option<Arc<dyn RunStore>>,
+    memory: Option<Arc<dyn Memory>>,
+    jev_base_url: Option<String>,
+    timing: QueueTiming,
+    states: PhantomData<(Q, S, M, J)>,
 }
 
 impl Worker {
-    pub fn new(
-        queue: RedisRunQueue,
-        store: Arc<dyn RunStore>,
-        memory: Arc<dyn Memory>,
-        jev_base_url: impl Into<String>,
-        timing: QueueTiming,
-    ) -> Self {
-        Self {
-            queue,
-            store,
-            memory,
-            jev_base_url: jev_base_url.into(),
-            timing,
+    pub fn builder() -> WorkerBuilder<Missing, Missing, Missing, Missing> {
+        WorkerBuilder {
+            queue: None,
+            store: None,
+            memory: None,
+            jev_base_url: None,
+            timing: QueueTiming::default(),
+            states: PhantomData,
+        }
+    }
+}
+
+impl<Q, S, M, J> WorkerBuilder<Q, S, M, J> {
+    fn to<Q2, S2, M2, J2>(self) -> WorkerBuilder<Q2, S2, M2, J2> {
+        WorkerBuilder {
+            queue: self.queue,
+            store: self.store,
+            memory: self.memory,
+            jev_base_url: self.jev_base_url,
+            timing: self.timing,
+            states: PhantomData,
         }
     }
 
+    pub fn timing(mut self, timing: QueueTiming) -> Self {
+        self.timing = timing;
+        self
+    }
+}
+
+impl<S, M, J> WorkerBuilder<Missing, S, M, J> {
+    pub fn queue(mut self, queue: RedisRunQueue) -> WorkerBuilder<Given, S, M, J> {
+        self.queue = Some(queue);
+        self.to()
+    }
+}
+
+impl<Q, M, J> WorkerBuilder<Q, Missing, M, J> {
+    pub fn store(mut self, store: Arc<dyn RunStore>) -> WorkerBuilder<Q, Given, M, J> {
+        self.store = Some(store);
+        self.to()
+    }
+}
+
+impl<Q, S, J> WorkerBuilder<Q, S, Missing, J> {
+    pub fn memory(mut self, memory: Arc<dyn Memory>) -> WorkerBuilder<Q, S, Given, J> {
+        self.memory = Some(memory);
+        self.to()
+    }
+}
+
+impl<Q, S, M> WorkerBuilder<Q, S, M, Missing> {
+    pub fn jev(mut self, base_url: impl Into<String>) -> WorkerBuilder<Q, S, M, Given> {
+        self.jev_base_url = Some(base_url.into());
+        self.to()
+    }
+}
+
+impl WorkerBuilder<Given, Given, Given, Given> {
+    pub fn build(self) -> Worker {
+        let (Some(queue), Some(store), Some(memory), Some(jev_base_url)) =
+            (self.queue, self.store, self.memory, self.jev_base_url)
+        else {
+            unreachable!("every required input is given in this state")
+        };
+        Worker {
+            queue,
+            store,
+            memory,
+            jev_base_url,
+            timing: self.timing,
+        }
+    }
+}
+
+/// A run this worker claimed, with the token its lease holds.
+pub struct Claim<'a> {
+    worker: &'a Worker,
+    delivery: Delivery,
+    token: String,
+}
+
+/// What `Claim::prepare` found.
+pub enum Prepared<'a> {
+    /// An open run to execute.
+    Open(Open<'a>),
+    /// Nothing to run: the run already ended, was just failed for too many
+    /// deliveries, or is not stored.
+    Done(Done<'a>),
+}
+
+/// A claimed run that is open, with its stored log.
+pub struct Open<'a> {
+    claim: Claim<'a>,
+    stored: Box<StoredRun>,
+}
+
+/// A claimed run executed, with the events to record.
+pub struct Executed<'a> {
+    claim: Claim<'a>,
+    events: Vec<Event>,
+}
+
+/// A claimed run whose log is terminal, or that is not stored: the only
+/// state that can acknowledge.
+pub struct Done<'a> {
+    claim: Claim<'a>,
+    recorded: Option<Append>,
+}
+
+impl Worker {
     /// Claims the oldest queued run, with its lease, or nothing when the
     /// queue is empty.
     pub fn claim(&self) -> Result<Option<Claim<'_>>, String> {
@@ -52,109 +166,196 @@ impl Worker {
         Ok(self
             .queue
             .claim(&token, self.timing.lease)?
-            .map(|run_id| Claim {
+            .map(|delivery| Claim {
                 worker: self,
-                run_id,
+                delivery,
                 token,
             }))
     }
 
     /// Claims one run and takes it to its end: runs it unless its log has
     /// already ended (owner decision 3A), records what the harness did, and
-    /// only then acknowledges it. `None` when the queue was empty. A failure
-    /// before the acknowledgement leaves the claim to expire, and the reaper
+    /// only then acknowledges it. `None` when the queue was empty. An error
+    /// before the acknowledgement leaves the lease to expire, and the reaper
     /// hands the run back.
     pub fn work_one(&self) -> Result<Option<RunId>, String> {
         let Some(claim) = self.claim()? else {
             return Ok(None);
         };
-        if let Some(stored) = claim.prepare()? {
-            let events = claim.execute(&stored);
-            claim.record(events)?;
-        }
-        claim.ack()?;
-        Ok(Some(claim.run_id))
+        let done = match claim.prepare()? {
+            Prepared::Open(open) => open.execute().record()?,
+            Prepared::Done(done) => done,
+        };
+        done.ack().map(Some)
     }
 
-    /// Works the queue for as long as the process runs.
+    /// Works the queue for as long as the process runs. An error or a panic
+    /// in one run leaves that run's lease to expire; the worker waits, twice
+    /// as long after each failure in a row, and goes on.
     pub fn work_forever(&self) {
+        let mut failures = 0u32;
         loop {
-            match self.work_one() {
-                Ok(Some(_)) => {}
-                Ok(None) => std::thread::sleep(self.timing.idle_wait),
-                Err(error) => {
-                    eprintln!("gol: queue worker: {error}");
+            match catch_unwind(AssertUnwindSafe(|| self.work_one())) {
+                Ok(Ok(Some(_))) => failures = 0,
+                Ok(Ok(None)) => {
+                    failures = 0;
                     std::thread::sleep(self.timing.idle_wait);
+                }
+                Ok(Err(error)) => {
+                    eprintln!("gol: queue worker: {error}");
+                    failures += 1;
+                    std::thread::sleep(backoff(self.timing, failures));
+                }
+                Err(_) => {
+                    eprintln!("gol: queue worker: a run panicked; its lease will expire");
+                    failures += 1;
+                    std::thread::sleep(backoff(self.timing, failures));
                 }
             }
         }
     }
 }
 
-impl Claim<'_> {
+/// `idle_wait` doubled for each failure in a row, at most `max_backoff`.
+fn backoff(timing: QueueTiming, failures: u32) -> Duration {
+    let factor = 2u32.saturating_pow(failures.saturating_sub(1).min(16));
+    timing
+        .idle_wait
+        .saturating_mul(factor)
+        .min(timing.max_backoff)
+}
+
+impl<'a> Claim<'a> {
     pub fn run_id(&self) -> RunId {
-        self.run_id
+        self.delivery.run_id
     }
 
-    /// The run to execute, or `None` when there is nothing to run: its log
-    /// already ended, or it is not stored.
-    pub fn prepare(&self) -> Result<Option<StoredRun>, String> {
-        let stored = self
-            .worker
+    /// Loads the run. A run whose log ended, or that is not stored, needs
+    /// nothing more. A run delivered more than `max_deliveries` times is
+    /// failed instead of run again.
+    pub fn prepare(self) -> Result<Prepared<'a>, String> {
+        let worker = self.worker;
+        let run_id = self.run_id();
+        let Some(stored) = worker
             .store
-            .run(self.run_id)
-            .map_err(|error| error.to_string())?;
-        Ok(stored.filter(|run| !run.events.iter().any(|event| is_terminal(&event.payload))))
+            .run(run_id)
+            .map_err(|error| error.to_string())?
+        else {
+            eprintln!("gol: queue worker: run {run_id} is not stored; dropping it from the queue");
+            return Ok(Prepared::Done(Done {
+                claim: self,
+                recorded: None,
+            }));
+        };
+        if stored
+            .events
+            .iter()
+            .any(|event| is_terminal(&event.payload))
+        {
+            return Ok(Prepared::Done(Done {
+                claim: self,
+                recorded: None,
+            }));
+        }
+        if self.delivery.count > worker.timing.max_deliveries {
+            let failed = run_failed_event(
+                &stored.spec,
+                FailureClass::Infrastructure,
+                format!("delivered {} times without ending", self.delivery.count - 1),
+            );
+            return Executed {
+                claim: self,
+                events: vec![failed],
+            }
+            .record()
+            .map(Prepared::Done);
+        }
+        Ok(Prepared::Open(Open {
+            claim: self,
+            stored: Box::new(stored),
+        }))
     }
+}
 
+impl<'a> Open<'a> {
     /// Runs the harness with Jev, renewing the lease every heartbeat, and
     /// returns what to record: scheduled, provisioning and starting, then the
     /// harness's events, which end the run (with `RunFailed` if the harness
     /// could not finish).
-    pub fn execute(&self, stored: &StoredRun) -> Vec<Event> {
-        let worker = self.worker;
-        std::thread::scope(|scope| {
+    pub fn execute(self) -> Executed<'a> {
+        let worker = self.claim.worker;
+        let claim = &self.claim;
+        let spec = &self.stored.spec;
+        let events = std::thread::scope(|scope| {
             let (stop, stopped) = mpsc::channel::<()>();
-            scope.spawn(move || self.heartbeat(&stopped));
-            let mut events = dispatch_events(&stored.spec);
-            let memory = RunMemory::new(worker.memory.as_ref());
-            let (harness, _outcome) = harness_events(&worker.jev_base_url, &stored.spec, &memory);
+            scope.spawn(move || claim.heartbeat(&stopped));
+            let mut events = dispatch_events(spec);
+            let (harness, _outcome) =
+                harness_events(&worker.jev_base_url, spec, worker.memory.as_ref());
             events.extend(harness);
             drop(stop);
             events
+        });
+        Executed {
+            claim: self.claim,
+            events,
+        }
+    }
+}
+
+impl<'a> Executed<'a> {
+    /// Appends the events. The store refuses them once the log is terminal,
+    /// so two workers on one run leave one terminal event. An error keeps the
+    /// claim from acknowledging.
+    pub fn record(self) -> Result<Done<'a>, String> {
+        let recorded = self
+            .claim
+            .worker
+            .store
+            .append_events(self.claim.run_id(), self.events)
+            .map_err(|error| error.to_string())?;
+        Ok(Done {
+            claim: self.claim,
+            recorded: Some(recorded),
         })
     }
+}
 
-    /// Appends `events`. The store refuses them once the log is terminal, so
-    /// two workers on one run leave one terminal event.
-    pub fn record(&self, events: Vec<Event>) -> Result<Append, String> {
-        self.worker
-            .store
-            .append_events(self.run_id, events)
-            .map_err(|error| error.to_string())
+impl Done<'_> {
+    /// What the record did, if there was one.
+    pub fn recorded(&self) -> Option<Append> {
+        self.recorded
     }
 
     /// Acknowledges the run: off the processing list, and its lease released
-    /// if this claim still holds it. Call it only once the run's log is
-    /// terminal.
-    pub fn ack(&self) -> Result<(), String> {
-        self.worker.queue.ack(self.run_id, &self.token)
+    /// if this claim still holds it.
+    pub fn ack(self) -> Result<RunId, String> {
+        let claim = self.claim;
+        claim.worker.queue.ack(claim.run_id(), &claim.token)?;
+        Ok(claim.run_id())
     }
+}
 
-    /// Renews the lease every heartbeat until `stopped` closes.
+impl Claim<'_> {
+    /// Renews the lease every heartbeat until `stopped` closes, or until the
+    /// lease is another worker's: the store keeps one terminal event
+    /// whichever records first.
     fn heartbeat(&self, stopped: &mpsc::Receiver<()>) {
         let timing = self.worker.timing;
         while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(timing.heartbeat) {
             match self
                 .worker
                 .queue
-                .renew(self.run_id, &self.token, timing.lease)
+                .renew(self.run_id(), &self.token, timing.lease)
             {
                 Ok(true) => {}
-                // Another worker has the run now; the store keeps one terminal
-                // event whichever records first.
-                Ok(false) => eprintln!("gol: queue worker: lost the lease on run {}", self.run_id),
-                Err(error) => eprintln!("gol: queue worker: renew run {}: {error}", self.run_id),
+                Ok(false) => {
+                    eprintln!("gol: queue worker: lost the lease on run {}", self.run_id());
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("gol: queue worker: renew run {}: {error}", self.run_id())
+                }
             }
         }
     }
@@ -164,8 +365,10 @@ impl Claim<'_> {
 /// the process runs.
 pub fn reap_forever(queue: &RedisRunQueue, timing: QueueTiming) {
     loop {
-        if let Err(error) = queue.reap() {
-            eprintln!("gol: queue reaper: {error}");
+        match catch_unwind(AssertUnwindSafe(|| queue.reap())) {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => eprintln!("gol: queue reaper: {error}"),
+            Err(_) => eprintln!("gol: queue reaper: reaping panicked"),
         }
         std::thread::sleep(timing.reap_every);
     }
@@ -179,18 +382,26 @@ pub struct QueueSettings {
 }
 
 /// `GOL_REDIS_URL` (unset or empty: no queue) with `GOL_WORKERS` worker
-/// threads, 2 by default (owner decision 1A for C4).
+/// threads, 2 by default (owner decision 1A for C4). The queue needs
+/// `GOL_DATABASE_URL`: its run ids outlive the process, and so must the runs.
 pub fn queue_from_env(env: &BTreeMap<String, String>) -> Result<Option<QueueSettings>, String> {
     let Some(redis_url) = env.get("GOL_REDIS_URL").filter(|url| !url.is_empty()) else {
         return Ok(None);
     };
+    if env.get("GOL_DATABASE_URL").is_none_or(|url| url.is_empty()) {
+        return Err(
+            "GOL_REDIS_URL needs GOL_DATABASE_URL: queued run ids outlive the process, and a run \
+             kept in memory would not"
+                .to_string(),
+        );
+    }
     let workers = match env.get("GOL_WORKERS").filter(|count| !count.is_empty()) {
         None => 2,
         Some(count) => count
             .parse::<usize>()
             .ok()
-            .filter(|count| *count > 0)
-            .ok_or_else(|| format!("GOL_WORKERS must be a positive count, not {count:?}"))?,
+            .filter(|count| (1..=256).contains(count))
+            .ok_or_else(|| format!("GOL_WORKERS must be a count from 1 to 256, not {count:?}"))?,
     };
     Ok(Some(QueueSettings {
         redis_url: redis_url.clone(),
@@ -205,18 +416,25 @@ pub fn start_queue(
     store: Arc<dyn RunStore>,
     memory: Arc<dyn Memory>,
     jev_base_url: &str,
-) {
+) -> Result<(), String> {
     let timing = QueueTiming::default();
-    for _ in 0..settings.workers {
-        let worker = Worker::new(
-            RedisRunQueue::open(&settings.redis_url),
-            store.clone(),
-            memory.clone(),
-            jev_base_url,
-            timing,
-        );
-        std::thread::spawn(move || worker.work_forever());
+    for index in 0..settings.workers {
+        let worker = Worker::builder()
+            .queue(RedisRunQueue::open(&settings.redis_url))
+            .store(store.clone())
+            .memory(memory.clone())
+            .jev(jev_base_url)
+            .timing(timing)
+            .build();
+        std::thread::Builder::new()
+            .name(format!("gol-worker-{index}"))
+            .spawn(move || worker.work_forever())
+            .map_err(|error| error.to_string())?;
     }
     let reaper = RedisRunQueue::open(&settings.redis_url);
-    std::thread::spawn(move || reap_forever(&reaper, timing));
+    std::thread::Builder::new()
+        .name("gol-reaper".to_string())
+        .spawn(move || reap_forever(&reaper, timing))
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }

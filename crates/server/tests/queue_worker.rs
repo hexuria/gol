@@ -11,8 +11,8 @@ use protocol::{
     Owner, RunId, RunSpec, WorkModel,
 };
 use server::{
-    is_terminal, queued_events, Append, PostgresStore, QueueTiming, RedisRunQueue, RunStore,
-    StoredRun, Worker,
+    is_terminal, queued_events, Append, InMemoryStore, PostgresStore, Prepared, QueueTiming,
+    RedisRunQueue, RunStore, StoreError, StoredRun, Worker,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -27,6 +27,8 @@ fn quick() -> QueueTiming {
         heartbeat: Duration::from_millis(100),
         reap_every: Duration::from_millis(150),
         idle_wait: Duration::from_millis(20),
+        max_backoff: Duration::from_millis(200),
+        max_deliveries: 5,
     }
 }
 
@@ -104,13 +106,17 @@ fn queued_run_in(store: Arc<dyn RunStore>) -> Setup {
 }
 
 fn worker(setup: &Setup, jev_uri: &str) -> Worker {
-    Worker::new(
-        RedisRunQueue::with_key(REDIS_URL, &setup.key),
-        setup.store.clone(),
-        Arc::new(InMemory::default()),
-        jev_uri,
-        quick(),
-    )
+    worker_with(setup, jev_uri, quick())
+}
+
+fn worker_with(setup: &Setup, jev_uri: &str, timing: QueueTiming) -> Worker {
+    Worker::builder()
+        .queue(RedisRunQueue::with_key(REDIS_URL, &setup.key))
+        .store(setup.store.clone())
+        .memory(Arc::new(InMemory::default()))
+        .jev(jev_uri)
+        .timing(timing)
+        .build()
 }
 
 fn terminals(store: &dyn RunStore, run_id: RunId) -> Vec<Event> {
@@ -187,13 +193,15 @@ async fn two_workers(uri: String, setup: fn() -> Setup) {
         let a = worker(&setup, &uri);
         let b = worker(&setup, &uri);
         let claim = a.claim().expect("claim").expect("a run");
-        let stored = claim.prepare().expect("prepare").expect("open run");
+        let Prepared::Open(open) = claim.prepare().expect("prepare") else {
+            panic!("the run is open");
+        };
         std::thread::sleep(quick().lease * 2);
         assert_eq!(setup.queue.reap().expect("reap"), [setup.run_id]);
         assert_eq!(b.work_one().expect("work"), Some(setup.run_id));
-        let events = claim.execute(&stored);
-        assert_eq!(claim.record(events).expect("record"), Append::Terminal);
-        claim.ack().expect("ack");
+        let done = open.execute().record().expect("record");
+        assert_eq!(done.recorded(), Some(Append::Terminal));
+        done.ack().expect("ack");
         assert_eq!(terminals(setup.store.as_ref(), setup.run_id).len(), 1);
         assert_eq!(setup.queue.processing().expect("processing"), []);
         assert_eq!(setup.queue.queued().expect("queued"), []);
@@ -254,10 +262,8 @@ async fn the_heartbeat_keeps_a_slow_run_leased() {
 #[test]
 fn the_reaper_leaves_a_live_lease() {
     let setup = queued_run();
-    let worker = Worker::new(
-        RedisRunQueue::with_key(REDIS_URL, &setup.key),
-        setup.store.clone(),
-        Arc::new(InMemory::default()),
+    let worker = worker_with(
+        &setup,
         "http://127.0.0.1:9",
         QueueTiming {
             lease: Duration::from_secs(30),
@@ -265,26 +271,151 @@ fn the_reaper_leaves_a_live_lease() {
         },
     );
     let claim = worker.claim().expect("claim").expect("a run");
+    assert_eq!(claim.run_id(), setup.run_id);
     assert_eq!(setup.queue.reap().expect("reap"), []);
     assert_eq!(
         setup.queue.processing().expect("processing"),
         [setup.run_id]
     );
-    claim.ack().expect("ack");
-    assert_eq!(setup.queue.processing().expect("processing"), []);
+    assert_eq!(setup.queue.queued().expect("queued"), []);
 }
 
 // An empty queue claims nothing.
 #[test]
 fn an_empty_queue_claims_nothing() {
-    let key = format!("gol:test:{}", RunId::new());
-    let worker = Worker::new(
-        RedisRunQueue::with_key(REDIS_URL, &key),
-        Arc::new(PostgresStore::connect(POSTGRES_URL).expect("connect")),
-        Arc::new(InMemory::default()),
-        "http://127.0.0.1:9",
-        quick(),
-    );
+    let setup = Setup {
+        queue: RedisRunQueue::with_key(REDIS_URL, "unused"),
+        store: Arc::new(InMemoryStore::default()),
+        run_id: RunId::new(),
+        key: format!("gol:test:{}", RunId::new()),
+    };
+    let worker = worker(&setup, "http://127.0.0.1:9");
     assert!(worker.claim().expect("claim").is_none());
     assert_eq!(worker.work_one().expect("work"), None);
+}
+
+/// The in-memory store, except that every append fails.
+struct AppendsFail(InMemoryStore);
+
+impl RunStore for AppendsFail {
+    fn put_agent(&self, agent: server::StoredAgent) -> Result<server::PutAgent, StoreError> {
+        self.0.put_agent(agent)
+    }
+    fn agent(&self, id: AgentId) -> Result<Option<server::StoredAgent>, StoreError> {
+        self.0.agent(id)
+    }
+    fn put_run(&self, run: StoredRun) -> Result<(), StoreError> {
+        self.0.put_run(run)
+    }
+    fn append_events(&self, _id: RunId, _events: Vec<Event>) -> Result<Append, StoreError> {
+        Err(StoreError::new("appends are down"))
+    }
+    fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {
+        self.0.run(id)
+    }
+    fn put_artifact(&self, artifact: server::StoredArtifact) -> Result<(), StoreError> {
+        self.0.put_artifact(artifact)
+    }
+    fn artifact(
+        &self,
+        id: protocol::ArtifactId,
+    ) -> Result<Option<server::StoredArtifact>, StoreError> {
+        self.0.artifact(id)
+    }
+}
+
+// A worker whose record fails does not acknowledge: the run stays in
+// processing under its lease, for the reaper to hand back once it expires.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_record_is_not_acknowledged() {
+    let jev = jev(Duration::ZERO).await;
+    let uri = jev.uri();
+    blocking(move || {
+        let setup = queued_run_in(Arc::new(AppendsFail(InMemoryStore::default())));
+        let error = worker(&setup, &uri)
+            .work_one()
+            .expect_err("the record failed");
+        assert!(error.contains("appends are down"), "{error}");
+        assert_eq!(
+            setup.queue.processing().expect("processing"),
+            [setup.run_id]
+        );
+        std::thread::sleep(quick().lease * 2);
+        assert_eq!(setup.queue.reap().expect("reap"), [setup.run_id]);
+    });
+}
+
+// A run delivered more times than max_deliveries without ending is failed,
+// not run again, and leaves the queue.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_delivered_too_often_is_failed() {
+    let jev = jev(Duration::ZERO).await;
+    let uri = jev.uri();
+    blocking(move || {
+        let setup = queued_run();
+        let timing = QueueTiming {
+            max_deliveries: 1,
+            ..quick()
+        };
+        let crashed = worker_with(&setup, &uri, timing);
+        drop(crashed.claim().expect("claim").expect("a run"));
+        std::thread::sleep(timing.lease * 2);
+        assert_eq!(setup.queue.reap().expect("reap"), [setup.run_id]);
+        let next = worker_with(&setup, &uri, timing);
+        assert_eq!(next.work_one().expect("work"), Some(setup.run_id));
+        assert!(matches!(
+            terminals(setup.store.as_ref(), setup.run_id).as_slice(),
+            [Event {
+                payload: EventPayload::RunFailed { message, .. },
+                ..
+            }] if message == "delivered 1 times without ending"
+        ));
+        assert_eq!(setup.queue.processing().expect("processing"), []);
+        assert_eq!(setup.queue.queued().expect("queued"), []);
+    });
+    assert!(jev.received_requests().await.expect("requests").is_empty());
+}
+
+// A run id queued twice is claimed once: the second claim finds it leased
+// and drops the duplicate.
+#[test]
+fn a_run_queued_twice_is_claimed_once() {
+    let setup = queued_run();
+    setup.queue.push(setup.run_id).expect("push again");
+    let worker = worker(&setup, "http://127.0.0.1:9");
+    let first = worker.claim().expect("claim").expect("a run");
+    assert_eq!(first.run_id(), setup.run_id);
+    assert!(worker.claim().expect("second claim").is_none());
+    assert_eq!(
+        setup.queue.processing().expect("processing"),
+        [setup.run_id]
+    );
+    assert_eq!(setup.queue.queued().expect("queued"), []);
+}
+
+// An entry that is not a run id is dropped when claimed, with an error,
+// instead of cycling through the queue for ever.
+#[test]
+fn a_malformed_entry_is_dropped() {
+    let setup = queued_run();
+    let mut redis = redis::Client::open(REDIS_URL)
+        .expect("client")
+        .get_connection()
+        .expect("connect");
+    redis::cmd("RPUSH")
+        .arg(format!("{{{}}}", setup.key))
+        .arg("not-a-run")
+        .query::<()>(&mut redis)
+        .expect("push");
+    let worker = worker(&setup, "http://127.0.0.1:9");
+    let error = worker.claim().map(|_| ()).expect_err("malformed");
+    assert!(error.contains("not-a-run"), "{error}");
+    let processing: Vec<String> = redis::cmd("LRANGE")
+        .arg(format!("{{{}}}:processing", setup.key))
+        .arg(0)
+        .arg(-1)
+        .query(&mut redis)
+        .expect("processing");
+    assert!(processing.is_empty(), "{processing:?}");
+    assert_eq!(setup.queue.queued().expect("queued"), [setup.run_id]);
 }

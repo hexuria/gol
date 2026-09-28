@@ -8,7 +8,7 @@ Resource: the memories table.
 - `memory::PostgresMemory` (`crates/memory/src/lib.rs:155`): one upsert per write (`:167`) and one select per read (`:156`), each on the store's one connection behind its lock (`with_client`, `:71`).
 - `harness::InMemory` (`crates/harness/src/memory.rs:56`): one lock per call.
 
-Writers: runs of different owners. Each has a driver that performs `MemoryWrite` (`crates/harness/src/driver.rs:318`) and `MemoryRead` (`:298`) under the key `memory_key` (`:366`) builds from `protocol::memory_owner_id` (`crates/protocol/src/effect.rs:81`). The server gives every run started by `POST /v1/runs` the shared memory (`crates/server/src/http.rs:653`). Today no server run writes memory, because Jev offers no memory effect; the drivers in the tests do. Each call is one atomic step.
+Writers: runs of different owners. Each has a driver that performs `MemoryWrite` (`crates/harness/src/driver.rs:318`) and `MemoryRead` (`:298`) under the key `memory_key` (`:366`) builds from `protocol::memory_owner_id` (`crates/protocol/src/effect.rs:81`). The server gives every run the shared memory, whether `POST /v1/runs` runs it (`crates/server/src/http.rs:664`) or a queue worker does (`Open::execute`, `crates/server/src/worker.rs`). Today no server run writes memory, because Jev offers no memory effect; the drivers in the tests do. Each call is one atomic step.
 
 `Design = "old"` keys an entry by its scope alone, as before C3. `Design = "new"` also keys it by its owner.
 
