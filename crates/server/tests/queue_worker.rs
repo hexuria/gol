@@ -168,6 +168,11 @@ async fn crash_after_claim(uri: String, setup: fn() -> Setup) {
         ));
         assert_eq!(setup.queue.processing().expect("processing"), []);
         assert_eq!(setup.queue.queued().expect("queued"), []);
+        assert_eq!(
+            setup.queue.starts(setup.run_id),
+            Ok(0),
+            "the ack clears the count"
+        );
     });
 }
 
@@ -345,22 +350,38 @@ async fn a_failed_record_is_not_acknowledged() {
     });
 }
 
-// A run delivered more times than max_deliveries without ending is failed,
-// not run again, and leaves the queue.
+// Only a start counts toward max_deliveries: with 2, a run started twice
+// without ending still runs a second time, and on its third start it is
+// failed instead, without Jev, and leaves the queue with its count cleared.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_run_delivered_too_often_is_failed() {
+async fn a_run_started_too_often_is_failed() {
     let jev = jev(Duration::ZERO).await;
-    let uri = jev.uri();
+    started_too_often(jev.uri(), queued_run).await;
+    started_too_often(jev.uri(), || {
+        queued_run_in(Arc::new(InMemoryStore::default()))
+    })
+    .await;
+    assert!(jev.received_requests().await.expect("requests").is_empty());
+}
+
+async fn started_too_often(uri: String, setup: fn() -> Setup) {
     blocking(move || {
-        let setup = queued_run();
+        let setup = setup();
         let timing = QueueTiming {
-            max_deliveries: 1,
+            max_deliveries: 2,
             ..quick()
         };
-        let crashed = worker_with(&setup, &uri, timing);
-        drop(crashed.claim().expect("claim").expect("a run"));
-        std::thread::sleep(timing.lease * 2);
-        assert_eq!(setup.queue.reap().expect("reap"), [setup.run_id]);
+        for start in 1..=2 {
+            let worker = worker_with(&setup, &uri, timing);
+            let claim = worker.claim().expect("claim").expect("a run");
+            let Prepared::Open(open) = claim.prepare().expect("prepare") else {
+                panic!("start {start} still runs");
+            };
+            drop(open);
+            assert_eq!(setup.queue.starts(setup.run_id), Ok(start));
+            std::thread::sleep(timing.lease * 2);
+            assert_eq!(setup.queue.reap().expect("reap"), [setup.run_id]);
+        }
         let next = worker_with(&setup, &uri, timing);
         assert_eq!(next.work_one().expect("work"), Some(setup.run_id));
         assert!(matches!(
@@ -368,12 +389,58 @@ async fn a_run_delivered_too_often_is_failed() {
             [Event {
                 payload: EventPayload::RunFailed { message, .. },
                 ..
-            }] if message == "delivered 1 times without ending"
+            }] if message == "started 2 times without ending"
         ));
         assert_eq!(setup.queue.processing().expect("processing"), []);
         assert_eq!(setup.queue.queued().expect("queued"), []);
+        assert_eq!(setup.queue.starts(setup.run_id), Ok(0));
     });
-    assert!(jev.received_requests().await.expect("requests").is_empty());
+}
+
+/// The in-memory store, except that every read of a run fails.
+struct ReadsFail(InMemoryStore);
+
+impl RunStore for ReadsFail {
+    fn put_agent(&self, agent: server::StoredAgent) -> Result<server::PutAgent, StoreError> {
+        self.0.put_agent(agent)
+    }
+    fn agent(&self, id: AgentId) -> Result<Option<server::StoredAgent>, StoreError> {
+        self.0.agent(id)
+    }
+    fn put_run(&self, run: StoredRun) -> Result<(), StoreError> {
+        self.0.put_run(run)
+    }
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
+        self.0.append_events(id, events)
+    }
+    fn run(&self, _id: RunId) -> Result<Option<StoredRun>, StoreError> {
+        Err(StoreError::new("reads are down"))
+    }
+    fn put_artifact(&self, artifact: server::StoredArtifact) -> Result<(), StoreError> {
+        self.0.put_artifact(artifact)
+    }
+    fn artifact(
+        &self,
+        id: protocol::ArtifactId,
+    ) -> Result<Option<server::StoredArtifact>, StoreError> {
+        self.0.artifact(id)
+    }
+}
+
+// A claim that cannot load its run hands it straight back to the front of
+// the queue, releases its lease, and counts no start: an outage of the store
+// does not use up a run's starts.
+#[test]
+fn a_load_error_releases_the_claim_without_counting() {
+    let setup = queued_run_in(Arc::new(ReadsFail(InMemoryStore::default())));
+    let error = worker(&setup, "http://127.0.0.1:9")
+        .work_one()
+        .expect_err("the load failed");
+    assert!(error.contains("reads are down"), "{error}");
+    assert_eq!(setup.queue.queued().expect("queued"), [setup.run_id]);
+    assert_eq!(setup.queue.processing().expect("processing"), []);
+    assert_eq!(setup.queue.starts(setup.run_id), Ok(0));
+    assert_eq!(setup.queue.reap().expect("reap"), []);
 }
 
 // A run id queued twice is claimed once: the second claim finds it leased

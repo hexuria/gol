@@ -19,7 +19,7 @@ use protocol::{Event, FailureClass, RunId};
 
 use crate::http::harness_events;
 use crate::inference::{dispatch_events, run_failed_event};
-use crate::queue::{Delivery, QueueTiming, RedisRunQueue};
+use crate::queue::{QueueTiming, RedisRunQueue};
 use crate::store::{is_terminal, Append, RunStore, StoredRun};
 
 /// Takes runs off the queue and runs them to their end.
@@ -124,13 +124,15 @@ impl WorkerBuilder<Given, Given, Given, Given> {
 }
 
 /// A run this worker claimed, with the token its lease holds.
+#[must_use = "a dropped claim waits out its lease before the run is redelivered"]
 pub struct Claim<'a> {
     worker: &'a Worker,
-    delivery: Delivery,
+    run_id: RunId,
     token: String,
 }
 
 /// What `Claim::prepare` found.
+#[must_use = "a dropped claim waits out its lease before the run is redelivered"]
 pub enum Prepared<'a> {
     /// An open run to execute.
     Open(Open<'a>),
@@ -140,12 +142,14 @@ pub enum Prepared<'a> {
 }
 
 /// A claimed run that is open, with its stored log.
+#[must_use = "a dropped claim waits out its lease before the run is redelivered"]
 pub struct Open<'a> {
     claim: Claim<'a>,
     stored: Box<StoredRun>,
 }
 
 /// A claimed run executed, with the events to record.
+#[must_use = "a dropped claim waits out its lease before the run is redelivered"]
 pub struct Executed<'a> {
     claim: Claim<'a>,
     events: Vec<Event>,
@@ -153,6 +157,7 @@ pub struct Executed<'a> {
 
 /// A claimed run whose log is terminal, or that is not stored: the only
 /// state that can acknowledge.
+#[must_use = "a dropped claim waits out its lease before the run is redelivered"]
 pub struct Done<'a> {
     claim: Claim<'a>,
     recorded: Option<Append>,
@@ -166,9 +171,9 @@ impl Worker {
         Ok(self
             .queue
             .claim(&token, self.timing.lease)?
-            .map(|delivery| Claim {
+            .map(|run_id| Claim {
                 worker: self,
-                delivery,
+                run_id,
                 token,
             }))
     }
@@ -227,20 +232,27 @@ fn backoff(timing: QueueTiming, failures: u32) -> Duration {
 
 impl<'a> Claim<'a> {
     pub fn run_id(&self) -> RunId {
-        self.delivery.run_id
+        self.run_id
     }
 
     /// Loads the run. A run whose log ended, or that is not stored, needs
-    /// nothing more. A run delivered more than `max_deliveries` times is
-    /// failed instead of run again.
+    /// nothing more. An open run counts a start; one started more than
+    /// `max_deliveries` times is failed instead of run again. A run that
+    /// cannot be loaded (the store is down) is handed straight back to the
+    /// front of the queue, and does not count.
     pub fn prepare(self) -> Result<Prepared<'a>, String> {
         let worker = self.worker;
         let run_id = self.run_id();
-        let Some(stored) = worker
-            .store
-            .run(run_id)
-            .map_err(|error| error.to_string())?
-        else {
+        let loaded = match worker.store.run(run_id) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                if let Err(release) = worker.queue.release(run_id, &self.token) {
+                    eprintln!("gol: queue worker: release run {run_id}: {release}");
+                }
+                return Err(format!("load run {run_id}: {error}"));
+            }
+        };
+        let Some(stored) = loaded else {
             eprintln!("gol: queue worker: run {run_id} is not stored; dropping it from the queue");
             return Ok(Prepared::Done(Done {
                 claim: self,
@@ -257,11 +269,16 @@ impl<'a> Claim<'a> {
                 recorded: None,
             }));
         }
-        if self.delivery.count > worker.timing.max_deliveries {
+        let starts = worker.queue.start(run_id)?;
+        if starts > worker.timing.max_deliveries {
+            let before = starts - 1;
             let failed = run_failed_event(
                 &stored.spec,
                 FailureClass::Infrastructure,
-                format!("delivered {} times without ending", self.delivery.count - 1),
+                format!(
+                    "started {before} time{} without ending",
+                    if before == 1 { "" } else { "s" }
+                ),
             );
             return Executed {
                 claim: self,
@@ -288,7 +305,10 @@ impl<'a> Open<'a> {
         let spec = &self.stored.spec;
         let events = std::thread::scope(|scope| {
             let (stop, stopped) = mpsc::channel::<()>();
-            scope.spawn(move || claim.heartbeat(&stopped));
+            std::thread::Builder::new()
+                .name(format!("gol-heartbeat-{}", claim.run_id()))
+                .spawn_scoped(scope, move || claim.heartbeat(&stopped))
+                .expect("spawn the heartbeat thread");
             let mut events = dispatch_events(spec);
             let (harness, _outcome) =
                 harness_events(&worker.jev_base_url, spec, worker.memory.as_ref());

@@ -7,14 +7,15 @@ Checked on 2026-09-28. `RunQueue.tla` is the Redis run queue, its workers and it
 Resources: the Redis runs list, the processing list, the per-run lease keys, and the run log.
 
 Writers:
-- **The producer:** `create_run` (`crates/server/src/http.rs:340`) stores the run as created and queued, then pushes it (`:352`, `RedisRunQueue::push`, `crates/server/src/queue.rs:147`). Both happen in one blocking task, so a client going away cannot separate them.
-- **Workers** (`Worker::work_one`, `crates/server/src/worker.rs:181`), `GOL_WORKERS` of them in the server process. Each one:
-  - claims a run: one script moves it to processing, leases it (`SET NX PX`) and counts the delivery (`CLAIM`, `queue.rs:61`; `claim`, `:173`);
-  - loads the run (`Claim::prepare`, `worker.rs:236`) and runs the harness (`Open::execute`, `:285`), renewing the lease every heartbeat (`:343`; `RENEW`, `queue.rs:72`);
-  - records the harness's events in one append (`Executed::record`, `worker.rs:310`; `RunStore::append_events`), which the store refuses once the log is terminal;
-  - acknowledges: one script removes the run from processing and releases the lease if it still holds it (`ACK`, `queue.rs:81`; `Done::ack`, `worker.rs:332`).
-  - Only a `Done` can acknowledge, and only `record`, or a `prepare` that finds nothing to run, makes one. So the ack comes after the record by construction.
-- **The reaper** (`reap_forever`, `worker.rs:366`): one script moves every run in processing whose lease is gone back to the front of the runs list (`REAP`, `queue.rs:92`).
+- **The producer:** `create_run` (`crates/server/src/http.rs:340`) stores the run as created and queued, then pushes it (`:363`, `RedisRunQueue::push`, `crates/server/src/queue.rs:157`). Both happen in one blocking task, so a client going away cannot separate them.
+- **Workers** (`Worker::work_one`, `crates/server/src/worker.rs:186`), `GOL_WORKERS` of them in the server process. Each one:
+  - claims a run: one script moves it to processing and leases it (`SET NX PX`) (`CLAIM`, `queue.rs:62`; `claim`, `:185`);
+  - loads the run (`Claim::prepare`, `worker.rs:243`). A load error hands the claim straight back to the front of the queue (`RELEASE`, `queue.rs:79`). An open run counts a start (`START`, `queue.rs:73`);
+  - runs the harness (`Open::execute`, `worker.rs:302`), renewing the lease every heartbeat (`:363`; `RENEW`, `queue.rs:89`);
+  - records the harness's events in one append (`Executed::record`, `worker.rs:330`; `RunStore::append_events`), which the store refuses once the log is terminal;
+  - acknowledges: one script removes the run from processing, clears its start count and releases the lease if it still holds it (`ACK`, `queue.rs:98`; `Done::ack`, `worker.rs:352`).
+  - Only a `Done` can acknowledge, and only `record`, or a `prepare` that finds nothing to run, makes one. So the ack of a stored run comes after its terminal event by construction. A run that is not stored is acknowledged without one, and dropped with an error.
+- **The reaper** (`reap_forever`, `worker.rs:386`): one script moves every run in processing whose lease is gone back to the front of the runs list (`REAP`, `queue.rs:109`).
 
 Each Redis command, each script and each append is one atomic step. `Push` is one step: the store and the push run in one blocking task.
 
@@ -30,10 +31,15 @@ The model's claims rest on these; each is outside what it checks.
 - **Push:**
   - The server process does not die between storing a run and pushing it. Such a crash leaves a stored, queued run that no worker sees (not modelled; see Recommended in the PR).
   - Cancellation cannot separate the two steps: they are one blocking task.
+  - A store whose put fails with an unknown outcome gets a best-effort `RunFailed` append, so a put that did commit is not left queued and unpushed.
 - **Store:** every queued run is in the store the workers read. The queue refuses to start without `GOL_DATABASE_URL`, and one Redis serves one deployment. A worker drops a run it cannot find, with an error.
-- **Record:** a record eventually succeeds, or the run is failed. A run delivered more than `max_deliveries` times (5) without ending is recorded `RunFailed` and acknowledged. The model bounds crashes instead.
+- **Record:** a record eventually succeeds, or the run is failed.
+  - A run started more than `max_deliveries` times (5, owner decision of 2026-09-28) without ending is recorded `RunFailed` and acknowledged.
+  - Only a claim that opens the run counts. A claim that cannot load the run hands it back to the front of the queue and does not count, so a store outage uses no starts.
+  - A run that can never be loaded is retried for as long as that lasts, with backoff and an error each time.
+  - The model bounds crashes instead.
 - **Workers:** a crashed worker comes back. `work_forever` catches a panic, lets that claim expire, backs off and goes on. A process that dies is restarted by its supervisor.
-- **Redis:** Redis keeps what it is given: `noeviction`, and AOF persistence.
+- **Redis:** Redis keeps what it is given: standalone, `noeviction`, and AOF persistence. Redis answers or times out: a connection's handshake, and every read and write, has a 5 s deadline.
 - **AtMostOneTerminal** is `formal/runlog`'s property, and that model owns it. `Record` here takes the store's refusal as given, so this model links to it and does not check it again.
 
 ## Properties
@@ -84,7 +90,7 @@ Tests in `crates/server/tests/queue_worker.rs`, against Redis and Postgres (the 
   - A's record is refused (`Append::Terminal`), one terminal event stays, and both acknowledgements leave the queue empty.
 - **`AckAfterTerminal`:** the claim's types (`Done` alone acknowledges) and `a_failed_record_is_not_acknowledged`.
   - `an_ended_run_is_acknowledged_without_jev` covers the found-ended path (owner decision 3A).
-- **The delivery cap:** `a_run_delivered_too_often_is_failed`.
+- **The start cap:** `a_run_started_too_often_is_failed`, on both stores. It checks the boundary (with a cap of 2, the second start still runs, and the third is failed) and that the ack clears the count. A store outage uses no starts: `a_load_error_releases_the_claim_without_counting`.
 - **The claim takes the lease with the run:** `the_reaper_leaves_a_live_lease` shows a claimed run is leased. That the two happen in one step rests on reading `CLAIM`: no test can interleave inside a script. A run queued twice is claimed once: `a_run_queued_twice_is_claimed_once`.
 - **The heartbeat:** `the_heartbeat_keeps_a_slow_run_leased`. The reaper, run all through a 1.5 s Jev call with a 400 ms lease, hands nothing back.
 - **Malformed entries:** `a_malformed_entry_is_dropped`.

@@ -426,3 +426,22 @@ fn the_queue_comes_from_the_environment() {
         assert!(error.contains("GOL_DATABASE_URL"), "{error}");
     }
 }
+
+// A Redis that accepts a connection and never answers does not hang the
+// caller: the handshake has a deadline, and the call fails.
+#[test]
+fn a_silent_redis_fails_instead_of_hanging() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let held = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+    let queue = server::RedisRunQueue::open(format!("redis://127.0.0.1:{port}/"));
+    let started = std::time::Instant::now();
+    let answered = queue.ping();
+    let waited = started.elapsed();
+    assert!(answered.is_err(), "{answered:?}");
+    assert!(
+        waited < std::time::Duration::from_secs(8),
+        "waited {waited:?}"
+    );
+    drop(held);
+}

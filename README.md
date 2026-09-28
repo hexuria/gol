@@ -20,12 +20,12 @@ Runs and memory are kept in the process unless `GOL_DATABASE_URL` names a Postgr
 - Memory bounds a lock wait at 5 s and a statement at 10 s unless the URL, role or database sets its own. Behind a transaction-mode pooler, set them on the role.
 
 `GOL_REDIS_URL` queues runs instead of running them inside `POST /v1/runs`:
-- The server stores a run as created and queued and pushes it onto `gol:runs`, and `GOL_WORKERS` worker threads (default 2) in the same process run it.
+- The server stores a run as created and queued and pushes it onto `{gol:runs}`, and `GOL_WORKERS` worker threads (default 2) in the same process run it. The processing list, start counts and leases are `{gol:runs}:processing`, `{gol:runs}:deliveries` and `{gol:runs}:lease:<run>`.
 - A worker claims a run and its 30 s lease in one step, renews the lease every 10 s, records the run's events, and only then acknowledges it.
 - A reaper puts a run whose lease ran out back at the front of the queue, every 15 s, so a crashed worker's run is redelivered.
-- A redelivered run that already ended is acknowledged without running again, and one delivered more than five times without ending is failed.
+- A redelivered run that already ended is acknowledged without running again, and one started more than five times without ending is failed. A run the worker cannot load (the database is down) goes straight back to the front of the queue and does not count as a start.
 - Delivery is at least once: a redelivered run starts over and repeats its Jev calls.
-- The queue needs `GOL_DATABASE_URL`, since queued run ids outlive the process. One Redis serves one deployment. Configure it with `noeviction` and AOF persistence.
+- The queue needs `GOL_DATABASE_URL`, since queued run ids outlive the process. One Redis serves one deployment: a standalone Redis (no cluster), with `noeviction` and AOF persistence. A Redis that does not answer a connection within 5 s counts as down.
 - The server refuses to start if Redis does not answer, and starts the workers only once its port is bound.
 
 ## Authentication
