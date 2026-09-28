@@ -364,7 +364,7 @@ impl<'a> Open<'a> {
                 .name("gol-heartbeat".to_string())
                 .spawn_scoped(scope, move || claim.heartbeat(&stopped))
                 .expect("spawn the heartbeat thread");
-            let outcome = worker.store_as_it_goes(stored);
+            let outcome = worker.store_as_it_goes(stored, &claim.token);
             drop(stop);
             outcome
         });
@@ -380,18 +380,28 @@ impl<'a> Open<'a> {
 /// before it hands the run back to the queue.
 const RELOADS: usize = 3;
 
+/// Why `Worker::run_from` stopped.
+enum Stopped {
+    /// What the store answered to its last append.
+    Store(Append),
+    /// Its claim no longer holds the run's lease.
+    LostLease,
+}
+
 impl Worker {
     /// Runs `stored` from its log, and again from a reloaded log each time
     /// another writer moved it, up to `RELOADS` times. `Appended` when this
     /// worker ended the run, `Terminal` when another writer did, `Moved` when
-    /// it gave up.
-    fn store_as_it_goes(&self, stored: StoredRun) -> Result<Append, String> {
+    /// it gave up or lost its lease (`Done::ack` then releases the run, which
+    /// does nothing once another worker holds the lease).
+    fn store_as_it_goes(&self, stored: StoredRun, token: &str) -> Result<Append, String> {
         let spec = stored.spec;
         let mut events = stored.events;
         for reload in 0..=RELOADS {
-            match self.run_from(&spec, events)? {
-                Append::Moved if reload < RELOADS => {}
-                other => return Ok(other),
+            match self.run_from(&spec, events, token)? {
+                Stopped::Store(Append::Moved) if reload < RELOADS => {}
+                Stopped::Store(other) => return Ok(other),
+                Stopped::LostLease => return Ok(Append::Moved),
             }
             events = match self.store.run(spec.run_id).map_err(|e| e.to_string())? {
                 Some(run) => run.events,
@@ -402,24 +412,32 @@ impl Worker {
     }
 
     /// Runs `spec`'s run from `events`, its stored log, appending as it goes.
-    /// Stops at the first append the store refuses, and reports it.
-    fn run_from(&self, spec: &RunSpec, mut events: Vec<Event>) -> Result<Append, String> {
+    /// Stops at the first append the store refuses, and reports it, or at
+    /// the first step boundary where `token` no longer holds the run's lease:
+    /// the lease ran out under this worker and another may be running it.
+    fn run_from(
+        &self,
+        spec: &RunSpec,
+        mut events: Vec<Event>,
+        token: &str,
+    ) -> Result<Stopped, String> {
         // Another writer ended it: a reload finds the log as it was left.
         if events.iter().any(|event| is_terminal(&event.payload)) {
-            return Ok(Append::Terminal);
+            return Ok(Stopped::Store(Append::Terminal));
         }
         let run_id = spec.run_id;
         let mut seen = events.len();
         let append = |seen: usize, new: Vec<Event>| {
             self.store
                 .append_events_after(run_id, seen, new)
+                .map(Stopped::Store)
                 .map_err(|error| error.to_string())
         };
         // A queued run is scheduled first, as one append.
         if fold(spec, &events).dispatch == DispatchPhase::Queued {
             let ladder = dispatch_events(spec);
             match append(seen, ladder.clone())? {
-                Append::Appended => {}
+                Stopped::Store(Append::Appended) => {}
                 refused => return Ok(refused),
             }
             seen += ladder.len();
@@ -460,12 +478,19 @@ impl Worker {
             &UnavailableModel,
             &memory,
             &mut |driver| {
+                // A worker whose lease ran out stops writing here: another
+                // may already be running the run (a Redis error keeps going,
+                // as the heartbeat does).
+                if let Ok(false) = self.queue.renew(run_id, token, self.timing.lease) {
+                    refused = Some(Ok(Stopped::LostLease));
+                    return Boundary::Pause;
+                }
                 let new = &driver.events()[seen..];
                 if new.is_empty() {
                     return Boundary::Continue;
                 }
                 match append(seen, new.to_vec()) {
-                    Ok(Append::Appended) => {
+                    Ok(Stopped::Store(Append::Appended)) => {
                         seen = driver.events().len();
                         Boundary::Continue
                     }
@@ -488,7 +513,7 @@ impl Worker {
             ));
         }
         if tail.is_empty() {
-            return Ok(Append::Appended);
+            return Ok(Stopped::Store(Append::Appended));
         }
         append(seen, tail)
     }

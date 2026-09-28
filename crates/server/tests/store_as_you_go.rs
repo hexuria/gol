@@ -290,6 +290,9 @@ struct AppendsBefore {
     every: Option<RunSpec>,
     /// Set: this run ends before the second read of it (a worker's reload).
     end_on_reload: Option<Event>,
+    /// Set: at the `at`-th append, this Redis key (the run's lease) passes to
+    /// another holder, as when the lease ran out under a live worker.
+    steal_lease: Option<String>,
     reads: Mutex<usize>,
     calls: Mutex<usize>,
     lengths: Mutex<Vec<usize>>,
@@ -303,6 +306,7 @@ impl AppendsBefore {
             write: Mutex::new(Some(write)),
             every: None,
             end_on_reload: None,
+            steal_lease: None,
             reads: Mutex::new(0),
             calls: Mutex::new(0),
             lengths: Mutex::new(Vec::new()),
@@ -343,6 +347,17 @@ impl RunStore for AppendsBefore {
         if call == self.at {
             if let Some(write) = self.write.lock().unwrap().take() {
                 self.inner.append_events(id, write)?;
+            }
+            if let Some(lease) = &self.steal_lease {
+                let mut redis = redis::Client::open(REDIS_URL)
+                    .expect("client")
+                    .get_connection()
+                    .expect("connect");
+                redis::cmd("SET")
+                    .arg(lease)
+                    .arg("another-worker")
+                    .query::<()>(&mut redis)
+                    .expect("steal the lease");
             }
         }
         if let Some(spec) = &self.every {
@@ -569,6 +584,48 @@ async fn a_run_ended_before_the_reload_is_left_ended() {
                 message: "ended elsewhere".to_string(),
             });
             assert_eq!(payloads(&events), expected);
+        });
+        assert_eq!(server.received_requests().await.expect("requests").len(), 0);
+    }
+}
+
+// The lease passes to another worker while this one runs (it ran out under
+// a live worker). At its next step boundary this worker renews, finds the
+// lease gone, and stops: it stores nothing more, never asks Jev, and leaves
+// the run in the new holder's hands instead of handing it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_that_lost_its_lease_stops_at_the_next_boundary() {
+    for which in 0..2 {
+        let server = jev(&["complete"]).await;
+        let uri = server.uri();
+        blocking(move || {
+            let inner = stores().swap_remove(which);
+            let spec = spec();
+            inner
+                .put_run(StoredRun {
+                    spec: spec.clone(),
+                    events: queued_events(&spec),
+                })
+                .expect("put run");
+            let key = format!("gol:test:{}", RunId::new());
+            let mut store = AppendsBefore::new(inner, 1, Vec::new());
+            store.steal_lease = Some(format!("{{{key}}}:lease:{}", spec.run_id));
+            let store = Arc::new(store);
+            let queue = RedisRunQueue::with_key(REDIS_URL, &key);
+            queue.push(spec.run_id).expect("push");
+            let worker = worker(store.clone(), &key, &uri);
+            assert_eq!(worker.work_one().expect("work"), Some(spec.run_id));
+            let events = store.run(spec.run_id).expect("read").expect("run").events;
+            assert_eq!(
+                payloads(&events[3..]),
+                [
+                    EventPayload::RunScheduled,
+                    EventPayload::RunProvisioning,
+                    EventPayload::RunStarting,
+                ]
+            );
+            assert_eq!(queue.processing().expect("processing"), [spec.run_id]);
+            assert_eq!(queue.queued().expect("queued"), []);
         });
         assert_eq!(server.received_requests().await.expect("requests").len(), 0);
     }

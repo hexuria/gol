@@ -77,7 +77,7 @@ TLC2 Version 2.19 of 08 August 2024, from tla2tools v1.7.4, which `scripts/insta
 - `RunQueue.cfg`: 863 states generated, 339 distinct, depth 19. Before Phase 1.5b let `Release` act after `Run` too: 795 generated, 339 distinct, depth 19; before C6: 793, 337, depth 17.
 - `RunQueueCrash.cfg`: 1,727 states generated, 678 distinct, depth 20 (before Phase 1.5b: 1,591 generated, 678 distinct).
 
-Checked again on 2026-09-29 for Phase 1.5b. The only change is that `Release` is enabled from `ran` as well as `claimed`, so no new state is reachable, only new transitions between the same states. Every invariant and property still passes.
+Checked again on 2026-09-29 for Phase 1.5b. The only change is that `Release` is enabled from `ran` as well as `claimed`, so no new state is reachable, only new transitions between the same states. Every invariant and property still passes. Load-failure releases and hand-backs share `MaxReleases`, so at the PR constants a release after `Run` is explored within the same budget of two.
 
 Larger bounds; the first two rows are `RunQueueCrash.cfg` (`MaxProducerDeaths = 1`) with the constants changed:
 

@@ -20,6 +20,8 @@ Late == "late"
 Msg == "msg"
 \* A worker's appends, in order: the last one ends the run.
 StepId(k) == CASE k = 1 -> "s1" [] k = 2 -> "s2" [] k = 3 -> "s3"
+\* StepId names three steps; a config asking for more fails here, not later.
+ASSUME Steps \in 1..3
 StepIds == IF Workers = {} THEN {} ELSE {StepId(k) : k \in 1..Steps}
 LastStep == IF Workers = {} THEN {} ELSE {StepId(Steps)}
 Terminal == {Jev} \cup Completers \cup Failers \cup LastStep
