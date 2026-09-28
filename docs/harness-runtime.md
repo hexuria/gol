@@ -41,7 +41,7 @@ Each variant carries only the fields that variant needs.
 | `MemoryRead` | Allowed when the spec lists `memory.read`, and for session or workspace scope when its metadata names `session_id` or `workspace_id`. Global scope is denied. From `Running`, `reduce` emits the read. |
 | `MemoryWrite` | Allowed when the spec lists `memory.write`, with the same rules for session, workspace and global scope. From `Running`, `reduce` emits the write. |
 | `Complete` | Always allowed. From `Running`, `reduce` enters `Completed`. |
-| `Delegate` | Allowed when the spec lists `agent.delegate` and the run is fewer than `MAX_DELEGATION_HOPS` (8) hops from its root. From `Running`, `reduce` emits it. The driver records `ChildStarted` or `DelegateRefused`; with no spawner configured it refuses. |
+| `Delegate` | Allowed when the spec lists `agent.delegate` and the run is fewer than `MAX_DELEGATION_HOPS` (8) hops from its root. From `Running`, `reduce` emits it. The driver starts the child through its `AgentSpawner` with half of the steps and model calls the run has left, and records `ChildStarted` (with those limits, which then count as spent for the parent) or `DelegateRefused`. It refuses the eleventh child (`MAX_CHILDREN`), a run with fewer than 2 steps or model calls left, and any delegation when no spawner is configured. The server's `OwnedSpawner` queues the child as a run of an agent the parent's owner holds, with the capabilities both allow and the parent's placement, work model and session. |
 | `Execute`, `AskUser`, `RequestApproval`, `Wait`, `PublishArtifact` | Denied. The loop continues. |
 
 `PolicyDecision` is `Allow`, `Deny { reason }`, `RequireApproval`, `Modify`, `Limit`, or `Redirect`. The authorizer in this slice returns `Allow` or `Deny` only.

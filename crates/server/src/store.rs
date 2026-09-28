@@ -44,6 +44,15 @@ pub struct StoredArtifact {
     pub body: Vec<u8>,
 }
 
+/// What `RunStore::put_run` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PutRun {
+    /// The run is new, and is now stored.
+    Stored,
+    /// A run was already stored under this id. Nothing was written.
+    Existed,
+}
+
 /// What `RunStore::append_events` did. The log only grows, and it ends at the
 /// first terminal event (formal/runlog/RunLog.tla).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +102,7 @@ pub trait RunStore: Send + Sync {
     /// Store a new run. A run already stored under that id keeps its spec and
     /// events, so a redelivered put cannot drop anything appended since. A
     /// batch with an event after its terminal event is refused.
-    fn put_run(&self, run: StoredRun) -> Result<(), StoreError>;
+    fn put_run(&self, run: StoredRun) -> Result<PutRun, StoreError>;
     /// Append `events` onto the stored run in one atomic step, unless the
     /// stored log is already terminal or the run is missing. `spec` and the
     /// events already stored never change. A batch with an event after its
@@ -155,12 +164,15 @@ impl RunStore for InMemoryStore {
         Ok(read(&self.agents).get(&id).cloned())
     }
 
-    fn put_run(&self, run: StoredRun) -> Result<(), StoreError> {
+    fn put_run(&self, run: StoredRun) -> Result<PutRun, StoreError> {
         check_one_terminal(&run.events)?;
-        write(&self.runs, "run")?
-            .entry(run.spec.run_id)
-            .or_insert(run);
-        Ok(())
+        match write(&self.runs, "run")?.entry(run.spec.run_id) {
+            std::collections::hash_map::Entry::Occupied(_) => Ok(PutRun::Existed),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(run);
+                Ok(PutRun::Stored)
+            }
+        }
     }
 
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
@@ -217,6 +229,23 @@ mod tests {
                 max_model_calls: 1,
             })
             .build()
+    }
+
+    // A second put of the same run stores nothing and says so; the first
+    // spec and events stay.
+    #[test]
+    fn a_second_put_of_a_run_reports_it_existed() {
+        let store = InMemoryStore::default();
+        let spec = spec();
+        let run = StoredRun {
+            spec: spec.clone(),
+            events: vec![],
+        };
+        assert_eq!(store.put_run(run.clone()), Ok(PutRun::Stored));
+        let mut other = run;
+        other.spec.input = "changed".to_string();
+        assert_eq!(store.put_run(other), Ok(PutRun::Existed));
+        assert_eq!(store.run(spec.run_id).unwrap().unwrap().spec, spec);
     }
 
     // Owner decision 3A: a writer that panicked holding the lock leaves reads

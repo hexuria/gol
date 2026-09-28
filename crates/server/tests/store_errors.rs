@@ -30,7 +30,7 @@ impl RunStore for DownStore {
         down()
     }
 
-    fn put_run(&self, _run: StoredRun) -> Result<(), StoreError> {
+    fn put_run(&self, _run: StoredRun) -> Result<server::PutRun, StoreError> {
         down()
     }
 
@@ -190,7 +190,7 @@ impl RunStore for PartlyDown {
         self.inner.agent(id)
     }
 
-    fn put_run(&self, run: StoredRun) -> Result<(), StoreError> {
+    fn put_run(&self, run: StoredRun) -> Result<server::PutRun, StoreError> {
         self.check("put_run")?;
         self.inner.put_run(run)
     }

@@ -228,6 +228,10 @@ fn payloads(max_steps: u32) -> Vec<EventPayload> {
         EventPayload::ChildStarted {
             run_id: RunId::from_uuid(Uuid::from_u128(7)),
             agent_id: AgentId::from_uuid(Uuid::from_u128(8)),
+            limits: Limits {
+                max_steps: 1,
+                max_model_calls: 1,
+            },
         },
         EventPayload::DelegateRefused {
             agent_id: AgentId::from_uuid(Uuid::from_u128(8)),

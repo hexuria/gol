@@ -661,11 +661,11 @@ impl RunStore for WatchedMemory {
         self.inner.agent(id)
     }
 
-    fn put_run(&self, run: StoredRun) -> Result<(), server::StoreError> {
+    fn put_run(&self, run: StoredRun) -> Result<server::PutRun, server::StoreError> {
         self.ids.lock().expect("ids").push(run.spec.run_id);
-        self.inner.put_run(run)?;
+        let put = self.inner.put_run(run)?;
         (self.after_put)();
-        Ok(())
+        Ok(put)
     }
 
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, server::StoreError> {

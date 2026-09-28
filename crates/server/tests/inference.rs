@@ -806,7 +806,7 @@ impl RunStore for WriteAfterSnapshot {
         self.inner.agent(id)
     }
 
-    fn put_run(&self, run: StoredRun) -> Result<(), server::StoreError> {
+    fn put_run(&self, run: StoredRun) -> Result<server::PutRun, server::StoreError> {
         self.inner.put_run(run)
     }
 

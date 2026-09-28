@@ -450,12 +450,12 @@ impl RunStore for WatchedPostgres {
         self.inner.agent(id)
     }
 
-    fn put_run(&self, run: StoredRun) -> Result<(), server::StoreError> {
+    fn put_run(&self, run: StoredRun) -> Result<server::PutRun, server::StoreError> {
         let run_id = run.spec.run_id;
         self.ids.lock().expect("ids").push(run_id);
-        self.inner.put_run(run)?;
+        let put = self.inner.put_run(run)?;
         (self.after_put)(&self.inner, run_id);
-        Ok(())
+        Ok(put)
     }
 
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, server::StoreError> {
@@ -1817,4 +1817,24 @@ fn no_database_url_keeps_runs_out_of_postgres() {
     assert!(stores.runs.run(run_id).expect("store").is_some());
     let postgres = PostgresStore::connect(POSTGRES_URL).expect("connect");
     assert!(postgres.run(run_id).expect("store").is_none());
+}
+
+// A second put of the same run stores nothing and says so; the first spec
+// stays.
+#[test]
+fn a_second_put_reports_the_run_existed_in_postgres() {
+    let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    let spec = spec();
+    let run = StoredRun {
+        spec: spec.clone(),
+        events: vec![],
+    };
+    assert_eq!(store.put_run(run.clone()), Ok(server::PutRun::Stored));
+    let mut other = run;
+    other.spec.input = "changed".to_string();
+    assert_eq!(store.put_run(other), Ok(server::PutRun::Existed));
+    assert_eq!(
+        store.run(spec.run_id).expect("read").expect("run").spec,
+        spec
+    );
 }

@@ -343,42 +343,19 @@ async fn create_run(
         let queued = crate::inference::queued_events(&spec);
         let store = state.store.clone();
         let spec_for_queue = spec.clone();
-        let queued_for_store = queued.clone();
         tokio::task::spawn_blocking(move || {
-            let run_id = spec_for_queue.run_id;
-            queue
-                .pend(run_id)
-                .map_err(|error| ApiError::Decider(format!("queue unavailable: {error}")))?;
-            if let Err(error) = store.put_run(StoredRun {
-                spec: spec_for_queue.clone(),
-                events: queued_for_store,
-            }) {
-                // The put may have committed before it failed: end the run in
-                // case it did, so it is not left queued and never pushed. A
-                // store that holds no such run refuses the append.
-                let failed = run_failed_event(
-                    &spec_for_queue,
-                    FailureClass::Infrastructure,
-                    "store unavailable".to_string(),
-                );
-                if let Err(store_error) = store.append_events(run_id, vec![failed]) {
-                    eprintln!("gol: could not end run {run_id}: {store_error}");
+            crate::spawner::enqueue(
+                store.as_ref(),
+                &queue,
+                &spec_for_queue,
+                crate::spawner::OnPushFailure::End,
+            )
+            .map_err(|error| match error {
+                crate::spawner::EnqueueError::Queue(error) => {
+                    ApiError::Decider(format!("queue unavailable: {error}"))
                 }
-                return Err(ApiError::from(error));
-            }
-            queue.push(run_id).map_err(|error| {
-                // The run is stored but will never be picked up: end it, so it is
-                // not left open. Its pending entry stays; the sweep finds the run
-                // ended and drops it.
-                let failed = run_failed_event(
-                    &spec_for_queue,
-                    FailureClass::Infrastructure,
-                    format!("queue push failed: {error}"),
-                );
-                if let Err(store_error) = store.append_events(run_id, vec![failed]) {
-                    eprintln!("gol: could not end run {run_id}: {store_error}");
-                }
-                ApiError::Decider(error)
+                crate::spawner::EnqueueError::Store(error) => ApiError::from(error),
+                crate::spawner::EnqueueError::Push(error) => ApiError::Decider(error),
             })
         })
         .await

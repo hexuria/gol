@@ -25,12 +25,15 @@ pub fn authorize(spec: &RunSpec, effect: &Effect, tools: &[ToolDescriptor]) -> P
                 reason: format!("unknown tool: {name}"),
             },
         },
-        Effect::Delegate { .. } if spec.lineage.hop >= MAX_DELEGATION_HOPS => {
-            PolicyDecision::Deny {
-                reason: format!("delegation is already {MAX_DELEGATION_HOPS} hops deep"),
+        // The capability first, as for memory; then the depth.
+        Effect::Delegate { .. } => match allow_capability(spec, AGENT_DELEGATE) {
+            PolicyDecision::Allow if spec.lineage.hop >= MAX_DELEGATION_HOPS => {
+                PolicyDecision::Deny {
+                    reason: format!("delegation is already {MAX_DELEGATION_HOPS} hops deep"),
+                }
             }
-        }
-        Effect::Delegate { .. } => allow_capability(spec, AGENT_DELEGATE),
+            decision => decision,
+        },
         Effect::Execute { .. }
         | Effect::AskUser { .. }
         | Effect::RequestApproval { .. }
@@ -147,6 +150,14 @@ mod tests {
             authorize(&spec, &delegate(), &[]),
             PolicyDecision::Deny {
                 reason: "delegation is already 8 hops deep".to_string()
+            }
+        );
+        // Without the capability, that is the reason at any depth.
+        spec.capabilities.clear();
+        assert_eq!(
+            authorize(&spec, &delegate(), &[]),
+            PolicyDecision::Deny {
+                reason: "missing capability: agent.delegate".to_string()
             }
         );
     }

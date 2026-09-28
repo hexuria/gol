@@ -268,7 +268,7 @@ impl RunSpecBuilder<Set, Set, Set, Set, Set> {
         self.draft.child_of = Some(ChildOf {
             parent: parent.run_id,
             root: parent.root(),
-            hop: parent.lineage.hop + 1,
+            hop: parent.lineage.hop.saturating_add(1),
             step,
         });
         self
@@ -454,6 +454,36 @@ mod lineage_tests {
         assert_ne!(child(&root, 3, agent, "draft!").run_id, id);
         assert_ne!(child(&sample_spec(), 3, agent, "draft").run_id, id);
         assert_ne!(sample_spec().run_id, sample_spec().run_id);
+    }
+
+    // The id's layout is fixed: once child ids are stored, a change to the
+    // name bytes or the namespace would rename every child. A second-level
+    // child, whose root and parent differ, shows the root counts on its own.
+    #[test]
+    fn a_child_id_is_fixed_by_its_layout() {
+        let id = |n: u128| RunId::from_uuid(uuid::Uuid::from_u128(n));
+        let mut parent = sample_spec();
+        parent.run_id = id(1);
+        parent.lineage = Lineage {
+            parent: Some(id(2)),
+            root: Some(id(3)),
+            hop: 1,
+        };
+        let agent = AgentId::from_uuid(uuid::Uuid::from_u128(4));
+        let named = child(&parent, 5, agent, "draft").run_id;
+        assert_eq!(named.to_string(), "4f6b81d8-6ace-5267-afe7-182617feebc3");
+        let mut other_root = parent.clone();
+        other_root.lineage.root = Some(id(9));
+        assert_ne!(child(&other_root, 5, agent, "draft").run_id, named);
+    }
+
+    // A corrupt hop at the top of its range stays there: it does not wrap
+    // to a child that looks like a root.
+    #[test]
+    fn a_hop_at_its_limit_does_not_wrap() {
+        let mut parent = sample_spec();
+        parent.lineage.hop = u32::MAX;
+        assert_eq!(child(&parent, 1, AgentId::new(), "x").lineage.hop, u32::MAX);
     }
 
     // A spec stored before lineage existed still loads, as a top-level run.

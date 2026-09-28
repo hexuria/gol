@@ -1,12 +1,14 @@
+use std::sync::Arc;
+
 use protocol::{
-    applicable, authorize, fold, Actor, Effect, Event, EventPayload, ExecutionPlacement,
-    FailureClass, HarnessState, InvocationId, MemoryScope, PolicyDecision, RunSpec, RunState,
-    Timestamp, ToolDescriptor,
+    applicable, authorize, fold, Actor, AgentId, Effect, Event, EventPayload, ExecutionPlacement,
+    FailureClass, HarnessState, InvocationId, Limits, MemoryScope, PolicyDecision, RunSpec,
+    RunState, Timestamp, ToolDescriptor, MAX_CHILDREN,
 };
 
 use crate::{
-    Decider, DeciderError, DecisionView, LoadedCatalog, Memory, MemoryKey, ModelCompletion, Skill,
-    StoreError, Tool,
+    AgentSpawner, ChildRequest, Decider, DeciderError, DecisionView, LoadedCatalog, Memory,
+    MemoryKey, ModelCompletion, Skill, StoreError, Tool,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,6 +21,7 @@ pub struct Driver {
     events: Vec<Event>,
     skills: Vec<Skill>,
     loaded: Option<Vec<Box<dyn Tool>>>,
+    spawner: Option<Arc<dyn AgentSpawner>>,
 }
 
 impl Driver {
@@ -31,6 +34,7 @@ impl Driver {
             events: Vec::new(),
             skills: Vec::new(),
             loaded: None,
+            spawner: None,
         };
         driver.push(EventPayload::RunStarted, Actor::System);
         Ok(driver)
@@ -57,6 +61,13 @@ impl Driver {
         };
         self.loaded = Some(tools);
         result
+    }
+
+    /// Delegations this run is allowed to make start their children through
+    /// `spawner`. Without one, they are refused.
+    pub fn with_spawner(mut self, spawner: Arc<dyn AgentSpawner>) -> Self {
+        self.spawner = Some(spawner);
+        self
     }
 
     pub fn events(&self) -> &[Event] {
@@ -127,8 +138,10 @@ impl Driver {
             return Ok(Vec::new());
         }
         let limits = &self.spec.limits;
-        let steps_spent = state.steps >= limits.max_steps;
-        let model_calls_spent = state.model_calls >= limits.max_model_calls;
+        // What this run gave its children is spent as if it had taken it.
+        let steps_spent = state.steps.saturating_add(state.given_steps) >= limits.max_steps;
+        let model_calls_spent =
+            state.model_calls.saturating_add(state.given_model_calls) >= limits.max_model_calls;
 
         let effect = {
             let view = DecisionView {
@@ -335,15 +348,7 @@ impl Driver {
                         }
                     }
                 }
-                // No spawner is wired into the driver yet: the delegation is
-                // recorded as refused, and the run goes on.
-                Effect::Delegate { agent_id, .. } => self.push(
-                    EventPayload::DelegateRefused {
-                        agent_id: *agent_id,
-                        reason: "no agent spawner is configured".to_string(),
-                    },
-                    Actor::System,
-                ),
+                Effect::Delegate { agent_id, input } => self.delegate(*agent_id, input),
                 Effect::Complete { .. }
                 | Effect::Execute { .. }
                 | Effect::AskUser { .. }
@@ -405,6 +410,60 @@ impl Driver {
             },
             Actor::System,
         );
+    }
+
+    /// Starts a child through the spawner, with half of what this run has
+    /// left, and records what happened. The run goes on either way.
+    fn delegate(&mut self, agent_id: AgentId, input: &str) {
+        let state = self.state();
+        let limits = self.spec.limits;
+        let left = |max: u32, used: u32, given: u32| max.saturating_sub(used.saturating_add(given));
+        let steps_left = left(limits.max_steps, state.steps, state.given_steps);
+        let model_calls_left = left(
+            limits.max_model_calls,
+            state.model_calls,
+            state.given_model_calls,
+        );
+        let refused = if !matches!(state.harness, HarnessState::Running { .. }) {
+            Err("the run is not running".to_string())
+        } else if state.children >= MAX_CHILDREN {
+            Err(format!("already started {MAX_CHILDREN} children"))
+        } else if steps_left < 2 || model_calls_left < 2 {
+            Err("not enough budget left to give a child".to_string())
+        } else {
+            Ok(Limits {
+                max_steps: steps_left / 2,
+                max_model_calls: model_calls_left / 2,
+            })
+        };
+        let step = match state.harness {
+            HarnessState::Running { step, .. } => step,
+            _ => 0,
+        };
+        let started = refused.and_then(|given| {
+            let spawner = self
+                .spawner
+                .clone()
+                .ok_or_else(|| "no agent spawner is configured".to_string())?;
+            let started = spawner.start(ChildRequest {
+                parent: &self.spec,
+                step,
+                agent_id,
+                input,
+                limits: given,
+            })?;
+            // The stored child's limits, which are what this run has given.
+            Ok((started.run_id, started.limits))
+        });
+        let payload = match started {
+            Ok((run_id, limits)) => EventPayload::ChildStarted {
+                run_id,
+                agent_id,
+                limits,
+            },
+            Err(reason) => EventPayload::DelegateRefused { agent_id, reason },
+        };
+        self.push(payload, Actor::System);
     }
 
     fn push(&mut self, payload: EventPayload, actor: Actor) {

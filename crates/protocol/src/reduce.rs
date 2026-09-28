@@ -337,6 +337,10 @@ mod tests {
             EventPayload::ChildStarted {
                 run_id: crate::RunId::new(),
                 agent_id: AgentId::new(),
+                limits: Limits {
+                    max_steps: 1,
+                    max_model_calls: 1,
+                },
             },
             EventPayload::DelegateRefused {
                 agent_id: AgentId::new(),

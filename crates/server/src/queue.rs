@@ -76,11 +76,21 @@ const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
 /// decision 3A for C6).
 const IDLE_CONNECTIONS: usize = 4;
 
-/// Marks ARGV[1] pending, scored with the Redis clock in ms.
+/// Marks ARGV[1] pending, scored with the Redis clock in ms. An entry that is
+/// already pending keeps its score, so asking again does not put off its
+/// sweep.
 const PEND: &str = r"
 local now = redis.call('TIME')
-redis.call('ZADD', KEYS[1], now[1] * 1000 + math.floor(now[2] / 1000), ARGV[1])
+redis.call('ZADD', KEYS[1], 'NX', now[1] * 1000 + math.floor(now[2] / 1000), ARGV[1])
 return 1
+";
+
+/// 1 if ARGV[1] is on the runs list (KEYS[1]) or in processing (KEYS[2]).
+const QUEUED_OR_CLAIMED: &str = r"
+if redis.call('LPOS', KEYS[1], ARGV[1]) or redis.call('LPOS', KEYS[2], ARGV[1]) then
+  return 1
+end
+return 0
 ";
 
 /// Queues ARGV[1] on the runs list and takes it off pending, in one step.
@@ -264,6 +274,19 @@ impl RedisRunQueue {
             }
         }
         Ok(ids)
+    }
+
+    /// Whether `id` is waiting on the runs list or claimed by a worker, in
+    /// one step.
+    pub fn queued_or_claimed(&self, id: RunId) -> Result<bool, String> {
+        let found: i64 = self.with_connection(|connection| {
+            Script::new(QUEUED_OR_CLAIMED)
+                .key(&self.runs)
+                .key(&self.processing)
+                .arg(id.to_string())
+                .invoke(connection)
+        })?;
+        Ok(found == 1)
     }
 
     /// Takes `id` off pending without queueing it.
