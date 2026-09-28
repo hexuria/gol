@@ -488,14 +488,18 @@ async fn limits_outside_one_to_sixty_four_are_400_and_start_nothing() {
     }
 }
 
+// Redis goes down after the run is stored and before it is pushed (with
+// Redis down from the start, nothing is stored: `redis_down_stores_no_run`).
 #[tokio::test]
 async fn redis_push_failure_does_not_run_the_harness() {
     let jev = jev_mock().await;
-    let store = Arc::new(WatchedMemory::new());
+    let proxy = common::redis_proxy::RedisProxy::start();
+    let down = proxy.clone();
+    let store = Arc::new(WatchedMemory::then(move || down.go_down()));
     let app = router_with_queue(
         store.clone(),
         jev.uri(),
-        Some("redis://127.0.0.1:6390".to_string()),
+        Some(proxy.url(15)),
         common::authenticator(),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -624,13 +628,20 @@ async fn send_when_up(
 struct WatchedMemory {
     inner: InMemoryStore,
     ids: Mutex<Vec<RunId>>,
+    /// Runs right after each put of a run.
+    after_put: Box<dyn Fn() + Send + Sync>,
 }
 
 impl WatchedMemory {
     fn new() -> Self {
+        Self::then(|| {})
+    }
+
+    fn then(after_put: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             inner: InMemoryStore::default(),
             ids: Mutex::new(Vec::new()),
+            after_put: Box::new(after_put),
         }
     }
 }
@@ -652,7 +663,9 @@ impl RunStore for WatchedMemory {
 
     fn put_run(&self, run: StoredRun) -> Result<(), server::StoreError> {
         self.ids.lock().expect("ids").push(run.spec.run_id);
-        self.inner.put_run(run)
+        self.inner.put_run(run)?;
+        (self.after_put)();
+        Ok(())
     }
 
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, server::StoreError> {

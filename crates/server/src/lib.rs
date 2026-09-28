@@ -34,7 +34,7 @@ pub use store::{
 pub use stores::{stores_from_env, Stores};
 pub use surface::{ag_ui_events, json_render_spec};
 pub use worker::{
-    queue_from_env, reap_forever, start_queue, Claim, Done, Executed, Open, Prepared,
+    queue_from_env, reap_forever, start_queue, sweep, Claim, Done, Executed, Open, Prepared,
     QueueSettings, Worker, WorkerBuilder,
 };
 
