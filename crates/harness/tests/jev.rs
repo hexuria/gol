@@ -3,14 +3,17 @@
 //! choices the driver can take. Jev is mocked with wiremock on
 //! `/v1/systemone`; the requests it receives are read back and checked.
 
+use std::sync::Arc;
+
 use harness::{
-    jev_choices, jev_state, run_to_completion, DeciderError, DecisionView, Driver, EchoTool,
-    InMemory, JevDecider, ModelCompletion, Skill, Tool, MAX_EVENT_TEXT,
+    jev_choices, jev_state, run_to_completion, AgentSpawner, ChildRequest, DeciderError,
+    DecisionView, DelegateTarget, Driver, EchoTool, InMemory, JevDecider, ModelCompletion, Skill,
+    StartedChild, Tool, MAX_EVENT_TEXT,
 };
 use protocol::{
-    AgentId, Capability, CredentialSource, Event, EventPayload, ExecutionPlacement, HarnessState,
-    Limits, MessageRole, ModelMessage, ModelProvider, ModelRequest, RunSpec, ToolDescriptor,
-    WorkModel,
+    AgentId, Capability, CredentialSource, Effect, Event, EventPayload, ExecutionPlacement,
+    HarnessState, Limits, MessageRole, ModelMessage, ModelProvider, ModelRequest, RunId, RunSpec,
+    ToolDescriptor, WorkModel,
 };
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
@@ -334,6 +337,7 @@ fn view<'a>(
         events,
         tools,
         skills,
+        agents: &[],
         steps_exhausted: false,
         model_calls_exhausted: false,
     }
@@ -378,4 +382,226 @@ fn jev_state_carries_skills_and_the_last_16_events() {
         rendered["skills"],
         json!([{"name": "tone", "body": "Be brief."}])
     );
+}
+
+fn target(agent_id: AgentId, name: &str, description: &str) -> DelegateTarget {
+    DelegateTarget {
+        agent_id,
+        name: name.to_string(),
+        description: description.to_string(),
+    }
+}
+
+fn delegating(limits: Limits) -> RunSpec {
+    let mut spec = spec(limits);
+    spec.capabilities.push(Capability::new("agent.delegate"));
+    spec
+}
+
+fn labels(view: &DecisionView<'_>) -> Vec<String> {
+    jev_choices(view)
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect()
+}
+
+// Phase 1.2b: each of the owner's other agents is offered as
+// `delegate:<name>`, and only while a delegation could start a child: the run
+// holds `agent.delegate`, is running below the hop limit with fewer than 10
+// children, and after this decision's step still has 2 steps and 2 model
+// calls to give. A shared name gets the first 8 characters of the id; an
+// empty name is the id.
+#[test]
+fn jev_offers_delegate_choices_only_when_allowed() {
+    let editor_a: AgentId = "aaaaaaaa-0000-4000-8000-000000000001".parse().unwrap();
+    let editor_b: AgentId = "bbbbbbbb-0000-4000-8000-000000000002".parse().unwrap();
+    let unnamed: AgentId = "cccccccc-0000-4000-8000-000000000003".parse().unwrap();
+    let writer = AgentId::new();
+    let spec = delegating(limits(3, 2));
+    let targets = [
+        target(writer, "writer", "Writes things up."),
+        target(spec.agent_id, "me", "This run's own agent."),
+        target(editor_a, "editor", ""),
+        target(editor_b, "editor", ""),
+        target(unnamed, "", ""),
+    ];
+    let driver = Driver::boot(spec.clone()).unwrap();
+    let state = driver.state();
+    let tools = [EchoTool.descriptor()];
+    let mut offered = view(&spec, &state, driver.events(), &tools, &[]);
+    offered.agents = &targets;
+    assert_eq!(
+        labels(&offered),
+        [
+            "echo",
+            "delegate:writer",
+            "delegate:editor-aaaaaaaa",
+            "delegate:editor-bbbbbbbb",
+            "delegate:cccccccc-0000-4000-8000-000000000003",
+            "model",
+            "complete",
+        ]
+    );
+    let choices = jev_choices(&offered);
+    assert_eq!(choices[1].1.as_deref(), Some("Writes things up."));
+    assert_eq!(
+        choices[2].1.as_deref(),
+        Some("Hand the input to agent editor.")
+    );
+
+    let delegates = |view: &DecisionView<'_>| {
+        labels(view)
+            .into_iter()
+            .filter(|label| label.starts_with("delegate:"))
+            .count()
+    };
+    assert_eq!(delegates(&offered), 4);
+
+    // No capability.
+    let plain = spec_with_input(limits(3, 2), "hi");
+    let mut refused = view(&plain, &state, driver.events(), &tools, &[]);
+    refused.agents = &targets;
+    assert_eq!(delegates(&refused), 0);
+
+    // Two steps left: this decision takes one, leaving one to give.
+    let short = delegating(limits(2, 2));
+    let mut refused = view(&short, &state, driver.events(), &tools, &[]);
+    refused.agents = &targets;
+    assert_eq!(delegates(&refused), 0);
+
+    // One model call left.
+    let short = delegating(limits(3, 1));
+    let mut refused = view(&short, &state, driver.events(), &tools, &[]);
+    refused.agents = &targets;
+    assert_eq!(delegates(&refused), 0);
+
+    // What earlier children were given is spent.
+    let mut given = state.clone();
+    given.given_model_calls = 1;
+    let mut refused = view(&spec, &given, driver.events(), &tools, &[]);
+    refused.agents = &targets;
+    assert_eq!(delegates(&refused), 0);
+    // Steps and model calls already taken are spent.
+    let mut taken = state.clone();
+    taken.steps = 1;
+    let mut refused = view(&spec, &taken, driver.events(), &tools, &[]);
+    refused.agents = &targets;
+    assert_eq!(delegates(&refused), 0);
+    let mut taken = state.clone();
+    taken.model_calls = 1;
+    let mut refused = view(&spec, &taken, driver.events(), &tools, &[]);
+    refused.agents = &targets;
+    assert_eq!(delegates(&refused), 0);
+    let mut given = state.clone();
+    given.given_steps = 1;
+    let mut refused = view(&spec, &given, driver.events(), &tools, &[]);
+    refused.agents = &targets;
+    assert_eq!(delegates(&refused), 0);
+
+    // Ten children already.
+    let mut full = state.clone();
+    full.children = 10;
+    let mut refused = view(&spec, &full, driver.events(), &tools, &[]);
+    refused.agents = &targets;
+    assert_eq!(delegates(&refused), 0);
+
+    // Already 8 hops deep.
+    let mut deep = spec.clone();
+    deep.lineage.hop = 8;
+    let mut refused = view(&deep, &state, driver.events(), &tools, &[]);
+    refused.agents = &targets;
+    assert_eq!(delegates(&refused), 0);
+
+    // Not running.
+    let mut waiting = state.clone();
+    waiting.harness = HarnessState::Cancelled;
+    let mut refused = view(&spec, &waiting, driver.events(), &tools, &[]);
+    refused.agents = &targets;
+    assert_eq!(delegates(&refused), 0);
+
+    // A tool named like a delegate choice is left out.
+    let mut clash = EchoTool.descriptor();
+    clash.name = "delegate:writer".into();
+    let tools = [clash];
+    let mut offered = view(&spec, &state, driver.events(), &tools, &[]);
+    offered.agents = &targets;
+    assert_eq!(
+        labels(&offered)
+            .iter()
+            .filter(|label| *label == "delegate:writer")
+            .count(),
+        1
+    );
+}
+
+/// Starts every child it is asked for, and remembers the requests.
+#[derive(Default)]
+struct Starts {
+    asked: std::sync::Mutex<Vec<AgentId>>,
+}
+
+impl AgentSpawner for Starts {
+    fn start(&self, request: ChildRequest<'_>) -> Result<StartedChild, String> {
+        self.asked.lock().unwrap().push(request.agent_id);
+        Ok(StartedChild {
+            run_id: RunId::new(),
+            limits: request.limits,
+        })
+    }
+}
+
+// Jev picks `delegate:writer`: the driver decides a Delegate of the writer
+// agent with the run's input, and the spawner starts it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delegate_choice_maps_to_the_named_agent() {
+    let server = jev(&["delegate:writer", "complete"]).await;
+    let writer = AgentId::new();
+    let reader = AgentId::new();
+    let spawner = Arc::new(Starts::default());
+    let base_url = server.uri();
+    let started = spawner.clone();
+    let events = tokio::task::spawn_blocking(move || {
+        let client = typesafe_sdk::blocking::Client::builder()
+            .api_key("gol")
+            .base_url(base_url)
+            .retry(typesafe_sdk::RetryPolicy::disabled())
+            .build()
+            .unwrap();
+        let mut decider = JevDecider::new(client);
+        let mut driver = Driver::boot(delegating(limits(8, 4)))
+            .unwrap()
+            .with_spawner(
+                started,
+                vec![
+                    target(reader, "reader", "Reads."),
+                    target(writer, "writer", "Writes."),
+                ],
+            );
+        run_to_completion(
+            &mut driver,
+            &mut decider,
+            &[],
+            &Answering,
+            &InMemory::default(),
+        )
+        .unwrap();
+        driver.events().to_vec()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(*spawner.asked.lock().unwrap(), [writer]);
+    assert!(events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::EffectDecided {
+            effect: Effect::Delegate { agent_id, input },
+        } if *agent_id == writer && input == "hi"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::ChildStarted { agent_id, .. } if *agent_id == writer
+    )));
+    let sent = requests(&server).await;
+    let offered = criteria(&sent[0]);
+    assert!(offered.to_string().contains("delegate:writer"), "{offered}");
 }

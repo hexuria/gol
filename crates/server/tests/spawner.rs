@@ -51,6 +51,8 @@ fn agent_of(store: &dyn RunStore, holder: Owner) -> AgentId {
             manifest: AgentManifest {
                 id,
                 version: "7".to_string(),
+                name: String::new(),
+                description: String::new(),
                 instructions: "Write it up.".to_string(),
                 tools: vec!["echo".to_string()],
                 required_capabilities: vec![
@@ -321,6 +323,9 @@ impl RunStore for GoesDownAfterPut {
     }
     fn agent(&self, id: AgentId) -> Result<Option<StoredAgent>, server::StoreError> {
         self.inner.agent(id)
+    }
+    fn agents_of(&self, owner: &Owner) -> Result<Vec<StoredAgent>, server::StoreError> {
+        self.inner.agents_of(owner)
     }
     fn put_run(&self, run: server::StoredRun) -> Result<server::PutRun, server::StoreError> {
         let put = self.inner.put_run(run)?;

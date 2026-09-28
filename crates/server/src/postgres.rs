@@ -234,6 +234,18 @@ fn json(error: serde_json::Error) -> StoreError {
     StoreError::new(format!("json: {error}"))
 }
 
+/// An `agents` row read as `manifest, owner_issuer, owner_subject, owner_tenant`.
+fn stored_agent(row: &postgres::Row) -> Result<StoredAgent, StoreError> {
+    Ok(StoredAgent {
+        manifest: serde_json::from_value(row.try_get::<_, Value>(0).map_err(sql)?).map_err(json)?,
+        owner: Owner::new(
+            row.try_get::<_, String>(1).map_err(sql)?,
+            row.try_get::<_, String>(2).map_err(sql)?,
+            row.try_get::<_, String>(3).map_err(sql)?,
+        ),
+    })
+}
+
 impl RunStore for PostgresStore {
     /// One statement: insert, or replace the row only when the same
     /// principal (issuer and subject) owns it. No row changed means another
@@ -278,15 +290,20 @@ impl RunStore for PostgresStore {
         else {
             return Ok(None);
         };
-        Ok(Some(StoredAgent {
-            manifest: serde_json::from_value(row.try_get::<_, Value>(0).map_err(sql)?)
-                .map_err(json)?,
-            owner: Owner::new(
-                row.try_get::<_, String>(1).map_err(sql)?,
-                row.try_get::<_, String>(2).map_err(sql)?,
-                row.try_get::<_, String>(3).map_err(sql)?,
-            ),
-        }))
+        stored_agent(&row).map(Some)
+    }
+
+    fn agents_of(&self, owner: &Owner) -> Result<Vec<StoredAgent>, StoreError> {
+        let rows = self.with_client(|client| {
+            client
+                .query(
+                    "select manifest, owner_issuer, owner_subject, owner_tenant from agents
+                     where owner_issuer = $1 and owner_subject = $2 order by id",
+                    &[&owner.issuer, &owner.subject],
+                )
+                .map_err(sql)
+        })?;
+        rows.iter().map(stored_agent).collect()
     }
 
     /// One transaction: the run row, and its events only when the row is

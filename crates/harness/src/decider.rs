@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 
 use protocol::{Effect, Event, RunSpec, RunState, ToolDescriptor};
 
+use crate::DelegateTarget;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Skill {
     pub name: String,
@@ -14,6 +16,8 @@ pub struct DecisionView<'a> {
     pub events: &'a [Event],
     pub tools: &'a [ToolDescriptor],
     pub skills: &'a [Skill],
+    /// The agents this run may hand work to. Empty without a spawner.
+    pub agents: &'a [DelegateTarget],
     /// The run has spent its step budget. Only a `Complete` that finishes the
     /// run is still allowed; any other decision fails the run with `Budget`.
     /// While a tool call is outstanding even a `Complete` cannot finish the

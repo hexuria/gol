@@ -8,8 +8,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use harness::{
-    run_to_completion, BootError, Driver, EchoTool, InMemory, JevDecider, Memory, RunMemory,
-    StoreError, UnavailableModel,
+    run_to_completion, AgentSpawner, BootError, DelegateTarget, Driver, EchoTool, InMemory,
+    JevDecider, Memory, RunMemory, StoreError, UnavailableModel,
 };
 use protocol::{
     fold, AgentId, Capability, Event, EventPayload, ExecutionPlacement, FailureClass, Limits,
@@ -377,7 +377,8 @@ async fn create_run(
                 events: vec![message],
             })
             .map_err(RunStartError::Store)?;
-        let (events, outcome) = harness_events(&jev_base_url, &spec_for_run, memory.as_ref());
+        // Inline: a child needs the run queue, so this run offers no delegation.
+        let (events, outcome) = harness_events(&jev_base_url, &spec_for_run, memory.as_ref(), None);
         // Append, never overwrite: anything stored while Jev ran stays. When the
         // run is already terminal the store keeps its log and refuses these.
         store_for_run
@@ -603,15 +604,20 @@ async fn get_ui(
     Ok(Json(json_render_spec(&stored.spec.input, &outcome)))
 }
 
+/// A spawner for a run's delegations, and the agents its decider is offered.
+pub(crate) type Delegation = (Arc<dyn AgentSpawner>, Vec<DelegateTarget>);
+
 /// Runs the harness with Jev and returns the events to record: what the
 /// harness did, and when it could not finish, the `RunFailed` that ends the
-/// run instead of leaving it open.
+/// run instead of leaving it open. Without `delegation` every delegation is
+/// refused and none is offered.
 pub(crate) fn harness_events(
     jev_base_url: &str,
     spec: &RunSpec,
     memory: &dyn Memory,
+    delegation: Option<Delegation>,
 ) -> (Vec<Event>, Result<(), RunStartError>) {
-    let (mut events, outcome) = run_with_jev(jev_base_url, spec.clone(), memory);
+    let (mut events, outcome) = run_with_jev(jev_base_url, spec.clone(), memory, delegation);
     if let Err(error) = &outcome {
         let (class, message) = match error {
             RunStartError::Unsupported(placement) => (
@@ -638,6 +644,7 @@ fn run_with_jev(
     jev_base_url: &str,
     spec: RunSpec,
     memory: &dyn Memory,
+    delegation: Option<Delegation>,
 ) -> (Vec<Event>, Result<(), RunStartError>) {
     let mut driver = match Driver::boot(spec) {
         Ok(driver) => driver,
@@ -645,6 +652,9 @@ fn run_with_jev(
             return (Vec::new(), Err(RunStartError::Unsupported(placement)));
         }
     };
+    if let Some((spawner, targets)) = delegation {
+        driver = driver.with_spawner(spawner, targets);
+    }
     let client = match jev_client(jev_base_url) {
         Ok(client) => client,
         Err(message) => return (Vec::new(), Err(RunStartError::Decider(message))),

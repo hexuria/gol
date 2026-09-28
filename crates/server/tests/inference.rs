@@ -806,6 +806,13 @@ impl RunStore for WriteAfterSnapshot {
         self.inner.agent(id)
     }
 
+    fn agents_of(
+        &self,
+        owner: &protocol::Owner,
+    ) -> Result<Vec<server::StoredAgent>, server::StoreError> {
+        self.inner.agents_of(owner)
+    }
+
     fn put_run(&self, run: StoredRun) -> Result<server::PutRun, server::StoreError> {
         self.inner.put_run(run)
     }

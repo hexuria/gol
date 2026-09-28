@@ -89,6 +89,8 @@ fn manifest(id: AgentId, version: &str, capabilities: &[&str]) -> serde_json::Va
     serde_json::to_value(AgentManifest {
         id,
         version: version.to_string(),
+        name: String::new(),
+        description: String::new(),
         instructions: "finish".to_string(),
         tools: vec!["echo".to_string()],
         required_capabilities: capabilities.iter().map(|c| Capability::new(*c)).collect(),

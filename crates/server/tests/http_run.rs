@@ -71,6 +71,8 @@ async fn post_run_reads_completed_and_events() {
         &AgentManifest {
             id: agent_id,
             version: "1".to_string(),
+            name: String::new(),
+            description: String::new(),
             instructions: "Echo the input, then finish.".to_string(),
             tools: vec!["echo".to_string()],
             required_capabilities: vec![Capability::new("tool.echo")],
@@ -359,6 +361,8 @@ async fn registered(base: &str) -> AgentId {
         &AgentManifest {
             id: agent_id,
             version: "1".to_string(),
+            name: String::new(),
+            description: String::new(),
             instructions: "Echo the input, then finish.".to_string(),
             tools: vec!["echo".to_string()],
             required_capabilities: vec![Capability::new("tool.echo")],
@@ -659,6 +663,13 @@ impl RunStore for WatchedMemory {
         id: protocol::AgentId,
     ) -> Result<Option<server::StoredAgent>, server::StoreError> {
         self.inner.agent(id)
+    }
+
+    fn agents_of(
+        &self,
+        owner: &protocol::Owner,
+    ) -> Result<Vec<server::StoredAgent>, server::StoreError> {
+        self.inner.agents_of(owner)
     }
 
     fn put_run(&self, run: StoredRun) -> Result<server::PutRun, server::StoreError> {

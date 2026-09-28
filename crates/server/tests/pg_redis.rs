@@ -51,6 +51,8 @@ fn postgres_round_trips_event_and_artifact_on_a_new_connection() {
                 manifest: AgentManifest {
                     id: run.agent_id,
                     version: "1".to_string(),
+                    name: String::new(),
+                    description: String::new(),
                     instructions: "store".to_string(),
                     tools: vec!["echo".to_string()],
                     required_capabilities: vec![Capability::new("tool.echo")],
@@ -156,6 +158,8 @@ async fn create_run_writes_postgres_and_enqueues_redis() {
         .json(&AgentManifest {
             id: agent_id,
             version: "1".to_string(),
+            name: String::new(),
+            description: String::new(),
             instructions: "Echo the input, then finish.".to_string(),
             tools: vec!["echo".to_string()],
             required_capabilities: vec![Capability::new("tool.echo")],
@@ -450,6 +454,13 @@ impl RunStore for WatchedPostgres {
         self.inner.agent(id)
     }
 
+    fn agents_of(
+        &self,
+        owner: &protocol::Owner,
+    ) -> Result<Vec<server::StoredAgent>, server::StoreError> {
+        self.inner.agents_of(owner)
+    }
+
     fn put_run(&self, run: StoredRun) -> Result<server::PutRun, server::StoreError> {
         let run_id = run.spec.run_id;
         self.ids.lock().expect("ids").push(run_id);
@@ -514,6 +525,8 @@ async fn post(store: Arc<WatchedPostgres>, jev: &wiremock::MockServer, redis: Op
         .json(&AgentManifest {
             id: agent_id,
             version: "1".to_string(),
+            name: String::new(),
+            description: String::new(),
             instructions: "Echo the input, then finish.".to_string(),
             tools: vec!["echo".to_string()],
             required_capabilities: vec![Capability::new("tool.echo")],
@@ -929,6 +942,8 @@ fn first_owner_keeps_the_agent_in_postgres() {
                             manifest: AgentManifest {
                                 id,
                                 version: version.to_string(),
+                                name: String::new(),
+                                description: String::new(),
                                 instructions: "race".to_string(),
                                 tools: Vec::new(),
                                 required_capabilities: Vec::new(),
@@ -967,6 +982,8 @@ fn agent_for(id: AgentId, subject: &str, tenant: &str, version: &str) -> server:
         manifest: AgentManifest {
             id,
             version: version.to_string(),
+            name: String::new(),
+            description: String::new(),
             instructions: "owner".to_string(),
             tools: Vec::new(),
             required_capabilities: Vec::new(),

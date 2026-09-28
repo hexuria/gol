@@ -7,8 +7,8 @@ use protocol::{
 };
 
 use crate::{
-    AgentSpawner, ChildRequest, Decider, DeciderError, DecisionView, LoadedCatalog, Memory,
-    MemoryKey, ModelCompletion, Skill, StoreError, Tool,
+    AgentSpawner, ChildRequest, Decider, DeciderError, DecisionView, DelegateTarget, LoadedCatalog,
+    Memory, MemoryKey, ModelCompletion, Skill, StoreError, Tool,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +22,7 @@ pub struct Driver {
     skills: Vec<Skill>,
     loaded: Option<Vec<Box<dyn Tool>>>,
     spawner: Option<Arc<dyn AgentSpawner>>,
+    targets: Vec<DelegateTarget>,
 }
 
 impl Driver {
@@ -35,6 +36,7 @@ impl Driver {
             skills: Vec::new(),
             loaded: None,
             spawner: None,
+            targets: Vec::new(),
         };
         driver.push(EventPayload::RunStarted, Actor::System);
         Ok(driver)
@@ -64,9 +66,15 @@ impl Driver {
     }
 
     /// Delegations this run is allowed to make start their children through
-    /// `spawner`. Without one, they are refused.
-    pub fn with_spawner(mut self, spawner: Arc<dyn AgentSpawner>) -> Self {
+    /// `spawner`. Without one, they are refused. `targets` are the agents the
+    /// decider is offered.
+    pub fn with_spawner(
+        mut self,
+        spawner: Arc<dyn AgentSpawner>,
+        targets: Vec<DelegateTarget>,
+    ) -> Self {
         self.spawner = Some(spawner);
+        self.targets = targets;
         self
     }
 
@@ -150,6 +158,7 @@ impl Driver {
                 events: &self.events,
                 tools,
                 skills,
+                agents: &self.targets,
                 steps_exhausted: steps_spent,
                 model_calls_exhausted: model_calls_spent,
             };

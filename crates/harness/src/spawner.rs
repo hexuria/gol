@@ -22,6 +22,15 @@ pub struct StartedChild {
     pub limits: Limits,
 }
 
+/// An agent a run may hand work to, offered to the decider by name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegateTarget {
+    pub agent_id: AgentId,
+    /// Empty when the agent's manifest has none.
+    pub name: String,
+    pub description: String,
+}
+
 /// Starts child runs. The driver records the child as `ChildStarted`, or the
 /// error as the reason of `DelegateRefused`.
 pub trait AgentSpawner: Send + Sync {
