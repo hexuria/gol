@@ -914,10 +914,11 @@ fn terminate_backends(application: &str) -> i64 {
     }
 }
 
-// A dead connection answers 503 for the request that finds it, and the next
-// request reconnects (owner decision 1A). The server process never restarts.
+// An idle connection whose backend was killed is found dead when the pool
+// checks it out and replaced before the request uses it (C2; C1 answered one
+// 503 first). The server process never restarts.
 #[tokio::test]
-async fn a_killed_backend_is_503_then_the_next_request_reconnects() {
+async fn a_killed_idle_backend_is_replaced_before_the_next_request() {
     let application = format!("gol_c1_{}", uuid::Uuid::new_v4().simple());
     let url = format!("{POSTGRES_URL}?application_name={application}");
     let spec = spec();
@@ -960,16 +961,17 @@ async fn a_killed_backend_is_503_then_the_next_request_reconnects() {
         .await
         .expect("terminate thread");
     assert_eq!(killed, 1);
-    let (status, body) = get().await;
-    assert_eq!(
-        (status, body.as_str()),
-        (503, r#"{"error":"store unavailable"}"#)
-    );
-    assert_eq!(get().await.0, 200, "after reconnect");
+    assert_eq!(get().await.0, 200, "after the kill");
+    assert_eq!(get().await.0, 200, "and after that");
 }
 
 /// Waits until the backend of `application` is waiting on a lock.
 fn wait_for_lock_wait(application: &str) {
+    wait_for_lock_waits(application, 1);
+}
+
+/// Waits until `count` backends of `application` are waiting on a lock.
+fn wait_for_lock_waits(application: &str, count: i64) {
     let mut admin = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("admin");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -981,7 +983,7 @@ fn wait_for_lock_wait(application: &str) {
             )
             .expect("activity")
             .get(0);
-        if waiting == 1 {
+        if waiting == count {
             return;
         }
         assert!(std::time::Instant::now() < deadline, "put never waited");
@@ -1018,47 +1020,180 @@ fn a_backend_killed_mid_statement_is_replaced_on_the_next_call() {
     assert_eq!(store.run(RunId::new()).map(|run| run.is_none()), Ok(true));
 }
 
-/// Runs `call` inside a Tokio runtime, where the blocking Postgres client
-/// panics, and returns what it returned, or None when it panicked.
-fn in_a_runtime<T: Send + 'static>(call: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(async { call() })
-    })
-    .join()
-    .ok()
+fn completed(spec: &RunSpec, at: i64, outcome: String) -> Event {
+    record(
+        spec,
+        Actor::System,
+        at,
+        EventPayload::RunCompleted { outcome },
+    )
 }
 
-// A call that panics while it holds the connection leaves the store usable:
-// the next call reconnects instead of reporting a poisoned lock forever.
+// Sixteen writers on sixteen pooled connections race a terminal append on one
+// run: the run row lock admits one, and the rest see its terminal event.
 #[test]
-fn a_call_that_panics_holding_the_connection_does_not_lock_the_store_out() {
-    let store = Arc::new(PostgresStore::connect(POSTGRES_URL).expect("connect"));
-    let inner = store.clone();
-    assert!(
-        in_a_runtime(move || inner.run(RunId::new())).is_none(),
-        "the call panicked"
+fn sixteen_racing_terminal_appends_one_wins() {
+    let application = format!("gol_c2_{}", uuid::Uuid::new_v4().simple());
+    let url = format!("{POSTGRES_URL}?application_name={application}");
+    let store = Arc::new(PostgresStore::connect_with_pool_size(&url, 16).expect("connect"));
+    // Open all sixteen connections first: the pool opens them one at a time,
+    // which would otherwise line the racers up. Sixteen puts wait on a row
+    // alice holds, each on its own connection, until she rolls back.
+    let held = AgentId::new();
+    let mut alice = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("connect");
+    let mut tx = alice.transaction().expect("begin");
+    let manifest =
+        serde_json::to_value(agent_for(held, "alice", "tenant-1", "1").manifest).unwrap();
+    tx.execute(
+        "insert into agents (id, manifest, owner_issuer, owner_subject, owner_tenant)
+         values ($1, $2, 'https://issuer.test', 'alice', 'tenant-1')",
+        &[&held.as_uuid(), &manifest],
+    )
+    .expect("insert");
+    let warmers: Vec<_> = (0..16)
+        .map(|_| {
+            let store = store.clone();
+            std::thread::spawn(move || store.put_agent(agent_for(held, "bob", "tenant-1", "9")))
+        })
+        .collect();
+    wait_for_lock_waits(&application, 16);
+    tx.rollback().expect("rollback");
+    for warmer in warmers {
+        warmer.join().unwrap().expect("warm put");
+    }
+
+    let spec = spec();
+    let run_id = spec.run_id;
+    store
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: vec![user_message(&spec, 1)],
+        })
+        .expect("put run");
+    let start = Arc::new(std::sync::Barrier::new(16));
+    let racers: Vec<_> = (0..16)
+        .map(|n| {
+            let (store, start, spec) = (store.clone(), start.clone(), spec.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                store.append_events(run_id, vec![completed(&spec, 2, n.to_string())])
+            })
+        })
+        .collect();
+    let outcomes: Vec<Append> = racers
+        .into_iter()
+        .map(|racer| racer.join().unwrap().expect("append"))
+        .collect();
+    let won = outcomes.iter().filter(|o| **o == Append::Appended).count();
+    let refused = outcomes.iter().filter(|o| **o == Append::Terminal).count();
+    assert_eq!((won, refused), (1, 15));
+    let events = reconnect(run_id).events;
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| server::is_terminal(&event.payload))
+            .count(),
+        1
     );
-    assert_eq!(store.run(RunId::new()).map(|run| run.is_none()), Ok(true));
 }
 
-// A reconnect that panics is a StoreError, not a panic in the caller, and the
-// next call reconnects.
+// Postgres keeps one row per event, numbered from 1, and pages by count.
 #[test]
-fn a_reconnect_that_panics_is_a_store_error() {
-    let application = format!("gol_c1_{}", uuid::Uuid::new_v4().simple());
+fn postgres_pages_events_after_seq() {
+    let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    let spec = spec();
+    let run_id = spec.run_id;
+    let first: Vec<Event> = (1..=3).map(|at| user_message(&spec, at)).collect();
+    let more: Vec<Event> = (4..=5).map(|at| user_message(&spec, at)).collect();
+    store
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: first.clone(),
+        })
+        .expect("put run");
+    assert_eq!(
+        store.append_events(run_id, more.clone()),
+        Ok(Append::Appended)
+    );
+    let all: Vec<Event> = first.into_iter().chain(more).collect();
+    let page = |after, limit| {
+        store
+            .run_page(run_id, after, limit)
+            .expect("store")
+            .expect("run")
+            .events
+    };
+    assert_eq!(page(0, 2), all[0..2]);
+    assert_eq!(page(2, 2), all[2..4]);
+    assert_eq!(page(4, 2), all[4..5]);
+    assert!(page(5, 2).is_empty());
+    assert_eq!(page(0, 500), all);
+    assert_eq!(reconnect(run_id).events, all);
+    assert!(store.run_page(RunId::new(), 0, 2).expect("store").is_none());
+}
+
+// One call waiting on a lock no longer holds up the others: each takes its
+// own pooled connection (C1 serialized every call on one).
+#[test]
+fn pool_serves_concurrent_requests() {
+    let application = format!("gol_c2_{}", uuid::Uuid::new_v4().simple());
     let url = format!("{POSTGRES_URL}?application_name={application}");
     let store = Arc::new(PostgresStore::connect(&url).expect("connect"));
-    assert_eq!(terminate_backends(&application), 1);
-    assert!(
-        store.run(RunId::new()).is_err(),
-        "the call on the dead connection"
-    );
-    let inner = store.clone();
-    assert_eq!(
-        in_a_runtime(move || inner.run(RunId::new()).map(|run| run.is_none())),
-        Some(Err(server::StoreError::new("postgres connect panicked")))
-    );
+    let id = AgentId::new();
+    let mut alice = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("connect");
+    let mut tx = alice.transaction().expect("begin");
+    let manifest = serde_json::to_value(agent_for(id, "alice", "tenant-1", "1").manifest).unwrap();
+    tx.execute(
+        "insert into agents (id, manifest, owner_issuer, owner_subject, owner_tenant)
+         values ($1, $2, 'https://issuer.test', 'alice', 'tenant-1')",
+        &[&id.as_uuid(), &manifest],
+    )
+    .expect("insert");
+    let blocked = {
+        let store = store.clone();
+        std::thread::spawn(move || store.put_agent(agent_for(id, "bob", "tenant-1", "9")))
+    };
+    wait_for_lock_wait(&application);
+    let started = std::time::Instant::now();
     assert_eq!(store.run(RunId::new()).map(|run| run.is_none()), Ok(true));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "a read waited behind the blocked put"
+    );
+    tx.rollback().expect("rollback");
+    assert_eq!(blocked.join().unwrap(), Ok(server::PutAgent::Stored));
+}
+
+// A database whose runs table still holds the events as one jsonb column is
+// refused at connect (owner decision 2A for C2), before anything is written.
+#[test]
+fn an_old_runs_table_is_refused_at_connect() {
+    let mut admin = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("connect");
+    let schema = format!("c2_old_{}", std::process::id());
+    admin
+        .batch_execute(&format!(
+            "drop schema if exists {schema} cascade;
+             create schema {schema};
+             create table {schema}.runs (id uuid primary key, spec jsonb not null, events jsonb not null);"
+        ))
+        .expect("old schema");
+    let url = format!("{POSTGRES_URL}?options=-csearch_path%3D{schema}");
+    let connected = PostgresStore::connect(&url).map(|_| ());
+    let created: i64 = admin
+        .query_one(
+            "select count(*) from information_schema.tables where table_schema = $1",
+            &[&schema],
+        )
+        .expect("tables")
+        .get(0);
+    admin
+        .batch_execute(&format!("drop schema {schema} cascade"))
+        .expect("drop");
+    let error = connected.expect_err("connect must fail");
+    assert!(
+        format!("{error}").contains("drop tables runs and run_events"),
+        "{error}"
+    );
+    assert_eq!(created, 1, "connect created tables before refusing");
 }

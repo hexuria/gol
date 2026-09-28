@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::extract::rejection::JsonRejection;
-use axum::extract::{FromRequestParts, Path, State};
+use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
@@ -84,9 +84,31 @@ async fn owned_run(
     id: RunId,
     principal: &Principal,
 ) -> Result<StoredRun, ApiError> {
+    owned(state, principal, move |store| store.run(id)).await
+}
+
+/// `owned_run` with only the events after the first `after`, at most `limit`.
+async fn owned_run_page(
+    state: &AppState,
+    id: RunId,
+    principal: &Principal,
+    after: usize,
+    limit: usize,
+) -> Result<StoredRun, ApiError> {
+    owned(state, principal, move |store| {
+        store.run_page(id, after, limit)
+    })
+    .await
+}
+
+async fn owned(
+    state: &AppState,
+    principal: &Principal,
+    read: impl FnOnce(&dyn RunStore) -> Result<Option<StoredRun>, StoreError> + Send + 'static,
+) -> Result<StoredRun, ApiError> {
     let store = state.store.clone();
     let owner = owner_of(principal);
-    tokio::task::spawn_blocking(move || store.run(id))
+    tokio::task::spawn_blocking(move || read(store.as_ref()))
         .await
         .map_err(|error| ApiError::Decider(error.to_string()))?
         .map_err(ApiError::from)?
@@ -506,12 +528,30 @@ async fn get_run(
     Ok(Json(fold(&stored.spec, &stored.events)))
 }
 
+/// The most events one page of `GET /v1/runs/{id}/events` holds, and the
+/// page size when the caller names none (owner decision 4A for C2).
+const EVENTS_PAGE_MAX: usize = 500;
+
+#[derive(Debug, Deserialize)]
+struct EventsQuery {
+    /// How many events the caller has already seen.
+    #[serde(default)]
+    after: usize,
+    limit: Option<usize>,
+}
+
 async fn get_events(
     Authenticated(principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<RunId>,
+    query: Result<Query<EventsQuery>, QueryRejection>,
 ) -> Result<Json<Vec<Event>>, ApiError> {
-    let stored = owned_run(&state, id, &principal).await?;
+    let Query(query) = query.map_err(|_| ApiError::BadRequest("after and limit must be counts"))?;
+    let limit = query.limit.unwrap_or(EVENTS_PAGE_MAX);
+    if limit == 0 || limit > EVENTS_PAGE_MAX {
+        return Err(ApiError::BadRequest("limit must be between 1 and 500"));
+    }
+    let stored = owned_run_page(&state, id, &principal, query.after, limit).await?;
     Ok(Json(stored.events))
 }
 

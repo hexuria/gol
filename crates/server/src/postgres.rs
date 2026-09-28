@@ -1,23 +1,27 @@
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use postgres::NoTls;
 use protocol::{AgentId, ArtifactId, Event, Owner, RunId};
+use r2d2_postgres::PostgresConnectionManager;
 use serde_json::Value;
 
 use harness::StoreError;
 
-use crate::store::{Append, PutAgent, RunStore, StoredAgent, StoredArtifact, StoredRun};
+use crate::store::{
+    is_terminal, Append, PutAgent, RunStore, StoredAgent, StoredArtifact, StoredRun,
+};
 
-/// The run store in Postgres over one connection. A connection that dies is
-/// replaced on the next call (owner decision 1A for C1); the call that saw it
-/// die reports a StoreError and is not retried, since a write may have
-/// committed (2A).
+/// The run store in Postgres over a pool of connections (C2, owner decision
+/// 1A). The pool checks a connection before lending it, so one whose backend
+/// died is replaced before a call uses it. A call that fails mid-statement
+/// reports a StoreError and is not retried, since a write may have committed
+/// (C1 decision 2A).
 pub struct PostgresStore {
-    url: String,
-    client: Mutex<Option<postgres::Client>>,
+    pool: r2d2::Pool<PostgresConnectionManager<NoTls>>,
 }
+
+/// Connections a store keeps at most when the caller names no size.
+const DEFAULT_POOL_SIZE: u32 = 8;
 
 const SCHEMA: &str = "
 create table if not exists agents (
@@ -29,9 +33,16 @@ create table if not exists agents (
 );
 create table if not exists runs (
     id uuid primary key,
-    spec jsonb not null,
-    events jsonb not null
+    spec jsonb not null
 );
+create table if not exists run_events (
+    run_id uuid not null references runs (id),
+    seq bigint not null,
+    body jsonb not null,
+    terminal boolean not null,
+    primary key (run_id, seq)
+);
+create unique index if not exists run_events_one_terminal on run_events (run_id) where terminal;
 create table if not exists artifacts (
     id uuid primary key,
     run_id uuid not null,
@@ -40,88 +51,73 @@ create table if not exists artifacts (
 );
 ";
 
-fn ensure_schema(client: &mut postgres::Client) -> Result<(), postgres::Error> {
-    client.batch_execute("begin")?;
-    if let Err(err) = client.query_one("select pg_advisory_xact_lock(872346)", &[]) {
-        let _ = client.batch_execute("rollback");
-        return Err(err);
-    }
-    if let Err(err) = client.batch_execute(SCHEMA) {
-        let _ = client.batch_execute("rollback");
-        return Err(err);
-    }
+fn ensure_schema(client: &mut postgres::Client) -> Result<(), StoreError> {
+    let mut tx = client.transaction().map_err(sql)?;
+    tx.query_one("select pg_advisory_xact_lock(872346)", &[])
+        .map_err(sql)?;
+    tx.batch_execute(SCHEMA).map_err(sql)?;
     // `create table if not exists` leaves a table from an older schema as it
-    // was. Fail here, at connect, rather than on the first write.
-    if let Err(err) =
-        client.batch_execute("select owner_issuer, owner_subject, owner_tenant from agents limit 0")
-    {
-        let _ = client.batch_execute("rollback");
-        return Err(err);
+    // was. Fail here, at connect, rather than on the first write; dropping
+    // the transaction rolls back anything created above.
+    tx.batch_execute("select owner_issuer, owner_subject, owner_tenant from agents limit 0")
+        .map_err(sql)?;
+    let events_column = tx
+        .query_opt(
+            "select 1 from information_schema.columns
+             where table_schema = current_schema() and table_name = 'runs'
+               and column_name = 'events'",
+            &[],
+        )
+        .map_err(sql)?;
+    if events_column.is_some() {
+        return Err(StoreError::new(
+            "runs keeps its events in one jsonb column, from before per-row events: \
+             drop tables runs and run_events",
+        ));
     }
-    client.batch_execute("commit")
+    tx.commit().map_err(sql)
 }
 
 impl PostgresStore {
-    pub fn connect(url: &str) -> Result<Self, postgres::Error> {
-        let client = open(url)?;
-        Ok(Self {
-            url: url.to_string(),
-            client: Mutex::new(Some(client)),
-        })
+    /// A store with a pool of at most eight connections.
+    pub fn connect(url: &str) -> Result<Self, StoreError> {
+        Self::connect_with_pool_size(url, DEFAULT_POOL_SIZE)
     }
 
-    /// Runs `op` on the connection, opening a new one first when there is
-    /// none. Any failed call drops the connection, so the next call
-    /// reconnects: a backend killed mid-statement reports a database error,
-    /// not a closed connection, and its client still looks open.
+    /// A store with a pool of at most `size` connections. The first one
+    /// checks the schema, so a database the store cannot use fails here.
+    pub fn connect_with_pool_size(url: &str, size: u32) -> Result<Self, StoreError> {
+        let mut config: postgres::Config = url.parse().map_err(sql)?;
+        if config.get_connect_timeout().is_none() {
+            config.connect_timeout(CONNECT_TIMEOUT);
+        }
+        let pool = r2d2::Pool::builder()
+            .max_size(size)
+            .min_idle(Some(0))
+            .connection_timeout(CONNECT_TIMEOUT)
+            .build_unchecked(PostgresConnectionManager::new(config, NoTls));
+        let store = Self { pool };
+        store.with_client(ensure_schema)?;
+        Ok(store)
+    }
+
+    /// Runs `op` on a pooled connection. The pool tests a connection before
+    /// lending it and discards one whose backend is gone.
     fn with_client<T>(
         &self,
         op: impl FnOnce(&mut postgres::Client) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        // A panic while the lock was held leaves the connection in an unknown
-        // state. Drop it and keep serving, rather than refuse every later call.
-        let mut slot = self.client.lock().unwrap_or_else(|poisoned| {
-            self.client.clear_poison();
-            let mut slot = poisoned.into_inner();
-            *slot = None;
-            slot
-        });
-        if slot.as_ref().is_none_or(postgres::Client::is_closed) {
-            *slot = None;
-            *slot = Some(reconnect(&self.url)?);
-        }
-        let Some(client) = slot.as_mut() else {
-            return Err(StoreError::new("postgres connection missing"));
-        };
-        let result = op(client);
-        if result.is_err() {
-            *slot = None;
-        }
-        result
+        let mut client = self
+            .pool
+            .get()
+            .map_err(|error| StoreError::new(format!("postgres pool: {error}")))?;
+        op(&mut client)
     }
 }
 
-/// How long a connect may take when the URL sets no `connect_timeout`.
+/// How long a connect, or a wait for a free pooled connection, may take when
+/// the URL sets no `connect_timeout`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn open(url: &str) -> Result<postgres::Client, postgres::Error> {
-    let mut config: postgres::Config = url.parse()?;
-    if config.get_connect_timeout().is_none() {
-        config.connect_timeout(CONNECT_TIMEOUT);
-    }
-    let mut client = config.connect(NoTls)?;
-    ensure_schema(&mut client)?;
-    Ok(client)
-}
-
-/// `open` for a running store. `postgres::Config::connect` unwraps building
-/// its runtime, which panics when the process is out of file descriptors;
-/// that is a StoreError here, not a panic in the request.
-fn reconnect(url: &str) -> Result<postgres::Client, StoreError> {
-    catch_unwind(AssertUnwindSafe(|| open(url)))
-        .map_err(|_| StoreError::new("postgres connect panicked"))?
-        .map_err(sql)
-}
 
 /// The full error for stderr: `postgres::Error` displays only its kind.
 fn sql(error: postgres::Error) -> StoreError {
@@ -197,67 +193,106 @@ impl RunStore for PostgresStore {
         }))
     }
 
+    /// One transaction: the run row, and its events only when the row is
+    /// new, so a run already stored keeps its spec and events.
     fn put_run(&self, run: StoredRun) -> Result<(), StoreError> {
         let spec = serde_json::to_value(&run.spec).map_err(json)?;
-        let events = serde_json::to_value(&run.events).map_err(json)?;
+        let rows = EventRows::new(&run.events)?;
+        let id = run.spec.run_id.as_uuid();
         self.with_client(|client| {
-            client
+            let mut tx = client.transaction().map_err(sql)?;
+            let inserted = tx
                 .execute(
-                    "insert into runs (id, spec, events) values ($1, $2, $3)
-                 on conflict (id) do nothing",
-                    &[&run.spec.run_id.as_uuid(), &spec, &events],
-                )
-                .map_err(sql)
-        })?;
-        Ok(())
-    }
-
-    fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
-        let events = serde_json::to_value(&events).map_err(json)?;
-        self.with_client(|client| {
-            // One statement: the terminal check and the append see the same row.
-            // The payloads of store::is_terminal. Unit variants serialize as a string
-            // ("RunCancelled"), the others as {"RunCompleted": ..}; `?|` matches both.
-            let appended = client
-                .execute(
-                    "update runs set events = events || $2::jsonb
-                 where id = $1 and not exists (
-                     select 1 from jsonb_array_elements(events) as event
-                     where event->'payload' ?| array['RunCompleted', 'RunFailed', 'RunCancelled', 'RunExpired'])",
-                    &[&id.as_uuid(), &events],
+                    "insert into runs (id, spec) values ($1, $2) on conflict (id) do nothing",
+                    &[&id, &spec],
                 )
                 .map_err(sql)?;
-            if appended == 1 {
-                return Ok(Append::Appended);
+            if inserted == 1 {
+                rows.insert(&mut tx, id, 0)?;
             }
-            let exists = client
-                .query_opt("select 1 from runs where id = $1", &[&id.as_uuid()])
-                .map_err(sql)?
-                .is_some();
-            Ok(if exists {
-                Append::Terminal
-            } else {
-                Append::Missing
-            })
+            tx.commit().map_err(sql)
+        })
+    }
+
+    /// One transaction. The run row is locked first, so appends to one run
+    /// take turns: each sees every event committed before it, checks for a
+    /// terminal one, and only then inserts. A batch holds at most one
+    /// terminal event (the partial unique index refuses a second).
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
+        let rows = EventRows::new(&events)?;
+        let id = id.as_uuid();
+        self.with_client(|client| {
+            let mut tx = client.transaction().map_err(sql)?;
+            let locked = tx
+                .query_opt("select 1 from runs where id = $1 for update", &[&id])
+                .map_err(sql)?;
+            if locked.is_none() {
+                return Ok(Append::Missing);
+            }
+            let last = tx
+                .query_one(
+                    "select coalesce(max(seq), 0), coalesce(bool_or(terminal), false)
+                     from run_events where run_id = $1",
+                    &[&id],
+                )
+                .map_err(sql)?;
+            if last.try_get::<_, bool>(1).map_err(sql)? {
+                return Ok(Append::Terminal);
+            }
+            rows.insert(&mut tx, id, last.try_get(0).map_err(sql)?)?;
+            tx.commit().map_err(sql)?;
+            Ok(Append::Appended)
         })
     }
 
     fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {
-        let Some(row) = self.with_client(|client| {
-            client
-                .query_opt(
-                    "select spec, events from runs where id = $1",
-                    &[&id.as_uuid()],
+        self.run_page(id, 0, usize::MAX)
+    }
+
+    fn run_page(
+        &self,
+        id: RunId,
+        after: usize,
+        limit: usize,
+    ) -> Result<Option<StoredRun>, StoreError> {
+        let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let id = id.as_uuid();
+        let Some((spec, rows)) = self.with_client(|client| {
+            // One snapshot, so the spec and the events agree.
+            let mut tx = client
+                .build_transaction()
+                .read_only(true)
+                .isolation_level(postgres::IsolationLevel::RepeatableRead)
+                .start()
+                .map_err(sql)?;
+            let Some(spec) = tx
+                .query_opt("select spec from runs where id = $1", &[&id])
+                .map_err(sql)?
+            else {
+                return Ok(None);
+            };
+            let rows = tx
+                .query(
+                    "select body from run_events where run_id = $1 and seq > $2
+                     order by seq limit $3",
+                    &[&id, &after, &limit],
                 )
-                .map_err(sql)
+                .map_err(sql)?;
+            tx.commit().map_err(sql)?;
+            Ok(Some((spec, rows)))
         })?
         else {
             return Ok(None);
         };
         let spec =
-            serde_json::from_value(row.try_get::<_, Value>(0).map_err(sql)?).map_err(json)?;
-        let events =
-            serde_json::from_value(row.try_get::<_, Value>(1).map_err(sql)?).map_err(json)?;
+            serde_json::from_value(spec.try_get::<_, Value>(0).map_err(sql)?).map_err(json)?;
+        let events = rows
+            .iter()
+            .map(|row| {
+                serde_json::from_value(row.try_get::<_, Value>(0).map_err(sql)?).map_err(json)
+            })
+            .collect::<Result<_, _>>()?;
         Ok(Some(StoredRun { spec, events }))
     }
 
@@ -297,5 +332,44 @@ impl RunStore for PostgresStore {
             name: row.try_get(1).map_err(sql)?,
             body: row.try_get(2).map_err(sql)?,
         }))
+    }
+}
+
+/// Events as `run_events` rows: each body, and whether it ends the run.
+struct EventRows {
+    bodies: Vec<Value>,
+    terminal: Vec<bool>,
+}
+
+impl EventRows {
+    fn new(events: &[Event]) -> Result<Self, StoreError> {
+        Ok(Self {
+            bodies: events
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()
+                .map_err(json)?,
+            terminal: events
+                .iter()
+                .map(|event| is_terminal(&event.payload))
+                .collect(),
+        })
+    }
+
+    /// Inserts the rows numbered after `last`, in order, in one statement.
+    fn insert(
+        &self,
+        tx: &mut postgres::Transaction<'_>,
+        run_id: uuid::Uuid,
+        last: i64,
+    ) -> Result<(), StoreError> {
+        tx.execute(
+            "insert into run_events (run_id, seq, body, terminal)
+             select $1, $2 + row.ord, row.body, row.terminal
+             from unnest($3::jsonb[], $4::bool[]) with ordinality as row (body, terminal, ord)",
+            &[&run_id, &last, &self.bodies, &self.terminal],
+        )
+        .map_err(sql)?;
+        Ok(())
     }
 }

@@ -83,6 +83,20 @@ pub trait RunStore: Send + Sync {
     /// events already stored never change.
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError>;
     fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError>;
+    /// The run with at most `limit` of its events: those after the first
+    /// `after`. A store that keeps events in order by row overrides this to
+    /// read only the page.
+    fn run_page(
+        &self,
+        id: RunId,
+        after: usize,
+        limit: usize,
+    ) -> Result<Option<StoredRun>, StoreError> {
+        Ok(self.run(id)?.map(|mut run| {
+            run.events = run.events.into_iter().skip(after).take(limit).collect();
+            run
+        }))
+    }
     fn put_artifact(&self, artifact: StoredArtifact) -> Result<(), StoreError>;
     fn artifact(&self, id: ArtifactId) -> Result<Option<StoredArtifact>, StoreError>;
 }
