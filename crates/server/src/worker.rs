@@ -411,7 +411,8 @@ pub fn reap_forever(queue: &RedisRunQueue, store: &dyn RunStore, timing: QueueTi
 /// never pushed: the producer died in between (C6). A pending run that was
 /// never stored, or whose log has moved past created and queued, is taken
 /// off pending instead. Returns the runs it pushed. A run the store cannot
-/// load now stays pending for the next sweep.
+/// load, or that Redis cannot push or unpend now, stays pending for the next
+/// sweep; the others are still swept.
 pub fn sweep(
     queue: &RedisRunQueue,
     store: &dyn RunStore,
@@ -420,11 +421,15 @@ pub fn sweep(
     let mut pushed = Vec::new();
     for run_id in queue.pending_for(after)? {
         match store.run(run_id) {
-            Ok(Some(run)) if waiting(&run) => {
-                queue.push(run_id)?;
-                pushed.push(run_id);
+            Ok(Some(run)) if waiting(&run) => match queue.push(run_id) {
+                Ok(()) => pushed.push(run_id),
+                Err(error) => eprintln!("gol: queue sweep: push run {run_id}: {error}"),
+            },
+            Ok(_) => {
+                if let Err(error) = queue.unpend(run_id) {
+                    eprintln!("gol: queue sweep: unpend run {run_id}: {error}");
+                }
             }
-            Ok(_) => queue.unpend(run_id)?,
             Err(error) => eprintln!("gol: queue sweep: load run {run_id}: {error}"),
         }
     }

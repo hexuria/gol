@@ -439,7 +439,10 @@ impl RedisRunQueue {
                 let mut slot = self.lock_slot();
                 slot.probing = false;
                 match connected {
-                    Ok(connection) => connection,
+                    Ok(connection) => {
+                        slot.failed_at = None;
+                        connection
+                    }
                     Err(error) => {
                         slot.failed_at = Some(Instant::now());
                         return Err(error.to_string());
