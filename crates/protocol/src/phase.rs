@@ -4,6 +4,13 @@ use crate::{ApprovalId, InvocationId};
 
 pub const MAX_RETRIES: u32 = 2;
 
+/// How deep a chain of delegations may go: a run this many hops from its
+/// root may not start another.
+pub const MAX_DELEGATION_HOPS: u32 = 8;
+
+/// How many child runs one run may start.
+pub const MAX_CHILDREN: u32 = 10;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HarnessState {
     Idle,

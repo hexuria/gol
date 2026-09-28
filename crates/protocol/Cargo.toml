@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "serde", "v5"] }
 
 [dev-dependencies]
 criterion = "0.5"

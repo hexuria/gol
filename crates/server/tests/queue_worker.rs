@@ -994,3 +994,29 @@ fn the_reaper_sweeps_stranded_runs() {
     assert_eq!(setup.queue.queued().expect("queued"), [setup.run_id]);
     assert_eq!(setup.queue.pending().expect("pending"), []);
 }
+
+// Every event the server records for a child run names its parent.
+#[test]
+fn the_servers_events_for_a_child_name_its_parent() {
+    let parent = spec();
+    let child = RunSpec::builder()
+        .owner(parent.owner.clone())
+        .agent(AgentId::new(), "1")
+        .input("draft")
+        .placement(parent.placement)
+        .work_model(parent.work_model.clone())
+        .child_of(&parent, 1)
+        .build();
+    let mut events = queued_events(&child);
+    events.push(server::run_failed_event(
+        &child,
+        protocol::FailureClass::Infrastructure,
+        "stopped".to_string(),
+    ));
+    assert!(events
+        .iter()
+        .all(|event| event.envelope.parent_run_id == Some(parent.run_id)));
+    assert!(queued_events(&parent)
+        .iter()
+        .all(|event| event.envelope.parent_run_id.is_none()));
+}

@@ -225,6 +225,14 @@ fn payloads(max_steps: u32) -> Vec<EventPayload> {
             key: "k".to_string(),
             value: "v".to_string(),
         },
+        EventPayload::ChildStarted {
+            run_id: RunId::from_uuid(Uuid::from_u128(7)),
+            agent_id: AgentId::from_uuid(Uuid::from_u128(8)),
+        },
+        EventPayload::DelegateRefused {
+            agent_id: AgentId::from_uuid(Uuid::from_u128(8)),
+            reason: "no".to_string(),
+        },
     ];
     for class in classes() {
         all.push(EventPayload::RunFailed {
@@ -253,7 +261,7 @@ fn payloads(max_steps: u32) -> Vec<EventPayload> {
             all.push(tool_result(TOOL, invocation(), step, attempt + 1));
         }
     }
-    assert_covers(all.iter().map(payload_index), 25);
+    assert_covers(all.iter().map(payload_index), 27);
     all
 }
 
@@ -284,6 +292,8 @@ fn payload_index(payload: &EventPayload) -> usize {
         EventPayload::ModelResponded { .. } => 22,
         EventPayload::MemoryRead { .. } => 23,
         EventPayload::MemoryWritten { .. } => 24,
+        EventPayload::ChildStarted { .. } => 25,
+        EventPayload::DelegateRefused { .. } => 26,
     }
 }
 
@@ -502,9 +512,9 @@ fn expected_next(state: &HarnessState, payload: &EventPayload) -> HarnessState {
     }
 }
 
-/// The exact effects of every pair. An authorized model call or memory
-/// access passes through from any running step; an authorized tool call only
-/// from an unanswered step inside the budget. Nothing else emits.
+/// The exact effects of every pair. An authorized model call, memory access
+/// or delegation passes through from any running step; an authorized tool
+/// call only from an unanswered step inside the budget. Nothing else emits.
 fn expected_effects(state: &HarnessState, payload: &EventPayload, max_steps: u32) -> Vec<Effect> {
     let (HarnessState::Running { step, answered, .. }, EventPayload::EffectAuthorized { effect }) =
         (state, payload)
@@ -513,9 +523,11 @@ fn expected_effects(state: &HarnessState, payload: &EventPayload, max_steps: u32
     };
     let emits = match effect {
         Effect::ToolCall { .. } => !answered && (1..=max_steps).contains(step),
-        Effect::ModelCall { .. } | Effect::MemoryRead { .. } | Effect::MemoryWrite { .. } => true,
+        Effect::ModelCall { .. }
+        | Effect::MemoryRead { .. }
+        | Effect::MemoryWrite { .. }
+        | Effect::Delegate { .. } => true,
         Effect::Execute { .. }
-        | Effect::Delegate { .. }
         | Effect::AskUser { .. }
         | Effect::RequestApproval { .. }
         | Effect::Wait { .. }

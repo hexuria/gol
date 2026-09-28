@@ -1,9 +1,12 @@
 use crate::policy::PolicyDecision;
-use crate::{memory_owner_id, Capability, Effect, MemoryScope, RunSpec, ToolDescriptor};
+use crate::{
+    memory_owner_id, Capability, Effect, MemoryScope, RunSpec, ToolDescriptor, MAX_DELEGATION_HOPS,
+};
 
 const MODEL_CALL: &str = "model.call";
 const MEMORY_READ: &str = "memory.read";
 const MEMORY_WRITE: &str = "memory.write";
+const AGENT_DELEGATE: &str = "agent.delegate";
 
 pub fn authorize(spec: &RunSpec, effect: &Effect, tools: &[ToolDescriptor]) -> PolicyDecision {
     match effect {
@@ -22,8 +25,13 @@ pub fn authorize(spec: &RunSpec, effect: &Effect, tools: &[ToolDescriptor]) -> P
                 reason: format!("unknown tool: {name}"),
             },
         },
+        Effect::Delegate { .. } if spec.lineage.hop >= MAX_DELEGATION_HOPS => {
+            PolicyDecision::Deny {
+                reason: format!("delegation is already {MAX_DELEGATION_HOPS} hops deep"),
+            }
+        }
+        Effect::Delegate { .. } => allow_capability(spec, AGENT_DELEGATE),
         Effect::Execute { .. }
-        | Effect::Delegate { .. }
         | Effect::AskUser { .. }
         | Effect::RequestApproval { .. }
         | Effect::Wait { .. }
@@ -105,6 +113,42 @@ mod tests {
 
         spec.capabilities.push(Capability::new("tool.echo"));
         assert_eq!(authorize(&spec, &effect, &tools), PolicyDecision::Allow);
+    }
+
+    fn delegate() -> Effect {
+        Effect::Delegate {
+            agent_id: crate::AgentId::new(),
+            input: "draft".to_string(),
+        }
+    }
+
+    #[test]
+    fn delegate_needs_its_capability() {
+        let mut spec = sample_spec();
+        assert_eq!(
+            authorize(&spec, &delegate(), &[]),
+            PolicyDecision::Deny {
+                reason: "missing capability: agent.delegate".to_string()
+            }
+        );
+        spec.capabilities.push(Capability::new("agent.delegate"));
+        assert_eq!(authorize(&spec, &delegate(), &[]), PolicyDecision::Allow);
+    }
+
+    // A run eight hops from its root may not start a ninth.
+    #[test]
+    fn delegation_stops_after_eight_hops() {
+        let mut spec = sample_spec();
+        spec.capabilities.push(Capability::new("agent.delegate"));
+        spec.lineage.hop = crate::MAX_DELEGATION_HOPS - 1;
+        assert_eq!(authorize(&spec, &delegate(), &[]), PolicyDecision::Allow);
+        spec.lineage.hop = crate::MAX_DELEGATION_HOPS;
+        assert_eq!(
+            authorize(&spec, &delegate(), &[]),
+            PolicyDecision::Deny {
+                reason: "delegation is already 8 hops deep".to_string()
+            }
+        );
     }
 
     #[test]

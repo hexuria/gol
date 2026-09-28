@@ -256,9 +256,11 @@ mod tests {
         assert_eq!(
             protocol::authorize(&spec, &delegate, &[]),
             protocol::PolicyDecision::Deny {
-                reason: "effect is not implemented in this slice".to_string(),
+                reason: "missing capability: agent.delegate".to_string(),
             }
         );
+        // With no spawner, a performed delegation is recorded as refused and
+        // starts nothing.
         let mut denied = harness::Driver::boot(spec).unwrap();
         let events_before = denied.events().len();
         let harness_before = denied.state().harness.clone();
@@ -268,8 +270,14 @@ mod tests {
             &harness::UnavailableModel,
             &harness::InMemory::default(),
         );
-        assert_eq!(denied.events().len(), events_before);
+        assert_eq!(denied.events().len(), events_before + 1);
+        assert!(matches!(
+            denied.events().last().map(|event| &event.payload),
+            Some(protocol::EventPayload::DelegateRefused { reason, .. })
+                if reason == "no agent spawner is configured"
+        ));
         assert_eq!(denied.state().harness, harness_before);
+        assert_eq!(denied.state().children, 0);
         assert!(denied
             .events()
             .iter()

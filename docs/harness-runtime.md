@@ -41,7 +41,8 @@ Each variant carries only the fields that variant needs.
 | `MemoryRead` | Allowed when the spec lists `memory.read`, and for session or workspace scope when its metadata names `session_id` or `workspace_id`. Global scope is denied. From `Running`, `reduce` emits the read. |
 | `MemoryWrite` | Allowed when the spec lists `memory.write`, with the same rules for session, workspace and global scope. From `Running`, `reduce` emits the write. |
 | `Complete` | Always allowed. From `Running`, `reduce` enters `Completed`. |
-| `Execute`, `Delegate`, `AskUser`, `RequestApproval`, `Wait`, `PublishArtifact` | Denied. The loop continues. |
+| `Delegate` | Allowed when the spec lists `agent.delegate` and the run is fewer than `MAX_DELEGATION_HOPS` (8) hops from its root. From `Running`, `reduce` emits it. The driver records `ChildStarted` or `DelegateRefused`; with no spawner configured it refuses. |
+| `Execute`, `AskUser`, `RequestApproval`, `Wait`, `PublishArtifact` | Denied. The loop continues. |
 
 `PolicyDecision` is `Allow`, `Deny { reason }`, `RequireApproval`, `Modify`, `Limit`, or `Redirect`. The authorizer in this slice returns `Allow` or `Deny` only.
 
@@ -68,9 +69,9 @@ A memory store that cannot answer ends the run `Failed { class: Infrastructure }
 
 Every event has one envelope and one payload.
 
-Envelope fields are `event_id`, `event_type`, `run_id`, `step_id`, `parent_run_id`, `agent_id`, `agent_version`, `at`, `actor`, and `caused_by`. `at` is Unix milliseconds. `event_type` is copied from the payload when the event is recorded, so the label cannot drift from the variant.
+Envelope fields are `event_id`, `event_type`, `run_id`, `step_id`, `parent_run_id`, `agent_id`, `agent_version`, `at`, `actor`, and `caused_by`. `parent_run_id` names the run that started this one (from the spec's `lineage`), and is absent for a top-level run. `at` is Unix milliseconds. `event_type` is copied from the payload when the event is recorded, so the label cannot drift from the variant.
 
-Lifecycle payloads run from `RunCreated` through `RunCancelled`, and include `RunExpired`. `StepRetried` and `StepAdvanced` are the retry and advance transitions. Decision payloads are `EffectDecided`, `EffectAuthorized`, and `EffectDenied`. Execution payloads are `ToolResult`, `ModelResponded`, `MemoryRead`, and `MemoryWritten`.
+Lifecycle payloads run from `RunCreated` through `RunCancelled`, and include `RunExpired`. `StepRetried` and `StepAdvanced` are the retry and advance transitions. Decision payloads are `EffectDecided`, `EffectAuthorized`, and `EffectDenied`. Execution payloads are `ToolResult`, `ModelResponded`, `MemoryRead`, `MemoryWritten`, `ChildStarted`, and `DelegateRefused`.
 
 The runtime does not copy secret material into events or into the decision view. `CredentialSource::BringYourOwn` stores a `secret_ref` name. It does not store the secret.
 

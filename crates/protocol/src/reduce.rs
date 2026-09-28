@@ -179,7 +179,9 @@ pub fn reduce(state: HarnessState, event: &Event, spec: &RunSpec) -> (HarnessSta
         | EventPayload::ModelResponded { .. }
         | EventPayload::UserMessage { .. }
         | EventPayload::MemoryRead { .. }
-        | EventPayload::MemoryWritten { .. } => (state, Vec::new()),
+        | EventPayload::MemoryWritten { .. }
+        | EventPayload::ChildStarted { .. }
+        | EventPayload::DelegateRefused { .. } => (state, Vec::new()),
     }
 }
 
@@ -196,9 +198,9 @@ pub fn applicable(state: &HarnessState, effect: &Effect, spec: &RunSpec) -> bool
         Effect::Complete { .. }
         | Effect::ModelCall { .. }
         | Effect::MemoryRead { .. }
-        | Effect::MemoryWrite { .. } => true,
+        | Effect::MemoryWrite { .. }
+        | Effect::Delegate { .. } => true,
         Effect::Execute { .. }
-        | Effect::Delegate { .. }
         | Effect::AskUser { .. }
         | Effect::RequestApproval { .. }
         | Effect::Wait { .. }
@@ -292,6 +294,65 @@ mod tests {
 
         assert!(!applicable(&running(false), &wait, &spec));
         assert!(!applicable(&HarnessState::Cancelled, &complete, &spec));
+    }
+
+    // An authorized delegation passes through from a running step, as a
+    // memory access does: the driver performs it and records what happened.
+    #[test]
+    fn an_authorized_delegate_passes_through_a_running_step() {
+        let spec = sample_spec();
+        let delegate = Effect::Delegate {
+            agent_id: AgentId::new(),
+            input: "draft".to_string(),
+        };
+        let running = HarnessState::Running {
+            step: 2,
+            attempt: 0,
+            answered: false,
+        };
+        assert!(applicable(&running, &delegate, &spec));
+        let (next, effects) = reduce(
+            running.clone(),
+            &ev(EventPayload::EffectAuthorized {
+                effect: delegate.clone(),
+            }),
+            &spec,
+        );
+        assert_eq!(next, running);
+        assert_eq!(effects, vec![delegate.clone()]);
+        let waiting = echo_wait(2, 0);
+        assert!(!applicable(&waiting, &delegate, &spec));
+    }
+
+    // What the driver records about a delegation changes neither state.
+    #[test]
+    fn a_started_or_refused_child_changes_no_state() {
+        let spec = sample_spec();
+        let running = HarnessState::Running {
+            step: 2,
+            attempt: 0,
+            answered: false,
+        };
+        for payload in [
+            EventPayload::ChildStarted {
+                run_id: crate::RunId::new(),
+                agent_id: AgentId::new(),
+            },
+            EventPayload::DelegateRefused {
+                agent_id: AgentId::new(),
+                reason: "no".to_string(),
+            },
+        ] {
+            let event = ev(payload);
+            assert_eq!(
+                reduce(running.clone(), &event, &spec),
+                (running.clone(), vec![])
+            );
+            assert_eq!(
+                reduce_dispatch(DispatchPhase::Running, &event),
+                DispatchPhase::Running
+            );
+        }
     }
 
     fn echo_call(input: &str) -> Effect {

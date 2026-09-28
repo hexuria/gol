@@ -335,9 +335,17 @@ impl Driver {
                         }
                     }
                 }
+                // No spawner is wired into the driver yet: the delegation is
+                // recorded as refused, and the run goes on.
+                Effect::Delegate { agent_id, .. } => self.push(
+                    EventPayload::DelegateRefused {
+                        agent_id: *agent_id,
+                        reason: "no agent spawner is configured".to_string(),
+                    },
+                    Actor::System,
+                ),
                 Effect::Complete { .. }
                 | Effect::Execute { .. }
-                | Effect::Delegate { .. }
                 | Effect::AskUser { .. }
                 | Effect::RequestApproval { .. }
                 | Effect::Wait { .. }
@@ -401,13 +409,7 @@ impl Driver {
 
     fn push(&mut self, payload: EventPayload, actor: Actor) {
         self.events.push(Event::record(
-            protocol::EventSource::new(
-                self.spec.run_id,
-                self.spec.agent_id,
-                &self.spec.agent_version,
-                actor,
-                Timestamp::now(),
-            ),
+            protocol::EventSource::for_spec(&self.spec, actor, Timestamp::now()),
             payload,
         ));
     }

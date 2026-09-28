@@ -640,13 +640,7 @@ fn sandbox_error(error: SandboxError) -> TurnError {
 
 pub fn user_message_event(spec: &RunSpec) -> Event {
     Event::record(
-        EventSource::new(
-            spec.run_id,
-            spec.agent_id,
-            &spec.agent_version,
-            Actor::System,
-            Timestamp::now(),
-        ),
+        EventSource::for_spec(spec, Actor::System, Timestamp::now()),
         EventPayload::UserMessage {
             text: spec.input.clone(),
         },
@@ -656,13 +650,7 @@ pub fn user_message_event(spec: &RunSpec) -> Event {
 /// A `payload` event from the system, for `spec`'s run.
 fn system_event(spec: &RunSpec, payload: EventPayload) -> Event {
     Event::record(
-        EventSource::new(
-            spec.run_id,
-            spec.agent_id,
-            &spec.agent_version,
-            Actor::System,
-            Timestamp::now(),
-        ),
+        EventSource::for_spec(spec, Actor::System, Timestamp::now()),
         payload,
     )
 }
@@ -692,13 +680,7 @@ pub(crate) fn dispatch_events(spec: &RunSpec) -> Vec<Event> {
 /// the run, so a failure never leaves the run open.
 pub fn run_failed_event(spec: &RunSpec, class: FailureClass, message: String) -> Event {
     Event::record(
-        EventSource::new(
-            spec.run_id,
-            spec.agent_id,
-            &spec.agent_version,
-            Actor::System,
-            Timestamp::now(),
-        ),
+        EventSource::for_spec(spec, Actor::System, Timestamp::now()),
         EventPayload::RunFailed { class, message },
     )
 }
@@ -727,13 +709,7 @@ fn append_completion(spec: &RunSpec, events: &mut Vec<Event>, text: &str) {
 
 fn push(spec: &RunSpec, events: &mut Vec<Event>, actor: Actor, payload: EventPayload) {
     events.push(Event::record(
-        EventSource::new(
-            spec.run_id,
-            spec.agent_id,
-            &spec.agent_version,
-            actor,
-            Timestamp::now(),
-        ),
+        EventSource::for_spec(spec, actor, Timestamp::now()),
         payload,
     ));
 }

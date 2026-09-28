@@ -90,6 +90,16 @@ pub struct Limits {
     pub max_model_calls: u32,
 }
 
+/// Where a run came from. A top-level run has no parent, is its own root
+/// and is at hop 0; a run started by another run names its parent and the
+/// root of the chain, one hop further on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lineage {
+    pub parent: Option<RunId>,
+    pub root: Option<RunId>,
+    pub hop: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSpec {
     pub run_id: RunId,
@@ -102,7 +112,30 @@ pub struct RunSpec {
     pub capabilities: Vec<Capability>,
     pub limits: Limits,
     pub metadata: BTreeMap<String, String>,
+    /// Absent from specs stored before lineage existed: those are top level.
+    #[serde(default)]
+    pub lineage: Lineage,
 }
+
+impl RunSpec {
+    /// The first run of this run's chain: its own id for a top-level run.
+    pub fn root(&self) -> RunId {
+        self.lineage.root.unwrap_or(self.run_id)
+    }
+}
+
+/// The request a child run is started for: its parent, and the parent's
+/// step that asked for it.
+struct ChildOf {
+    parent: RunId,
+    root: RunId,
+    hop: u32,
+    step: u32,
+}
+
+/// The namespace of child run ids (UUID v5 over the request).
+const CHILD_RUN_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x6f8b_1c2e_4a7d_4e5b_9c3f_2d1a_0b8e_7c6d);
 
 struct SpecDraft {
     owner: Option<Owner>,
@@ -114,6 +147,7 @@ struct SpecDraft {
     capabilities: Vec<Capability>,
     limits: Limits,
     metadata: BTreeMap<String, String>,
+    child_of: Option<ChildOf>,
 }
 
 pub struct RunSpecBuilder<A, I, P, W, O> {
@@ -149,6 +183,7 @@ impl RunSpecBuilder<Missing, Missing, Missing, Missing, Missing> {
                     max_model_calls: 4,
                 },
                 metadata: BTreeMap::new(),
+                child_of: None,
             },
             _state: PhantomData,
         }
@@ -221,19 +256,55 @@ impl RunSpecBuilder<Set, Set, Set, Set, Set> {
         self
     }
 
+    /// Makes this a child of `parent`, started by the parent's `step`. The
+    /// child's id is derived from its root, parent, step, agent and input, so
+    /// the same request always names the same run (a parent that is run again
+    /// does not start a second child), and any other request names another.
+    pub fn child_of(mut self, parent: &RunSpec, step: u32) -> Self {
+        self.draft.child_of = Some(ChildOf {
+            parent: parent.run_id,
+            root: parent.root(),
+            hop: parent.lineage.hop + 1,
+            step,
+        });
+        self
+    }
+
     pub fn build(self) -> RunSpec {
         let draft = self.draft;
+        let agent_id = draft.agent_id.expect("typestate recorded the agent");
+        let input = draft.input.expect("typestate recorded the input");
+        let (run_id, lineage) = match &draft.child_of {
+            None => (RunId::new(), Lineage::default()),
+            Some(child) => {
+                let mut name = Vec::with_capacity(52 + input.len());
+                name.extend_from_slice(child.root.as_uuid().as_bytes());
+                name.extend_from_slice(child.parent.as_uuid().as_bytes());
+                name.extend_from_slice(&child.step.to_le_bytes());
+                name.extend_from_slice(agent_id.as_uuid().as_bytes());
+                name.extend_from_slice(input.as_bytes());
+                (
+                    RunId::from_uuid(uuid::Uuid::new_v5(&CHILD_RUN_NAMESPACE, &name)),
+                    Lineage {
+                        parent: Some(child.parent),
+                        root: Some(child.root),
+                        hop: child.hop,
+                    },
+                )
+            }
+        };
         RunSpec {
-            run_id: RunId::new(),
+            run_id,
             owner: draft.owner.expect("typestate recorded the owner"),
-            agent_id: draft.agent_id.expect("typestate recorded the agent"),
+            agent_id,
             agent_version: draft.agent_version.expect("typestate recorded the agent"),
-            input: draft.input.expect("typestate recorded the input"),
+            input,
             placement: draft.placement.expect("typestate recorded the placement"),
             work_model: draft.work_model.expect("typestate recorded the work model"),
             capabilities: draft.capabilities,
             limits: draft.limits,
             metadata: draft.metadata,
+            lineage,
         }
     }
 }
@@ -318,5 +389,77 @@ mod owner_tests {
         assert_eq!(json["owner"]["subject"], "user-1");
         let back: super::RunSpec = serde_json::from_value(json).unwrap();
         assert_eq!(back.owner, spec.owner);
+    }
+}
+
+#[cfg(test)]
+mod lineage_tests {
+    use super::*;
+
+    fn child(parent: &RunSpec, step: u32, agent: AgentId, input: &str) -> RunSpec {
+        RunSpec::builder()
+            .owner(parent.owner.clone())
+            .agent(agent, "1")
+            .input(input)
+            .placement(parent.placement)
+            .work_model(parent.work_model.clone())
+            .child_of(parent, step)
+            .build()
+    }
+
+    // A top-level run is its own root at hop 0; a child names its parent and
+    // its root and is one hop further.
+    #[test]
+    fn a_child_is_traced_to_its_parent_and_root() {
+        let root = sample_spec();
+        assert_eq!(root.lineage, Lineage::default());
+        assert_eq!(root.root(), root.run_id);
+        let agent = AgentId::new();
+        let first = child(&root, 1, agent, "a");
+        assert_eq!(
+            first.lineage,
+            Lineage {
+                parent: Some(root.run_id),
+                root: Some(root.run_id),
+                hop: 1,
+            }
+        );
+        let second = child(&first, 2, agent, "b");
+        assert_eq!(
+            second.lineage,
+            Lineage {
+                parent: Some(first.run_id),
+                root: Some(root.run_id),
+                hop: 2,
+            }
+        );
+        assert_eq!(second.root(), root.run_id);
+    }
+
+    // A child's id comes from what was asked: the same request gives the same
+    // id, so a redelivered parent starts no second child, and a different
+    // step, agent, input or parent gives another.
+    #[test]
+    fn a_child_id_is_derived_from_its_request() {
+        let root = sample_spec();
+        let agent = AgentId::new();
+        let id = child(&root, 3, agent, "draft").run_id;
+        assert_eq!(child(&root, 3, agent, "draft").run_id, id);
+        assert_ne!(child(&root, 4, agent, "draft").run_id, id);
+        assert_ne!(child(&root, 3, AgentId::new(), "draft").run_id, id);
+        assert_ne!(child(&root, 3, agent, "draft!").run_id, id);
+        assert_ne!(child(&sample_spec(), 3, agent, "draft").run_id, id);
+        assert_ne!(sample_spec().run_id, sample_spec().run_id);
+    }
+
+    // A spec stored before lineage existed still loads, as a top-level run.
+    #[test]
+    fn a_spec_stored_without_lineage_loads_as_top_level() {
+        let spec = sample_spec();
+        let mut json = serde_json::to_value(&spec).unwrap();
+        json.as_object_mut().unwrap().remove("lineage");
+        let back: RunSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(back.lineage, Lineage::default());
+        assert_eq!(back.root(), back.run_id);
     }
 }
