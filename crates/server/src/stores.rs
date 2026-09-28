@@ -14,12 +14,13 @@ pub struct Stores {
     pub memory: Arc<dyn Memory>,
 }
 
-/// Postgres when `GOL_DATABASE_URL` is set, with `GOL_DATABASE_POOL_SIZE`
+/// Postgres when `GOL_DATABASE_URL` is set and not empty, with
+/// `GOL_DATABASE_POOL_SIZE`
 /// connections (8 by default) and one kept idle; memory otherwise. An error
 /// says why the server cannot start. It connects, so call it from a blocking
 /// thread.
 pub fn stores_from_env(env: &BTreeMap<String, String>) -> Result<Stores, String> {
-    let Some(url) = env.get("GOL_DATABASE_URL") else {
+    let Some(url) = env.get("GOL_DATABASE_URL").filter(|url| !url.is_empty()) else {
         return Ok(Stores {
             runs: Arc::new(InMemoryStore::default()),
             memory: Arc::new(InMemory::default()),

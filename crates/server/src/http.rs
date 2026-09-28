@@ -8,8 +8,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use harness::{
-    run_to_completion, BootError, Driver, EchoTool, InMemory, JevDecider, Memory, StoreError,
-    UnavailableModel,
+    run_to_completion, BootError, Driver, EchoTool, InMemory, JevDecider, Memory, RunMemory,
+    StoreError, UnavailableModel,
 };
 use protocol::{
     fold, AgentId, Capability, Event, EventPayload, ExecutionPlacement, FailureClass, Limits,
@@ -650,7 +650,7 @@ fn run_with_jev(
         &mut decider,
         &[&echo],
         &UnavailableModel,
-        memory,
+        &RunMemory::new(memory),
     )
     .map_err(|error| RunStartError::Decider(error.message));
     (driver.events().to_vec(), outcome)

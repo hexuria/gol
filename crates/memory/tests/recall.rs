@@ -158,6 +158,22 @@ fn session_memory_belongs_to_its_user() {
     memory_scenarios::session_memory_belongs_to_its_user(&connect());
 }
 
+#[test]
+fn workspace_memory_belongs_to_its_organization() {
+    memory_scenarios::workspace_memory_belongs_to_its_organization(&connect());
+}
+
+#[test]
+fn global_memory_is_denied() {
+    memory_scenarios::global_memory_is_denied(&connect());
+}
+
+// The counterexample trace of formal/memory, forced.
+#[test]
+fn no_cross_scope_read_in_the_model_trace() {
+    memory_scenarios::no_cross_scope_read_in_the_model_trace(&connect());
+}
+
 // The Rust test of `NoCrossScopeRead` in formal/memory/Memory.tla.
 #[test]
 fn no_cross_scope_read() {
@@ -190,6 +206,60 @@ fn a_memories_table_without_owners_is_refused_at_connect() {
         .expect("drop");
     let error = connected.expect_err("connect must fail");
     assert!(error.to_string().contains("drop table memories"), "{error}");
+}
+
+// A table given the owner column by hand but still keyed by (scope, key) is
+// refused too: every write to it would fail at runtime.
+#[test]
+fn a_memories_table_with_the_old_key_is_refused_at_connect() {
+    let mut admin = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("connect");
+    let schema = format!("c3_rekeyed_{}", std::process::id());
+    admin
+        .batch_execute(&format!(
+            "drop schema if exists {schema} cascade;
+             create schema {schema};
+             create table {schema}.memories (scope text not null, key text not null,
+                 value text not null, primary key (scope, key));
+             alter table {schema}.memories add column owner_id text not null default '';"
+        ))
+        .expect("old schema");
+    let url = format!("{POSTGRES_URL}?options=-csearch_path%3D{schema}");
+    let connected = PostgresMemory::connect(&url).map(|_| ());
+    admin
+        .batch_execute(&format!("drop schema {schema} cascade"))
+        .expect("drop");
+    let error = connected.expect_err("connect must fail");
+    assert!(error.to_string().contains("drop table memories"), "{error}");
+}
+
+// Every run shares one connection, so a write stuck behind a row lock gives
+// up after the lock timeout instead of holding the rest up without end.
+#[test]
+fn a_write_waiting_on_a_lock_gives_up() {
+    let key = format!("topic-locked-{}", uuid_key());
+    let store = connect();
+    let scope = serde_json::to_string(&MemoryScope::Run).unwrap();
+    let mut holder = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("holder");
+    let mut tx = holder.transaction().expect("begin");
+    tx.execute(
+        "insert into memories (scope, owner_id, key, value) values ($1, 'recall', $2, 'held')",
+        &[&scope, &key],
+    )
+    .expect("insert");
+    let started = std::time::Instant::now();
+    let result = store.write(&owner(MemoryScope::Run), &key, "rust");
+    let waited = started.elapsed();
+    tx.rollback().expect("rollback");
+    assert!(result.is_err(), "the write waited out the lock");
+    assert!(
+        waited < std::time::Duration::from_secs(10),
+        "waited {waited:?}"
+    );
+    assert_eq!(
+        store.write(&owner(MemoryScope::Run), &key, "rust"),
+        Ok(()),
+        "the next write, once the lock is gone"
+    );
 }
 
 /// Coarse on macOS, so each test also names its own key prefix.

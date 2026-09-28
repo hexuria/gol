@@ -361,9 +361,14 @@ impl Driver {
         self.push(EventPayload::StepAdvanced, Actor::System);
     }
 
-    /// Whose memory `scope` is for this run at its current step.
+    /// Whose memory `scope` is for this run at its current harness step
+    /// (`Running.step`, which advances after a tool or model result).
     fn memory_key(&self, scope: MemoryScope) -> Option<MemoryKey> {
-        protocol::memory_owner_id(&self.spec, scope, self.state().steps)
+        let step = match self.state().harness {
+            HarnessState::Running { step, .. } | HarnessState::WaitingForTool { step, .. } => step,
+            _ => 0,
+        };
+        protocol::memory_owner_id(&self.spec, scope, step)
             .map(|owner_id| MemoryKey { scope, owner_id })
     }
 

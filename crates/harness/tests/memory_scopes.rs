@@ -28,6 +28,22 @@ fn session_memory_belongs_to_its_user() {
     memory_scenarios::session_memory_belongs_to_its_user(&InMemory::default());
 }
 
+#[test]
+fn workspace_memory_belongs_to_its_organization() {
+    memory_scenarios::workspace_memory_belongs_to_its_organization(&InMemory::default());
+}
+
+#[test]
+fn global_memory_is_denied() {
+    memory_scenarios::global_memory_is_denied(&InMemory::default());
+}
+
+// The counterexample trace of formal/memory, forced.
+#[test]
+fn no_cross_scope_read_in_the_model_trace() {
+    memory_scenarios::no_cross_scope_read_in_the_model_trace(&InMemory::default());
+}
+
 // The Rust test of `NoCrossScopeRead` in formal/memory/Memory.tla.
 #[test]
 fn no_cross_scope_read() {
@@ -38,7 +54,7 @@ fn no_cross_scope_read() {
 // authorizer denies those, so only a caller of `perform` that skipped it gets
 // here) fails the run, and reaches no memory.
 #[test]
-fn a_session_effect_without_a_session_id_fails_the_run() {
+fn a_session_or_workspace_effect_without_its_id_fails_the_run() {
     use harness::{Driver, UnavailableModel};
     use protocol::{
         AgentId, CredentialSource, Effect, EventPayload, ExecutionPlacement, FailureClass,
@@ -55,27 +71,38 @@ fn a_session_effect_without_a_session_id_fails_the_run() {
             credential: CredentialSource::PlatformGateway,
         })
         .build();
-    let mut driver = Driver::boot(spec).expect("boot");
     let memory = InMemory::default();
-    driver.perform(
-        &[Effect::MemoryWrite {
+    for effect in [
+        Effect::MemoryWrite {
             scope: MemoryScope::Session,
             key: "topic".to_string(),
             value: "talk".to_string(),
-        }],
-        &[],
-        &UnavailableModel,
-        &memory,
-    );
-    assert!(matches!(
-        driver.events().last().map(|event| &event.payload),
-        Some(EventPayload::RunFailed {
-            class: FailureClass::Policy,
-            ..
-        })
-    ));
-    assert!(!driver
-        .events()
-        .iter()
-        .any(|event| matches!(event.payload, EventPayload::MemoryWritten { .. })));
+        },
+        Effect::MemoryRead {
+            scope: MemoryScope::Workspace,
+            key: "topic".to_string(),
+        },
+    ] {
+        let mut driver = Driver::boot(spec.clone()).expect("boot");
+        driver.perform(
+            std::slice::from_ref(&effect),
+            &[],
+            &UnavailableModel,
+            &memory,
+        );
+        assert!(
+            matches!(
+                driver.events().last().map(|event| &event.payload),
+                Some(EventPayload::RunFailed {
+                    class: FailureClass::Policy,
+                    ..
+                })
+            ),
+            "{effect:?}"
+        );
+        assert!(!driver.events().iter().any(|event| matches!(
+            event.payload,
+            EventPayload::MemoryWritten { .. } | EventPayload::MemoryRead { .. }
+        )));
+    }
 }

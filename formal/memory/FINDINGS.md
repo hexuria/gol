@@ -4,11 +4,18 @@ Checked on 2026-09-28. `Memory.tla` is the memories table and the runs that writ
 
 ## Model
 
-Resource: the memories table. That is `memory::PostgresMemory` (`crates/memory/src/lib.rs`: one upsert per write, one select per read) and `harness::InMemory` (`crates/harness/src/memory.rs`: one lock per call).
+Resource: the memories table.
+- `memory::PostgresMemory` (`crates/memory/src/lib.rs:144`): one upsert per write (`:156`) and one select per read (`:145`), each on the store's one connection behind its lock (`with_client`, `:71`).
+- `harness::InMemory` (`crates/harness/src/memory.rs:56`): one lock per call.
 
-Writers: runs of different owners, each with a driver that performs `MemoryWrite` and `MemoryRead` effects (`Driver::perform` in `crates/harness/src/driver.rs`). On the server, every run started by `POST /v1/runs` shares one memory (`AppState::memory`, `crates/server/src/http.rs`). Each call is one atomic step.
+Writers: runs of different owners. Each has a driver that performs `MemoryWrite` (`crates/harness/src/driver.rs:318`) and `MemoryRead` (`:298`) under the key `memory_key` (`:366`) builds from `protocol::memory_owner_id` (`crates/protocol/src/effect.rs:81`). The server gives every run started by `POST /v1/runs` the shared memory (`crates/server/src/http.rs:653`). Today no server run writes memory, because Jev offers no memory effect; the drivers in the tests do. Each call is one atomic step.
 
-`Design = "old"` keys an entry by its scope alone, as before C3. `Design = "new"` also keys it by its owner, the id that `protocol::memory_owner_id` gives the run. The model checks the organization scope, owned by the run's tenant; the other scopes differ only in which id names the owner.
+`Design = "old"` keys an entry by its scope alone, as before C3. `Design = "new"` also keys it by its owner.
+
+The model checks the organization scope, owned by the run's tenant, so `NoCrossScopeRead` means no run reads another tenant's organization memory. The other scopes are not all tenant-bound:
+- User, agent and session memory follow their principal (issuer and subject) across that principal's tenants, by design. Session memory is also keyed by the tenant.
+- Global memory is denied by the authorizer.
+- Each scope's key is checked in Rust (Mapping).
 
 Runs are numbered `1..NRuns`, and run `r` belongs to tenant `r % NTenants`. Each run writes its own value, then reads its key back.
 
@@ -47,7 +54,10 @@ Negative controls, each on a copy of the config with `-workers 1`:
   - `user_memory_isolated_between_tenants`
   - `session_memory_belongs_to_its_user`
 - The key itself is tested by the `memory_owner_tests` unit tests in `crates/protocol/src/effect.rs`, which build each scope's id and check that no two owners' ids run together.
-- The model's environment assumption is that each call is atomic. In Postgres, each call is one statement on a single-connection store behind a lock. In memory, it is one lock scope.
-- `ReadsFindAValue` and `EveryRunReads`: unlinked. Each call is one statement or lock scope that returns.
+- The counterexample trace for the unscoped design, forced: `no_cross_scope_read_in_the_model_trace` (run 1 writes, run 2 of another tenant writes, run 1 reads its own value), on both memories.
+- The model's environment assumption is that each call is atomic. In Postgres, each call is one SQL statement. In memory, it is one lock scope.
+- `EveryRunReads` assumes each call returns. In Postgres, a statement or lock wait is bounded by `statement_timeout` and `lock_timeout` of 5 s: `a_write_waiting_on_a_lock_gives_up` (`crates/memory/tests/recall.rs`).
+- `ReadsFindAValue`: unlinked.
+- Not modelled: a crash between a Postgres write and the run's `MemoryWritten` event leaves a row that no run log records.
 
 Retire this model if memory moves to a store whose API takes the owner as a required, typed part of every call, so that an unscoped read cannot be written.

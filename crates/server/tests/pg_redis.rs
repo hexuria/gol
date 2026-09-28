@@ -1601,3 +1601,22 @@ fn a_bad_database_setting_refuses_to_start() {
         .expect_err("no database");
     assert!(error.contains("does not exist"), "{error}");
 }
+
+// Without GOL_DATABASE_URL, what the server stores stays in the process: a
+// Postgres connection does not find it.
+#[test]
+fn no_database_url_keeps_runs_out_of_postgres() {
+    let stores = server::stores_from_env(&env(&[("GOL_DATABASE_URL", "")])).expect("stores");
+    let spec = spec();
+    let run_id = spec.run_id;
+    stores
+        .runs
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: vec![user_message(&spec, 1)],
+        })
+        .expect("put run");
+    assert!(stores.runs.run(run_id).expect("store").is_some());
+    let postgres = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    assert!(postgres.run(run_id).expect("store").is_none());
+}

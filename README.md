@@ -14,8 +14,9 @@ The toolchain is Rust 1.98.1.
 The server listens on `http://127.0.0.1:43123`. Override the port with `GOL_PORT`.
 
 Runs and memory are kept in the process unless `GOL_DATABASE_URL` names a Postgres database, for example `postgres://gol:gol@127.0.0.1/gol`. The server then keeps both there:
-- It uses a pool of `GOL_DATABASE_POOL_SIZE` connections (default 8) and keeps one idle.
-- It refuses to start, saying why, when it cannot reach the database or the pool size is not a positive count.
+- It uses a pool of `GOL_DATABASE_POOL_SIZE` connections (default 8) for runs, keeps one idle, and opens one more connection for memory.
+- It refuses to start, saying why, when it cannot reach the database, the pool size is not a positive count, or a table predates the current schema (drop it).
+- It connects without TLS, so keep the database on a private network.
 
 ## Authentication
 

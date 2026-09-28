@@ -31,20 +31,25 @@ fn ensure_schema(client: &mut postgres::Client) -> Result<(), StoreError> {
         .map_err(sql)?;
     tx.batch_execute(SCHEMA).map_err(sql)?;
     // A table from before owners keeps `create table if not exists` from
-    // adding the column. Its rows have no owner, and under an empty one any
-    // owner could read them, so it is refused (owner decision 4A for C3);
-    // dropping the transaction rolls back anything created above.
-    let owner_column = tx
+    // adding the column or the key. Its rows have no owner, so it is refused
+    // (owner decision 4A for C3), and so is one given the column but not the
+    // key, whose writes would all fail; dropping the transaction rolls back
+    // anything created above.
+    let keyed_by_owner = tx
         .query_opt(
-            "select 1 from pg_attribute
-             where attrelid = to_regclass('memories') and attname = 'owner_id'
-               and not attisdropped",
+            "select 1 from pg_index
+             where indrelid = to_regclass('memories') and indisprimary
+               and (select array_agg(attname::text order by attname::text)
+                    from pg_attribute
+                    where attrelid = indrelid and attnum = any(indkey))
+                   = array['key', 'owner_id', 'scope']",
             &[],
         )
         .map_err(sql)?;
-    if owner_column.is_none() {
+    if keyed_by_owner.is_none() {
         return Err(StoreError::new(
-            "memories keeps no owner per entry, from before scoped memory: drop table memories",
+            "memories is not keyed by (scope, owner_id, key), from before scoped memory: \
+             drop table memories",
         ));
     }
     tx.commit().map_err(sql)
@@ -99,6 +104,12 @@ fn open(url: &str) -> Result<postgres::Client, StoreError> {
         config.connect_timeout(CONNECT_TIMEOUT);
     }
     let mut client = config.connect(NoTls).map_err(sql)?;
+    // Every run shares this one connection, and a call holds it for its
+    // statement: bound how long a statement or its locks can keep the rest
+    // waiting.
+    client
+        .batch_execute("set statement_timeout = '5s'; set lock_timeout = '5s'")
+        .map_err(sql)?;
     ensure_schema(&mut client)?;
     Ok(client)
 }

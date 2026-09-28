@@ -34,10 +34,19 @@ pub fn authorize(spec: &RunSpec, effect: &Effect, tools: &[ToolDescriptor]) -> P
 }
 
 /// The capability, and for session and workspace memory the id that names
-/// whose memory it is (owner decision 2B for C3).
+/// whose memory it is (owner decision 2B for C3). Global memory is denied:
+/// every tenant would share it, and a manifest grants its own capabilities.
 fn allow_memory(spec: &RunSpec, capability: &str, scope: MemoryScope) -> PolicyDecision {
     let decision = allow_capability(spec, capability);
-    if decision != PolicyDecision::Allow || memory_owner_id(spec, scope, 0).is_some() {
+    if decision != PolicyDecision::Allow {
+        return decision;
+    }
+    if scope == MemoryScope::Global {
+        return PolicyDecision::Deny {
+            reason: "global memory is shared by every tenant and is not offered".to_string(),
+        };
+    }
+    if memory_owner_id(spec, scope, 0).is_some() {
         return decision;
     }
     let key = match scope {
@@ -169,6 +178,22 @@ mod tests {
                 PolicyDecision::Allow,
                 "{effect:?}"
             );
+        }
+    }
+
+    // Global memory would be shared by every tenant, so it is denied even
+    // with both capabilities.
+    #[test]
+    fn global_memory_is_denied() {
+        let spec = memory_spec(&[]);
+        let denied = PolicyDecision::Deny {
+            reason: "global memory is shared by every tenant and is not offered".to_string(),
+        };
+        for effect in [
+            read(crate::MemoryScope::Global),
+            write(crate::MemoryScope::Global),
+        ] {
+            assert_eq!(authorize(&spec, &effect, &[]), denied, "{effect:?}");
         }
     }
 

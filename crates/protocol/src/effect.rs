@@ -65,15 +65,19 @@ pub const SESSION_ID: &str = "session_id";
 /// The metadata key that names a run's workspace, for workspace memory.
 pub const WORKSPACE_ID: &str = "workspace_id";
 
-/// Whose memory `scope` is, for a run of `spec` at step `step`: the id that,
-/// with the scope, keys the memory (owner decisions 1A and 3A for C3).
+/// Whose memory `scope` is, for a run of `spec` at harness step `step`
+/// (`HarnessState::Running.step`): the id that, with the scope, keys the
+/// memory (owner decisions 1A and 3A for C3).
 ///
 /// A user is the issuer and subject, as `Owner::is` compares them; an
-/// organization is the issuer and tenant. Session and workspace ids come
-/// from the caller's metadata, so a session belongs to its user and a
+/// organization is the issuer and tenant. An agent's memory belongs to the
+/// agent and the principal running it, so a spec naming someone else's agent
+/// id reaches a different owner. Session and workspace ids come from the
+/// caller's metadata, so a session belongs to its user in its tenant and a
 /// workspace to its organization. Parts are length-prefixed, so no two
 /// different owners share an id. `None` when the metadata names no session or
-/// workspace (the authorizer denies those effects, decision 2B).
+/// workspace (the authorizer denies those effects, decision 2B). Global
+/// memory has no owner; the authorizer denies it.
 pub fn memory_owner_id(spec: &RunSpec, scope: MemoryScope, step: u32) -> Option<String> {
     let owner = &spec.owner;
     let user = || joined(&[&owner.issuer, &owner.subject]);
@@ -87,10 +91,10 @@ pub fn memory_owner_id(spec: &RunSpec, scope: MemoryScope, step: u32) -> Option<
     Some(match scope {
         MemoryScope::Step => format!("{}/{step}", spec.run_id),
         MemoryScope::Run => spec.run_id.to_string(),
-        MemoryScope::Agent => spec.agent_id.to_string(),
+        MemoryScope::Agent => user() + &joined(&[&spec.agent_id.to_string()]),
         MemoryScope::User => user(),
         MemoryScope::Organization => organization(),
-        MemoryScope::Session => user() + &named(SESSION_ID)?,
+        MemoryScope::Session => user() + &joined(&[&owner.tenant]) + &named(SESSION_ID)?,
         MemoryScope::Workspace => organization() + &named(WORKSPACE_ID)?,
         MemoryScope::Global => String::new(),
     })
@@ -125,13 +129,19 @@ mod memory_owner_tests {
         let organization = "19:https://issuer.test8:tenant-1";
         assert_eq!(owner(MemoryScope::Run), Some(spec.run_id.to_string()));
         assert_eq!(owner(MemoryScope::Step), Some(format!("{}/3", spec.run_id)));
-        assert_eq!(owner(MemoryScope::Agent), Some(spec.agent_id.to_string()));
+        assert_eq!(
+            owner(MemoryScope::Agent),
+            Some(format!("{user}36:{}", spec.agent_id))
+        );
         assert_eq!(owner(MemoryScope::User), Some(user.to_string()));
         assert_eq!(
             owner(MemoryScope::Organization),
             Some(organization.to_string())
         );
-        assert_eq!(owner(MemoryScope::Session), Some(format!("{user}3:s-1")));
+        assert_eq!(
+            owner(MemoryScope::Session),
+            Some(format!("{user}8:tenant-13:s-1"))
+        );
         assert_eq!(
             owner(MemoryScope::Workspace),
             Some(format!("{organization}3:w-1"))
@@ -160,6 +170,25 @@ mod memory_owner_tests {
                 0
             ),
             memory_owner_id(&other_tenant, MemoryScope::Workspace, 0)
+        );
+    }
+
+    // Agent memory belongs to the agent and its runner; a session to its user
+    // in its tenant.
+    #[test]
+    fn agent_and_session_memory_stay_with_their_principal() {
+        let alice = with_metadata(&[(SESSION_ID, "s")]);
+        let mut mallory = alice.clone();
+        mallory.owner.subject = "mallory".to_string();
+        assert_ne!(
+            memory_owner_id(&alice, MemoryScope::Agent, 0),
+            memory_owner_id(&mallory, MemoryScope::Agent, 0)
+        );
+        let mut alice_elsewhere = alice.clone();
+        alice_elsewhere.owner.tenant = "tenant-2".to_string();
+        assert_ne!(
+            memory_owner_id(&alice, MemoryScope::Session, 0),
+            memory_owner_id(&alice_elsewhere, MemoryScope::Session, 0)
         );
     }
 
