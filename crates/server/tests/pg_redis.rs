@@ -472,6 +472,14 @@ impl RunStore for WatchedPostgres {
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, server::StoreError> {
         self.inner.append_events(id, events)
     }
+    fn append_events_after(
+        &self,
+        id: RunId,
+        seen: usize,
+        events: Vec<Event>,
+    ) -> Result<Append, server::StoreError> {
+        self.inner.append_events_after(id, seen, events)
+    }
 
     fn run(&self, id: RunId) -> Result<Option<StoredRun>, server::StoreError> {
         self.inner.run(id)

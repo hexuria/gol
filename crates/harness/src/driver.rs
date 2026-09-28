@@ -597,20 +597,34 @@ pub fn run_to_completion(
     models: &dyn ModelCompletion,
     memory: &dyn Memory,
 ) -> Result<(), DeciderError> {
-    run_until(driver, decider, tools, models, memory, &|| false)
+    run_until(driver, decider, tools, models, memory, &mut |_| {
+        Boundary::Continue
+    })
 }
 
-/// Runs step by step until the run ends. `should_stop` is read at each step
-/// boundary, before the next decision; when it answers yes the run is
-/// cancelled there (decision 1.5a-2A). Effects a resumed log left pending are
-/// performed first.
+/// What the caller of `run_until` asks at a step boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Boundary {
+    /// Go on to the next decision.
+    Continue,
+    /// Cancel the run here: it ends with `RunCancelled` (decision 1.5a-2A).
+    Cancel,
+    /// Return with the run open and nothing recorded, for a caller that
+    /// resumes it from its log later (Phase 1.5b).
+    Pause,
+}
+
+/// Runs step by step until the run ends. `at_boundary` is asked at each step
+/// boundary, before the next decision, with the driver as it stands; a caller
+/// storing the run as it goes appends the new events there (Phase 1.5b).
+/// Effects a resumed log left pending are performed first.
 pub fn run_until(
     driver: &mut Driver,
     decider: &mut dyn Decider,
     tools: &[&dyn Tool],
     models: &dyn ModelCompletion,
     memory: &dyn Memory,
-    should_stop: &dyn Fn() -> bool,
+    at_boundary: &mut dyn FnMut(&Driver) -> Boundary,
 ) -> Result<(), DeciderError> {
     let descriptors: Vec<ToolDescriptor> = tools.iter().map(|tool| tool.descriptor()).collect();
     let mut pending = std::mem::take(&mut driver.pending);
@@ -627,9 +641,13 @@ pub fn run_until(
         if driver.state().harness.is_terminal() || driver.log_ended() {
             return Ok(());
         }
-        if should_stop() {
-            driver.cancel();
-            return Ok(());
+        match at_boundary(driver) {
+            Boundary::Continue => {}
+            Boundary::Cancel => {
+                driver.cancel();
+                return Ok(());
+            }
+            Boundary::Pause => return Ok(()),
         }
         let effects = driver.decide(decider, &descriptors)?;
         if effects.is_empty() {

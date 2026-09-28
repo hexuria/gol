@@ -339,6 +339,14 @@ impl RunStore for GoesDownAfterPut {
     ) -> Result<server::Append, server::StoreError> {
         self.inner.append_events(id, events)
     }
+    fn append_events_after(
+        &self,
+        id: RunId,
+        seen: usize,
+        events: Vec<protocol::Event>,
+    ) -> Result<server::Append, server::StoreError> {
+        self.inner.append_events_after(id, seen, events)
+    }
     fn run(&self, id: RunId) -> Result<Option<server::StoredRun>, server::StoreError> {
         self.inner.run(id)
     }

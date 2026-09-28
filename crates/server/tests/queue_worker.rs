@@ -181,19 +181,20 @@ async fn crash_after_claim(uri: String, setup: fn() -> Setup) {
 }
 
 // Forced: worker A loads the run, its lease runs out, and B claims, runs and
-// acknowledges it; then A runs Jev too and records. The store keeps one
-// terminal event, A's record is refused, and A's acknowledgement leaves the
-// queue empty.
+// acknowledges it; then A executes. A's first write (the scheduling ladder)
+// finds its lease gone, so A stores nothing and never asks Jev (Phase 1.5b:
+// before, A ran the whole run and its one append was refused as terminal). The store keeps one terminal event, and A's acknowledgement
+// leaves the queue empty.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_workers_one_terminal() {
     let jev = jev(Duration::ZERO).await;
     two_workers(jev.uri(), queued_run).await;
-    assert_eq!(jev.received_requests().await.expect("requests").len(), 2);
+    assert_eq!(jev.received_requests().await.expect("requests").len(), 1);
     two_workers(jev.uri(), || {
         queued_run_in(Arc::new(server::InMemoryStore::default()))
     })
     .await;
-    assert_eq!(jev.received_requests().await.expect("requests").len(), 4);
+    assert_eq!(jev.received_requests().await.expect("requests").len(), 2);
 }
 
 async fn two_workers(uri: String, setup: fn() -> Setup) {
@@ -209,7 +210,9 @@ async fn two_workers(uri: String, setup: fn() -> Setup) {
         assert_eq!(setup.queue.reap().expect("reap"), [setup.run_id]);
         assert_eq!(b.work_one().expect("work"), Some(setup.run_id));
         let done = open.execute().record().expect("record");
-        assert_eq!(done.recorded(), Some(Append::Terminal));
+        // A's lease ran out, so its first write stops at the lease check and
+        // stores nothing (reported as `Moved`; its release does nothing).
+        assert_eq!(done.recorded(), Some(Append::Moved));
         done.ack().expect("ack");
         assert_eq!(terminals(setup.store.as_ref(), setup.run_id).len(), 1);
         assert_eq!(setup.queue.processing().expect("processing"), []);
@@ -322,6 +325,14 @@ impl RunStore for AppendsFail {
     fn append_events(&self, _id: RunId, _events: Vec<Event>) -> Result<Append, StoreError> {
         Err(StoreError::new("appends are down"))
     }
+    fn append_events_after(
+        &self,
+        _id: RunId,
+        _seen: usize,
+        _events: Vec<Event>,
+    ) -> Result<Append, StoreError> {
+        Err(StoreError::new("appends are down"))
+    }
     fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {
         self.0.run(id)
     }
@@ -423,6 +434,14 @@ impl RunStore for ReadsFail {
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
         self.0.append_events(id, events)
     }
+    fn append_events_after(
+        &self,
+        id: RunId,
+        seen: usize,
+        events: Vec<Event>,
+    ) -> Result<Append, StoreError> {
+        self.0.append_events_after(id, seen, events)
+    }
     fn run(&self, _id: RunId) -> Result<Option<StoredRun>, StoreError> {
         Err(StoreError::new("reads are down"))
     }
@@ -522,6 +541,14 @@ impl RunStore for FirstLoadHangsThenFails {
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
         self.inner.append_events(id, events)
     }
+    fn append_events_after(
+        &self,
+        id: RunId,
+        seen: usize,
+        events: Vec<Event>,
+    ) -> Result<Append, StoreError> {
+        self.inner.append_events_after(id, seen, events)
+    }
     fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {
         let first = !std::mem::replace(&mut *self.hung.lock().unwrap(), true);
         if first {
@@ -606,6 +633,14 @@ impl RunStore for OneUnloadable {
     }
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
         self.inner.append_events(id, events)
+    }
+    fn append_events_after(
+        &self,
+        id: RunId,
+        seen: usize,
+        events: Vec<Event>,
+    ) -> Result<Append, StoreError> {
+        self.inner.append_events_after(id, seen, events)
     }
     fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {
         if id == self.bad {
@@ -814,6 +849,14 @@ impl RunStore for CutsRedis {
     }
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
         self.inner.append_events(id, events)
+    }
+    fn append_events_after(
+        &self,
+        id: RunId,
+        seen: usize,
+        events: Vec<Event>,
+    ) -> Result<Append, StoreError> {
+        self.inner.append_events_after(id, seen, events)
     }
     fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {
         if id == self.cut_on {

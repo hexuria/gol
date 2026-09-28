@@ -188,12 +188,13 @@ Expire(r) ==
   /\ UNCHANGED <<produced, waiting, processing, job, pc, ended, terminals, ackedOpen, crashes, releases>>
   /\ UNCHANGED producerVars
 
-\* One release script, for a claim that could not load or start its run: back
-\* on the runs list, off processing, the lease gone, all only while w holds
-\* the lease. In Design "loose" it acts whoever holds the lease. At most
-\* MaxReleases load failures.
+\* One release script, for a claim that could not load or start its run, or
+\* (Phase 1.5b) one that ran but found the run log kept moving under it and
+\* stored no end: back on the runs list, off processing, the lease gone, all
+\* only while w holds the lease. In Design "loose" it acts whoever holds the
+\* lease. At most MaxReleases of them.
 Release(w) ==
-  /\ pc[w] = "claimed"
+  /\ pc[w] \in {"claimed", "ran"}
   /\ Design # "rpop"
   /\ releases < MaxReleases
   /\ releases' = releases + 1

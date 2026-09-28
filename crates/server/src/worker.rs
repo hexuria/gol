@@ -5,8 +5,13 @@
 //! run to execute) or `Prepared::Done` (nothing to run); `Open::execute`
 //! gives `Executed`, and `Executed::record` gives `Done`. Only `Done` can
 //! acknowledge, so a run leaves the queue only after its record or a finding
-//! that it already ended. Delivery is at least once: a redelivered run starts
-//! over, and repeats its Jev calls.
+//! that it already ended. Delivery is at least once.
+//!
+//! A worker stores a run as it goes (Phase 1.5b): each step's events are
+//! appended at the step boundary with `append_events_after`, which the store
+//! refuses once another writer moved the log. A redelivered run resumes from
+//! its stored log, so a stored step is not decided again; a step that was not
+//! stored when its worker died is.
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -14,10 +19,15 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::Duration;
 
-use harness::{DelegateTarget, Memory};
-use protocol::{Capability, Event, EventPayload, FailureClass, RunId, RunSpec};
+use harness::{
+    run_until, Boundary, DelegateTarget, Driver, EchoTool, JevDecider, Memory, RunMemory,
+    UnavailableModel,
+};
+use protocol::{
+    fold, Capability, DispatchPhase, Event, EventPayload, FailureClass, RunId, RunSpec,
+};
 
-use crate::http::{harness_events, Delegation};
+use crate::http::{jev_client, Delegation};
 use crate::inference::{dispatch_events, run_failed_event};
 use crate::queue::{QueueTiming, RedisRunQueue};
 use crate::spawner::OwnedSpawner;
@@ -154,7 +164,10 @@ pub struct Open<'a> {
 #[must_use = "a dropped claim waits out its lease before the run is redelivered"]
 pub struct Executed<'a> {
     claim: Claim<'a>,
+    /// Events still to append in one go (a run started too often).
     events: Vec<Event>,
+    /// What storing the run step by step came to, when it was.
+    stored: Option<Result<Append, String>>,
 }
 
 /// A claimed run whose log is terminal, or that is not stored: the only
@@ -324,6 +337,7 @@ impl<'a> Claim<'a> {
             return Executed {
                 claim: self,
                 events: vec![failed],
+                stored: None,
             }
             .record()
             .map(Prepared::Done);
@@ -337,34 +351,182 @@ impl<'a> Claim<'a> {
 
 impl<'a> Open<'a> {
     /// Runs the harness with Jev, renewing the lease every heartbeat, and
-    /// returns what to record: scheduled, provisioning and starting, then the
-    /// harness's events, which end the run (with `RunFailed` if the harness
-    /// could not finish).
+    /// stores the run as it goes: the scheduling ladder for a queued run,
+    /// then each step's events at its boundary, then the tail that ends the
+    /// run (with `RunFailed` if the decider failed).
     pub fn execute(self) -> Executed<'a> {
         let worker = self.claim.worker;
         let claim = &self.claim;
-        let spec = &self.stored.spec;
-        let events = std::thread::scope(|scope| {
+        let stored = *self.stored;
+        let outcome = std::thread::scope(|scope| {
             let (stop, stopped) = mpsc::channel::<()>();
             std::thread::Builder::new()
                 .name("gol-heartbeat".to_string())
                 .spawn_scoped(scope, move || claim.heartbeat(&stopped))
                 .expect("spawn the heartbeat thread");
-            let mut events = dispatch_events(spec);
-            let (harness, _outcome) = harness_events(
-                &worker.jev_base_url,
-                spec,
-                worker.memory.as_ref(),
-                Some(worker.delegation(spec)),
-            );
-            events.extend(harness);
+            let outcome = worker.store_as_it_goes(stored, &claim.token);
             drop(stop);
-            events
+            outcome
         });
         Executed {
             claim: self.claim,
-            events,
+            events: Vec::new(),
+            stored: Some(outcome),
         }
+    }
+}
+
+/// How many times a worker reloads a run whose log another writer moved
+/// before it hands the run back to the queue.
+const RELOADS: usize = 3;
+
+/// Why `Worker::run_from` stopped.
+enum Stopped {
+    /// What the store answered to its last append.
+    Store(Append),
+    /// Its claim no longer holds the run's lease.
+    LostLease,
+}
+
+impl Worker {
+    /// Runs `stored` from its log, and again from a reloaded log each time
+    /// another writer moved it, up to `RELOADS` times. `Appended` when this
+    /// worker ended the run, `Terminal` when another writer did, `Moved` when
+    /// it gave up or lost its lease (`Done::ack` then releases the run, which
+    /// does nothing once another worker holds the lease).
+    fn store_as_it_goes(&self, stored: StoredRun, token: &str) -> Result<Append, String> {
+        let spec = stored.spec;
+        let mut events = stored.events;
+        let mut reloads = 0;
+        loop {
+            match self.run_from(&spec, events, token)? {
+                Stopped::Store(Append::Moved) if reloads < RELOADS => reloads += 1,
+                Stopped::Store(other) => return Ok(other),
+                Stopped::LostLease => return Ok(Append::Moved),
+            }
+            events = match self.store.run(spec.run_id).map_err(|e| e.to_string())? {
+                Some(run) => run.events,
+                None => return Ok(Append::Missing),
+            };
+        }
+    }
+
+    /// Runs `spec`'s run from `events`, its stored log, appending as it goes.
+    /// Stops at the first append the store refuses, and reports it, or at
+    /// the first step boundary where `token` no longer holds the run's lease:
+    /// the lease ran out under this worker and another may be running it.
+    fn run_from(
+        &self,
+        spec: &RunSpec,
+        mut events: Vec<Event>,
+        token: &str,
+    ) -> Result<Stopped, String> {
+        // Another writer ended it: a reload finds the log as it was left.
+        if events.iter().any(|event| is_terminal(&event.payload)) {
+            return Ok(Stopped::Store(Append::Terminal));
+        }
+        let run_id = spec.run_id;
+        let mut seen = events.len();
+        // Every write first checks that this claim still holds the lease: a
+        // lease can run out during a long step (a Jev or model call), and the
+        // write after it may be the one that ends the run. A Redis error
+        // keeps going, as the heartbeat does.
+        let holds = || {
+            !matches!(
+                self.queue.renew(run_id, token, self.timing.lease),
+                Ok(false)
+            )
+        };
+        let append = |seen: usize, new: Vec<Event>| {
+            if !holds() {
+                return Ok(Stopped::LostLease);
+            }
+            self.store
+                .append_events_after(run_id, seen, new)
+                .map(Stopped::Store)
+                .map_err(|error| error.to_string())
+        };
+        // A queued run is scheduled first, as one append.
+        if fold(spec, &events).dispatch == DispatchPhase::Queued {
+            let ladder = dispatch_events(spec);
+            match append(seen, ladder.clone())? {
+                Stopped::Store(Append::Appended) => {}
+                refused => return Ok(refused),
+            }
+            seen += ladder.len();
+            events.extend(ladder);
+        }
+        let mut driver = match Driver::resume(spec.clone(), events) {
+            Ok(driver) => driver,
+            Err(error) => {
+                let failed = run_failed_event(
+                    spec,
+                    FailureClass::Infrastructure,
+                    format!("cannot resume: {error:?}"),
+                );
+                return append(seen, vec![failed]);
+            }
+        };
+        // run_until first finishes the step the log was cut in, which can
+        // perform an effect (a tool call, a delegation) before any boundary.
+        if !holds() {
+            return Ok(Stopped::LostLease);
+        }
+        let (spawner, targets) = self.delegation(spec);
+        driver = driver.with_spawner(spawner, targets);
+        let mut decider = match jev_client(&self.jev_base_url) {
+            Ok(client) => JevDecider::new(client),
+            Err(message) => {
+                let mut tail = driver.events()[seen..].to_vec();
+                tail.push(run_failed_event(
+                    spec,
+                    FailureClass::Dependency,
+                    format!("decider: {message}"),
+                ));
+                return append(seen, tail);
+            }
+        };
+        let echo = EchoTool;
+        let memory = RunMemory::new(self.memory.as_ref());
+        let mut refused = None;
+        let outcome = run_until(
+            &mut driver,
+            &mut decider,
+            &[&echo],
+            &UnavailableModel,
+            &memory,
+            &mut |driver| {
+                let new = &driver.events()[seen..];
+                if new.is_empty() {
+                    return Boundary::Continue;
+                }
+                match append(seen, new.to_vec()) {
+                    Ok(Stopped::Store(Append::Appended)) => {
+                        seen = driver.events().len();
+                        Boundary::Continue
+                    }
+                    other => {
+                        refused = Some(other);
+                        Boundary::Pause
+                    }
+                }
+            },
+        );
+        if let Some(refused) = refused {
+            return refused;
+        }
+        let mut tail = driver.events()[seen..].to_vec();
+        if let Err(error) = outcome {
+            tail.push(run_failed_event(
+                spec,
+                FailureClass::Dependency,
+                format!("decider: {}", error.message),
+            ));
+        }
+        if tail.is_empty() {
+            return Ok(Stopped::Store(Append::Appended));
+        }
+        append(seen, tail)
     }
 }
 
@@ -373,12 +535,15 @@ impl<'a> Executed<'a> {
     /// so two workers on one run leave one terminal event. An error keeps the
     /// claim from acknowledging.
     pub fn record(self) -> Result<Done<'a>, String> {
-        let recorded = self
-            .claim
-            .worker
-            .store
-            .append_events(self.claim.run_id(), self.events)
-            .map_err(|error| error.to_string())?;
+        let recorded = match self.stored {
+            Some(stored) => stored?,
+            None => self
+                .claim
+                .worker
+                .store
+                .append_events(self.claim.run_id(), self.events)
+                .map_err(|error| error.to_string())?,
+        };
         Ok(Done {
             claim: self.claim,
             recorded: Some(recorded),
@@ -396,6 +561,12 @@ impl Done<'_> {
     /// if this claim still holds it.
     pub fn ack(self) -> Result<RunId, String> {
         let claim = self.claim;
+        // Still open: other writers kept moving the log. The run goes back
+        // on the queue, and its next delivery resumes from the stored log.
+        if self.recorded == Some(Append::Moved) {
+            claim.worker.queue.release(claim.run_id(), &claim.token)?;
+            return Ok(claim.run_id());
+        }
         claim.worker.queue.ack(claim.run_id(), &claim.token)?;
         Ok(claim.run_id())
     }
