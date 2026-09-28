@@ -1263,10 +1263,7 @@ fn a_waiting_append_sees_what_the_lock_holder_committed() {
         .expect("show")
         .get(0);
     assert_eq!(isolation, "serializable", "the option took effect");
-    for extra in [
-        "",
-        "&options=-cdefault_transaction_isolation%3Dserializable",
-    ] {
+    for extra in ["", serializable] {
         assert_eq!(
             forced_append_after_a_holder(extra, true),
             (Ok(Append::Terminal), 2),
@@ -1448,13 +1445,21 @@ fn connect_panic_in_this_process() {
     };
     wait_for_lock_wait(&application);
     // Out of descriptors, the pool's connect for a second caller panics.
+    // The child runs under `ulimit -n 256`: far fewer opens than this cap
+    // exhaust it. Hitting the cap means the limit was not lowered, and the
+    // test stops before it starves anything else.
     let mut hog = Vec::new();
     while let Ok(file) = std::fs::File::open("/dev/null") {
         hog.push(file);
+        assert!(hog.len() < 4096, "descriptor limit not lowered");
     }
     let during = store.run(RunId::new());
     drop(hog);
-    assert!(during.is_err(), "no connection could open");
+    let error = during.expect_err("no connection could open");
+    assert!(
+        error.to_string().contains("postgres connect panicked"),
+        "{error}"
+    );
     // With descriptors free again, the second slot still opens.
     assert_eq!(
         store.run(RunId::new()).map(|run| run.is_none()),
