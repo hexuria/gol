@@ -334,16 +334,21 @@ async fn create_run(
     )?;
     if let Some(queue) = state.queue.clone() {
         // Created and queued are on the record before the push, so a worker
-        // that takes the run finds them (C4). The store, the push and a
+        // that takes the run finds them (C4). The run is pending before it
+        // is stored, and the push takes it off pending: if this process dies
+        // between the store and the push, the sweep pushes it (C6). With
+        // Redis down, nothing is stored. The pend, the store, the push and a
         // failed push's RunFailed are one blocking task: it runs to its end
-        // even if the client goes away, so no run is stored and left
-        // unqueued.
+        // even if the client goes away.
         let queued = crate::inference::queued_events(&spec);
         let store = state.store.clone();
         let spec_for_queue = spec.clone();
         let queued_for_store = queued.clone();
         tokio::task::spawn_blocking(move || {
             let run_id = spec_for_queue.run_id;
+            queue
+                .pend(run_id)
+                .map_err(|error| ApiError::Decider(format!("queue unavailable: {error}")))?;
             if let Err(error) = store.put_run(StoredRun {
                 spec: spec_for_queue.clone(),
                 events: queued_for_store,
@@ -363,7 +368,8 @@ async fn create_run(
             }
             queue.push(run_id).map_err(|error| {
                 // The run is stored but will never be picked up: end it, so it is
-                // not left open.
+                // not left open. Its pending entry stays; the sweep finds the run
+                // ended and drops it.
                 let failed = run_failed_event(
                     &spec_for_queue,
                     FailureClass::Infrastructure,

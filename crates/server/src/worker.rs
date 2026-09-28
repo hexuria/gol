@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use harness::Memory;
-use protocol::{Event, FailureClass, RunId};
+use protocol::{Event, EventPayload, FailureClass, RunId};
 
 use crate::http::harness_events;
 use crate::inference::{dispatch_events, run_failed_event};
@@ -389,17 +389,68 @@ impl Claim<'_> {
     }
 }
 
-/// Hands back runs whose lease ran out, every `reap_every`, for as long as
-/// the process runs.
-pub fn reap_forever(queue: &RedisRunQueue, timing: QueueTiming) {
+/// Hands back runs whose lease ran out, and sweeps runs left pending, every
+/// `reap_every`, for as long as the process runs.
+pub fn reap_forever(queue: &RedisRunQueue, store: &dyn RunStore, timing: QueueTiming) {
     loop {
         match catch_unwind(AssertUnwindSafe(|| queue.reap())) {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => eprintln!("gol: queue reaper: {error}"),
             Err(_) => eprintln!("gol: queue reaper: reaping panicked"),
         }
+        match catch_unwind(AssertUnwindSafe(|| {
+            sweep(queue, store, timing.sweep_after, timing.forget_after)
+        })) {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => eprintln!("gol: queue sweep: {error}"),
+            Err(_) => eprintln!("gol: queue sweep: sweeping panicked"),
+        }
         std::thread::sleep(timing.reap_every);
     }
+}
+
+/// Pushes each run pending for at least `after` that its producer stored but
+/// never pushed: the producer died in between (C6). A pending run whose log
+/// has moved past created and queued is taken off pending. A pending run not
+/// in the store is kept (its put may still be in flight) until it has been
+/// pending for `forget_after`, then dropped. Returns the runs it pushed. A run
+/// the store cannot load, or that Redis cannot push or unpend now, stays
+/// pending for the next sweep; the others are still swept.
+pub fn sweep(
+    queue: &RedisRunQueue,
+    store: &dyn RunStore,
+    after: Duration,
+    forget_after: Duration,
+) -> Result<Vec<RunId>, String> {
+    let forgotten = queue.pending_for(forget_after)?;
+    let mut pushed = Vec::new();
+    for run_id in queue.pending_for(after)? {
+        match store.run(run_id) {
+            Ok(Some(run)) if waiting(&run) => match queue.push(run_id) {
+                Ok(()) => pushed.push(run_id),
+                Err(error) => eprintln!("gol: queue sweep: push run {run_id}: {error}"),
+            },
+            Ok(None) if !forgotten.contains(&run_id) => {}
+            Ok(_) => {
+                if let Err(error) = queue.unpend(run_id) {
+                    eprintln!("gol: queue sweep: unpend run {run_id}: {error}");
+                }
+            }
+            Err(error) => eprintln!("gol: queue sweep: load run {run_id}: {error}"),
+        }
+    }
+    Ok(pushed)
+}
+
+/// Whether `run`'s log is still as its producer stored it: created, queued
+/// and its message.
+fn waiting(run: &StoredRun) -> bool {
+    run.events.iter().all(|event| {
+        matches!(
+            event.payload,
+            EventPayload::RunCreated | EventPayload::RunQueued | EventPayload::UserMessage { .. }
+        )
+    })
 }
 
 /// The queue the server runs, from its environment.
@@ -437,8 +488,8 @@ pub fn queue_from_env(env: &BTreeMap<String, String>) -> Result<Option<QueueSett
     }))
 }
 
-/// Starts `settings.workers` worker threads and one reaper, which run for as
-/// long as the process does.
+/// Starts `settings.workers` worker threads and one reaper, which also
+/// sweeps, all running for as long as the process does.
 pub fn start_queue(
     settings: &QueueSettings,
     store: Arc<dyn RunStore>,
@@ -462,7 +513,7 @@ pub fn start_queue(
     let reaper = RedisRunQueue::open(&settings.redis_url);
     std::thread::Builder::new()
         .name("gol-reaper".to_string())
-        .spawn(move || reap_forever(&reaper, timing))
+        .spawn(move || reap_forever(&reaper, store.as_ref(), timing))
         .map_err(|error| error.to_string())?;
     Ok(())
 }

@@ -6,6 +6,11 @@
 //! run's terminal event is stored. The reaper moves a run whose lease ran out
 //! back to the front of the runs list. `formal/runqueue` models it.
 //!
+//! A run is pending from before its producer stores it until it is pushed
+//! (C6): the push takes it off pending in the same step. A producer that dies
+//! in between leaves it pending, and the sweep (`crate::worker::sweep`)
+//! pushes it once it has been pending for `QueueTiming::sweep_after`.
+//!
 //! This is standalone Redis: the client follows no cluster redirects. Every
 //! key shares the hash tag `{<key>}`, and the scripts touch lease keys they
 //! build from their arguments. Redis must keep what it is given:
@@ -35,12 +40,21 @@ pub struct QueueTiming {
     /// again. Only a claim that opens the run to execute it counts; a claim
     /// that cannot load the run does not.
     pub max_deliveries: u32,
+    /// How long a run may stay pending before the sweep takes its producer
+    /// for dead and pushes it (owner decision 2A for C6).
+    pub sweep_after: Duration,
+    /// How long a pending run that is not in the store yet is kept before the
+    /// sweep drops it. A put still in flight after this long is taken for
+    /// dead; until then the run stays pending, so a put that commits late is
+    /// still pushed by the sweep.
+    pub forget_after: Duration,
 }
 
 impl Default for QueueTiming {
     /// A 30 s lease, renewed every 10 s, reaped every 15 s: a crashed
     /// worker's run is back at the front of the queue within about 45 s. A
-    /// run started five times without ending is failed.
+    /// run started five times without ending is failed. A run left pending
+    /// for 60 s is pushed by the sweep, which runs with the reaper.
     fn default() -> Self {
         Self {
             lease: Duration::from_secs(30),
@@ -49,12 +63,39 @@ impl Default for QueueTiming {
             idle_wait: Duration::from_millis(500),
             max_backoff: Duration::from_secs(30),
             max_deliveries: 5,
+            sweep_after: Duration::from_secs(60),
+            forget_after: Duration::from_secs(24 * 60 * 60),
         }
     }
 }
 
 /// How long a connect, a read or a write to Redis may take.
 const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many idle connections a queue keeps for its next callers (owner
+/// decision 3A for C6).
+const IDLE_CONNECTIONS: usize = 4;
+
+/// Marks ARGV[1] pending, scored with the Redis clock in ms.
+const PEND: &str = r"
+local now = redis.call('TIME')
+redis.call('ZADD', KEYS[1], now[1] * 1000 + math.floor(now[2] / 1000), ARGV[1])
+return 1
+";
+
+/// Queues ARGV[1] on the runs list and takes it off pending, in one step.
+const PUSH: &str = r"
+redis.call('LPUSH', KEYS[1], ARGV[1])
+redis.call('ZREM', KEYS[2], ARGV[1])
+return 1
+";
+
+/// The entries pending for at least ARGV[1] ms, by the Redis clock.
+const PENDING_FOR: &str = r"
+local now = redis.call('TIME')
+local cutoff = now[1] * 1000 + math.floor(now[2] / 1000) - tonumber(ARGV[1])
+return redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', cutoff)
+";
 
 /// Moves the oldest run to processing and leases it to ARGV[2] for ARGV[3]
 /// ms, in one step. A run already leased (an id queued twice) is dropped from
@@ -125,17 +166,22 @@ pub struct RedisRunQueue {
     runs: String,
     processing: String,
     deliveries: String,
+    pending: String,
     lease_prefix: String,
-    /// A connection for the next caller, and when a connect last failed.
+    /// Idle connections for the next callers, and how connecting has gone.
     slot: Mutex<Slot>,
 }
 
-/// The queue's idle connection. A caller takes it out while it works, so no
-/// caller waits on another's command or connect.
+/// The queue's idle connections. A caller takes one out while it works, so
+/// no caller waits on another's command or connect.
 #[derive(Default)]
 struct Slot {
-    idle: Option<redis::Connection>,
+    idle: Vec<redis::Connection>,
+    /// When a connect last failed, until one works.
     failed_at: Option<Instant>,
+    /// A connect after a failure is under way: other callers fail at once
+    /// instead of each waiting out a connect of their own.
+    probing: bool,
 }
 
 impl RedisRunQueue {
@@ -144,14 +190,15 @@ impl RedisRunQueue {
         Self::with_key(url, "gol:runs")
     }
 
-    /// A queue under `{key}`, with `{key}:processing`, `{key}:deliveries`
-    /// and `{key}:lease:<run>`.
+    /// A queue under `{key}`, with `{key}:processing`, `{key}:deliveries`,
+    /// `{key}:pending` and `{key}:lease:<run>`.
     pub fn with_key(url: impl Into<String>, key: impl Into<String>) -> Self {
         let tag = format!("{{{}}}", key.into());
         Self {
             url: url.into(),
             processing: format!("{tag}:processing"),
             deliveries: format!("{tag}:deliveries"),
+            pending: format!("{tag}:pending"),
             lease_prefix: format!("{tag}:lease:"),
             runs: tag,
             slot: Mutex::new(Slot::default()),
@@ -164,8 +211,69 @@ impl RedisRunQueue {
             .map(|_| ())
     }
 
+    /// Marks `id` pending: its producer is about to store it and push it.
+    pub fn pend(&self, id: RunId) -> Result<(), String> {
+        self.with_connection(|connection| {
+            Script::new(PEND)
+                .key(&self.pending)
+                .arg(id.to_string())
+                .invoke::<i64>(connection)
+        })
+        .map(|_| ())
+    }
+
+    /// Queues `id` and takes it off pending, in one step.
     pub fn push(&self, id: RunId) -> Result<(), String> {
-        self.with_connection(|connection| connection.lpush::<_, _, ()>(&self.runs, id.to_string()))
+        self.with_connection(|connection| {
+            Script::new(PUSH)
+                .key(&self.runs)
+                .key(&self.pending)
+                .arg(id.to_string())
+                .invoke::<i64>(connection)
+        })
+        .map(|_| ())
+    }
+
+    /// The pending runs, longest pending first. Entries that are not run ids
+    /// are left out.
+    pub fn pending(&self) -> Result<Vec<RunId>, String> {
+        let values: Vec<String> =
+            self.with_connection(|connection| connection.zrange(&self.pending, 0, -1))?;
+        Ok(values.iter().filter_map(|text| parse(text).ok()).collect())
+    }
+
+    /// The runs pending for at least `age`, longest pending first. An entry
+    /// that is not a run id is dropped; one that cannot be dropped now is
+    /// left for the next call.
+    pub fn pending_for(&self, age: Duration) -> Result<Vec<RunId>, String> {
+        let values: Vec<String> = self.with_connection(|connection| {
+            Script::new(PENDING_FOR)
+                .key(&self.pending)
+                .arg(u64::try_from(age.as_millis()).unwrap_or(u64::MAX))
+                .invoke(connection)
+        })?;
+        let mut ids = Vec::new();
+        for text in values {
+            match parse(&text) {
+                Ok(id) => ids.push(id),
+                Err(_) => {
+                    if let Err(error) = self.unpend_entry(&text) {
+                        eprintln!("gol: queue: drop pending entry {text:?}: {error}");
+                    }
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Takes `id` off pending without queueing it.
+    pub fn unpend(&self, id: RunId) -> Result<(), String> {
+        self.unpend_entry(&id.to_string())
+    }
+
+    fn unpend_entry(&self, entry: &str) -> Result<(), String> {
+        self.with_connection(|connection| connection.zrem::<_, _, i64>(&self.pending, entry))
+            .map(|_| ())
     }
 
     /// Takes the oldest run off the queue for good, with no lease: a crash
@@ -304,41 +412,62 @@ impl RedisRunQueue {
         Ok(values.iter().filter_map(|text| parse(text).ok()).collect())
     }
 
-    /// Runs `op` on the queue's idle connection, or on a new one. The lock is
-    /// held only to take or return the idle connection, never across a
-    /// command or a connect. For `REDIS_TIMEOUT` after a failed connect, calls
-    /// fail at once instead of each waiting out a connect of their own. A
+    /// Runs `op` on an idle connection, or on a new one. The lock is held
+    /// only to take or return a connection, never across a command or a
+    /// connect. An idle connection is used whenever there is one. Without
+    /// one, for `REDIS_TIMEOUT` after a failed connect calls fail at once;
+    /// after that one caller connects again while the others still fail at
+    /// once, so a Redis that is down costs one wait, not one per caller. A
     /// connection that errs is dropped; one that works goes back for the next
-    /// call.
+    /// call, up to `IDLE_CONNECTIONS` of them.
     fn with_connection<T>(
         &self,
         op: impl FnOnce(&mut redis::Connection) -> redis::RedisResult<T>,
     ) -> Result<T, String> {
         let taken = {
             let mut slot = self.lock_slot();
-            if slot
-                .failed_at
-                .is_some_and(|failed| failed.elapsed() < REDIS_TIMEOUT)
-            {
-                return Err("redis is unavailable: a connect failed moments ago".to_string());
+            match slot.idle.pop() {
+                Some(connection) => Some(connection),
+                None if slot.probing => {
+                    return Err("redis is unavailable: a connect is being retried".to_string());
+                }
+                None if slot
+                    .failed_at
+                    .is_some_and(|failed| failed.elapsed() < REDIS_TIMEOUT) =>
+                {
+                    return Err("redis is unavailable: a connect failed moments ago".to_string());
+                }
+                None => {
+                    slot.probing = slot.failed_at.is_some();
+                    None
+                }
             }
-            slot.idle.take()
         };
         let mut connection = match taken {
             Some(connection) => connection,
-            None => match connect(&self.url) {
-                Ok(connection) => connection,
-                Err(error) => {
-                    self.lock_slot().failed_at = Some(Instant::now());
-                    return Err(error.to_string());
+            None => {
+                let connected = connect(&self.url);
+                let mut slot = self.lock_slot();
+                slot.probing = false;
+                match connected {
+                    Ok(connection) => {
+                        slot.failed_at = None;
+                        connection
+                    }
+                    Err(error) => {
+                        slot.failed_at = Some(Instant::now());
+                        return Err(error.to_string());
+                    }
                 }
-            },
+            }
         };
         let result = op(&mut connection);
         if result.is_ok() {
             let mut slot = self.lock_slot();
             slot.failed_at = None;
-            slot.idle.get_or_insert(connection);
+            if slot.idle.len() < IDLE_CONNECTIONS {
+                slot.idle.push(connection);
+            }
         }
         result.map_err(|error| error.to_string())
     }
@@ -347,7 +476,8 @@ impl RedisRunQueue {
         self.slot.lock().unwrap_or_else(|poisoned| {
             self.slot.clear_poison();
             let mut slot = poisoned.into_inner();
-            slot.idle = None;
+            slot.idle.clear();
+            slot.probing = false;
             slot
         })
     }
@@ -391,4 +521,124 @@ fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis())
         .unwrap_or(u64::MAX)
         .max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RedisRunQueue, REDIS_TIMEOUT};
+    use std::collections::BTreeSet;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// The Redis client ids of the connections that `callers` concurrent
+    /// calls use, each holding its connection until all of them have one.
+    fn client_ids(queue: &Arc<RedisRunQueue>, callers: usize) -> BTreeSet<i64> {
+        let barrier = Arc::new(Barrier::new(callers));
+        let handles: Vec<_> = (0..callers)
+            .map(|_| {
+                let queue = queue.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    queue
+                        .with_connection(|connection| {
+                            barrier.wait();
+                            redis::cmd("CLIENT").arg("ID").query::<i64>(connection)
+                        })
+                        .expect("client id")
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("caller"))
+            .collect()
+    }
+
+    // Four idle connections are kept for the next callers, and no more.
+    #[test]
+    fn four_idle_connections_serve_four_concurrent_callers() {
+        let queue = Arc::new(RedisRunQueue::with_key(
+            "redis://127.0.0.1/",
+            "gol:test:pool",
+        ));
+        let first = client_ids(&queue, 4);
+        assert_eq!(first.len(), 4);
+        assert_eq!(client_ids(&queue, 4), first);
+        let five = client_ids(&queue, 5);
+        assert_eq!(five.len(), 5);
+        assert!(first.is_subset(&five));
+        let again = client_ids(&queue, 5);
+        assert_eq!(
+            again.intersection(&five).count(),
+            4,
+            "only four idle connections are kept"
+        );
+    }
+
+    // After a failed connect, once the fail-fast window is over, one caller
+    // tries Redis again while the others fail at once, instead of each
+    // waiting out a connect of its own.
+    #[test]
+    fn one_probe_connects_while_the_others_fail_fast() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        // Refuse (close at once) until `hold`; then accept and never answer.
+        let hold = Arc::new(Mutex::new(false));
+        let held = Arc::new(Mutex::new(Vec::new()));
+        {
+            let hold = hold.clone();
+            let held = held.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    if *hold.lock().expect("hold") {
+                        held.lock().expect("held").push(stream);
+                    }
+                }
+            });
+        }
+        let queue = Arc::new(RedisRunQueue::with_key(
+            format!("redis://127.0.0.1:{port}/1"),
+            "gol:test:probe",
+        ));
+        assert!(queue.ping().is_err(), "a refused connect fails");
+        let failed = Instant::now();
+        *hold.lock().expect("hold") = true;
+        // Inside the window a call fails at once, without a connect that
+        // would wait out REDIS_TIMEOUT on a Redis that never answers.
+        let started = Instant::now();
+        assert!(queue.ping().is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?} inside the fail-fast window",
+            started.elapsed()
+        );
+        std::thread::sleep(
+            (REDIS_TIMEOUT + Duration::from_millis(100)).saturating_sub(failed.elapsed()),
+        );
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let queue = queue.clone();
+                std::thread::spawn(move || {
+                    let started = Instant::now();
+                    let answer = queue.ping();
+                    (answer.is_err(), started.elapsed())
+                })
+            })
+            .collect();
+        let calls: Vec<(bool, Duration)> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("caller"))
+            .collect();
+        assert!(calls.iter().all(|(failed, _)| *failed), "{calls:?}");
+        let waited = calls
+            .iter()
+            .filter(|(_, took)| *took >= REDIS_TIMEOUT - Duration::from_millis(500))
+            .count();
+        let fast = calls
+            .iter()
+            .filter(|(_, took)| *took < Duration::from_secs(1))
+            .count();
+        assert_eq!((waited, fast), (1, 2), "{calls:?}");
+    }
 }

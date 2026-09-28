@@ -9,8 +9,9 @@ use protocol::{
 };
 use server::{
     accept_subscription_completion, box_container_name, fail_turn, open_turn, router_with_queue,
-    AgentManifest, Append, GatewayCall, GatewayPoster, MemorySandbox, PostgresStore, RedisRunQueue,
-    RunStore, SandboxError, SandboxHost, StoredArtifact, StoredRun, TurnError,
+    sweep, AgentManifest, Append, GatewayCall, GatewayPoster, MemorySandbox, PostgresStore,
+    QueueTiming, RedisRunQueue, RunStore, SandboxError, SandboxHost, StoredArtifact, StoredRun,
+    TurnError, Worker,
 };
 
 const POSTGRES_URL: &str = "postgres://gol:gol@127.0.0.1/gol";
@@ -423,10 +424,15 @@ fn choice(effect: &str) -> serde_json::Value {
     })
 }
 
-/// Postgres, recording the id of every run the server stores.
+/// What a test does once the server's put of a run has returned.
+type AfterPut = Box<dyn Fn(&PostgresStore, RunId) + Send + Sync>;
+
+/// Postgres, recording the id of every run the server stores, and running
+/// `after_put` right after each put.
 struct WatchedPostgres {
     inner: PostgresStore,
     ids: std::sync::Mutex<Vec<RunId>>,
+    after_put: AfterPut,
 }
 
 impl RunStore for WatchedPostgres {
@@ -445,8 +451,11 @@ impl RunStore for WatchedPostgres {
     }
 
     fn put_run(&self, run: StoredRun) -> Result<(), server::StoreError> {
-        self.ids.lock().expect("ids").push(run.spec.run_id);
-        self.inner.put_run(run)
+        let run_id = run.spec.run_id;
+        self.ids.lock().expect("ids").push(run_id);
+        self.inner.put_run(run)?;
+        (self.after_put)(&self.inner, run_id);
+        Ok(())
     }
 
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, server::StoreError> {
@@ -466,13 +475,25 @@ impl RunStore for WatchedPostgres {
     }
 }
 
-/// Posts one run to a server on `store` and returns the status and the id of
-/// the stored run, read back on a new connection.
+/// Posts one run to a server on `store` and returns the status and the
+/// stored run, read back on a new connection.
 async fn post_run(
     store: Arc<WatchedPostgres>,
     jev: &wiremock::MockServer,
     redis: Option<&str>,
 ) -> (u16, StoredRun) {
+    let status = post(store.clone(), jev, redis).await;
+    let ids = store.ids.lock().expect("ids").clone();
+    assert_eq!(ids.len(), 1, "the run was not stored");
+    let id = ids[0];
+    let stored = tokio::task::spawn_blocking(move || reconnect(id))
+        .await
+        .expect("reconnect thread");
+    (status, stored)
+}
+
+/// Posts one run to a server on `store` and returns the status.
+async fn post(store: Arc<WatchedPostgres>, jev: &wiremock::MockServer, redis: Option<&str>) -> u16 {
     let app = router_with_queue(
         store.clone(),
         jev.uri(),
@@ -519,16 +540,16 @@ async fn post_run(
         .send()
         .await
         .expect("post run");
-    let ids = store.ids.lock().expect("ids").clone();
-    assert_eq!(ids.len(), 1, "the run was not stored");
-    let id = ids[0];
-    let stored = tokio::task::spawn_blocking(move || reconnect(id))
-        .await
-        .expect("reconnect thread");
-    (response.status().as_u16(), stored)
+    response.status().as_u16()
 }
 
 async fn watched_postgres() -> Arc<WatchedPostgres> {
+    watched_postgres_then(|_, _| {}).await
+}
+
+async fn watched_postgres_then(
+    after_put: impl Fn(&PostgresStore, RunId) + Send + Sync + 'static,
+) -> Arc<WatchedPostgres> {
     let inner =
         tokio::task::spawn_blocking(|| PostgresStore::connect(POSTGRES_URL).expect("connect"))
             .await
@@ -536,7 +557,22 @@ async fn watched_postgres() -> Arc<WatchedPostgres> {
     Arc::new(WatchedPostgres {
         inner,
         ids: std::sync::Mutex::new(Vec::new()),
+        after_put: Box::new(after_put),
     })
+}
+
+/// Redis database `db`, emptied: each queue test below has one of its own,
+/// so none takes another's runs off `gol:runs`.
+fn fresh_redis(db: u8) -> String {
+    let url = format!("redis://127.0.0.1/{db}");
+    let mut redis = redis::Client::open(url.as_str())
+        .expect("client")
+        .get_connection()
+        .expect("connect");
+    redis::cmd("FLUSHDB")
+        .query::<()>(&mut redis)
+        .expect("flush");
+    url
 }
 
 #[tokio::test]
@@ -575,15 +611,27 @@ async fn jev_error_leaves_run_failed_in_postgres() {
     );
 }
 
+// With Redis down, create_run fails before it stores anything: no run is
+// left stored and never queued.
 #[tokio::test]
-async fn redis_push_failure_leaves_run_failed_in_postgres() {
+async fn redis_down_stores_no_run() {
     let jev = wiremock::MockServer::start().await;
-    let (status, stored) = post_run(
-        watched_postgres().await,
-        &jev,
-        Some("redis://127.0.0.1:6390"),
-    )
-    .await;
+    let store = watched_postgres().await;
+    let status = post(store.clone(), &jev, Some("redis://127.0.0.1:6390")).await;
+    assert_eq!(status, 502);
+    assert_eq!(store.ids.lock().expect("ids").as_slice(), []);
+}
+
+// Redis goes down between the store and the push: the run is ended, and
+// its pending entry, left for the sweep, is dropped without a push.
+#[tokio::test]
+async fn a_push_that_fails_after_the_store_ends_the_run() {
+    let direct = fresh_redis(13);
+    let proxy = common::redis_proxy::RedisProxy::start();
+    let down = proxy.clone();
+    let jev = wiremock::MockServer::start().await;
+    let store = watched_postgres_then(move |_, _| down.go_down()).await;
+    let (status, stored) = post_run(store, &jev, Some(&proxy.url(13))).await;
     assert_eq!(status, 502);
     assert!(
         matches!(
@@ -613,6 +661,139 @@ async fn redis_push_failure_leaves_run_failed_in_postgres() {
         "{:?}",
         stored.events
     );
+    let run_id = stored.spec.run_id;
+    tokio::task::spawn_blocking(move || {
+        let queue = RedisRunQueue::open(direct);
+        let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+        assert_eq!(queue.pending().expect("pending"), [run_id]);
+        assert_eq!(
+            sweep(
+                &queue,
+                &store,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO
+            ),
+            Ok(vec![])
+        );
+        assert_eq!(queue.pending().expect("pending"), []);
+        assert_eq!(queue.queued().expect("queued"), []);
+    })
+    .await
+    .expect("sweep thread");
+}
+
+// The producer dies between storing the run and pushing it (the put panics
+// once the run is in). The run is left pending and off the queue, and the
+// sweep queues it.
+#[tokio::test]
+async fn a_producer_that_dies_after_the_store_leaves_the_run_to_the_sweep() {
+    let redis = fresh_redis(12);
+    let jev = wiremock::MockServer::start().await;
+    let store = watched_postgres_then(|_, _| panic!("the producer dies after the store")).await;
+    let (status, stored) = post_run(store, &jev, Some(&redis)).await;
+    assert_eq!(status, 502);
+    assert!(
+        matches!(
+            stored.events.as_slice(),
+            [
+                Event {
+                    payload: EventPayload::RunCreated,
+                    ..
+                },
+                Event {
+                    payload: EventPayload::RunQueued,
+                    ..
+                },
+                Event {
+                    payload: EventPayload::UserMessage { .. },
+                    ..
+                },
+            ]
+        ),
+        "{:?}",
+        stored.events
+    );
+    let run_id = stored.spec.run_id;
+    tokio::task::spawn_blocking(move || {
+        let queue = RedisRunQueue::open(redis);
+        let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+        assert_eq!(queue.pending().expect("pending"), [run_id]);
+        assert_eq!(queue.queued().expect("queued"), []);
+        assert_eq!(
+            sweep(
+                &queue,
+                &store,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO
+            ),
+            Ok(vec![run_id])
+        );
+        assert_eq!(queue.pending().expect("pending"), []);
+        assert_eq!(queue.queued().expect("queued"), [run_id]);
+    })
+    .await
+    .expect("sweep thread");
+}
+
+// Forced: a sweep lands between the producer's store and its push, so the
+// run is pushed twice. It still runs once: the second claim finds it ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sweep_between_store_and_push_runs_the_run_once() {
+    let redis = fresh_redis(14);
+    let jev = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/systemone"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(choice("complete")))
+        .mount(&jev)
+        .await;
+    let sweeper = redis.clone();
+    let store = watched_postgres_then(move |inner, run_id| {
+        let queue = RedisRunQueue::open(sweeper.as_str());
+        assert_eq!(
+            sweep(
+                &queue,
+                inner,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO
+            ),
+            Ok(vec![run_id])
+        );
+    })
+    .await;
+    let (status, stored) = post_run(store, &jev, Some(&redis)).await;
+    assert_eq!(status, 200);
+    let run_id = stored.spec.run_id;
+    let uri = jev.uri();
+    tokio::task::spawn_blocking(move || {
+        let queue = RedisRunQueue::open(redis.as_str());
+        assert_eq!(queue.queued().expect("queued"), [run_id, run_id]);
+        assert_eq!(queue.pending().expect("pending"), []);
+        let store: Arc<dyn RunStore> =
+            Arc::new(PostgresStore::connect(POSTGRES_URL).expect("connect"));
+        let worker = Worker::builder()
+            .queue(RedisRunQueue::open(redis.as_str()))
+            .store(store.clone())
+            .memory(Arc::new(harness::InMemory::default()))
+            .jev(&uri)
+            .timing(QueueTiming::default())
+            .build();
+        assert_eq!(worker.work_one().expect("first"), Some(run_id));
+        assert_eq!(worker.work_one().expect("second"), Some(run_id));
+        assert_eq!(worker.work_one().expect("empty"), None);
+        let terminals = store
+            .run(run_id)
+            .expect("store")
+            .expect("run")
+            .events
+            .into_iter()
+            .filter(|event| server::is_terminal(&event.payload))
+            .count();
+        assert_eq!(terminals, 1);
+    })
+    .await
+    .expect("worker thread");
+    let calls = jev.received_requests().await.expect("requests").len();
+    assert_eq!(calls, 1, "the run ran twice");
 }
 
 /// A subscription turn never posts to the gateway.

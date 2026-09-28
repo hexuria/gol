@@ -60,13 +60,39 @@ jobs:
             MaxCrashes = 2
             MaxSlow = 2
             MaxReleases = 2
+            MaxProducerDeaths = 0
           INVARIANT TypeOK
           INVARIANT NoOrphan
           INVARIANT AckAfterTerminal
           INVARIANT AtMostOneTerminal
           INVARIANT WaitingUnleased
+          INVARIANT NoStrandedRun
           PROPERTY EveryRunEnds
           CFG
           java -XX:+UseParallelGC -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \
             -jar "$HOME/.local/tla/tla2tools.jar" -workers auto -lncheck final \
             -config "$RUNNER_TEMP/RunQueueNightly.cfg" RunQueue.tla
+      - name: RunQueue with three workers, two runs, two crashes, two slow leases, two releases and a producer death
+        working-directory: formal/runqueue
+        run: |
+          cat > "$RUNNER_TEMP/RunQueueCrashNightly.cfg" <<'CFG'
+          SPECIFICATION Spec
+          CONSTANTS
+            Design = "new"
+            Workers = {"w1", "w2", "w3"}
+            Runs = {"r1", "r2"}
+            MaxCrashes = 2
+            MaxSlow = 2
+            MaxReleases = 2
+            MaxProducerDeaths = 1
+          INVARIANT TypeOK
+          INVARIANT NoOrphan
+          INVARIANT AckAfterTerminal
+          INVARIANT AtMostOneTerminal
+          INVARIANT WaitingUnleased
+          INVARIANT NoStrandedRun
+          PROPERTY EveryRunEnds
+          CFG
+          java -XX:+UseParallelGC -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \
+            -jar "$HOME/.local/tla/tla2tools.jar" -workers auto -lncheck final \
+            -config "$RUNNER_TEMP/RunQueueCrashNightly.cfg" RunQueue.tla

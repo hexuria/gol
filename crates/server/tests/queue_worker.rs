@@ -2,6 +2,8 @@
 //! lease in one step, a worker acknowledges only after the run's terminal
 //! event is stored, and the reaper hands back a run whose lease expired.
 //! Needs Postgres and Redis, as `pg_redis.rs` does.
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,8 +13,8 @@ use protocol::{
     Owner, RunId, RunSpec, WorkModel,
 };
 use server::{
-    is_terminal, queued_events, Append, InMemoryStore, PostgresStore, Prepared, QueueTiming,
-    RedisRunQueue, RunStore, StoreError, StoredRun, Worker,
+    is_terminal, queued_events, reap_forever, sweep, Append, InMemoryStore, PostgresStore,
+    Prepared, QueueTiming, RedisRunQueue, RunStore, StoreError, StoredRun, Worker,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -29,6 +31,8 @@ fn quick() -> QueueTiming {
         idle_wait: Duration::from_millis(20),
         max_backoff: Duration::from_millis(200),
         max_deliveries: 5,
+        sweep_after: Duration::ZERO,
+        forget_after: Duration::ZERO,
     }
 }
 
@@ -677,4 +681,265 @@ fn redis_rpush(key: &str, id: RunId) {
         .arg(id.to_string())
         .query::<()>(&mut redis)
         .expect("push");
+}
+
+/// A run as a producer leaves it when it dies between the store and the
+/// push: pending, stored as created and queued, and not on the queue.
+fn stranded_run() -> Setup {
+    let key = format!("gol:test:{}", RunId::new());
+    let queue = RedisRunQueue::with_key(REDIS_URL, &key);
+    let store: Arc<dyn RunStore> = Arc::new(PostgresStore::connect(POSTGRES_URL).expect("connect"));
+    let spec = spec();
+    let run_id = spec.run_id;
+    queue.pend(run_id).expect("pend");
+    store
+        .put_run(StoredRun {
+            events: queued_events(&spec),
+            spec,
+        })
+        .expect("put run");
+    Setup {
+        queue,
+        store,
+        run_id,
+        key,
+    }
+}
+
+// A producer that dies between storing a run and pushing it leaves the run
+// pending. The sweep pushes it, and a worker ends it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_stored_but_not_pushed_is_queued_by_the_sweep() {
+    let jev = jev(Duration::ZERO).await;
+    let uri = jev.uri();
+    blocking(move || {
+        let setup = stranded_run();
+        assert_eq!(setup.queue.pending().expect("pending"), [setup.run_id]);
+        assert_eq!(setup.queue.queued().expect("queued"), []);
+        assert_eq!(
+            sweep(
+                &setup.queue,
+                setup.store.as_ref(),
+                Duration::ZERO,
+                Duration::ZERO
+            ),
+            Ok(vec![setup.run_id])
+        );
+        assert_eq!(setup.queue.pending().expect("pending"), []);
+        assert_eq!(setup.queue.queued().expect("queued"), [setup.run_id]);
+        assert_eq!(
+            worker(&setup, &uri).work_one().expect("work"),
+            Some(setup.run_id)
+        );
+        assert!(matches!(
+            terminals(setup.store.as_ref(), setup.run_id).as_slice(),
+            [Event {
+                payload: EventPayload::RunCompleted { .. },
+                ..
+            }]
+        ));
+        assert_eq!(setup.queue.processing().expect("processing"), []);
+    });
+}
+
+// Inside its grace a pending run is left alone: its producer may be about
+// to push it.
+#[test]
+fn a_pending_run_inside_its_grace_is_left() {
+    let setup = stranded_run();
+    assert_eq!(
+        sweep(
+            &setup.queue,
+            setup.store.as_ref(),
+            Duration::from_secs(60),
+            Duration::ZERO
+        ),
+        Ok(vec![])
+    );
+    assert_eq!(setup.queue.pending().expect("pending"), [setup.run_id]);
+    assert_eq!(setup.queue.queued().expect("queued"), []);
+}
+
+// A pending run that is not stored yet may belong to a producer whose put is
+// still in flight: it stays pending until `forget_after`, then is dropped.
+#[test]
+fn a_pending_run_not_yet_stored_is_kept_until_forgotten() {
+    let queue = RedisRunQueue::with_key(REDIS_URL, format!("gol:test:{}", RunId::new()));
+    let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    let run_id = RunId::new();
+    queue.pend(run_id).expect("pend");
+    assert_eq!(
+        sweep(&queue, &store, Duration::ZERO, Duration::from_secs(3600)),
+        Ok(vec![])
+    );
+    assert_eq!(queue.pending().expect("pending"), [run_id]);
+    assert_eq!(
+        sweep(&queue, &store, Duration::ZERO, Duration::ZERO),
+        Ok(vec![])
+    );
+    assert_eq!(queue.pending().expect("pending"), []);
+}
+
+/// Postgres, cutting the queue's Redis connections while it loads `cut_on`.
+struct CutsRedis {
+    inner: PostgresStore,
+    proxy: common::redis_proxy::RedisProxy,
+    cut_on: RunId,
+}
+
+impl RunStore for CutsRedis {
+    fn put_agent(&self, agent: server::StoredAgent) -> Result<server::PutAgent, StoreError> {
+        self.inner.put_agent(agent)
+    }
+    fn agent(&self, id: AgentId) -> Result<Option<server::StoredAgent>, StoreError> {
+        self.inner.agent(id)
+    }
+    fn put_run(&self, run: StoredRun) -> Result<(), StoreError> {
+        self.inner.put_run(run)
+    }
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
+        self.inner.append_events(id, events)
+    }
+    fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {
+        if id == self.cut_on {
+            self.proxy.cut();
+        }
+        self.inner.run(id)
+    }
+    fn put_artifact(&self, artifact: server::StoredArtifact) -> Result<(), StoreError> {
+        self.inner.put_artifact(artifact)
+    }
+    fn artifact(
+        &self,
+        id: protocol::ArtifactId,
+    ) -> Result<Option<server::StoredArtifact>, StoreError> {
+        self.inner.artifact(id)
+    }
+}
+
+// A Redis error on one pending run does not stop the sweep: the next run is
+// still pushed, and the failed one stays pending for the next sweep.
+#[test]
+fn a_redis_error_on_one_run_does_not_stop_the_sweep() {
+    let proxy = common::redis_proxy::RedisProxy::start();
+    let queue = RedisRunQueue::with_key(proxy.url(0), format!("gol:test:{}", RunId::new()));
+    let postgres = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    let (first, second) = (spec(), spec());
+    for spec in [&first, &second] {
+        queue.pend(spec.run_id).expect("pend");
+        postgres
+            .put_run(StoredRun {
+                events: queued_events(spec),
+                spec: spec.clone(),
+            })
+            .expect("put run");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let store = CutsRedis {
+        inner: postgres,
+        proxy,
+        cut_on: first.run_id,
+    };
+    assert_eq!(
+        sweep(&queue, &store, Duration::ZERO, Duration::ZERO),
+        Ok(vec![second.run_id])
+    );
+    assert_eq!(queue.pending().expect("pending"), [first.run_id]);
+    assert_eq!(queue.queued().expect("queued"), [second.run_id]);
+}
+
+// A pending run that was never stored (its producer died before the store,
+// or the store failed) is dropped once forgotten, not pushed.
+#[test]
+fn a_pending_run_that_was_never_stored_is_dropped() {
+    let queue = RedisRunQueue::with_key(REDIS_URL, format!("gol:test:{}", RunId::new()));
+    let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    let run_id = RunId::new();
+    queue.pend(run_id).expect("pend");
+    assert_eq!(
+        sweep(&queue, &store, Duration::ZERO, Duration::ZERO),
+        Ok(vec![])
+    );
+    assert_eq!(queue.pending().expect("pending"), []);
+    assert_eq!(queue.queued().expect("queued"), []);
+}
+
+// A pending run whose log has moved past created and queued (a worker
+// started it, or it ended) is not pushed again; its entry is dropped.
+#[test]
+fn a_pending_run_that_moved_on_is_not_pushed() {
+    for ended in [false, true] {
+        let setup = stranded_run();
+        let stored = setup.store.run(setup.run_id).expect("store").expect("run");
+        let next = if ended {
+            server::run_failed_event(
+                &stored.spec,
+                protocol::FailureClass::Infrastructure,
+                "ended elsewhere".to_string(),
+            )
+        } else {
+            Event::record(
+                protocol::EventSource::new(
+                    setup.run_id,
+                    stored.spec.agent_id,
+                    &stored.spec.agent_version,
+                    protocol::Actor::System,
+                    protocol::Timestamp::now(),
+                ),
+                EventPayload::RunScheduled,
+            )
+        };
+        assert_eq!(
+            setup.store.append_events(setup.run_id, vec![next]),
+            Ok(Append::Appended)
+        );
+        assert_eq!(
+            sweep(
+                &setup.queue,
+                setup.store.as_ref(),
+                Duration::ZERO,
+                Duration::ZERO
+            ),
+            Ok(vec![]),
+            "ended: {ended}"
+        );
+        assert_eq!(
+            setup.queue.pending().expect("pending"),
+            [],
+            "ended: {ended}"
+        );
+        assert_eq!(setup.queue.queued().expect("queued"), [], "ended: {ended}");
+    }
+}
+
+// The producer's push takes the run off pending in the same step.
+#[test]
+fn a_push_clears_the_pending_entry() {
+    let queue = RedisRunQueue::with_key(REDIS_URL, format!("gol:test:{}", RunId::new()));
+    let run_id = RunId::new();
+    queue.pend(run_id).expect("pend");
+    queue.push(run_id).expect("push");
+    assert_eq!(queue.pending().expect("pending"), []);
+    assert_eq!(queue.queued().expect("queued"), [run_id]);
+}
+
+// The reaper's loop sweeps too: a stranded run is queued within a few rounds
+// once it has been pending for `sweep_after`.
+#[test]
+fn the_reaper_sweeps_stranded_runs() {
+    let setup = stranded_run();
+    let queue = RedisRunQueue::with_key(REDIS_URL, &setup.key);
+    let store = setup.store.clone();
+    // The loop runs for as long as the test process does.
+    std::thread::spawn(move || reap_forever(&queue, store.as_ref(), quick()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while setup.queue.queued().expect("queued").is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reaper never swept the run"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(setup.queue.queued().expect("queued"), [setup.run_id]);
+    assert_eq!(setup.queue.pending().expect("pending"), []);
 }
