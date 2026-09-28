@@ -8,18 +8,18 @@ Resources: the Redis runs list, the processing list, the pending set, the per-ru
 
 Writers:
 - **The producer:** `create_run` (`crates/server/src/http.rs`), in one blocking task, so a client going away cannot separate its steps:
-  - marks the run pending: one script adds it to the pending set, scored by the Redis clock (`:350`; `PEND`, `crates/server/src/queue.rs:74`; `pend`, `:209`). With Redis down it fails here, and nothing is stored;
+  - marks the run pending: one script adds it to the pending set, scored by the Redis clock (`:350`; `PEND`, `crates/server/src/queue.rs:80`; `pend`, `:215`). With Redis down it fails here, and nothing is stored;
   - stores the run as created and queued (`:352`);
-  - pushes it: one script queues it and takes it off pending (`:369`; `PUSH`, `queue.rs:81`; `push`, `:220`).
+  - pushes it: one script queues it and takes it off pending (`:369`; `PUSH`, `queue.rs:87`; `push`, `:226`).
 - **Workers** (`Worker::work_one`, `crates/server/src/worker.rs:186`), `GOL_WORKERS` of them in the server process. Each one:
-  - claims a run: one script moves it to processing and leases it with `SET NX PX` (`CLAIM`, `queue.rs:97`; `claim`, `:292`). A run already leased (queued again while held) is dropped from the list instead;
-  - loads the run (`Claim::prepare`, `worker.rs:243`). An open run counts a start (`START`, `queue.rs:108`). A claim that cannot load or start its run releases it: one script, which acts only while the claim still holds the lease, moves it off processing, onto the back of the runs list, and deletes the lease (`RELEASE`, `queue.rs:116`);
-  - runs the harness (`Open::execute`, `worker.rs:310`), renewing the lease every heartbeat (`:371`; `RENEW`, `queue.rs:126`);
+  - claims a run: one script moves it to processing and leases it with `SET NX PX` (`CLAIM`, `queue.rs:103`; `claim`, `:303`). A run already leased (queued again while held) is dropped from the list instead;
+  - loads the run (`Claim::prepare`, `worker.rs:243`). An open run counts a start (`START`, `queue.rs:114`). A claim that cannot load or start its run releases it: one script, which acts only while the claim still holds the lease, moves it off processing, onto the back of the runs list, and deletes the lease (`RELEASE`, `queue.rs:122`);
+  - runs the harness (`Open::execute`, `worker.rs:310`), renewing the lease every heartbeat (`:371`; `RENEW`, `queue.rs:132`);
   - records the harness's events in one append (`Executed::record`, `worker.rs:338`; `RunStore::append_events`), which the store refuses once the log is terminal;
-  - acknowledges: one script removes the run from processing, clears its start count and releases the lease if it still holds it (`ACK`, `queue.rs:135`; `Done::ack`, `worker.rs:360`).
+  - acknowledges: one script removes the run from processing, clears its start count and releases the lease if it still holds it (`ACK`, `queue.rs:141`; `Done::ack`, `worker.rs:360`).
   - Only a `Done` can acknowledge, and only `record`, or a `prepare` that finds nothing to run, makes one. So the ack of a stored run comes after its terminal event by construction. A run that is not stored is acknowledged without one, and dropped with an error.
-- **The reaper** (`reap_forever`, `worker.rs:394`): one script moves every run in processing whose lease is gone back to the front of the runs list (`REAP`, `queue.rs:146`).
-- **The sweep** (`sweep`, `worker.rs:415`), in the reaper's loop: for each run pending for at least `sweep_after` (60 s; `PENDING_FOR`, `queue.rs:88`), it loads the run. A run still created and queued is pushed with the producer's script; a run that has started or ended is taken off pending (`unpend`). A run not in the store yet stays pending, since its put may still be in flight, until it has been pending for `forget_after` (24 h), when it is dropped.
+- **The reaper** (`reap_forever`, `worker.rs:394`): one script moves every run in processing whose lease is gone back to the front of the runs list (`REAP`, `queue.rs:152`).
+- **The sweep** (`sweep`, `worker.rs:419`), in the reaper's loop: for each run pending for at least `sweep_after` (60 s; `PENDING_FOR`, `queue.rs:94`), it loads the run. A run still created and queued is pushed with the producer's script; a run that has started or ended is taken off pending (`unpend`, `queue.rs:270`). A run not in the store yet stays pending, since its put may still be in flight, until it has been pending for `forget_after` (24 h), when it is dropped.
 
 Each Redis command, each script and each append is one atomic step. The producer's pend, store and push are three steps, and the server process may die between them (`ProducerDies`, at most `MaxProducerDeaths` times).
 

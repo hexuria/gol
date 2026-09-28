@@ -11,6 +11,9 @@ pub struct RunState {
     pub dispatch: DispatchPhase,
     pub steps: u32,
     pub model_calls: u32,
+    /// Child runs this run started.
+    #[serde(default)]
+    pub children: u32,
 }
 
 pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
@@ -18,6 +21,7 @@ pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
     let mut dispatch = DispatchPhase::Created;
     let mut steps = 0;
     let mut model_calls = 0;
+    let mut children = 0;
 
     for event in events {
         match &event.payload {
@@ -33,6 +37,7 @@ pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
             } => {
                 model_calls += 1;
             }
+            EventPayload::ChildStarted { .. } => children += 1,
             _ => {}
         }
         dispatch = reduce_dispatch(dispatch, event);
@@ -46,6 +51,7 @@ pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
         harness,
         steps,
         model_calls,
+        children,
     }
 }
 
@@ -72,6 +78,29 @@ mod tests {
 
     fn started(spec: &RunSpec, terminal: EventPayload) -> Vec<Event> {
         vec![ev(spec, EventPayload::RunStarted), ev(spec, terminal)]
+    }
+
+    // The children a run started are counted; a refused one is not.
+    #[test]
+    fn started_children_are_counted() {
+        let spec = sample_spec();
+        let child = |payload| ev(&spec, payload);
+        let events = vec![
+            ev(&spec, EventPayload::RunStarted),
+            child(EventPayload::ChildStarted {
+                run_id: crate::RunId::new(),
+                agent_id: crate::AgentId::new(),
+            }),
+            child(EventPayload::DelegateRefused {
+                agent_id: crate::AgentId::new(),
+                reason: "no".to_string(),
+            }),
+            child(EventPayload::ChildStarted {
+                run_id: crate::RunId::new(),
+                agent_id: crate::AgentId::new(),
+            }),
+        ];
+        assert_eq!(fold(&spec, &events).children, 2);
     }
 
     // A Complete that cannot finish the run (a tool call is outstanding) is a

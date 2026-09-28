@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentId, ApprovalId, Effect, EventId, FailureClass, InvocationId, MemoryScope, ModelMessage,
-    RunId, StepId,
+    RunId, RunSpec, StepId,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +113,16 @@ pub enum EventPayload {
         key: String,
         value: String,
     },
+    /// An authorized delegation started a child run.
+    ChildStarted {
+        run_id: RunId,
+        agent_id: AgentId,
+    },
+    /// An authorized delegation started nothing, for `reason`.
+    DelegateRefused {
+        agent_id: AgentId,
+        reason: String,
+    },
 }
 
 impl EventPayload {
@@ -143,6 +153,8 @@ impl EventPayload {
             Self::ModelResponded { .. } => "model.responded",
             Self::MemoryRead { .. } => "memory.read",
             Self::MemoryWritten { .. } => "memory.written",
+            Self::ChildStarted { .. } => "child.started",
+            Self::DelegateRefused { .. } => "delegate.refused",
         }
     }
 }
@@ -155,6 +167,7 @@ pub struct Event {
 
 pub struct EventSource<'a> {
     pub run_id: RunId,
+    pub parent_run_id: Option<RunId>,
     pub agent_id: AgentId,
     pub agent_version: &'a str,
     pub step_id: Option<StepId>,
@@ -173,12 +186,22 @@ impl<'a> EventSource<'a> {
     ) -> Self {
         Self {
             run_id,
+            parent_run_id: None,
             agent_id,
             agent_version,
             step_id: None,
             actor,
             caused_by: None,
             at,
+        }
+    }
+
+    /// A source for an event of `spec`'s run, naming its parent if it has
+    /// one.
+    pub fn for_spec(spec: &'a RunSpec, actor: Actor, at: Timestamp) -> Self {
+        Self {
+            parent_run_id: spec.lineage.parent,
+            ..Self::new(spec.run_id, spec.agent_id, &spec.agent_version, actor, at)
         }
     }
 }
@@ -191,7 +214,7 @@ impl Event {
                 event_type: payload.event_type().to_string(),
                 run_id: source.run_id,
                 step_id: source.step_id,
-                parent_run_id: None,
+                parent_run_id: source.parent_run_id,
                 agent_id: source.agent_id,
                 agent_version: source.agent_version.to_string(),
                 at: source.at,
@@ -200,5 +223,37 @@ impl Event {
             },
             payload,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::sample_spec;
+    use crate::RunSpec;
+
+    // Every event of a child run names its parent; a top-level run's names
+    // none.
+    #[test]
+    fn an_event_of_a_child_names_its_parent() {
+        let parent = sample_spec();
+        let child = RunSpec::builder()
+            .owner(parent.owner.clone())
+            .agent(AgentId::new(), "1")
+            .input("draft")
+            .placement(parent.placement)
+            .work_model(parent.work_model.clone())
+            .child_of(&parent, 1)
+            .build();
+        let at = Timestamp::unix_millis(0);
+        let of = |spec: &RunSpec| {
+            Event::record(
+                EventSource::for_spec(spec, Actor::System, at),
+                EventPayload::RunStarted,
+            )
+        };
+        assert_eq!(of(&parent).envelope.parent_run_id, None);
+        assert_eq!(of(&child).envelope.parent_run_id, Some(parent.run_id));
+        assert_eq!(of(&child).envelope.run_id, child.run_id);
     }
 }

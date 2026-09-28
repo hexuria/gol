@@ -17,11 +17,13 @@ pub use event::{Actor, Event, EventEnvelope, EventPayload, EventSource, Timestam
 pub use fold::{fold, RunState};
 pub use id::{AgentId, ApprovalId, ArtifactId, EventId, InvocationId, RunId, StepId, ToolId};
 pub use model::{MessageRole, ModelMessage, ModelRequest};
-pub use phase::{DispatchPhase, FailureClass, HarnessState, MAX_RETRIES};
+pub use phase::{
+    DispatchPhase, FailureClass, HarnessState, MAX_CHILDREN, MAX_DELEGATION_HOPS, MAX_RETRIES,
+};
 pub use policy::PolicyDecision;
 pub use reduce::{applicable, reduce, reduce_dispatch, Effects};
 pub use spec::{
-    Capability, CredentialSource, ExecutionPlacement, Limits, Missing, ModelProvider, Owner,
-    RunSpec, RunSpecBuilder, Set, WorkModel,
+    Capability, CredentialSource, ExecutionPlacement, Limits, Lineage, Missing, ModelProvider,
+    Owner, RunSpec, RunSpecBuilder, Set, WorkModel,
 };
 pub use tool::ToolDescriptor;
