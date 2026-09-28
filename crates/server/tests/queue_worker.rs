@@ -925,8 +925,9 @@ fn a_pending_run_that_moved_on_is_not_pushed() {
 }
 
 // A malformed pending entry that cannot be dropped (here Redis refuses
-// ZREM to this client) is logged and left; the sweep still returns and
-// goes on to the other runs.
+// ZREM to this client) is logged and left, and the sweep still returns
+// rather than failing. (That the sweep goes on past a failed entry is
+// `a_redis_error_on_one_run_does_not_stop_the_sweep`.)
 #[test]
 fn a_malformed_entry_that_cannot_be_dropped_does_not_end_the_sweep() {
     let user = format!("gol-nozrem-{}", RunId::new());
@@ -961,6 +962,13 @@ fn a_malformed_entry_that_cannot_be_dropped_does_not_end_the_sweep() {
         .query::<()>(&mut admin)
         .expect("drop acl user");
     assert_eq!(swept, Ok(vec![]));
+    let left: Vec<String> = redis::cmd("ZRANGE")
+        .arg(format!("{{{key}}}:pending"))
+        .arg(0)
+        .arg(-1)
+        .query(&mut admin)
+        .expect("pending entries");
+    assert_eq!(left, ["not-a-run-id"]);
 }
 
 // The producer's push takes the run off pending in the same step.
