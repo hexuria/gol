@@ -19,7 +19,7 @@ Writers:
   - acknowledges: one script removes the run from processing, clears its start count and releases the lease if it still holds it (`ACK`, `queue.rs:135`; `Done::ack`, `worker.rs:360`).
   - Only a `Done` can acknowledge, and only `record`, or a `prepare` that finds nothing to run, makes one. So the ack of a stored run comes after its terminal event by construction. A run that is not stored is acknowledged without one, and dropped with an error.
 - **The reaper** (`reap_forever`, `worker.rs:394`): one script moves every run in processing whose lease is gone back to the front of the runs list (`REAP`, `queue.rs:146`).
-- **The sweep** (`sweep`, `worker.rs:415`), in the reaper's loop: for each run pending for at least `sweep_after` (60 s; `PENDING_FOR`, `queue.rs:88`), it loads the run. A run still created and queued is pushed with the producer's script; any other entry (never stored, started or ended) is taken off pending (`unpend`, `queue.rs:259`).
+- **The sweep** (`sweep`, `worker.rs:415`), in the reaper's loop: for each run pending for at least `sweep_after` (60 s; `PENDING_FOR`, `queue.rs:88`), it loads the run. A run still created and queued is pushed with the producer's script; a run that has started or ended is taken off pending (`unpend`). A run not in the store yet stays pending, since its put may still be in flight, until it has been pending for `forget_after` (24 h), when it is dropped.
 
 Each Redis command, each script and each append is one atomic step. The producer's pend, store and push are three steps, and the server process may die between them (`ProducerDies`, at most `MaxProducerDeaths` times).
 
@@ -42,7 +42,7 @@ In `Design = "new"` no queued run holds a lease (`WaitingUnleased`, checked by `
 
 The model's claims rest on these; each is outside what it checks.
 - **Push:**
-  - The grace: the sweep takes a pending run only after its producer has pushed it or died. `sweep_after` is 60 s, against a pend, a put and a push that each give up within seconds (`REDIS_TIMEOUT` is 5 s). A producer slower than that is not modelled; the sweep then pushes a run its producer pushes too. An id queued twice is claimed once, and a claim of an ended run acknowledges it without running it (`a_sweep_between_store_and_push_runs_the_run_once`).
+  - The grace: the sweep takes a pending run only after its producer has pushed it or died. `sweep_after` is 60 s. The pend and the push give up within 5 s (`REDIS_TIMEOUT`); the put can wait 30 s for a pooled connection and has no statement timeout, which is why a run not yet in the store is kept rather than dropped at the grace. A producer whose put is visible but whose push is later than that is not modelled; the sweep then pushes a run its producer pushes too. An id queued twice is claimed once, and a claim of an ended run acknowledges it without running it (`a_sweep_between_store_and_push_runs_the_run_once`). A put not yet visible is not taken for dead at the grace: the sweep keeps the entry (`a_pending_run_not_yet_stored_is_kept_until_forgotten`). `Sweep` drops a never-stored run only once its producer is dead, which the code takes to be true after `forget_after` (24 h): a put still in flight after 24 h is outside this model.
   - Cancellation cannot separate the two steps: they are one blocking task.
   - A store whose put fails with an unknown outcome gets a best-effort `RunFailed` append, so a put that did commit is not left queued and unpushed.
 - **Store:** every queued run is in the store the workers read. The queue refuses to start without `GOL_DATABASE_URL`, and one Redis serves one deployment. A worker drops a run it cannot find, with an error.
@@ -126,7 +126,7 @@ Tests in `crates/server/tests/queue_worker.rs`, against Redis and Postgres (the 
   - `a_producer_that_dies_after_the_store_leaves_the_run_to_the_sweep` (`pg_redis.rs`): the real `create_run` dies after its store (the put panics once the run is in). The run is pending and off the queue, and the sweep queues it.
   - `a_run_stored_but_not_pushed_is_queued_by_the_sweep` (`queue_worker.rs`): the sweep pushes such a run, and a worker ends it.
   - `redis_down_stores_no_run` (`pg_redis.rs`): the pend comes before the store, so with Redis down nothing is stored.
-  - The sweep's other cases: `a_pending_run_that_was_never_stored_is_dropped`, `a_pending_run_that_moved_on_is_not_pushed` (started, or ended) and `a_pending_run_inside_its_grace_is_left`; the push's `a_push_clears_the_pending_entry`; and a push that fails after the store, `a_push_that_fails_after_the_store_ends_the_run` (`pg_redis.rs`) and `redis_push_failure_does_not_run_the_harness` (`http_run.rs`).
+  - The sweep's other cases: `a_pending_run_not_yet_stored_is_kept_until_forgotten`, `a_redis_error_on_one_run_does_not_stop_the_sweep`, `a_pending_run_that_was_never_stored_is_dropped`, `a_pending_run_that_moved_on_is_not_pushed` (started, or ended) and `a_pending_run_inside_its_grace_is_left`; the push's `a_push_clears_the_pending_entry`; and a push that fails after the store, `a_push_that_fails_after_the_store_ends_the_run` (`pg_redis.rs`) and `redis_push_failure_does_not_run_the_harness` (`http_run.rs`).
   - Beyond the grace assumption: `a_sweep_between_store_and_push_runs_the_run_once`, the sweep forced into the producer's gap. The run is pushed twice and runs once.
 - **`EveryRunEnds`:** unlinked.
 

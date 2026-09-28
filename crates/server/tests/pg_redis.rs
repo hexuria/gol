@@ -666,7 +666,15 @@ async fn a_push_that_fails_after_the_store_ends_the_run() {
         let queue = RedisRunQueue::open(direct);
         let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
         assert_eq!(queue.pending().expect("pending"), [run_id]);
-        assert_eq!(sweep(&queue, &store, std::time::Duration::ZERO), Ok(vec![]));
+        assert_eq!(
+            sweep(
+                &queue,
+                &store,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO
+            ),
+            Ok(vec![])
+        );
         assert_eq!(queue.pending().expect("pending"), []);
         assert_eq!(queue.queued().expect("queued"), []);
     })
@@ -712,7 +720,12 @@ async fn a_producer_that_dies_after_the_store_leaves_the_run_to_the_sweep() {
         assert_eq!(queue.pending().expect("pending"), [run_id]);
         assert_eq!(queue.queued().expect("queued"), []);
         assert_eq!(
-            sweep(&queue, &store, std::time::Duration::ZERO),
+            sweep(
+                &queue,
+                &store,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO
+            ),
             Ok(vec![run_id])
         );
         assert_eq!(queue.pending().expect("pending"), []);
@@ -737,7 +750,12 @@ async fn a_sweep_between_store_and_push_runs_the_run_once() {
     let store = watched_postgres_then(move |inner, run_id| {
         let queue = RedisRunQueue::open(sweeper.as_str());
         assert_eq!(
-            sweep(&queue, inner, std::time::Duration::ZERO),
+            sweep(
+                &queue,
+                inner,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO
+            ),
             Ok(vec![run_id])
         );
     })

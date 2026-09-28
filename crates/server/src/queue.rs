@@ -43,6 +43,11 @@ pub struct QueueTiming {
     /// How long a run may stay pending before the sweep takes its producer
     /// for dead and pushes it (owner decision 2A for C6).
     pub sweep_after: Duration,
+    /// How long a pending run that is not in the store yet is kept before the
+    /// sweep drops it. A put still in flight after this long is taken for
+    /// dead; until then the run stays pending, so a put that commits late is
+    /// still pushed by the sweep.
+    pub forget_after: Duration,
 }
 
 impl Default for QueueTiming {
@@ -59,6 +64,7 @@ impl Default for QueueTiming {
             max_backoff: Duration::from_secs(30),
             max_deliveries: 5,
             sweep_after: Duration::from_secs(60),
+            forget_after: Duration::from_secs(24 * 60 * 60),
         }
     }
 }
@@ -237,7 +243,8 @@ impl RedisRunQueue {
     }
 
     /// The runs pending for at least `age`, longest pending first. An entry
-    /// that is not a run id is dropped.
+    /// that is not a run id is dropped; one that cannot be dropped now is
+    /// left for the next call.
     pub fn pending_for(&self, age: Duration) -> Result<Vec<RunId>, String> {
         let values: Vec<String> = self.with_connection(|connection| {
             Script::new(PENDING_FOR)
@@ -249,7 +256,11 @@ impl RedisRunQueue {
         for text in values {
             match parse(&text) {
                 Ok(id) => ids.push(id),
-                Err(_) => self.unpend_entry(&text)?,
+                Err(_) => {
+                    if let Err(error) = self.unpend_entry(&text) {
+                        eprintln!("gol: queue: drop pending entry {text:?}: {error}");
+                    }
+                }
             }
         }
         Ok(ids)

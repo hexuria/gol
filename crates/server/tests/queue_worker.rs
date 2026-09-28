@@ -2,6 +2,8 @@
 //! lease in one step, a worker acknowledges only after the run's terminal
 //! event is stored, and the reaper hands back a run whose lease expired.
 //! Needs Postgres and Redis, as `pg_redis.rs` does.
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +32,7 @@ fn quick() -> QueueTiming {
         max_backoff: Duration::from_millis(200),
         max_deliveries: 5,
         sweep_after: Duration::ZERO,
+        forget_after: Duration::ZERO,
     }
 }
 
@@ -714,7 +717,12 @@ async fn a_run_stored_but_not_pushed_is_queued_by_the_sweep() {
         assert_eq!(setup.queue.pending().expect("pending"), [setup.run_id]);
         assert_eq!(setup.queue.queued().expect("queued"), []);
         assert_eq!(
-            sweep(&setup.queue, setup.store.as_ref(), Duration::ZERO),
+            sweep(
+                &setup.queue,
+                setup.store.as_ref(),
+                Duration::ZERO,
+                Duration::ZERO
+            ),
             Ok(vec![setup.run_id])
         );
         assert_eq!(setup.queue.pending().expect("pending"), []);
@@ -740,22 +748,118 @@ async fn a_run_stored_but_not_pushed_is_queued_by_the_sweep() {
 fn a_pending_run_inside_its_grace_is_left() {
     let setup = stranded_run();
     assert_eq!(
-        sweep(&setup.queue, setup.store.as_ref(), Duration::from_secs(60)),
+        sweep(
+            &setup.queue,
+            setup.store.as_ref(),
+            Duration::from_secs(60),
+            Duration::ZERO
+        ),
         Ok(vec![])
     );
     assert_eq!(setup.queue.pending().expect("pending"), [setup.run_id]);
     assert_eq!(setup.queue.queued().expect("queued"), []);
 }
 
+// A pending run that is not stored yet may belong to a producer whose put is
+// still in flight: it stays pending until `forget_after`, then is dropped.
+#[test]
+fn a_pending_run_not_yet_stored_is_kept_until_forgotten() {
+    let queue = RedisRunQueue::with_key(REDIS_URL, format!("gol:test:{}", RunId::new()));
+    let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    let run_id = RunId::new();
+    queue.pend(run_id).expect("pend");
+    assert_eq!(
+        sweep(&queue, &store, Duration::ZERO, Duration::from_secs(3600)),
+        Ok(vec![])
+    );
+    assert_eq!(queue.pending().expect("pending"), [run_id]);
+    assert_eq!(
+        sweep(&queue, &store, Duration::ZERO, Duration::ZERO),
+        Ok(vec![])
+    );
+    assert_eq!(queue.pending().expect("pending"), []);
+}
+
+/// Postgres, cutting the queue's Redis connections while it loads `cut_on`.
+struct CutsRedis {
+    inner: PostgresStore,
+    proxy: common::redis_proxy::RedisProxy,
+    cut_on: RunId,
+}
+
+impl RunStore for CutsRedis {
+    fn put_agent(&self, agent: server::StoredAgent) -> Result<server::PutAgent, StoreError> {
+        self.inner.put_agent(agent)
+    }
+    fn agent(&self, id: AgentId) -> Result<Option<server::StoredAgent>, StoreError> {
+        self.inner.agent(id)
+    }
+    fn put_run(&self, run: StoredRun) -> Result<(), StoreError> {
+        self.inner.put_run(run)
+    }
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
+        self.inner.append_events(id, events)
+    }
+    fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {
+        if id == self.cut_on {
+            self.proxy.cut();
+        }
+        self.inner.run(id)
+    }
+    fn put_artifact(&self, artifact: server::StoredArtifact) -> Result<(), StoreError> {
+        self.inner.put_artifact(artifact)
+    }
+    fn artifact(
+        &self,
+        id: protocol::ArtifactId,
+    ) -> Result<Option<server::StoredArtifact>, StoreError> {
+        self.inner.artifact(id)
+    }
+}
+
+// A Redis error on one pending run does not stop the sweep: the next run is
+// still pushed, and the failed one stays pending for the next sweep.
+#[test]
+fn a_redis_error_on_one_run_does_not_stop_the_sweep() {
+    let proxy = common::redis_proxy::RedisProxy::start();
+    let queue = RedisRunQueue::with_key(proxy.url(0), format!("gol:test:{}", RunId::new()));
+    let postgres = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    let (first, second) = (spec(), spec());
+    for spec in [&first, &second] {
+        queue.pend(spec.run_id).expect("pend");
+        postgres
+            .put_run(StoredRun {
+                events: queued_events(spec),
+                spec: spec.clone(),
+            })
+            .expect("put run");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let store = CutsRedis {
+        inner: postgres,
+        proxy,
+        cut_on: first.run_id,
+    };
+    assert_eq!(
+        sweep(&queue, &store, Duration::ZERO, Duration::ZERO),
+        Ok(vec![second.run_id])
+    );
+    assert_eq!(queue.pending().expect("pending"), [first.run_id]);
+    assert_eq!(queue.queued().expect("queued"), [second.run_id]);
+}
+
 // A pending run that was never stored (its producer died before the store,
-// or the store failed) is dropped, not pushed.
+// or the store failed) is dropped once forgotten, not pushed.
 #[test]
 fn a_pending_run_that_was_never_stored_is_dropped() {
     let queue = RedisRunQueue::with_key(REDIS_URL, format!("gol:test:{}", RunId::new()));
     let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
     let run_id = RunId::new();
     queue.pend(run_id).expect("pend");
-    assert_eq!(sweep(&queue, &store, Duration::ZERO), Ok(vec![]));
+    assert_eq!(
+        sweep(&queue, &store, Duration::ZERO, Duration::ZERO),
+        Ok(vec![])
+    );
     assert_eq!(queue.pending().expect("pending"), []);
     assert_eq!(queue.queued().expect("queued"), []);
 }
@@ -790,7 +894,12 @@ fn a_pending_run_that_moved_on_is_not_pushed() {
             Ok(Append::Appended)
         );
         assert_eq!(
-            sweep(&setup.queue, setup.store.as_ref(), Duration::ZERO),
+            sweep(
+                &setup.queue,
+                setup.store.as_ref(),
+                Duration::ZERO,
+                Duration::ZERO
+            ),
             Ok(vec![]),
             "ended: {ended}"
         );

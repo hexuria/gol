@@ -398,7 +398,9 @@ pub fn reap_forever(queue: &RedisRunQueue, store: &dyn RunStore, timing: QueueTi
             Ok(Err(error)) => eprintln!("gol: queue reaper: {error}"),
             Err(_) => eprintln!("gol: queue reaper: reaping panicked"),
         }
-        match catch_unwind(AssertUnwindSafe(|| sweep(queue, store, timing.sweep_after))) {
+        match catch_unwind(AssertUnwindSafe(|| {
+            sweep(queue, store, timing.sweep_after, timing.forget_after)
+        })) {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => eprintln!("gol: queue sweep: {error}"),
             Err(_) => eprintln!("gol: queue sweep: sweeping panicked"),
@@ -408,16 +410,19 @@ pub fn reap_forever(queue: &RedisRunQueue, store: &dyn RunStore, timing: QueueTi
 }
 
 /// Pushes each run pending for at least `after` that its producer stored but
-/// never pushed: the producer died in between (C6). A pending run that was
-/// never stored, or whose log has moved past created and queued, is taken
-/// off pending instead. Returns the runs it pushed. A run the store cannot
-/// load, or that Redis cannot push or unpend now, stays pending for the next
-/// sweep; the others are still swept.
+/// never pushed: the producer died in between (C6). A pending run whose log
+/// has moved past created and queued is taken off pending. A pending run not
+/// in the store is kept (its put may still be in flight) until it has been
+/// pending for `forget_after`, then dropped. Returns the runs it pushed. A run
+/// the store cannot load, or that Redis cannot push or unpend now, stays
+/// pending for the next sweep; the others are still swept.
 pub fn sweep(
     queue: &RedisRunQueue,
     store: &dyn RunStore,
     after: Duration,
+    forget_after: Duration,
 ) -> Result<Vec<RunId>, String> {
+    let forgotten = queue.pending_for(forget_after)?;
     let mut pushed = Vec::new();
     for run_id in queue.pending_for(after)? {
         match store.run(run_id) {
@@ -425,6 +430,7 @@ pub fn sweep(
                 Ok(()) => pushed.push(run_id),
                 Err(error) => eprintln!("gol: queue sweep: push run {run_id}: {error}"),
             },
+            Ok(None) if !forgotten.contains(&run_id) => {}
             Ok(_) => {
                 if let Err(error) = queue.unpend(run_id) {
                     eprintln!("gol: queue sweep: unpend run {run_id}: {error}");

@@ -51,6 +51,13 @@ impl RedisProxy {
         format!("redis://127.0.0.1:{}/{db}", self.port)
     }
 
+    /// Cuts every open connection; new ones still go through.
+    pub fn cut(&self) {
+        for stream in self.state.lock().expect("proxy").open.drain(..) {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
     /// Refuses every new connection and cuts every open one: Redis is gone.
     pub fn go_down(&self) {
         let mut state = self.state.lock().expect("proxy");
