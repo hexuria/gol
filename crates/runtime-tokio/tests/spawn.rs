@@ -261,6 +261,9 @@ fn a_refused_spawn_is_not_journaled() {
         assert_eq!(spawner.asked(), asked);
         assert_eq!(journal.history().unwrap(), History::default());
     }
+    // The retry is the same request, so it names the same child.
+    let asked = spawner.asked.lock().unwrap();
+    assert_eq!(asked[0], asked[1]);
 }
 
 // Decision 1.3-2A: a workflow names its agent by id. Name lookup comes with
