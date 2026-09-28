@@ -129,7 +129,9 @@ pub fn jev_choices(view: &DecisionView<'_>) -> Vec<(String, Option<String>)> {
 /// running, has 10 children, or has fewer than 2 steps or 2 model calls left
 /// to give once this decision has taken its step; the authorizer refuses one
 /// without `agent.delegate` or 8 hops deep. A name several targets share gets
-/// the first 8 characters of each id; an empty name is the id.
+/// the first 8 characters of each id; an empty name is the id. The chosen
+/// label is looked up exactly, so a label that still names more than one
+/// target is not offered at all.
 fn delegate_choices(view: &DecisionView<'_>) -> Vec<(String, String, AgentId)> {
     let (spec, state) = (view.spec, view.state);
     let left = |max: u32, used: u32, given: u32| max.saturating_sub(used.saturating_add(given));
@@ -162,7 +164,7 @@ fn delegate_choices(view: &DecisionView<'_>) -> Vec<(String, String, AgentId)> {
         .iter()
         .filter(|target| target.agent_id != spec.agent_id)
         .collect();
-    targets
+    let choices: Vec<(String, String, AgentId)> = targets
         .iter()
         .map(|target| {
             let named = name(target);
@@ -180,6 +182,17 @@ fn delegate_choices(view: &DecisionView<'_>) -> Vec<(String, String, AgentId)> {
             };
             (label, description, target.agent_id)
         })
+        .collect();
+    choices
+        .iter()
+        .filter(|(label, _, _)| {
+            choices
+                .iter()
+                .filter(|(other, _, _)| other == label)
+                .count()
+                == 1
+        })
+        .cloned()
         .collect()
 }
 

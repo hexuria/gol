@@ -605,3 +605,38 @@ async fn a_delegate_choice_maps_to_the_named_agent() {
     let offered = criteria(&sent[0]);
     assert!(offered.to_string().contains("delegate:writer"), "{offered}");
 }
+
+// Labels are looked up exactly, so two targets must never share one. A label
+// that still collides after the id suffix is not offered: no choice can reach
+// the wrong agent.
+#[test]
+fn an_ambiguous_delegate_label_is_not_offered() {
+    let spec = delegating(limits(3, 2));
+    let same_prefix_a: AgentId = "dddddddd-0000-4000-8000-000000000001".parse().unwrap();
+    let same_prefix_b: AgentId = "dddddddd-0000-4000-8000-000000000002".parse().unwrap();
+    let editor: AgentId = "eeeeeeee-0000-4000-8000-000000000001".parse().unwrap();
+    let editor_too: AgentId = "ffffffff-0000-4000-8000-000000000001".parse().unwrap();
+    let posing: AgentId = "11111111-0000-4000-8000-000000000001".parse().unwrap();
+    let writer = AgentId::new();
+    let targets = [
+        target(same_prefix_a, "x", ""),
+        target(same_prefix_b, "x", ""),
+        target(editor, "editor", ""),
+        target(editor_too, "editor", ""),
+        target(posing, "editor-eeeeeeee", ""),
+        target(writer, "writer", ""),
+    ];
+    let driver = Driver::boot(spec.clone()).unwrap();
+    let state = driver.state();
+    let mut offered = view(&spec, &state, driver.events(), &[], &[]);
+    offered.agents = &targets;
+    assert_eq!(
+        labels(&offered),
+        [
+            "delegate:editor-ffffffff",
+            "delegate:writer",
+            "model",
+            "complete"
+        ]
+    );
+}
