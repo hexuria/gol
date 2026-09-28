@@ -865,32 +865,44 @@ fn a_pending_run_that_was_never_stored_is_dropped() {
 }
 
 // A pending run whose log has moved past created and queued (a worker
-// started it, or it ended) is not pushed again; its entry is dropped.
+// started it, or it ended) is not pushed again; its entry is dropped. The
+// push takes a run off pending in the same script, so this only guards a
+// run that reached the queue some other way; "started" is what a worker
+// appends when it opens a run.
 #[test]
 fn a_pending_run_that_moved_on_is_not_pushed() {
     for ended in [false, true] {
         let setup = stranded_run();
         let stored = setup.store.run(setup.run_id).expect("store").expect("run");
-        let next = if ended {
-            server::run_failed_event(
+        let next: Vec<Event> = if ended {
+            vec![server::run_failed_event(
                 &stored.spec,
                 protocol::FailureClass::Infrastructure,
                 "ended elsewhere".to_string(),
-            )
+            )]
         } else {
-            Event::record(
-                protocol::EventSource::new(
-                    setup.run_id,
-                    stored.spec.agent_id,
-                    &stored.spec.agent_version,
-                    protocol::Actor::System,
-                    protocol::Timestamp::now(),
-                ),
+            [
                 EventPayload::RunScheduled,
-            )
+                EventPayload::RunProvisioning,
+                EventPayload::RunStarting,
+            ]
+            .into_iter()
+            .map(|payload| {
+                Event::record(
+                    protocol::EventSource::new(
+                        setup.run_id,
+                        stored.spec.agent_id,
+                        &stored.spec.agent_version,
+                        protocol::Actor::System,
+                        protocol::Timestamp::now(),
+                    ),
+                    payload,
+                )
+            })
+            .collect()
         };
         assert_eq!(
-            setup.store.append_events(setup.run_id, vec![next]),
+            setup.store.append_events(setup.run_id, next),
             Ok(Append::Appended)
         );
         assert_eq!(
@@ -910,6 +922,45 @@ fn a_pending_run_that_moved_on_is_not_pushed() {
         );
         assert_eq!(setup.queue.queued().expect("queued"), [], "ended: {ended}");
     }
+}
+
+// A malformed pending entry that cannot be dropped (here Redis refuses
+// ZREM to this client) is logged and left; the sweep still returns and
+// goes on to the other runs.
+#[test]
+fn a_malformed_entry_that_cannot_be_dropped_does_not_end_the_sweep() {
+    let user = format!("gol-nozrem-{}", RunId::new());
+    let mut admin = redis::Client::open(REDIS_URL)
+        .expect("client")
+        .get_connection()
+        .expect("connect");
+    redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg(&user)
+        .arg("on")
+        .arg(">pw")
+        .arg("~*")
+        .arg("&*")
+        .arg("+@all")
+        .arg("-zrem")
+        .query::<()>(&mut admin)
+        .expect("acl user");
+    let key = format!("gol:test:{}", RunId::new());
+    redis::cmd("ZADD")
+        .arg(format!("{{{key}}}:pending"))
+        .arg(0)
+        .arg("not-a-run-id")
+        .query::<()>(&mut admin)
+        .expect("malformed entry");
+    let queue = RedisRunQueue::with_key(format!("redis://{user}:pw@127.0.0.1/"), &key);
+    let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    let swept = sweep(&queue, &store, Duration::ZERO, Duration::ZERO);
+    redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(&user)
+        .query::<()>(&mut admin)
+        .expect("drop acl user");
+    assert_eq!(swept, Ok(vec![]));
 }
 
 // The producer's push takes the run off pending in the same step.
