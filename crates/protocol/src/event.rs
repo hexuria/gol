@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, ApprovalId, Effect, EventId, FailureClass, InvocationId, MemoryScope, ModelMessage,
-    RunId, RunSpec, StepId,
+    AgentId, ApprovalId, Effect, EventId, FailureClass, InvocationId, Limits, MemoryScope,
+    ModelMessage, RunId, RunSpec, StepId,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,10 +113,12 @@ pub enum EventPayload {
         key: String,
         value: String,
     },
-    /// An authorized delegation started a child run.
+    /// An authorized delegation started a child run, and gave it `limits`
+    /// from this run's budget.
     ChildStarted {
         run_id: RunId,
         agent_id: AgentId,
+        limits: Limits,
     },
     /// An authorized delegation started nothing, for `reason`.
     DelegateRefused {

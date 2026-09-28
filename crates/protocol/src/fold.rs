@@ -14,6 +14,12 @@ pub struct RunState {
     /// Child runs this run started.
     #[serde(default)]
     pub children: u32,
+    /// Steps and model calls this run gave its children. They are spent for
+    /// this run as if it had taken them itself.
+    #[serde(default)]
+    pub given_steps: u32,
+    #[serde(default)]
+    pub given_model_calls: u32,
 }
 
 pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
@@ -22,6 +28,8 @@ pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
     let mut steps = 0;
     let mut model_calls = 0;
     let mut children = 0;
+    let mut given_steps: u32 = 0;
+    let mut given_model_calls: u32 = 0;
 
     for event in events {
         match &event.payload {
@@ -37,7 +45,11 @@ pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
             } => {
                 model_calls += 1;
             }
-            EventPayload::ChildStarted { .. } => children += 1,
+            EventPayload::ChildStarted { limits, .. } => {
+                children += 1;
+                given_steps = given_steps.saturating_add(limits.max_steps);
+                given_model_calls = given_model_calls.saturating_add(limits.max_model_calls);
+            }
             _ => {}
         }
         dispatch = reduce_dispatch(dispatch, event);
@@ -52,6 +64,8 @@ pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
         steps,
         model_calls,
         children,
+        given_steps,
+        given_model_calls,
     }
 }
 
@@ -80,16 +94,22 @@ mod tests {
         vec![ev(spec, EventPayload::RunStarted), ev(spec, terminal)]
     }
 
-    // The children a run started are counted; a refused one is not.
+    // The children a run started are counted, with the budget each was
+    // given; a refused one is neither.
     #[test]
-    fn started_children_are_counted() {
+    fn started_children_and_their_budget_are_counted() {
         let spec = sample_spec();
         let child = |payload| ev(&spec, payload);
+        let given = |steps, calls| crate::Limits {
+            max_steps: steps,
+            max_model_calls: calls,
+        };
         let events = vec![
             ev(&spec, EventPayload::RunStarted),
             child(EventPayload::ChildStarted {
                 run_id: crate::RunId::new(),
                 agent_id: crate::AgentId::new(),
+                limits: given(3, 2),
             }),
             child(EventPayload::DelegateRefused {
                 agent_id: crate::AgentId::new(),
@@ -98,9 +118,12 @@ mod tests {
             child(EventPayload::ChildStarted {
                 run_id: crate::RunId::new(),
                 agent_id: crate::AgentId::new(),
+                limits: given(1, 1),
             }),
         ];
-        assert_eq!(fold(&spec, &events).children, 2);
+        let state = fold(&spec, &events);
+        assert_eq!(state.children, 2);
+        assert_eq!((state.given_steps, state.given_model_calls), (4, 3));
     }
 
     // A Complete that cannot finish the run (a tool call is outstanding) is a

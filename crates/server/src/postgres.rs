@@ -8,8 +8,8 @@ use serde_json::Value;
 use harness::StoreError;
 
 use crate::store::{
-    check_one_terminal, is_terminal, Append, PutAgent, RunStore, StoredAgent, StoredArtifact,
-    StoredRun,
+    check_one_terminal, is_terminal, Append, PutAgent, PutRun, RunStore, StoredAgent,
+    StoredArtifact, StoredRun,
 };
 
 /// The run store in Postgres over a pool of connections (C2, owner decision
@@ -291,7 +291,7 @@ impl RunStore for PostgresStore {
 
     /// One transaction: the run row, and its events only when the row is
     /// new, so a run already stored keeps its spec and events.
-    fn put_run(&self, run: StoredRun) -> Result<(), StoreError> {
+    fn put_run(&self, run: StoredRun) -> Result<PutRun, StoreError> {
         let spec = serde_json::to_value(&run.spec).map_err(json)?;
         let rows = EventRows::new(&run.events)?;
         let id = run.spec.run_id.as_uuid();
@@ -306,7 +306,12 @@ impl RunStore for PostgresStore {
             if inserted == 1 {
                 rows.insert(&mut tx, id, 0)?;
             }
-            tx.commit().map_err(sql)
+            tx.commit().map_err(sql)?;
+            Ok(if inserted == 1 {
+                PutRun::Stored
+            } else {
+                PutRun::Existed
+            })
         })
     }
 

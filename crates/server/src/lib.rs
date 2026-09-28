@@ -6,6 +6,7 @@ mod inference;
 mod local;
 mod postgres;
 mod queue;
+mod spawner;
 mod store;
 mod stores;
 mod surface;
@@ -27,8 +28,9 @@ pub use inference::{
 pub use local::LocalEchoFactory;
 pub use postgres::{PoolOptions, PostgresStore};
 pub use queue::{QueueTiming, RedisRunQueue};
+pub use spawner::OwnedSpawner;
 pub use store::{
-    is_terminal, AgentManifest, Append, InMemoryStore, PutAgent, RunStore, StoredAgent,
+    is_terminal, AgentManifest, Append, InMemoryStore, PutAgent, PutRun, RunStore, StoredAgent,
     StoredArtifact, StoredRun,
 };
 pub use stores::{stores_from_env, Stores};
