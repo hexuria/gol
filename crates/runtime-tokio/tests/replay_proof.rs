@@ -121,6 +121,61 @@ fn kill_mid_start_header_rewrites_it() {
 /// ceiling for a stuck child, not the expected time.
 const DEADLINE: Duration = Duration::from_secs(30);
 
+/// The agent the bin's spawning workflow starts.
+const CHILD: &str = "00000000-0000-4000-8000-00000000c41d";
+
+/// The request the bin's spawner records: parent, step, agent and input,
+/// which together name the child (`RunSpecBuilder::child_of`).
+const ASKED: &str =
+    "00000000-0000-4000-8000-0000000000aa 0 00000000-0000-4000-8000-00000000c41d draft\n";
+
+fn spawned() -> Record {
+    Record::AgentSpawned {
+        agent: CHILD.to_string(),
+    }
+}
+
+// Phase 1.3: killed after the spawner started the child and before
+// `AgentSpawned` is committed. The rerun asks the spawner again with the same
+// request, so the same child (the owned spawner returns the one it stored,
+// `a_redelivered_parent_starts_one_child`), and then commits once.
+#[test]
+fn kill_between_spawn_and_commit_asks_for_the_same_child() {
+    let dir = proof_dir("spawn-before-commit");
+    let started = start_frame();
+    let (log, effect, next) = kill_when(&dir, &["spawn-before-commit"], |log, effect, _next| {
+        effect == ASKED.as_bytes() && log == started.as_slice()
+    });
+    assert_eq!(effect, ASKED.as_bytes());
+    assert_eq!(log, started);
+    assert_eq!(next.len(), 0);
+
+    run_again_as(&dir, "run-spawn");
+
+    assert_eq!(read_file(&dir.join("effect")), ASKED.repeat(2).into_bytes());
+    assert_eq!(read_file(&dir.join("log")), journal_bytes(&[spawned()]));
+    assert_eq!(read_file(&dir.join("next")).len(), 1);
+}
+
+// Killed after `AgentSpawned` is committed: the rerun does not ask again.
+#[test]
+fn kill_after_spawn_commit_does_not_spawn_again() {
+    let dir = proof_dir("spawn-after-commit");
+    let committed = journal_bytes(&[spawned()]);
+    let (log, effect, next) = kill_when(&dir, &["spawn-after-commit"], |log, effect, _next| {
+        effect == ASKED.as_bytes() && log == committed.as_slice()
+    });
+    assert_eq!(effect, ASKED.as_bytes());
+    assert_eq!(log, committed);
+    assert_eq!(next.len(), 0);
+
+    run_again_as(&dir, "run-spawn");
+
+    assert_eq!(read_file(&dir.join("effect")), ASKED.as_bytes());
+    assert_eq!(read_file(&dir.join("log")), committed);
+    assert_eq!(read_file(&dir.join("next")).len(), 1);
+}
+
 fn proof_dir(case: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("gol-proof-{}-{}", std::process::id(), case));
     let _ = fs::remove_dir_all(&dir);
@@ -175,11 +230,15 @@ where
 }
 
 fn run_again(dir: &Path) {
+    run_again_as(dir, "run");
+}
+
+fn run_again_as(dir: &Path, mode: &str) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_replay_proof"))
         .arg(dir.join("log"))
         .arg(dir.join("effect"))
         .arg(dir.join("next"))
-        .arg("run")
+        .arg(mode)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

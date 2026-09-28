@@ -1,28 +1,42 @@
+use harness::{AgentSpawner, ChildRequest, StartedChild};
+use protocol::{AgentId, RunSpec};
 use workflow_core::{
-    spawn, History, Record, WaitCondition, WorkflowCommand, WorkflowContext, WorkflowDriver,
-    WorkflowStep,
+    spawn, AgentSpec, History, Record, WaitCondition, WorkflowCommand, WorkflowContext,
+    WorkflowDriver, WorkflowStep,
 };
 
 use crate::Journal;
 
+/// What a workflow's spawn did on this replay: the child the spawner started,
+/// or why it did not start one.
+pub type Spawned = Result<StartedChild, String>;
+
+/// Evaluates the workflow over its journal and carries out a single command.
+/// A spawn starts the named agent through `spawner` as a child of `parent`,
+/// the workflow's own run, and commits `AgentSpawned` only once the child is
+/// started; a refused spawn is not journaled, so the next replay asks again.
+/// A kill between the start and the commit asks again with the same request,
+/// which names the same child.
 pub fn replay(
     driver: &impl WorkflowDriver,
     ctx: &WorkflowContext,
     journal: &mut Journal,
+    parent: &RunSpec,
+    spawner: &dyn AgentSpawner,
     stand_in: &mut dyn FnMut() -> i64,
-) -> std::io::Result<(WorkflowStep, Option<protocol::RunState>)> {
+) -> std::io::Result<(WorkflowStep, Option<Spawned>)> {
     let history = journal.history()?;
     let step = driver.evaluate(ctx, &history);
-    let harness = match step.commands.as_slice() {
-        [command @ WorkflowCommand::SpawnAgent(spec)] if history.records.is_empty() => {
-            let state = on_command(command);
-            journal.commit(&Record::AgentSpawned {
-                agent: spec.agent.clone(),
-            })?;
-            state
+    let spawned = match step.commands.as_slice() {
+        [WorkflowCommand::SpawnAgent(agent)] => {
+            let started = start_child(parent, spawner, &history, agent);
+            if started.is_ok() {
+                journal.commit(&Record::AgentSpawned {
+                    agent: agent.agent.clone(),
+                })?;
+            }
+            Some(started)
         }
-        [WorkflowCommand::SpawnAgent(_)] => None,
-        [command] => on_command(command),
         _ => None,
     };
     if let [WorkflowCommand::ExecuteTool(tool)] = step.commands.as_slice() {
@@ -31,7 +45,31 @@ pub fn replay(
             journal.commit(&Record::counter(value))?;
         }
     }
-    Ok((step, harness))
+    Ok((step, spawned))
+}
+
+/// Starts `agent` as the child the spawn at the journal's end asks for. The
+/// workflow names its agent by id (decision 1.3-2A), and the child gets the
+/// parent's limits (1.3-3A).
+fn start_child(
+    parent: &RunSpec,
+    spawner: &dyn AgentSpawner,
+    history: &History,
+    agent: &AgentSpec,
+) -> Spawned {
+    let agent_id: AgentId = agent
+        .agent
+        .parse()
+        .map_err(|_| "no such agent".to_string())?;
+    let step = u32::try_from(history.records.len())
+        .map_err(|_| "the workflow journal is too long".to_string())?;
+    spawner.start(ChildRequest {
+        parent,
+        step,
+        agent_id,
+        input: &agent.input,
+        limits: parent.limits,
+    })
 }
 
 pub fn join_all(
@@ -84,40 +122,6 @@ pub fn join_all(
     Ok(())
 }
 
-fn on_command(command: &WorkflowCommand) -> Option<protocol::RunState> {
-    match command {
-        WorkflowCommand::SpawnAgent(_) => {
-            let mut driver = harness::Driver::boot(
-                protocol::RunSpec::builder()
-                    .owner(protocol::Owner::new("local", "runtime-tokio", "local"))
-                    .agent(protocol::AgentId::new(), "1")
-                    .input("hello")
-                    .placement(protocol::ExecutionPlacement::Local)
-                    .work_model(protocol::WorkModel {
-                        provider: protocol::ModelProvider::OpenAI,
-                        model_name: "gpt-test".to_string(),
-                        credential: protocol::CredentialSource::PlatformGateway,
-                    })
-                    .build(),
-            )
-            .unwrap();
-            let mut decider = harness::ScriptedDecider::new([protocol::Effect::Complete {
-                outcome: "done".to_string(),
-            }]);
-            harness::run_to_completion(
-                &mut driver,
-                &mut decider,
-                &[],
-                &harness::UnavailableModel,
-                &harness::InMemory::default(),
-            )
-            .unwrap();
-            Some(driver.state())
-        }
-        WorkflowCommand::ExecuteTool(_) | WorkflowCommand::Complete | WorkflowCommand::Fail => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{join_all, replay};
@@ -139,6 +143,33 @@ mod tests {
     }
 
     /// The bytes of a journal holding `records`.
+    /// The workflow's own run.
+    fn parent() -> protocol::RunSpec {
+        protocol::RunSpec::builder()
+            .owner(protocol::Owner::new("local", "runtime-tokio", "local"))
+            .agent(protocol::AgentId::new(), "1")
+            .input("hello")
+            .placement(protocol::ExecutionPlacement::Local)
+            .work_model(protocol::WorkModel {
+                provider: protocol::ModelProvider::OpenAI,
+                model_name: "gpt-test".to_string(),
+                credential: protocol::CredentialSource::PlatformGateway,
+            })
+            .build()
+    }
+
+    /// A spawner for workflows that spawn nothing.
+    struct NoSpawner;
+
+    impl harness::AgentSpawner for NoSpawner {
+        fn start(
+            &self,
+            _request: harness::ChildRequest<'_>,
+        ) -> Result<harness::StartedChild, String> {
+            panic!("this workflow spawns nothing")
+        }
+    }
+
     fn journal_bytes(records: &[Record]) -> Vec<u8> {
         let mut bytes = start_frame();
         for record in records {
@@ -163,7 +194,15 @@ mod tests {
         let driver = CounterBranch;
         let ctx = WorkflowContext;
 
-        let (first, first_harness) = replay(&driver, &ctx, &mut journal, &mut stand_in).unwrap();
+        let (first, first_harness) = replay(
+            &driver,
+            &ctx,
+            &mut journal,
+            &parent(),
+            &NoSpawner,
+            &mut stand_in,
+        )
+        .unwrap();
         assert!(first_harness.is_none());
         assert_eq!(calls.get(), 1);
         assert_eq!(
@@ -173,7 +212,15 @@ mod tests {
         assert_eq!(first.wait, WaitCondition::None);
         assert_eq!(read_path(&path), journal_bytes(&[Record::counter(0)]));
 
-        let (second, second_harness) = replay(&driver, &ctx, &mut journal, &mut stand_in).unwrap();
+        let (second, second_harness) = replay(
+            &driver,
+            &ctx,
+            &mut journal,
+            &parent(),
+            &NoSpawner,
+            &mut stand_in,
+        )
+        .unwrap();
         assert!(second_harness.is_none());
         assert_eq!(calls.get(), 1);
         assert_eq!(second.commands, [WorkflowCommand::Complete]);
@@ -237,18 +284,8 @@ mod tests {
     }
 
     #[test]
-    fn spawn_agent_calls_run_to_completion_once() {
-        let spec = protocol::RunSpec::builder()
-            .owner(protocol::Owner::new("local", "runtime-tokio", "local"))
-            .agent(protocol::AgentId::new(), "1")
-            .input("hello")
-            .placement(protocol::ExecutionPlacement::Local)
-            .work_model(protocol::WorkModel {
-                provider: protocol::ModelProvider::OpenAI,
-                model_name: "gpt-test".to_string(),
-                credential: protocol::CredentialSource::PlatformGateway,
-            })
-            .build();
+    fn only_a_spawn_starts_a_child() {
+        let spec = parent();
         let delegate = protocol::Effect::Delegate {
             agent_id: protocol::AgentId::new(),
             input: "child".to_string(),
@@ -262,7 +299,7 @@ mod tests {
         // `perform` does not authorize (the decide step does). Performing a
         // delegation directly, with no spawner configured, records it as
         // refused and starts nothing.
-        let mut denied = harness::Driver::boot(spec).unwrap();
+        let mut denied = harness::Driver::boot(spec.clone()).unwrap();
         let events_before = denied.events().len();
         let harness_before = denied.state().harness.clone();
         denied.perform(
@@ -299,70 +336,6 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("gol-host-{}-spawn", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("log");
-        let mut journal = Journal::open(&path).unwrap();
-        let spawned = Record::AgentSpawned {
-            agent: "child".to_string(),
-        };
-        let calls = Cell::new(0u32);
-        let mut stand_in = || {
-            calls.set(calls.get() + 1);
-            0i64
-        };
-        let (step, harness) = replay(
-            &Fixed {
-                command: WorkflowCommand::SpawnAgent(AgentSpec::new("child", "")),
-            },
-            &WorkflowContext,
-            &mut journal,
-            &mut stand_in,
-        )
-        .unwrap();
-        assert_eq!(calls.get(), 0);
-        assert_eq!(
-            read_path(&path),
-            journal_bytes(std::slice::from_ref(&spawned))
-        );
-        assert_eq!(
-            step.commands,
-            [WorkflowCommand::SpawnAgent(AgentSpec::new("child", ""))]
-        );
-        assert_eq!(step.wait, WaitCondition::None);
-        let state = harness.unwrap();
-        // The spawned agent only completes, and Complete is not a step.
-        assert_eq!(state.steps, 0);
-        assert_eq!(state.model_calls, 0);
-        assert_eq!(
-            state.harness,
-            protocol::HarnessState::Completed {
-                outcome: "done".to_string(),
-            }
-        );
-        assert_eq!(
-            state.dispatch,
-            protocol::DispatchPhase::Completed {
-                outcome: "done".to_string(),
-            }
-        );
-
-        let (again, again_harness) = replay(
-            &Fixed {
-                command: WorkflowCommand::SpawnAgent(AgentSpec::new("child", "")),
-            },
-            &WorkflowContext,
-            &mut journal,
-            &mut stand_in,
-        )
-        .unwrap();
-        assert!(again_harness.is_none(), "harness started twice");
-        assert_eq!(
-            again.commands,
-            [WorkflowCommand::SpawnAgent(AgentSpec::new("child", ""))]
-        );
-        assert_eq!(again.wait, WaitCondition::None);
-        assert_eq!(calls.get(), 0);
-        assert_eq!(read_path(&path), journal_bytes(&[spawned]));
-
         for command in [
             WorkflowCommand::ExecuteTool(ToolSpec::new("counter", "")),
             WorkflowCommand::ExecuteTool(ToolSpec::new("other", "")),
@@ -382,6 +355,8 @@ mod tests {
                 },
                 &WorkflowContext,
                 &mut case_journal,
+                &spec,
+                &NoSpawner,
                 &mut case_stand_in,
             )
             .unwrap();
@@ -414,6 +389,8 @@ mod tests {
             &CounterBranch,
             &WorkflowContext,
             &mut failed_journal,
+            &parent(),
+            &NoSpawner,
             &mut fail_stand_in,
         )
         .unwrap();
