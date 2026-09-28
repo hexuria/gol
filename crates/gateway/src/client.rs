@@ -32,6 +32,19 @@ fn default_base_url(provider: ModelProvider) -> &'static str {
     }
 }
 
+/// Whether `name` is a plain model id: letters, digits, `.`, `_`, `-`, and
+/// `:` except for Gemini, where the name is a URL path segment and a colon
+/// names the method (`models/{name}:generateContent`).
+fn is_model_id(provider: ModelProvider, name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '_' | '-')
+                || (c == ':' && provider != ModelProvider::Gemini)
+        })
+}
+
 impl GatewayClient<Missing, Missing, UreqTransport> {
     pub fn new() -> Self {
         Self::with_transport(UreqTransport::default())
@@ -82,7 +95,8 @@ impl<P, C, T> GatewayClient<P, C, T> {
 }
 
 impl<C, T> GatewayClient<Missing, C, T> {
-    /// Also resets the base URL to the provider's own host.
+    /// Also resets the base URL to the provider's own host, so a base URL is
+    /// set after the provider.
     pub fn provider(mut self, provider: ModelProvider) -> GatewayClient<Set, C, T> {
         self.provider = Some(provider);
         self.base_url = default_base_url(provider).to_string();
@@ -110,12 +124,17 @@ impl<T: HttpTransport> GatewayClient<Set, Set, T> {
         if request.provider != provider {
             return Err(GatewayError::UnsupportedProvider(request.provider));
         }
+        if !is_model_id(provider, &request.model_name) {
+            return Err(GatewayError::InvalidModelName(request.model_name.clone()));
+        }
         let key = match credential {
             CredentialSource::BringYourOwn { .. } => return Err(GatewayError::BringYourOwn),
+            // A key with a control character (a line break) would split
+            // the request's headers.
             CredentialSource::PlatformGateway => self
                 .api_key
                 .as_deref()
-                .filter(|key| !key.is_empty())
+                .filter(|key| !key.is_empty() && !key.chars().any(char::is_control))
                 .ok_or(GatewayError::NotConfigured(provider))?,
         };
         let base = self.base_url.trim_end_matches('/');

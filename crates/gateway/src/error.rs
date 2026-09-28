@@ -11,6 +11,9 @@ pub enum GatewayError {
     /// A bring-your-own credential: the server cannot resolve its secret
     /// (decision 22A).
     BringYourOwn,
+    /// A model name that is not a plain model id. It goes into the request,
+    /// for Gemini into the URL path, so it is refused before any HTTP.
+    InvalidModelName(String),
     Transport(String),
     Malformed(String),
 }
@@ -27,6 +30,7 @@ impl fmt::Display for GatewayError {
                     "no platform key or base URL is configured for {provider:?}"
                 )
             }
+            Self::InvalidModelName(name) => write!(f, "not a model id: {name:?}"),
             Self::BringYourOwn => {
                 f.write_str("bring-your-own credentials are not supported for server runs")
             }

@@ -155,6 +155,98 @@ fn a_provider_that_does_not_answer_times_out() {
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 
+// Review of #70: a model name goes into the request (for Gemini, into the
+// URL path), and whoever creates a run chooses it. A name that is not a
+// plain model id is refused before any HTTP, so the platform's key is never
+// sent to a path the caller picked.
+#[test]
+fn a_model_name_that_is_not_an_id_is_refused_before_http() {
+    for kind in PROVIDERS {
+        for name in [
+            "../tunedModels/x",
+            "x#",
+            "x?key=1",
+            "a/b",
+            "",
+            "x y",
+            "x\ny",
+        ] {
+            let error = GatewayClient::with_transport(NoHttp)
+                .provider(kind)
+                .credential(CredentialSource::PlatformGateway)
+                .api_key("key-test")
+                .base_url("http://127.0.0.1:9")
+                .complete(&ModelRequest {
+                    provider: kind,
+                    model_name: name.to_string(),
+                    prompt: "ping".to_string(),
+                })
+                .expect_err("refused");
+            assert!(
+                matches!(error, GatewayError::InvalidModelName(_)),
+                "{kind:?} {name:?}: {error}"
+            );
+        }
+    }
+}
+
+// For Gemini the name is a path segment followed by `:generateContent`, so a
+// colon in it would name another method.
+#[test]
+fn a_gemini_model_name_with_a_colon_is_refused() {
+    let error = GatewayClient::with_transport(NoHttp)
+        .provider(ModelProvider::Gemini)
+        .credential(CredentialSource::PlatformGateway)
+        .api_key("key-test")
+        .complete(&ModelRequest {
+            provider: ModelProvider::Gemini,
+            model_name: "x:streamGenerateContent".to_string(),
+            prompt: "ping".to_string(),
+        })
+        .expect_err("refused");
+    assert!(
+        matches!(error, GatewayError::InvalidModelName(_)),
+        "{error}"
+    );
+}
+
+// A key with a line break would split the request's headers.
+#[test]
+fn a_key_with_a_line_break_is_refused_before_http() {
+    for key in ["key\r\nx-evil: 1", "key\n", "\rkey"] {
+        let error = GatewayClient::with_transport(NoHttp)
+            .provider(ModelProvider::Anthropic)
+            .credential(CredentialSource::PlatformGateway)
+            .api_key(key)
+            .complete(&request(ModelProvider::Anthropic))
+            .expect_err("refused");
+        assert!(matches!(error, GatewayError::NotConfigured(_)), "{key:?}");
+    }
+}
+
+// A provider's error says why the call failed; its start is kept.
+#[test]
+fn a_providers_error_body_is_kept_in_the_error() {
+    let (route, _, _) = case(ModelProvider::Anthropic, "");
+    let mock = provider(
+        route,
+        None,
+        ResponseTemplate::new(529).set_body_string("overloaded_error: try again later"),
+    );
+    let error = GatewayClient::new()
+        .provider(ModelProvider::Anthropic)
+        .credential(CredentialSource::PlatformGateway)
+        .api_key("key-test")
+        .base_url(&mock.uri)
+        .complete(&request(ModelProvider::Anthropic))
+        .expect_err("status error");
+    let message = error.to_string();
+    assert!(matches!(error, GatewayError::Transport(_)));
+    assert!(message.contains("529"), "{message}");
+    assert!(message.contains("overloaded_error"), "{message}");
+    assert!(!message.contains("key-test"), "{message}");
+}
+
 /// A provider mocked on a thread of its own: requests to `route` carrying
 /// `auth` get `response`. Returns the server's URI and a stop handle.
 struct Provider {
