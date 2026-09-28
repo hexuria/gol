@@ -32,7 +32,8 @@ struct AppState {
     store: Arc<dyn RunStore>,
     memory: Arc<dyn Memory>,
     jev_base_url: String,
-    redis_url: Option<String>,
+    /// The run queue, one connection shared by every request.
+    queue: Option<Arc<RedisRunQueue>>,
     poster: SharedPoster,
     sandbox: Arc<dyn SandboxHost>,
     auth: Arc<dyn Authenticator>,
@@ -218,7 +219,7 @@ fn router_with_parts(
             store,
             memory,
             jev_base_url: jev_base_url.into(),
-            redis_url,
+            queue: redis_url.map(|url| Arc::new(RedisRunQueue::open(url))),
             poster,
             sandbox,
             auth,
@@ -331,7 +332,7 @@ async fn create_run(
         },
         agent.manifest.required_capabilities,
     )?;
-    if let Some(url) = state.redis_url.clone() {
+    if let Some(queue) = state.queue.clone() {
         // Created and queued are on the record before the push, so a worker
         // that takes the run finds them (C4). The store, the push and a
         // failed push's RunFailed are one blocking task: it runs to its end
@@ -360,7 +361,7 @@ async fn create_run(
                 }
                 return Err(ApiError::from(error));
             }
-            RedisRunQueue::open(url).push(run_id).map_err(|error| {
+            queue.push(run_id).map_err(|error| {
                 // The run is stored but will never be picked up: end it, so it is
                 // not left open.
                 let failed = run_failed_event(

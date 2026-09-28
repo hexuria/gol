@@ -64,7 +64,7 @@ local id = redis.call('LMOVE', KEYS[1], KEYS[2], 'RIGHT', 'LEFT')
 if not id then return false end
 if not redis.call('SET', ARGV[1] .. id, ARGV[2], 'NX', 'PX', ARGV[3]) then
   redis.call('LREM', KEYS[2], 1, id)
-  return ''
+  return false
 end
 return id
 ";
@@ -74,12 +74,14 @@ const START: &str = r"
 return redis.call('HINCRBY', KEYS[1], ARGV[1], 1)
 ";
 
-/// Hands a claim back: ARGV[1] off processing and back to the front of the
-/// runs list, and its lease KEYS[2] released if ARGV[2] holds it.
+/// Hands a claim back while ARGV[2] still holds its lease KEYS[2]: ARGV[1]
+/// off processing, onto the back of the runs list, and the lease released.
+/// A claim whose lease another worker holds now changes nothing: its entry
+/// in processing is the new holder's.
 const RELEASE: &str = r"
-redis.call('LREM', KEYS[1], 1, ARGV[1])
-redis.call('RPUSH', KEYS[3], ARGV[1])
 if redis.call('GET', KEYS[2]) == ARGV[2] then
+  redis.call('LREM', KEYS[1], 1, ARGV[1])
+  redis.call('LPUSH', KEYS[3], ARGV[1])
   redis.call('DEL', KEYS[2])
 end
 return 1
@@ -192,7 +194,7 @@ impl RedisRunQueue {
                 .arg(millis(lease))
                 .invoke(connection)
         })?;
-        let Some(text) = claimed.filter(|text| !text.is_empty()) else {
+        let Some(text) = claimed else {
             return Ok(None);
         };
         match parse(&text) {
@@ -214,8 +216,10 @@ impl RedisRunQueue {
         })
     }
 
-    /// Hands `id` back to the front of the queue, without waiting for its
-    /// lease to run out: for a claim that could not load its run.
+    /// Hands `id` back to the back of the queue, without waiting for its
+    /// lease to run out, if `token` still holds the lease: for a claim that
+    /// could not load or start its run. Behind the other runs, a run that
+    /// cannot be loaded does not hold up the queue.
     pub fn release(&self, id: RunId, token: &str) -> Result<(), String> {
         self.with_connection(|connection| {
             Script::new(RELEASE)
@@ -327,7 +331,7 @@ fn connect(url: &str) -> redis::RedisResult<redis::Connection> {
     let client = redis::Client::open(url)?;
     let (sent, received) = std::sync::mpsc::channel();
     std::thread::Builder::new()
-        .name("gol-redis-connect".to_string())
+        .name("gol-redis-conn".to_string())
         .spawn(move || {
             let connection =
                 client

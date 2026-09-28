@@ -486,3 +486,195 @@ fn a_malformed_entry_is_dropped() {
     assert!(processing.is_empty(), "{processing:?}");
     assert_eq!(setup.queue.queued().expect("queued"), [setup.run_id]);
 }
+
+/// The in-memory store, except that the first read of a run waits at a gate
+/// and then fails, like a load on a connection that hung and timed out.
+struct FirstLoadHangsThenFails {
+    inner: InMemoryStore,
+    hung: std::sync::Mutex<bool>,
+    entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    gate: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl RunStore for FirstLoadHangsThenFails {
+    fn put_agent(&self, agent: server::StoredAgent) -> Result<server::PutAgent, StoreError> {
+        self.inner.put_agent(agent)
+    }
+    fn agent(&self, id: AgentId) -> Result<Option<server::StoredAgent>, StoreError> {
+        self.inner.agent(id)
+    }
+    fn put_run(&self, run: StoredRun) -> Result<(), StoreError> {
+        self.inner.put_run(run)
+    }
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
+        self.inner.append_events(id, events)
+    }
+    fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {
+        let first = !std::mem::replace(&mut *self.hung.lock().unwrap(), true);
+        if first {
+            let entered = self.entered.lock().unwrap().take().expect("entered");
+            let gate = self.gate.lock().unwrap().take().expect("gate");
+            entered.send(()).expect("enter");
+            gate.recv().expect("gate");
+            return Err(StoreError::new("the connection hung, then timed out"));
+        }
+        self.inner.run(id)
+    }
+    fn put_artifact(&self, artifact: server::StoredArtifact) -> Result<(), StoreError> {
+        self.inner.put_artifact(artifact)
+    }
+    fn artifact(
+        &self,
+        id: protocol::ArtifactId,
+    ) -> Result<Option<server::StoredArtifact>, StoreError> {
+        self.inner.artifact(id)
+    }
+}
+
+// The counterexample formal/runqueue finds for an unguarded release, forced:
+// A's load outlasts its lease; the reaper hands the run back and B claims and
+// opens it; A's load then fails. A's release must leave B's claim alone, so
+// when B dies the reaper still finds the run and hands it back.
+#[test]
+fn a_late_release_leaves_the_new_holders_claim() {
+    let (entered, entered_rx) = std::sync::mpsc::channel();
+    let (gate, gate_rx) = std::sync::mpsc::channel();
+    let store = Arc::new(FirstLoadHangsThenFails {
+        inner: InMemoryStore::default(),
+        hung: std::sync::Mutex::new(false),
+        entered: std::sync::Mutex::new(Some(entered)),
+        gate: std::sync::Mutex::new(Some(gate_rx)),
+    });
+    let setup = queued_run_in(store);
+    let a = worker(&setup, "http://127.0.0.1:9");
+    let b = worker(&setup, "http://127.0.0.1:9");
+    let c = worker(&setup, "http://127.0.0.1:9");
+    std::thread::scope(|scope| {
+        let a_work = scope.spawn(|| a.work_one());
+        entered_rx.recv().expect("A is inside its load");
+        std::thread::sleep(quick().lease * 2);
+        assert_eq!(setup.queue.reap().expect("reap"), [setup.run_id]);
+        let b_claim = b.claim().expect("claim").expect("B claims the reaped run");
+        let Prepared::Open(b_open) = b_claim.prepare().expect("prepare") else {
+            panic!("the run is open");
+        };
+        gate.send(()).expect("fail A's load");
+        assert!(a_work.join().expect("A").is_err());
+        assert_eq!(
+            setup.queue.processing().expect("processing"),
+            [setup.run_id]
+        );
+        assert_eq!(setup.queue.queued().expect("queued"), []);
+        assert!(c.claim().expect("claim").is_none(), "nothing to claim");
+        drop(b_open);
+    });
+    std::thread::sleep(quick().lease * 2);
+    assert_eq!(setup.queue.reap().expect("reap"), [setup.run_id]);
+}
+
+/// The in-memory store, except that one run can never be loaded.
+struct OneUnloadable {
+    inner: InMemoryStore,
+    bad: RunId,
+}
+
+impl RunStore for OneUnloadable {
+    fn put_agent(&self, agent: server::StoredAgent) -> Result<server::PutAgent, StoreError> {
+        self.inner.put_agent(agent)
+    }
+    fn agent(&self, id: AgentId) -> Result<Option<server::StoredAgent>, StoreError> {
+        self.inner.agent(id)
+    }
+    fn put_run(&self, run: StoredRun) -> Result<(), StoreError> {
+        self.inner.put_run(run)
+    }
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
+        self.inner.append_events(id, events)
+    }
+    fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {
+        if id == self.bad {
+            return Err(StoreError::new("json: the stored run does not decode"));
+        }
+        self.inner.run(id)
+    }
+    fn put_artifact(&self, artifact: server::StoredArtifact) -> Result<(), StoreError> {
+        self.inner.put_artifact(artifact)
+    }
+    fn artifact(
+        &self,
+        id: protocol::ArtifactId,
+    ) -> Result<Option<server::StoredArtifact>, StoreError> {
+        self.inner.artifact(id)
+    }
+}
+
+// A run that can never be loaded goes to the back of the queue each time,
+// so the runs queued behind it still run.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unloadable_run_does_not_hold_up_the_queue() {
+    let jev = jev(Duration::ZERO).await;
+    let uri = jev.uri();
+    blocking(move || {
+        let bad = spec();
+        let store = Arc::new(OneUnloadable {
+            inner: InMemoryStore::default(),
+            bad: bad.run_id,
+        });
+        let setup = queued_run_in(store.clone());
+        let bad_setup = Setup {
+            queue: RedisRunQueue::with_key(REDIS_URL, &setup.key),
+            store: store.clone(),
+            run_id: bad.run_id,
+            key: setup.key.clone(),
+        };
+        // The unloadable run is the oldest: the first a claim takes.
+        store
+            .inner
+            .put_run(StoredRun {
+                events: queued_events(&bad),
+                spec: bad,
+            })
+            .expect("put run");
+        let good: Vec<RunId> = (0..3)
+            .map(|_| {
+                let spec = spec();
+                let run_id = spec.run_id;
+                store
+                    .put_run(StoredRun {
+                        events: queued_events(&spec),
+                        spec,
+                    })
+                    .expect("put run");
+                run_id
+            })
+            .collect();
+        let pushes: Vec<RunId> = std::iter::once(setup.run_id)
+            .chain(good.iter().copied())
+            .collect();
+        redis_rpush(&setup.key, bad_setup.run_id);
+        for run_id in pushes.iter().skip(1) {
+            setup.queue.push(*run_id).expect("push");
+        }
+        let worker = worker(&setup, &uri);
+        for _ in 0..8 {
+            let _ = worker.work_one();
+        }
+        for run_id in pushes {
+            assert_eq!(terminals(setup.store.as_ref(), run_id).len(), 1, "{run_id}");
+        }
+        assert_eq!(setup.queue.queued().expect("queued"), [bad_setup.run_id]);
+    });
+}
+
+/// Puts `id` at the claiming end of the queue under `key`: the oldest run.
+fn redis_rpush(key: &str, id: RunId) {
+    let mut redis = redis::Client::open(REDIS_URL)
+        .expect("client")
+        .get_connection()
+        .expect("connect");
+    redis::cmd("RPUSH")
+        .arg(format!("{{{key}}}"))
+        .arg(id.to_string())
+        .query::<()>(&mut redis)
+        .expect("push");
+}

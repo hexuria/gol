@@ -238,8 +238,8 @@ impl<'a> Claim<'a> {
     /// Loads the run. A run whose log ended, or that is not stored, needs
     /// nothing more. An open run counts a start; one started more than
     /// `max_deliveries` times is failed instead of run again. A run that
-    /// cannot be loaded (the store is down) is handed straight back to the
-    /// front of the queue, and does not count.
+    /// cannot be loaded or started is handed straight back to the back of
+    /// the queue, and does not count.
     pub fn prepare(self) -> Result<Prepared<'a>, String> {
         let worker = self.worker;
         let run_id = self.run_id();
@@ -269,7 +269,15 @@ impl<'a> Claim<'a> {
                 recorded: None,
             }));
         }
-        let starts = worker.queue.start(run_id)?;
+        let starts = match worker.queue.start(run_id) {
+            Ok(starts) => starts,
+            Err(error) => {
+                if let Err(release) = worker.queue.release(run_id, &self.token) {
+                    eprintln!("gol: queue worker: release run {run_id}: {release}");
+                }
+                return Err(format!("start run {run_id}: {error}"));
+            }
+        };
         if starts > worker.timing.max_deliveries {
             let before = starts - 1;
             let failed = run_failed_event(
@@ -306,7 +314,7 @@ impl<'a> Open<'a> {
         let events = std::thread::scope(|scope| {
             let (stop, stopped) = mpsc::channel::<()>();
             std::thread::Builder::new()
-                .name(format!("gol-heartbeat-{}", claim.run_id()))
+                .name("gol-heartbeat".to_string())
                 .spawn_scoped(scope, move || claim.heartbeat(&stopped))
                 .expect("spawn the heartbeat thread");
             let mut events = dispatch_events(spec);

@@ -48,7 +48,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install TLA+ tools
         run: ./scripts/install-tla.sh
-      - name: RunQueue with three workers, two runs, two crashes and two slow leases
+      - name: RunQueue with three workers, two runs, two crashes, two slow leases and two releases
         working-directory: formal/runqueue
         run: |
           cat > "$RUNNER_TEMP/RunQueueNightly.cfg" <<'CFG'
@@ -59,6 +59,7 @@ jobs:
             Runs = {"r1", "r2"}
             MaxCrashes = 2
             MaxSlow = 2
+            MaxReleases = 2
           INVARIANT TypeOK
           INVARIANT NoOrphan
           INVARIANT AckAfterTerminal
