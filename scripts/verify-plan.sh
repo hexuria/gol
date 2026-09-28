@@ -199,7 +199,7 @@ SELF_TEST = [
     ("new append in a helper crate", {"crates/memory/src/lib.rs": (["    store.append_events(id, events);"], [])}, {"T0", "T2"}),
     ("delete a sandbox destroy", {"crates/server/src/sandbox.rs": ([], ["        sandbox.destroy(&name)?;"])}, {"T0", "T2"}),
     ("redis consumer with a lease", {"crates/execution/src/queue.rs": (['    let id: Option<String> = cmd("BLMOVE").query(conn)?;', "    const LEASE_TTL: u64 = 30;"], [])}, {"T0", "T3"}),
-    ("journal commit order", {"crates/runtime-tokio/src/journal.rs": (["    file.write_all(&record)?;"], [])}, {"T0", "T4"}),
+    ("journal commit order", {"crates/runtime-tokio/src/journal.rs": (["        if let Err(error) = self.file.write_all(frame) {"], [])}, {"T0", "T4"}),
     ("unsafe in the bend scanner", {"crates/workflow-bend/src/boundary.rs": (["    let b = unsafe { *bytes.get_unchecked(i) };"], [])}, {"T0", "T6", "T7", "T9"}),
     ("atomic cancel flag in the driver", {"crates/harness/src/driver.rs": (["    cancel: AtomicBool,"], [])}, {"T0", "T1", "T8"}),
     ("a method named is_terminal", {"crates/protocol/tests/probe.rs": (["    if state.is_terminal() {"], [])}, {"T0"}),

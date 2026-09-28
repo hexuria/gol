@@ -427,9 +427,9 @@ impl RunStore for ReadsFail {
     }
 }
 
-// A claim that cannot load its run hands it straight back to the front of
-// the queue, releases its lease, and counts no start: an outage of the store
-// does not use up a run's starts.
+// A claim that cannot load its run queues it again, behind the other runs,
+// releases its lease, and counts no start: an outage of the store does not
+// use up a run's starts.
 #[test]
 fn a_load_error_releases_the_claim_without_counting() {
     let setup = queued_run_in(Arc::new(ReadsFail(InMemoryStore::default())));

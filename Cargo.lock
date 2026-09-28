@@ -2712,8 +2712,10 @@ dependencies = [
 name = "runtime-tokio"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "harness",
  "harness-core",
+ "proptest",
  "protocol",
  "tokio",
  "workflow-core",

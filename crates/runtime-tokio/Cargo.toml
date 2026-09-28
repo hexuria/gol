@@ -10,3 +10,7 @@ harness-core = { path = "../harness-core" }
 harness = { path = "../harness" }
 protocol = { path = "../protocol" }
 tokio = { version = "1", default-features = false }
+crc32fast = "1.5.2"
+
+[dev-dependencies]
+proptest = "1.11.0"
