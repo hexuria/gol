@@ -534,6 +534,14 @@ async fn redis_push_failure_does_not_run_the_harness() {
             stored.events.as_slice(),
             [
                 protocol::Event {
+                    payload: EventPayload::RunCreated,
+                    ..
+                },
+                protocol::Event {
+                    payload: EventPayload::RunQueued,
+                    ..
+                },
+                protocol::Event {
                     payload: EventPayload::UserMessage { text },
                     ..
                 },
