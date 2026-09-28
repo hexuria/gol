@@ -653,6 +653,41 @@ pub fn user_message_event(spec: &RunSpec) -> Event {
     )
 }
 
+/// A `payload` event from the system, for `spec`'s run.
+fn system_event(spec: &RunSpec, payload: EventPayload) -> Event {
+    Event::record(
+        EventSource::new(
+            spec.run_id,
+            spec.agent_id,
+            &spec.agent_version,
+            Actor::System,
+            Timestamp::now(),
+        ),
+        payload,
+    )
+}
+
+/// What the Redis path of `POST /v1/runs` stores before it pushes the run:
+/// created, queued, and the user's message.
+pub fn queued_events(spec: &RunSpec) -> Vec<Event> {
+    vec![
+        system_event(spec, EventPayload::RunCreated),
+        system_event(spec, EventPayload::RunQueued),
+        user_message_event(spec),
+    ]
+}
+
+/// What a worker records ahead of the harness's events: the queued run is
+/// scheduled, provisioned and starting, so the driver's `RunStarted` takes
+/// dispatch to `Running`.
+pub(crate) fn dispatch_events(spec: &RunSpec) -> Vec<Event> {
+    vec![
+        system_event(spec, EventPayload::RunScheduled),
+        system_event(spec, EventPayload::RunProvisioning),
+        system_event(spec, EventPayload::RunStarting),
+    ]
+}
+
 /// The terminal event for a run the server could not finish. Appending it ends
 /// the run, so a failure never leaves the run open.
 pub fn run_failed_event(spec: &RunSpec, class: FailureClass, message: String) -> Event {

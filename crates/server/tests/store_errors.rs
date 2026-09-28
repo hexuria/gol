@@ -386,3 +386,99 @@ fn no_database_url_does_not_read_the_pool_size() {
         assert!(stores.runs.run(RunId::new()).expect("store").is_none());
     }
 }
+
+fn env_of(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+// GOL_REDIS_URL turns the queue on, with GOL_WORKERS workers (2 by default,
+// at most 256); unset or empty, there is no queue. The queue needs
+// GOL_DATABASE_URL, and a worker count out of range refuses to start.
+#[test]
+fn the_queue_comes_from_the_environment() {
+    use server::{queue_from_env, QueueSettings};
+    let redis = ("GOL_REDIS_URL", "redis://127.0.0.1/");
+    let database = ("GOL_DATABASE_URL", "postgres://gol:gol@127.0.0.1/gol");
+    assert_eq!(queue_from_env(&env_of(&[])), Ok(None));
+    assert_eq!(queue_from_env(&env_of(&[("GOL_REDIS_URL", "")])), Ok(None));
+    assert_eq!(
+        queue_from_env(&env_of(&[redis, database])),
+        Ok(Some(QueueSettings {
+            redis_url: "redis://127.0.0.1/".to_string(),
+            workers: 2
+        }))
+    );
+    assert_eq!(
+        queue_from_env(&env_of(&[redis, database, ("GOL_WORKERS", "5")]))
+            .map(|queue| queue.map(|queue| queue.workers)),
+        Ok(Some(5))
+    );
+    for count in ["0", "x", "-1", "257"] {
+        let error =
+            queue_from_env(&env_of(&[redis, database, ("GOL_WORKERS", count)])).expect_err(count);
+        assert!(error.contains("GOL_WORKERS"), "{error}");
+    }
+    for without in [vec![redis], vec![redis, ("GOL_DATABASE_URL", "")]] {
+        let error = queue_from_env(&env_of(&without)).expect_err("no database");
+        assert!(error.contains("GOL_DATABASE_URL"), "{error}");
+    }
+}
+
+// A Redis that accepts a connection and never answers does not hang the
+// caller: the handshake has a deadline, and the call fails.
+#[test]
+fn a_silent_redis_fails_instead_of_hanging() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let held = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+    let queue = server::RedisRunQueue::open(format!("redis://127.0.0.1:{port}/"));
+    let started = std::time::Instant::now();
+    let answered = queue.ping();
+    let waited = started.elapsed();
+    assert!(answered.is_err(), "{answered:?}");
+    assert!(
+        waited < std::time::Duration::from_secs(8),
+        "waited {waited:?}"
+    );
+    drop(held);
+}
+
+// Concurrent calls on one queue against a Redis that accepts and never
+// answers each fail within about one connect deadline: none waits behind
+// another's connect.
+#[test]
+fn concurrent_calls_to_a_silent_redis_do_not_queue_up() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            held.push(stream);
+        }
+    });
+    let queue = std::sync::Arc::new(server::RedisRunQueue::open(format!(
+        "redis://127.0.0.1:{port}/"
+    )));
+    let started = std::time::Instant::now();
+    let calls: Vec<_> = (0..4)
+        .map(|_| {
+            let queue = queue.clone();
+            std::thread::spawn(move || (queue.push(protocol::RunId::new()), started.elapsed()))
+        })
+        .collect();
+    for call in calls {
+        let (pushed, waited) = call.join().expect("call");
+        assert!(pushed.is_err(), "{pushed:?}");
+        assert!(
+            waited < std::time::Duration::from_secs(8),
+            "waited {waited:?}"
+        );
+    }
+    // Right after, a call fails at once.
+    let again = std::time::Instant::now();
+    assert!(queue.ping().is_err());
+    assert!(again.elapsed() < std::time::Duration::from_secs(1));
+}

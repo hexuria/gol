@@ -32,7 +32,8 @@ struct AppState {
     store: Arc<dyn RunStore>,
     memory: Arc<dyn Memory>,
     jev_base_url: String,
-    redis_url: Option<String>,
+    /// The run queue, one connection shared by every request.
+    queue: Option<Arc<RedisRunQueue>>,
     poster: SharedPoster,
     sandbox: Arc<dyn SandboxHost>,
     auth: Arc<dyn Authenticator>,
@@ -171,10 +172,13 @@ pub fn router_with_sandbox(
 
 /// The server's router: runs in `store`, and every run's memory in `memory`,
 /// shared across runs so agent, user and organization memory outlive a run.
+/// With `redis_url`, `POST /v1/runs` queues the run for the workers instead
+/// of running it.
 pub fn router_with_memory(
     store: Arc<dyn RunStore>,
     memory: Arc<dyn Memory>,
     jev_base_url: impl Into<String>,
+    redis_url: Option<String>,
     poster: Arc<dyn GatewayPoster>,
     auth: Arc<dyn Authenticator>,
 ) -> Router {
@@ -182,7 +186,7 @@ pub fn router_with_memory(
         store,
         memory,
         jev_base_url,
-        None,
+        redis_url,
         poster,
         sandbox_from_env(),
         auth,
@@ -215,7 +219,7 @@ fn router_with_parts(
             store,
             memory,
             jev_base_url: jev_base_url.into(),
-            redis_url,
+            queue: redis_url.map(|url| Arc::new(RedisRunQueue::open(url))),
             poster,
             sandbox,
             auth,
@@ -328,25 +332,36 @@ async fn create_run(
         },
         agent.manifest.required_capabilities,
     )?;
-    if let Some(url) = state.redis_url.clone() {
-        let message = crate::inference::user_message_event(&spec);
-        let store = state.store.clone();
-        let spec_for_store = spec.clone();
-        let message_for_store = message.clone();
-        tokio::task::spawn_blocking(move || {
-            store.put_run(StoredRun {
-                spec: spec_for_store,
-                events: vec![message_for_store],
-            })
-        })
-        .await
-        .map_err(|error| ApiError::Decider(error.to_string()))?
-        .map_err(ApiError::from)?;
-        let run_id = spec.run_id;
+    if let Some(queue) = state.queue.clone() {
+        // Created and queued are on the record before the push, so a worker
+        // that takes the run finds them (C4). The store, the push and a
+        // failed push's RunFailed are one blocking task: it runs to its end
+        // even if the client goes away, so no run is stored and left
+        // unqueued.
+        let queued = crate::inference::queued_events(&spec);
         let store = state.store.clone();
         let spec_for_queue = spec.clone();
+        let queued_for_store = queued.clone();
         tokio::task::spawn_blocking(move || {
-            RedisRunQueue::open(url).push(run_id).map_err(|error| {
+            let run_id = spec_for_queue.run_id;
+            if let Err(error) = store.put_run(StoredRun {
+                spec: spec_for_queue.clone(),
+                events: queued_for_store,
+            }) {
+                // The put may have committed before it failed: end the run in
+                // case it did, so it is not left queued and never pushed. A
+                // store that holds no such run refuses the append.
+                let failed = run_failed_event(
+                    &spec_for_queue,
+                    FailureClass::Infrastructure,
+                    "store unavailable".to_string(),
+                );
+                if let Err(store_error) = store.append_events(run_id, vec![failed]) {
+                    eprintln!("gol: could not end run {run_id}: {store_error}");
+                }
+                return Err(ApiError::from(error));
+            }
+            queue.push(run_id).map_err(|error| {
                 // The run is stored but will never be picked up: end it, so it is
                 // not left open.
                 let failed = run_failed_event(
@@ -357,13 +372,12 @@ async fn create_run(
                 if let Err(store_error) = store.append_events(run_id, vec![failed]) {
                     eprintln!("gol: could not end run {run_id}: {store_error}");
                 }
-                error
+                ApiError::Decider(error)
             })
         })
         .await
-        .map_err(|error| ApiError::Decider(error.to_string()))?
-        .map_err(ApiError::Decider)?;
-        return Ok(Json(fold(&spec, &[message])));
+        .map_err(|error| ApiError::Decider(error.to_string()))??;
+        return Ok(Json(fold(&spec, &queued)));
     }
 
     let jev_base_url = state.jev_base_url.clone();
@@ -380,26 +394,7 @@ async fn create_run(
                 events: vec![message],
             })
             .map_err(RunStartError::Store)?;
-        let (mut events, outcome) =
-            run_with_jev(&jev_base_url, spec_for_run.clone(), memory.as_ref());
-        // A run that could not finish still keeps what the harness did, and ends
-        // failed instead of being left open.
-        if let Err(error) = &outcome {
-            let (class, message) = match error {
-                RunStartError::Unsupported(placement) => (
-                    FailureClass::Environment,
-                    format!("unsupported placement: {placement:?}"),
-                ),
-                RunStartError::Decider(message) => {
-                    (FailureClass::Dependency, format!("decider: {message}"))
-                }
-                RunStartError::Store(_) => (
-                    FailureClass::Infrastructure,
-                    "store unavailable".to_string(),
-                ),
-            };
-            events.push(run_failed_event(&spec_for_run, class, message));
-        }
+        let (events, outcome) = harness_events(&jev_base_url, &spec_for_run, memory.as_ref());
         // Append, never overwrite: anything stored while Jev ran stays. When the
         // run is already terminal the store keeps its log and refuses these.
         store_for_run
@@ -625,6 +620,34 @@ async fn get_ui(
     Ok(Json(json_render_spec(&stored.spec.input, &outcome)))
 }
 
+/// Runs the harness with Jev and returns the events to record: what the
+/// harness did, and when it could not finish, the `RunFailed` that ends the
+/// run instead of leaving it open.
+pub(crate) fn harness_events(
+    jev_base_url: &str,
+    spec: &RunSpec,
+    memory: &dyn Memory,
+) -> (Vec<Event>, Result<(), RunStartError>) {
+    let (mut events, outcome) = run_with_jev(jev_base_url, spec.clone(), memory);
+    if let Err(error) = &outcome {
+        let (class, message) = match error {
+            RunStartError::Unsupported(placement) => (
+                FailureClass::Environment,
+                format!("unsupported placement: {placement:?}"),
+            ),
+            RunStartError::Decider(message) => {
+                (FailureClass::Dependency, format!("decider: {message}"))
+            }
+            RunStartError::Store(_) => (
+                FailureClass::Infrastructure,
+                "store unavailable".to_string(),
+            ),
+        };
+        events.push(run_failed_event(spec, class, message));
+    }
+    (events, outcome)
+}
+
 /// Runs the harness with Jev and returns every event it recorded, with how the
 /// run ended. On an error the events are still returned: they are what the
 /// harness did before it stopped.
@@ -665,7 +688,7 @@ fn jev_client(base_url: &str) -> Result<typesafe_sdk::blocking::Client, String> 
         .map_err(|error| error.to_string())
 }
 
-enum RunStartError {
+pub(crate) enum RunStartError {
     Unsupported(ExecutionPlacement),
     Decider(String),
     Store(StoreError),

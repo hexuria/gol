@@ -19,6 +19,15 @@ Runs and memory are kept in the process unless `GOL_DATABASE_URL` names a Postgr
 - It connects without TLS, so keep the database on a private network.
 - Memory bounds a lock wait at 5 s and a statement at 10 s unless the URL, role or database sets its own. Behind a transaction-mode pooler, set them on the role.
 
+`GOL_REDIS_URL` queues runs instead of running them inside `POST /v1/runs`:
+- The server stores a run as created and queued and pushes it onto `{gol:runs}`, and `GOL_WORKERS` worker threads (default 2) in the same process run it. The processing list, start counts and leases are `{gol:runs}:processing`, `{gol:runs}:deliveries` and `{gol:runs}:lease:<run>`.
+- A worker claims a run and its 30 s lease in one step, renews the lease every 10 s, records the run's events, and only then acknowledges it.
+- A reaper puts a run whose lease ran out back at the front of the queue, every 15 s, so a crashed worker's run is redelivered.
+- A redelivered run that already ended is acknowledged without running again, and one started more than five times without ending is failed. A run the worker cannot load (the database is down) is queued again at once, behind the other runs, and does not count as a start.
+- Delivery is at least once: a redelivered run starts over and repeats its Jev calls.
+- The queue needs `GOL_DATABASE_URL`, since queued run ids outlive the process. One Redis serves one deployment: a standalone Redis (no cluster), with `noeviction` and AOF persistence. A Redis that does not answer a connection within 5 s counts as down.
+- The server refuses to start if Redis does not answer, and starts the workers only once its port is bound.
+
 ## Authentication
 
 Every route needs `Authorization: Bearer <token>`. The server refuses to start unless one of these is configured:
@@ -116,7 +125,7 @@ export BEND_NO_TELEMETRY=1
 
 ## Formal model
 
-`formal/runlog/RunLog.tla` models the writers of a run's event log. Its findings are in `formal/runlog/FINDINGS.md`. `formal/agentowner/AgentOwner.tla` models principals racing to store one agent manifest; its findings are in `formal/agentowner/FINDINGS.md`. `formal/memory/Memory.tla` models runs of different tenants writing and reading memory at the same time; its findings are in `formal/memory/FINDINGS.md`. `formal/RETIRED.md` records retired checks and what owns their properties now. The reducers themselves are checked in Rust: `crates/protocol/tests/reduce_bounded.rs` enumerates every bounded (state, event) pair of production `reduce` and `reduce_dispatch`.
+`formal/runlog/RunLog.tla` models the writers of a run's event log. Its findings are in `formal/runlog/FINDINGS.md`. `formal/agentowner/AgentOwner.tla` models principals racing to store one agent manifest; its findings are in `formal/agentowner/FINDINGS.md`. `formal/memory/Memory.tla` models runs of different tenants writing and reading memory at the same time; its findings are in `formal/memory/FINDINGS.md`. `formal/runqueue/RunQueue.tla` models the Redis queue, its workers and reaper; its findings are in `formal/runqueue/FINDINGS.md`, and the nightly workflow checks it at larger constants. `formal/RETIRED.md` records retired checks and what owns their properties now. The reducers themselves are checked in Rust: `crates/protocol/tests/reduce_bounded.rs` enumerates every bounded (state, event) pair of production `reduce` and `reduce_dispatch`.
 
 `./scripts/install-tla.sh` installs the pinned TLA+ tools, v1.7.4 (TLC 2.19), at `~/.local/tla/tla2tools.jar` and checks its sha256. `./scripts/verify-tla.sh` runs TLC on every `formal/**/*.cfg` with `-workers auto -lncheck final`. TLC checks deadlock on every config; AGENTS.md forbids turning it off. The script reads the jar from `TLA_JAR`, then `~/.local/tla/tla2tools.jar`, then `/usr/share/java/tla2tools.jar`.
 

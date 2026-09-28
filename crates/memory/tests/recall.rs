@@ -244,6 +244,9 @@ fn a_memories_table_with_the_old_key_is_refused_at_connect() {
 #[test]
 fn a_write_waiting_on_a_lock_gives_up() {
     let key = format!("topic-locked-{}", uuid_key());
+    // Connecting creates the table the holder inserts into, whichever test
+    // runs first on a fresh database.
+    drop(connect());
     let scope = serde_json::to_string(&MemoryScope::Run).unwrap();
     let mut holder = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("holder");
     let mut tx = holder.transaction().expect("begin");

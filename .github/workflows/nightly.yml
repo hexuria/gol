@@ -34,3 +34,39 @@ jobs:
           # runtime-tokio: replay_proof calls posix_spawn, which Miri cannot execute.
           # workflow-js: boa_engine trips stacked-borrows UB inside Context::default.
           # workflow-bend: staging sources calls copy_file_range (syscall 326), which Miri cannot execute.
+
+  tlc-large:
+    # formal/runqueue at constants past the PR budget (AGENTS.md: TLC at PR
+    # constants runs on every PR, larger constants run nightly). The config is
+    # written here, not kept under formal/, so verify-tla.sh, which checks
+    # every formal/**/*.cfg, does not pick it up. TLC 2.19's default
+    # fingerprint set throws a division by zero while it estimates collisions
+    # after the check at these constants; the off-heap disk set does not.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install TLA+ tools
+        run: ./scripts/install-tla.sh
+      - name: RunQueue with three workers, two runs, two crashes, two slow leases and two releases
+        working-directory: formal/runqueue
+        run: |
+          cat > "$RUNNER_TEMP/RunQueueNightly.cfg" <<'CFG'
+          SPECIFICATION Spec
+          CONSTANTS
+            Design = "new"
+            Workers = {"w1", "w2", "w3"}
+            Runs = {"r1", "r2"}
+            MaxCrashes = 2
+            MaxSlow = 2
+            MaxReleases = 2
+          INVARIANT TypeOK
+          INVARIANT NoOrphan
+          INVARIANT AckAfterTerminal
+          INVARIANT AtMostOneTerminal
+          INVARIANT WaitingUnleased
+          PROPERTY EveryRunEnds
+          CFG
+          java -XX:+UseParallelGC -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \
+            -jar "$HOME/.local/tla/tla2tools.jar" -workers auto -lncheck final \
+            -config "$RUNNER_TEMP/RunQueueNightly.cfg" RunQueue.tla
