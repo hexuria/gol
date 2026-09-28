@@ -248,6 +248,7 @@ fn a_child_that_could_not_be_queued_is_not_started_again() {
             Err("the child could not be started".to_string())
         );
         assert_eq!(queue.queued().expect("queued"), []);
+        assert_eq!(queue.pending().expect("pending"), []);
     }
 }
 
