@@ -48,8 +48,26 @@ impl r2d2::ManageConnection for Connections {
     }
 }
 
-/// Connections a store keeps at most when the caller names no size.
-const DEFAULT_POOL_SIZE: u32 = 8;
+/// How a store's pool of connections is sized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolOptions {
+    /// Connections open at most, at least one.
+    pub max_size: u32,
+    /// Idle connections the pool keeps open ahead of need, at most
+    /// `max_size`. With none, a caller waiting on a full pool is not woken
+    /// when a busy connection comes back broken, and waits out the timeout.
+    pub min_idle: u32,
+}
+
+impl Default for PoolOptions {
+    /// Eight connections, none kept idle.
+    fn default() -> Self {
+        Self {
+            max_size: 8,
+            min_idle: 0,
+        }
+    }
+}
 
 const SCHEMA: &str = "
 create table if not exists agents (
@@ -129,13 +147,25 @@ impl PostgresStore {
     /// The store blocks: call it from a blocking thread, never from an async
     /// task (the postgres client panics inside a Tokio runtime).
     pub fn connect(url: &str) -> Result<Self, StoreError> {
-        Self::connect_with_pool_size(url, DEFAULT_POOL_SIZE)
+        Self::connect_with(url, PoolOptions::default())
     }
 
     /// A store with a pool of at most `size` connections, at least one. The
     /// first connection checks the schema, so a database the store cannot use
     /// fails here.
     pub fn connect_with_pool_size(url: &str, size: u32) -> Result<Self, StoreError> {
+        Self::connect_with(
+            url,
+            PoolOptions {
+                max_size: size,
+                ..PoolOptions::default()
+            },
+        )
+    }
+
+    /// A store with a pool sized by `options`.
+    pub fn connect_with(url: &str, options: PoolOptions) -> Result<Self, StoreError> {
+        let size = options.max_size;
         if size == 0 {
             return Err(StoreError::new(
                 "a postgres pool needs at least one connection",
@@ -155,7 +185,7 @@ impl PostgresStore {
         let wait = timeout.min(MAX_POOL_WAIT);
         let pool = r2d2::Pool::builder()
             .max_size(size)
-            .min_idle(Some(0))
+            .min_idle(Some(options.min_idle.min(size)))
             .test_on_check_out(true)
             .connection_timeout(wait)
             .build_unchecked(Connections { config });

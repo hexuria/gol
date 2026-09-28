@@ -1,12 +1,12 @@
 use protocol::{
     applicable, authorize, fold, Actor, Effect, Event, EventPayload, ExecutionPlacement,
-    FailureClass, HarnessState, InvocationId, PolicyDecision, RunSpec, RunState, Timestamp,
-    ToolDescriptor,
+    FailureClass, HarnessState, InvocationId, MemoryScope, PolicyDecision, RunSpec, RunState,
+    Timestamp, ToolDescriptor,
 };
 
 use crate::{
-    Decider, DeciderError, DecisionView, LoadedCatalog, Memory, ModelCompletion, Skill, StoreError,
-    Tool,
+    Decider, DeciderError, DecisionView, LoadedCatalog, Memory, MemoryKey, ModelCompletion, Skill,
+    StoreError, Tool,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,7 +48,7 @@ impl Driver {
         &mut self,
         decider: &mut dyn Decider,
         models: &dyn ModelCompletion,
-        memory: &mut dyn Memory,
+        memory: &dyn Memory,
     ) -> Result<(), DeciderError> {
         let tools = self.loaded.take().unwrap_or_default();
         let result = {
@@ -225,7 +225,7 @@ impl Driver {
         effects: &[Effect],
         tools: &[&dyn Tool],
         models: &dyn ModelCompletion,
-        memory: &mut dyn Memory,
+        memory: &dyn Memory,
     ) {
         for effect in effects {
             match effect {
@@ -295,22 +295,32 @@ impl Driver {
                 // is not recorded as done, and nothing retries a write whose
                 // outcome is unknown. The run log, which clients read, gets a
                 // fixed message; the store's detail goes to stderr only.
-                Effect::MemoryRead { scope, key } => match memory.read(*scope, key) {
-                    Ok(value) => self.push(
-                        EventPayload::MemoryRead {
-                            scope: *scope,
-                            key: key.clone(),
-                            value,
-                        },
-                        Actor::System,
-                    ),
-                    Err(error) => {
-                        self.fail_memory("read", &error);
+                Effect::MemoryRead { scope, key } => {
+                    let Some(owner) = self.memory_key(*scope) else {
+                        self.fail_unowned(*scope);
                         return;
+                    };
+                    match memory.read(&owner, key) {
+                        Ok(value) => self.push(
+                            EventPayload::MemoryRead {
+                                scope: *scope,
+                                key: key.clone(),
+                                value,
+                            },
+                            Actor::System,
+                        ),
+                        Err(error) => {
+                            self.fail_memory("read", &error);
+                            return;
+                        }
                     }
-                },
+                }
                 Effect::MemoryWrite { scope, key, value } => {
-                    match memory.write(*scope, key, value) {
+                    let Some(owner) = self.memory_key(*scope) else {
+                        self.fail_unowned(*scope);
+                        return;
+                    };
+                    match memory.write(&owner, key, value) {
                         Ok(()) => self.push(
                             EventPayload::MemoryWritten {
                                 scope: *scope,
@@ -351,6 +361,25 @@ impl Driver {
         self.push(EventPayload::StepAdvanced, Actor::System);
     }
 
+    /// Whose memory `scope` is for this run at its current step.
+    fn memory_key(&self, scope: MemoryScope) -> Option<MemoryKey> {
+        protocol::memory_owner_id(&self.spec, scope, self.state().steps)
+            .map(|owner_id| MemoryKey { scope, owner_id })
+    }
+
+    /// A session or workspace effect whose id the spec does not name. The
+    /// authorizer denies those (owner decision 2B for C3), so only a caller
+    /// of `perform` that skipped it gets here.
+    fn fail_unowned(&mut self, scope: MemoryScope) {
+        self.push(
+            EventPayload::RunFailed {
+                class: FailureClass::Policy,
+                message: format!("memory {scope:?}: the run names no owner for it"),
+            },
+            Actor::System,
+        );
+    }
+
     fn fail_memory(&mut self, operation: &str, error: &StoreError) {
         eprintln!(
             "gol: run {}: memory {operation} failed: {error}",
@@ -384,7 +413,7 @@ pub fn run_to_completion(
     decider: &mut dyn Decider,
     tools: &[&dyn Tool],
     models: &dyn ModelCompletion,
-    memory: &mut dyn Memory,
+    memory: &dyn Memory,
 ) -> Result<(), DeciderError> {
     let descriptors: Vec<ToolDescriptor> = tools.iter().map(|tool| tool.descriptor()).collect();
     loop {
@@ -521,7 +550,7 @@ mod tests {
             &mut decider,
             &tools,
             &UnavailableModel,
-            &mut InMemory::default(),
+            &InMemory::default(),
         )
         .unwrap();
 
@@ -606,7 +635,7 @@ mod tests {
             &mut decider,
             &tools,
             &UnavailableModel,
-            &mut InMemory::default(),
+            &InMemory::default(),
         )
         .unwrap();
         let state = driver.state();
@@ -644,7 +673,7 @@ mod tests {
             &mut decider,
             &tools,
             &UnavailableModel,
-            &mut InMemory::default(),
+            &InMemory::default(),
         )
         .unwrap();
         assert!(driver.events().iter().any(|event| {
@@ -705,12 +734,7 @@ mod tests {
         let echo = EchoTool;
         let descriptors = [echo.descriptor()];
         let effects = driver.decide(&mut decider, &descriptors).unwrap();
-        driver.perform(
-            &effects,
-            &[&echo],
-            &UnavailableModel,
-            &mut InMemory::default(),
-        );
+        driver.perform(&effects, &[&echo], &UnavailableModel, &InMemory::default());
         assert_eq!(tool_results(driver.events()).len(), 1);
         assert!(!driver.deliver_tool_result(
             "echo",
@@ -744,12 +768,7 @@ mod tests {
             InvocationId::from_uuid(uuid::Uuid::from_u128(1)),
             "late"
         ));
-        driver.perform(
-            &effects,
-            &[&echo],
-            &UnavailableModel,
-            &mut InMemory::default(),
-        );
+        driver.perform(&effects, &[&echo], &UnavailableModel, &InMemory::default());
         assert_eq!(driver.state().harness, HarnessState::Cancelled);
         assert!(tool_results(driver.events()).is_empty());
     }

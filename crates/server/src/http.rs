@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use harness::{
-    run_to_completion, BootError, Driver, EchoTool, InMemory, JevDecider, StoreError,
+    run_to_completion, BootError, Driver, EchoTool, InMemory, JevDecider, Memory, StoreError,
     UnavailableModel,
 };
 use protocol::{
@@ -30,6 +30,7 @@ use crate::surface::{ag_ui_events, json_render_spec};
 #[derive(Clone)]
 struct AppState {
     store: Arc<dyn RunStore>,
+    memory: Arc<dyn Memory>,
     jev_base_url: String,
     redis_url: Option<String>,
     poster: SharedPoster,
@@ -132,6 +133,7 @@ pub fn router_with_queue(
 ) -> Router {
     router_with_parts(
         store,
+        Arc::new(InMemory::default()),
         jev_base_url,
         redis_url,
         Arc::new(HttpGatewayPoster::from_env()),
@@ -156,11 +158,40 @@ pub fn router_with_sandbox(
     sandbox: Arc<dyn SandboxHost>,
     auth: Arc<dyn Authenticator>,
 ) -> Router {
-    router_with_parts(store, jev_base_url, None, poster, sandbox, auth)
+    router_with_parts(
+        store,
+        Arc::new(InMemory::default()),
+        jev_base_url,
+        None,
+        poster,
+        sandbox,
+        auth,
+    )
+}
+
+/// The server's router: runs in `store`, and every run's memory in `memory`,
+/// shared across runs so agent, user and organization memory outlive a run.
+pub fn router_with_memory(
+    store: Arc<dyn RunStore>,
+    memory: Arc<dyn Memory>,
+    jev_base_url: impl Into<String>,
+    poster: Arc<dyn GatewayPoster>,
+    auth: Arc<dyn Authenticator>,
+) -> Router {
+    router_with_parts(
+        store,
+        memory,
+        jev_base_url,
+        None,
+        poster,
+        sandbox_from_env(),
+        auth,
+    )
 }
 
 fn router_with_parts(
     store: Arc<dyn RunStore>,
+    memory: Arc<dyn Memory>,
     jev_base_url: impl Into<String>,
     redis_url: Option<String>,
     poster: SharedPoster,
@@ -182,6 +213,7 @@ fn router_with_parts(
         .route("/v1/coworker/turns/{id}/fail", post(fail_coworker_turn))
         .with_state(AppState {
             store,
+            memory,
             jev_base_url: jev_base_url.into(),
             redis_url,
             poster,
@@ -337,6 +369,7 @@ async fn create_run(
     let jev_base_url = state.jev_base_url.clone();
     let spec_for_run = spec.clone();
     let store_for_run = state.store.clone();
+    let memory = state.memory.clone();
     let stored = match tokio::task::spawn_blocking(move || {
         // The user message is on the record before the harness asks Jev.
         let message = crate::inference::user_message_event(&spec_for_run);
@@ -347,7 +380,8 @@ async fn create_run(
                 events: vec![message],
             })
             .map_err(RunStartError::Store)?;
-        let (mut events, outcome) = run_with_jev(&jev_base_url, spec_for_run.clone());
+        let (mut events, outcome) =
+            run_with_jev(&jev_base_url, spec_for_run.clone(), memory.as_ref());
         // A run that could not finish still keeps what the harness did, and ends
         // failed instead of being left open.
         if let Err(error) = &outcome {
@@ -594,7 +628,11 @@ async fn get_ui(
 /// Runs the harness with Jev and returns every event it recorded, with how the
 /// run ended. On an error the events are still returned: they are what the
 /// harness did before it stopped.
-fn run_with_jev(jev_base_url: &str, spec: RunSpec) -> (Vec<Event>, Result<(), RunStartError>) {
+fn run_with_jev(
+    jev_base_url: &str,
+    spec: RunSpec,
+    memory: &dyn Memory,
+) -> (Vec<Event>, Result<(), RunStartError>) {
     let mut driver = match Driver::boot(spec) {
         Ok(driver) => driver,
         Err(BootError::UnsupportedPlacement(placement)) => {
@@ -612,7 +650,7 @@ fn run_with_jev(jev_base_url: &str, spec: RunSpec) -> (Vec<Event>, Result<(), Ru
         &mut decider,
         &[&echo],
         &UnavailableModel,
-        &mut InMemory::default(),
+        memory,
     )
     .map_err(|error| RunStartError::Decider(error.message));
     (driver.events().to_vec(), outcome)

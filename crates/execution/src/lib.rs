@@ -44,7 +44,7 @@ fn run_on_worker(
             &mut decider,
             &tools,
             &UnavailableModel,
-            &mut InMemory::default(),
+            &InMemory::default(),
         )
         .map_err(|error: DeciderError| ExecError::Decider(error.message))?;
         Ok(PlacedRun {

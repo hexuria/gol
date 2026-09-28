@@ -368,3 +368,14 @@ async fn a_failed_turn_reports_its_own_error_when_the_store_cannot_end_it() {
         (502, r#"{"error":"gateway down"}"#)
     );
 }
+
+// Without GOL_DATABASE_URL the server keeps runs and memory in memory, and
+// does not read the pool size.
+#[test]
+fn no_database_url_keeps_the_stores_in_memory() {
+    let env = [("GOL_DATABASE_POOL_SIZE".to_string(), "x".to_string())]
+        .into_iter()
+        .collect();
+    let stores = server::stores_from_env(&env).expect("stores");
+    assert!(stores.runs.run(RunId::new()).expect("store").is_none());
+}

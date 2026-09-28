@@ -38,14 +38,29 @@ Each variant carries only the fields that variant needs.
 | --- | --- |
 | `ModelCall` | Allowed when the spec lists `model.call`. From `Running`, `reduce` emits the call and stays in `Running`. |
 | `ToolCall` | Allowed when the named tool is in the catalog and the spec lists that tool's capability. From unanswered `Running`, `reduce` enters `WaitingForTool` and emits the call. |
-| `MemoryRead` | Allowed when the spec lists `memory.read`. From `Running`, `reduce` emits the read. |
-| `MemoryWrite` | Allowed when the spec lists `memory.write`. From `Running`, `reduce` emits the write. |
+| `MemoryRead` | Allowed when the spec lists `memory.read`, and for session or workspace scope when its metadata names `session_id` or `workspace_id`. From `Running`, `reduce` emits the read. |
+| `MemoryWrite` | Allowed when the spec lists `memory.write`, with the same rule for session and workspace scope. From `Running`, `reduce` emits the write. |
 | `Complete` | Always allowed. From `Running`, `reduce` enters `Completed`. |
 | `Execute`, `Delegate`, `AskUser`, `RequestApproval`, `Wait`, `PublishArtifact` | Denied. The loop continues. |
 
 `PolicyDecision` is `Allow`, `Deny { reason }`, `RequireApproval`, `Modify`, `Limit`, or `Redirect`. The authorizer in this slice returns `Allow` or `Deny` only.
 
 A denied effect becomes `EffectDenied`. The tool, the gateway, and memory are not called.
+
+Memory is keyed by its scope and its owner, which `protocol::memory_owner_id` names from the spec:
+
+| Scope | Owner |
+|---|---|
+| `Run` | the run id |
+| `Step` | the run id and the current step number |
+| `Agent` | the agent id |
+| `User` | the issuer and subject |
+| `Organization` | the issuer and tenant |
+| `Session` | the user and the metadata's `session_id` |
+| `Workspace` | the organization and the metadata's `workspace_id` |
+| `Global` | no one: shared by every run |
+
+A server's runs share one memory, so agent, user and organization memory outlive a run. `formal/memory` checks that no run reads another tenant's organization memory.
 
 A memory store that cannot answer ends the run `Failed { class: Infrastructure }` with the message `memory read: store unavailable` or `memory write: store unavailable`. No `MemoryRead` or `MemoryWritten` is recorded, and the store's detail goes to stderr.
 

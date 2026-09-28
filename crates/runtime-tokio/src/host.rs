@@ -140,7 +140,7 @@ fn on_command(command: &WorkflowCommand) -> Option<protocol::RunState> {
                 &mut decider,
                 &[],
                 &harness::UnavailableModel,
-                &mut harness::InMemory::default(),
+                &harness::InMemory::default(),
             )
             .unwrap();
             Some(driver.state())
@@ -302,7 +302,7 @@ mod tests {
             &[delegate],
             &[],
             &harness::UnavailableModel,
-            &mut harness::InMemory::default(),
+            &harness::InMemory::default(),
         );
         assert_eq!(denied.events().len(), events_before);
         assert_eq!(denied.state().harness, harness_before);

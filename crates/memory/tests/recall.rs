@@ -1,4 +1,5 @@
-use harness::Memory;
+use harness::MemoryKey;
+use harness::{memory_scenarios, Memory};
 use memory::PostgresMemory;
 use protocol::MemoryScope;
 
@@ -8,16 +9,18 @@ const POSTGRES_URL: &str = "postgres://gol:gol@127.0.0.1/gol";
 fn postgres_recalls_a_value_on_a_new_connection() {
     let key = format!("topic-recall-{}", uuid_key());
     {
-        let mut store = PostgresMemory::connect(POSTGRES_URL).expect("connect");
-        assert_eq!(store.read(MemoryScope::Run, &key), Ok(None));
-        store.write(MemoryScope::Run, &key, "rust").expect("write");
+        let store = PostgresMemory::connect(POSTGRES_URL).expect("connect");
+        assert_eq!(store.read(&owner(MemoryScope::Run), &key), Ok(None));
+        store
+            .write(&owner(MemoryScope::Run), &key, "rust")
+            .expect("write");
     }
     let store = PostgresMemory::connect(POSTGRES_URL).expect("reconnect");
     assert_eq!(
-        store.read(MemoryScope::Run, &key),
+        store.read(&owner(MemoryScope::Run), &key),
         Ok(Some("rust".to_string()))
     );
-    assert_eq!(store.read(MemoryScope::Agent, &key), Ok(None));
+    assert_eq!(store.read(&owner(MemoryScope::Agent), &key), Ok(None));
 }
 
 // A dead connection fails the call that finds it, and the next call
@@ -26,10 +29,11 @@ fn postgres_recalls_a_value_on_a_new_connection() {
 fn a_killed_backend_fails_one_read_then_reconnects() {
     let key = format!("topic-idle-kill-{}", uuid_key());
     let application = format!("gol_c1_memory_{key}").replace('-', "_");
-    let mut store =
-        PostgresMemory::connect(&format!("{POSTGRES_URL}?application_name={application}"))
-            .expect("connect");
-    store.write(MemoryScope::Run, &key, "rust").expect("write");
+    let store = PostgresMemory::connect(&format!("{POSTGRES_URL}?application_name={application}"))
+        .expect("connect");
+    store
+        .write(&owner(MemoryScope::Run), &key, "rust")
+        .expect("write");
 
     let mut admin = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("admin");
     let killed: i64 = admin
@@ -55,9 +59,9 @@ fn a_killed_backend_fails_one_read_then_reconnects() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
-    assert!(store.read(MemoryScope::Run, &key).is_err());
+    assert!(store.read(&owner(MemoryScope::Run), &key).is_err());
     assert_eq!(
-        store.read(MemoryScope::Run, &key),
+        store.read(&owner(MemoryScope::Run), &key),
         Ok(Some("rust".to_string()))
     );
 }
@@ -76,17 +80,17 @@ fn a_backend_killed_mid_statement_is_replaced_on_the_next_call() {
     let mut holder = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("holder");
     let mut tx = holder.transaction().expect("begin");
     tx.execute(
-        "insert into memories (scope, key, value) values ($1, $2, 'held')",
+        "insert into memories (scope, owner_id, key, value) values ($1, 'recall', $2, 'held')",
         &[&scope, &key],
     )
     .expect("insert");
     // Connect first: connect waits on the schema lock too, and the kill must
     // land in the write.
-    let mut store = PostgresMemory::connect(&url).expect("connect");
+    let store = PostgresMemory::connect(&url).expect("connect");
     let blocked = {
         let key = key.clone();
         std::thread::spawn(move || {
-            let result = store.write(MemoryScope::Run, &key, "rust");
+            let result = store.write(&owner(MemoryScope::Run), &key, "rust");
             (store, result)
         })
     };
@@ -116,7 +120,76 @@ fn a_backend_killed_mid_statement_is_replaced_on_the_next_call() {
     let (store, result) = blocked.join().unwrap();
     assert!(result.is_err(), "the killed write");
     tx.rollback().expect("rollback");
-    assert_eq!(store.read(MemoryScope::Run, &key), Ok(None));
+    assert_eq!(store.read(&owner(MemoryScope::Run), &key), Ok(None));
+}
+
+/// The owner these tests keep their entries under.
+fn owner(scope: MemoryScope) -> MemoryKey {
+    MemoryKey {
+        scope,
+        owner_id: "recall".to_string(),
+    }
+}
+
+// The shared scoping scenarios (harness::memory_scenarios) against Postgres:
+// the same contract InMemory passes in crates/harness/tests/memory_scopes.rs.
+#[test]
+fn run_memory_isolated_between_runs() {
+    memory_scenarios::run_memory_isolated_between_runs(&connect());
+}
+
+#[test]
+fn step_memory_isolated_between_steps() {
+    memory_scenarios::step_memory_isolated_between_steps(&connect());
+}
+
+#[test]
+fn agent_memory_survives_across_runs() {
+    memory_scenarios::agent_memory_survives_across_runs(&connect());
+}
+
+#[test]
+fn user_memory_isolated_between_tenants() {
+    memory_scenarios::user_memory_isolated_between_tenants(&connect());
+}
+
+#[test]
+fn session_memory_belongs_to_its_user() {
+    memory_scenarios::session_memory_belongs_to_its_user(&connect());
+}
+
+// The Rust test of `NoCrossScopeRead` in formal/memory/Memory.tla.
+#[test]
+fn no_cross_scope_read() {
+    memory_scenarios::no_cross_scope_read(&connect());
+}
+
+fn connect() -> PostgresMemory {
+    PostgresMemory::connect(POSTGRES_URL).expect("connect")
+}
+
+// A memories table from before owners is refused at connect (owner decision
+// 4A for C3): keeping its rows under an empty owner would let any owner read
+// them.
+#[test]
+fn a_memories_table_without_owners_is_refused_at_connect() {
+    let mut admin = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("connect");
+    let schema = format!("c3_old_{}", std::process::id());
+    admin
+        .batch_execute(&format!(
+            "drop schema if exists {schema} cascade;
+             create schema {schema};
+             create table {schema}.memories (scope text not null, key text not null,
+                 value text not null, primary key (scope, key));"
+        ))
+        .expect("old schema");
+    let url = format!("{POSTGRES_URL}?options=-csearch_path%3D{schema}");
+    let connected = PostgresMemory::connect(&url).map(|_| ());
+    admin
+        .batch_execute(&format!("drop schema {schema} cascade"))
+        .expect("drop");
+    let error = connected.expect_err("connect must fail");
+    assert!(error.to_string().contains("drop table memories"), "{error}");
 }
 
 /// Coarse on macOS, so each test also names its own key prefix.

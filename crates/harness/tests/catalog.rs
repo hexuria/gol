@@ -117,7 +117,7 @@ fn declared_echo_runs_and_undeclared_tool_is_denied() {
         },
     ]);
     driver
-        .run_loaded(&mut decider, &UnavailableModel, &mut InMemory::default())
+        .run_loaded(&mut decider, &UnavailableModel, &InMemory::default())
         .unwrap();
     assert_eq!(tool_names(driver.events()), vec!["echo:hello".to_string()]);
     assert!(driver.events().iter().any(|event| matches!(
@@ -176,7 +176,7 @@ for line in sys.stdin:
         },
     ]);
     driver
-        .run_loaded(&mut decider, &UnavailableModel, &mut InMemory::default())
+        .run_loaded(&mut decider, &UnavailableModel, &InMemory::default())
         .unwrap();
     assert_eq!(
         tool_names(driver.events()),
@@ -244,7 +244,7 @@ fn skill_body_is_on_the_decision_view() {
         body: String::new(),
     };
     driver
-        .run_loaded(&mut decider, &UnavailableModel, &mut InMemory::default())
+        .run_loaded(&mut decider, &UnavailableModel, &InMemory::default())
         .unwrap();
     assert_eq!(decider.body, "note:remember the rust");
 }
@@ -262,7 +262,7 @@ fn run_call(catalog: LoadedCatalog, capability: &str, name: &str, input: &str) -
         },
     ]);
     driver
-        .run_loaded(&mut decider, &UnavailableModel, &mut InMemory::default())
+        .run_loaded(&mut decider, &UnavailableModel, &InMemory::default())
         .unwrap();
     driver
 }
