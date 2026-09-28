@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use protocol::{
-    applicable, authorize, fold, Actor, AgentId, Effect, Event, EventPayload, ExecutionPlacement,
-    FailureClass, HarnessState, InvocationId, Limits, MemoryScope, PolicyDecision, RunSpec,
-    RunState, Timestamp, ToolDescriptor, MAX_CHILDREN,
+    applicable, authorize, fold, Actor, AgentId, DispatchPhase, Effect, Event, EventPayload,
+    ExecutionPlacement, FailureClass, HarnessState, InvocationId, Limits, MemoryScope,
+    PolicyDecision, RunSpec, RunState, Timestamp, ToolDescriptor, MAX_CHILDREN,
 };
 
 use crate::{
@@ -14,6 +14,16 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BootError {
     UnsupportedPlacement(ExecutionPlacement),
+}
+
+/// Why `Driver::resume` would not rebuild a run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResumeError {
+    UnsupportedPlacement(ExecutionPlacement),
+    /// A log from before the harness started, whose dispatch is not one that
+    /// `RunStarted` starts (`Created` or `Starting`). A queued run is
+    /// scheduled first, as a worker records it.
+    NotStartable(DispatchPhase),
 }
 
 pub struct Driver {
@@ -54,21 +64,30 @@ impl Driver {
         Ok(driver)
     }
 
-    /// Rebuilds a driver from a stored log and picks up where it stopped. A
-    /// log from before the harness started gets its `RunStarted`. A log cut
-    /// after an effect was authorized and before its result was recorded
-    /// performs that effect again when `run_until` goes on, a tool with the
-    /// same invocation (decision 1.5a-3A). A harness that completed while
-    /// the log holds no terminal event gets its `RunCompleted` now, as
-    /// `decide` would have recorded it. A log another writer already ended
-    /// (a cancel, say) keeps that end: a second terminal event is refused.
-    pub fn resume(spec: RunSpec, events: Vec<Event>) -> Result<Self, BootError> {
+    /// Rebuilds a driver from a stored log and picks up where it stopped.
+    ///
+    /// - A log that already holds a terminal event (`is_run_end`) is left as
+    ///   it is: nothing is appended and `run_until` decides nothing, even
+    ///   when the harness fold never saw the end (a run failed or cancelled
+    ///   before it started, or cancelled after its `Complete` was
+    ///   authorized). A second terminal event would be refused.
+    /// - A log from before the harness started gets its `RunStarted` when
+    ///   its dispatch is `Created` or `Starting`; a queued log that no worker
+    ///   scheduled is refused with `NotStartable`.
+    /// - A log cut after a decision and before its authorization is
+    ///   authorized by `run_until`; one cut after an effect was authorized
+    ///   and before its result performs that effect again, a tool with the
+    ///   same invocation (decision 1.5a-3A).
+    /// - A harness that completed with no terminal event in the log gets its
+    ///   `RunCompleted`, as `decide` would have recorded it.
+    pub fn resume(spec: RunSpec, events: Vec<Event>) -> Result<Self, ResumeError> {
         match spec.placement {
             ExecutionPlacement::Local | ExecutionPlacement::Reverse | ExecutionPlacement::Box => {}
         }
         let started = events
             .iter()
             .any(|event| matches!(event.payload, EventPayload::RunStarted));
+        let ended = events.iter().any(|event| is_run_end(&event.payload));
         let mut driver = Self {
             spec,
             events,
@@ -80,14 +99,22 @@ impl Driver {
             undecided: None,
             resumed: false,
         };
-        if !started {
-            driver.push(EventPayload::RunStarted, Actor::System);
+        if ended {
             return Ok(driver);
         }
+        let state = driver.state();
+        if !started {
+            return match state.dispatch {
+                DispatchPhase::Created | DispatchPhase::Starting => {
+                    driver.push(EventPayload::RunStarted, Actor::System);
+                    Ok(driver)
+                }
+                other => Err(ResumeError::NotStartable(other)),
+            };
+        }
         driver.resumed = true;
-        let ended = driver.events.iter().any(|event| is_run_end(&event.payload));
-        match driver.state().harness {
-            HarnessState::Completed { outcome } if !ended => {
+        match state.harness {
+            HarnessState::Completed { outcome } => {
                 driver.push(EventPayload::RunCompleted { outcome }, Actor::System);
             }
             harness if !harness.is_terminal() => match driver.events.last() {
@@ -140,6 +167,11 @@ impl Driver {
         self.spawner = Some(spawner);
         self.targets = targets;
         self
+    }
+
+    /// Whether the log holds a terminal event.
+    fn log_ended(&self) -> bool {
+        self.events.iter().any(|event| is_run_end(&event.payload))
     }
 
     pub fn events(&self) -> &[Event] {
@@ -590,7 +622,9 @@ pub fn run_until(
         driver.advance_answered_step();
     }
     loop {
-        if driver.state().harness.is_terminal() {
+        // A log another writer ended stays ended, whatever the harness fold
+        // says (see `Driver::resume`).
+        if driver.state().harness.is_terminal() || driver.log_ended() {
             return Ok(());
         }
         if should_stop() {

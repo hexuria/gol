@@ -4,14 +4,14 @@
 //! after an effect was authorized and before its result performs that effect
 //! again, a tool with the same invocation (decision 1.5a-3A).
 use harness::{
-    run_to_completion, run_until, Driver, EchoTool, InMemory, ModelCompletion, ScriptedDecider,
-    Tool,
+    run_to_completion, run_until, Driver, EchoTool, InMemory, ModelCompletion, ResumeError,
+    ScriptedDecider, Tool,
 };
 use proptest::prelude::*;
 use protocol::{
-    fold, AgentId, Capability, CredentialSource, Effect, Event, EventPayload, ExecutionPlacement,
-    InvocationId, Limits, MessageRole, ModelMessage, ModelProvider, ModelRequest, Owner, RunSpec,
-    WorkModel,
+    fold, Actor, AgentId, Capability, CredentialSource, DispatchPhase, Effect, Event, EventPayload,
+    EventSource, ExecutionPlacement, FailureClass, HarnessState, InvocationId, Limits, MessageRole,
+    ModelMessage, ModelProvider, ModelRequest, Owner, RunSpec, Timestamp, WorkModel,
 };
 
 fn spec(limits: Limits) -> RunSpec {
@@ -213,8 +213,41 @@ proptest! {
     }
 }
 
-// A run's log from before its harness started (as the queue stores it) gets
-// its RunStarted on resume; a started run does not get a second one.
+fn event(spec: &RunSpec, payload: EventPayload) -> Event {
+    Event::record(
+        EventSource::for_spec(spec, Actor::System, Timestamp::now()),
+        payload,
+    )
+}
+
+/// What the queue stores for a new run (`queued_events` in the server).
+fn queued(spec: &RunSpec) -> Vec<Event> {
+    vec![
+        event(spec, EventPayload::RunCreated),
+        event(spec, EventPayload::RunQueued),
+        event(
+            spec,
+            EventPayload::UserMessage {
+                text: "hello".into(),
+            },
+        ),
+    ]
+}
+
+/// The queued log after a worker scheduled it (`dispatch_events`).
+fn scheduled(spec: &RunSpec) -> Vec<Event> {
+    let mut events = queued(spec);
+    for payload in [
+        EventPayload::RunScheduled,
+        EventPayload::RunProvisioning,
+        EventPayload::RunStarting,
+    ] {
+        events.push(event(spec, payload));
+    }
+    events
+}
+
+// A started run does not get a second RunStarted.
 #[test]
 fn resume_does_not_restart_a_started_run() {
     let spec = roomy();
@@ -225,11 +258,94 @@ fn resume_does_not_restart_a_started_run() {
             .filter(|event| matches!(event.payload, EventPayload::RunStarted))
             .count()
     };
-    let cut = &log[..3];
-    let driver = Driver::resume(spec.clone(), cut.to_vec()).unwrap();
+    let driver = Driver::resume(spec, log[..3].to_vec()).unwrap();
     assert_eq!(started(driver.events()), 1);
-    let fresh = Driver::resume(spec, Vec::new()).unwrap();
-    assert_eq!(payloads(fresh.events()), [EventPayload::RunStarted]);
+}
+
+// Review of #68: RunStarted starts a run only from dispatch Created or
+// Starting. A log the queue stored and no worker scheduled is not resumed; a
+// scheduled one starts, and its dispatch follows the harness to the end.
+#[test]
+fn a_queued_log_starts_only_once_it_is_scheduled() {
+    let spec = roomy();
+    assert_eq!(
+        Driver::resume(spec.clone(), queued(&spec)).err(),
+        Some(ResumeError::NotStartable(DispatchPhase::Queued))
+    );
+
+    let log = scheduled(&spec);
+    let mut driver = Driver::resume(spec.clone(), log.clone()).unwrap();
+    assert_eq!(
+        payloads(&driver.events()[log.len()..]),
+        [EventPayload::RunStarted]
+    );
+    assert_eq!(driver.state().dispatch, DispatchPhase::Running);
+    let mut decider = ScriptedDecider::new([complete()]);
+    run_until(
+        &mut driver,
+        &mut decider,
+        &[],
+        &Echoing,
+        &InMemory::default(),
+        &|| false,
+    )
+    .unwrap();
+    let state = driver.state();
+    assert!(matches!(state.harness, HarnessState::Completed { .. }));
+    assert!(matches!(state.dispatch, DispatchPhase::Completed { .. }));
+}
+
+// Review of #68: a run that ended before its harness started stays ended.
+// Nothing is appended and nothing is decided, whatever the harness fold says.
+#[test]
+fn a_log_that_ended_before_it_started_is_left_as_it_is() {
+    let spec = roomy();
+    for end in [
+        EventPayload::RunFailed {
+            class: FailureClass::Infrastructure,
+            message: "queue push failed".into(),
+        },
+        EventPayload::RunCancelled,
+        EventPayload::RunExpired,
+    ] {
+        let mut log = queued(&spec);
+        log.push(event(&spec, end));
+        let mut driver = Driver::resume(spec.clone(), log.clone()).unwrap();
+        let mut decider = ScriptedDecider::new([tool_call(1), complete()]);
+        let echo = EchoTool;
+        run_until(
+            &mut driver,
+            &mut decider,
+            &[&echo],
+            &Echoing,
+            &InMemory::default(),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(payloads(driver.events()), payloads(&log));
+    }
+}
+
+// A cancel another writer appended after the authorized Complete, before
+// RunCompleted: the log keeps the cancel as its end.
+#[test]
+fn a_cancel_after_an_authorized_complete_keeps_the_cancel() {
+    let spec = roomy();
+    let mut log = uninterrupted(&spec, &[complete()]);
+    log.pop();
+    log.push(event(&spec, EventPayload::RunCancelled));
+    let mut driver = Driver::resume(spec, log.clone()).unwrap();
+    let mut decider = ScriptedDecider::new([complete()]);
+    run_until(
+        &mut driver,
+        &mut decider,
+        &[],
+        &Echoing,
+        &InMemory::default(),
+        &|| false,
+    )
+    .unwrap();
+    assert_eq!(payloads(driver.events()), payloads(&log));
 }
 
 #[test]
