@@ -86,10 +86,16 @@ fn ensure_schema(client: &mut postgres::Client) -> Result<(), StoreError> {
     tx.batch_execute(SCHEMA).map_err(sql)?;
     // `create index if not exists` locks the table even when the index is
     // there, and would wait behind any writer stalled mid-append.
+    // Looked up on the table itself, not by name on the search path.
     let index = tx
-        .query_one("select to_regclass('run_events_one_terminal') is null", &[])
+        .query_opt(
+            "select 1 from pg_index join pg_class on pg_class.oid = pg_index.indexrelid
+             where pg_index.indrelid = 'run_events'::regclass
+               and pg_class.relname = 'run_events_one_terminal'",
+            &[],
+        )
         .map_err(sql)?;
-    if index.try_get::<_, bool>(0).map_err(sql)? {
+    if index.is_none() {
         tx.batch_execute(
             "create unique index run_events_one_terminal on run_events (run_id) where terminal",
         )
@@ -138,11 +144,14 @@ impl PostgresStore {
         let mut config: postgres::Config = url.parse().map_err(sql)?;
         let timeout = *config.get_connect_timeout().unwrap_or(&CONNECT_TIMEOUT);
         config.connect_timeout(timeout);
+        // A caller waits for a free connection at most this long, whatever
+        // the URL's connect_timeout: requests should not queue for a day.
+        let wait = timeout.min(MAX_POOL_WAIT);
         let pool = r2d2::Pool::builder()
             .max_size(size)
             .min_idle(Some(0))
             .test_on_check_out(true)
-            .connection_timeout(timeout)
+            .connection_timeout(wait)
             .build_unchecked(Connections { config });
         let store = Self { pool };
         store.with_client(ensure_schema)?;
@@ -166,6 +175,9 @@ impl PostgresStore {
 /// How long a connect may take, and a caller may wait for a pooled
 /// connection, when the URL sets no `connect_timeout`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The longest a caller waits for a pooled connection.
+const MAX_POOL_WAIT: Duration = Duration::from_secs(30);
 
 /// The full error for stderr: `postgres::Error` displays only its kind.
 fn sql(error: postgres::Error) -> StoreError {

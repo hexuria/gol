@@ -1252,6 +1252,17 @@ fn forced_append_after_a_holder(
 // refused after a terminal event and numbered after a plain one.
 #[test]
 fn a_waiting_append_sees_what_the_lock_holder_committed() {
+    let serializable = "&options=-cdefault_transaction_isolation%3Dserializable";
+    let mut session = postgres::Client::connect(
+        &format!("{POSTGRES_URL}?application_name=gol_c2_isolation{serializable}"),
+        postgres::NoTls,
+    )
+    .expect("session");
+    let isolation: String = session
+        .query_one("show default_transaction_isolation", &[])
+        .expect("show")
+        .get(0);
+    assert_eq!(isolation, "serializable", "the option took effect");
     for extra in [
         "",
         "&options=-cdefault_transaction_isolation%3Dserializable",
@@ -1342,4 +1353,114 @@ fn a_batch_with_two_terminal_events_is_refused_in_postgres() {
         .expect("put run");
     assert!(store.append_events(spec.run_id, two).is_err());
     assert_eq!(reconnect(spec.run_id).events.len(), 1);
+}
+
+// The terminal index is created in the store's own schema, even when another
+// schema on the search path has an index of the same name.
+#[test]
+fn the_terminal_index_is_created_in_the_store_schema() {
+    let mut admin = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("connect");
+    let (first, second) = (
+        format!("c2_index_{}", std::process::id()),
+        format!("c2_other_{}", std::process::id()),
+    );
+    admin
+        .batch_execute(&format!(
+            "drop schema if exists {first} cascade;
+             drop schema if exists {second} cascade;
+             create schema {first};
+             create schema {second};
+             create table {second}.other (id int);
+             create index run_events_one_terminal on {second}.other (id);"
+        ))
+        .expect("schemas");
+    let url = format!("{POSTGRES_URL}?options=-csearch_path%3D{first},{second}");
+    let connected = PostgresStore::connect(&url).map(|_| ());
+    let created: bool = admin
+        .query_one(
+            "select to_regclass($1) is not null",
+            &[&format!("{first}.run_events_one_terminal")],
+        )
+        .expect("index")
+        .get(0);
+    admin
+        .batch_execute(&format!(
+            "drop schema {first} cascade; drop schema {second} cascade"
+        ))
+        .expect("drop");
+    assert_eq!(connected, Ok(()));
+    assert!(created, "no terminal index on {first}.run_events");
+}
+
+// A connect_timeout past what an Instant can add is still a store.
+#[test]
+fn a_huge_connect_timeout_is_not_a_panic() {
+    let url = format!("{POSTGRES_URL}?connect_timeout=9223372036854775807");
+    let store = PostgresStore::connect(&url).expect("connect");
+    assert_eq!(store.run(RunId::new()).map(|run| run.is_none()), Ok(true));
+}
+
+const FD_CHILD: &str = "GOL_TEST_FD_EXHAUSTION_CHILD";
+
+// A connect that panics on a pool worker (the postgres crate unwraps building
+// its runtime, which fails when the process is out of file descriptors) does
+// not cost the pool a connection for good. The scenario runs in a child
+// process under `ulimit -n 256`, so only the child runs out of descriptors.
+#[test]
+fn a_connect_that_panics_does_not_shrink_the_pool() {
+    if std::env::var_os(FD_CHILD).is_some() {
+        return connect_panic_in_this_process();
+    }
+    let exe = std::env::current_exe().expect("test binary");
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"ulimit -n 256 && exec "$0" --exact "$1" --test-threads 1 --nocapture"#)
+        .arg(exe)
+        .arg("a_connect_that_panics_does_not_shrink_the_pool")
+        .env(FD_CHILD, "1")
+        .output()
+        .expect("child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "child failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn connect_panic_in_this_process() {
+    let application = format!("gol_c2_{}", uuid::Uuid::new_v4().simple());
+    let url = format!("{POSTGRES_URL}?application_name={application}");
+    let store = Arc::new(PostgresStore::connect_with_pool_size(&url, 2).expect("connect"));
+    // One pooled connection stays busy: a put that waits on alice's row.
+    let id = AgentId::new();
+    let mut alice = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("connect");
+    let mut tx = alice.transaction().expect("begin");
+    tx.execute(
+        "insert into agents (id, manifest, owner_issuer, owner_subject, owner_tenant)
+         values ($1, '{}'::jsonb, 'https://issuer.test', 'alice', 'tenant-1')",
+        &[&id.as_uuid()],
+    )
+    .expect("insert");
+    let blocked = {
+        let store = store.clone();
+        std::thread::spawn(move || store.put_agent(agent_for(id, "bob", "tenant-1", "9")))
+    };
+    wait_for_lock_wait(&application);
+    // Out of descriptors, the pool's connect for a second caller panics.
+    let mut hog = Vec::new();
+    while let Ok(file) = std::fs::File::open("/dev/null") {
+        hog.push(file);
+    }
+    let during = store.run(RunId::new());
+    drop(hog);
+    assert!(during.is_err(), "no connection could open");
+    // With descriptors free again, the second slot still opens.
+    assert_eq!(
+        store.run(RunId::new()).map(|run| run.is_none()),
+        Ok(true),
+        "the pool lost the slot of the panicked connect"
+    );
+    tx.rollback().expect("rollback");
+    blocked.join().unwrap().expect("put");
 }
