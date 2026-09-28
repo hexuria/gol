@@ -69,6 +69,9 @@ pub enum Append {
     Terminal,
     /// No run is stored under that id. Nothing was written.
     Missing,
+    /// `append_events_after` only: the stored log is no longer as long as
+    /// the writer saw it; another writer appended since. Nothing was written.
+    Moved,
 }
 
 /// The payloads that end a run: `DispatchPhase::is_terminal` after the reducer.
@@ -116,6 +119,16 @@ pub trait RunStore: Send + Sync {
     /// events already stored never change. A batch with an event after its
     /// terminal event is refused.
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError>;
+    /// `append_events`, and refused as `Moved` unless the stored log is still
+    /// `seen` events long, in the same atomic step. A writer that stores a
+    /// run step by step (a queue worker, Phase 1.5b) appends with this, so
+    /// no other writer's events land between what it read and what it adds.
+    fn append_events_after(
+        &self,
+        id: RunId,
+        seen: usize,
+        events: Vec<Event>,
+    ) -> Result<Append, StoreError>;
     fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError>;
     /// The run with at most `limit` of its events: those after the first
     /// `after`. A store that keeps events in order by row overrides this to
@@ -143,6 +156,35 @@ pub struct InMemoryStore {
     agents: Mutex<HashMap<AgentId, StoredAgent>>,
     runs: Mutex<HashMap<RunId, StoredRun>>,
     artifacts: Mutex<HashMap<ArtifactId, StoredArtifact>>,
+}
+
+impl InMemoryStore {
+    /// `append_events`, and with `seen` also refused as `Moved` unless the
+    /// log is `seen` events long: all under the lock.
+    fn append_checked(
+        &self,
+        id: RunId,
+        seen: Option<usize>,
+        events: Vec<Event>,
+    ) -> Result<Append, StoreError> {
+        check_one_terminal(&events)?;
+        let mut runs = write(&self.runs, "run")?;
+        let Some(stored) = runs.get_mut(&id) else {
+            return Ok(Append::Missing);
+        };
+        if stored
+            .events
+            .iter()
+            .any(|event| is_terminal(&event.payload))
+        {
+            return Ok(Append::Terminal);
+        }
+        if seen.is_some_and(|seen| seen != stored.events.len()) {
+            return Ok(Append::Moved);
+        }
+        stored.events.extend(events);
+        Ok(Append::Appended)
+    }
 }
 
 fn read<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -194,20 +236,16 @@ impl RunStore for InMemoryStore {
     }
 
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
-        check_one_terminal(&events)?;
-        let mut runs = write(&self.runs, "run")?;
-        let Some(stored) = runs.get_mut(&id) else {
-            return Ok(Append::Missing);
-        };
-        if stored
-            .events
-            .iter()
-            .any(|event| is_terminal(&event.payload))
-        {
-            return Ok(Append::Terminal);
-        }
-        stored.events.extend(events);
-        Ok(Append::Appended)
+        self.append_checked(id, None, events)
+    }
+
+    fn append_events_after(
+        &self,
+        id: RunId,
+        seen: usize,
+        events: Vec<Event>,
+    ) -> Result<Append, StoreError> {
+        self.append_checked(id, Some(seen), events)
     }
 
     fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {

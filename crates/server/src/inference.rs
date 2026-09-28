@@ -626,6 +626,8 @@ fn record_completion(
         Append::Appended => Ok(()),
         Append::Terminal => Err(TurnError::Conflict("turn already completed")),
         Append::Missing => Err(TurnError::NotFound),
+        // Only `append_events_after` reports a moved log.
+        Append::Moved => Err(TurnError::Store("the run log moved".to_string())),
     }
 }
 

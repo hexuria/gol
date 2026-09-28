@@ -4,8 +4,8 @@
 //! after an effect was authorized and before its result performs that effect
 //! again, a tool with the same invocation (decision 1.5a-3A).
 use harness::{
-    run_to_completion, run_until, Driver, EchoTool, InMemory, ModelCompletion, ResumeError,
-    ScriptedDecider, Tool,
+    run_to_completion, run_until, Boundary, Driver, EchoTool, InMemory, ModelCompletion,
+    ResumeError, ScriptedDecider, Tool,
 };
 use proptest::prelude::*;
 use protocol::{
@@ -127,7 +127,7 @@ fn resumed(spec: &RunSpec, script: &[Effect], log: &[Event]) -> Vec<Event> {
         &[&echo],
         &Echoing,
         &InMemory::default(),
-        &|| false,
+        &mut |_| Boundary::Continue,
     );
     driver.events().to_vec()
 }
@@ -287,7 +287,7 @@ fn a_queued_log_starts_only_once_it_is_scheduled() {
         &[],
         &Echoing,
         &InMemory::default(),
-        &|| false,
+        &mut |_| Boundary::Continue,
     )
     .unwrap();
     let state = driver.state();
@@ -319,7 +319,7 @@ fn a_log_that_ended_before_it_started_is_left_as_it_is() {
             &[&echo],
             &Echoing,
             &InMemory::default(),
-            &|| false,
+            &mut |_| Boundary::Continue,
         )
         .unwrap();
         assert_eq!(payloads(driver.events()), payloads(&log));
@@ -342,7 +342,7 @@ fn a_cancel_after_an_authorized_complete_keeps_the_cancel() {
         &[],
         &Echoing,
         &InMemory::default(),
-        &|| false,
+        &mut |_| Boundary::Continue,
     )
     .unwrap();
     assert_eq!(payloads(driver.events()), payloads(&log));
@@ -354,11 +354,15 @@ fn a_stop_request_ends_the_run_at_the_next_step_boundary() {
     let mut driver = Driver::boot(spec).unwrap();
     let mut decider = ScriptedDecider::new([tool_call(1), tool_call(2), complete()]);
     let echo = EchoTool;
-    let asked = std::cell::Cell::new(0);
-    // Stop once the first step is done.
-    let should_stop = || {
-        asked.set(asked.get() + 1);
-        asked.get() > 1
+    let mut asked = 0;
+    // Cancel once the first step is done.
+    let mut at_boundary = |_: &Driver| {
+        asked += 1;
+        if asked > 1 {
+            Boundary::Cancel
+        } else {
+            Boundary::Continue
+        }
     };
     run_until(
         &mut driver,
@@ -366,7 +370,7 @@ fn a_stop_request_ends_the_run_at_the_next_step_boundary() {
         &[&echo],
         &Echoing,
         &InMemory::default(),
-        &should_stop,
+        &mut at_boundary,
     )
     .unwrap();
     let events = payloads(driver.events());
@@ -408,7 +412,7 @@ fn a_log_ending_mid_tool_call_calls_the_tool_again() {
         &[&tool],
         &Echoing,
         &InMemory::default(),
-        &|| false,
+        &mut |_| Boundary::Continue,
     )
     .unwrap();
     assert_eq!(tool.calls.get(), 1);
@@ -457,8 +461,57 @@ fn a_terminal_log_resumes_to_nothing() {
         &[&echo],
         &Echoing,
         &InMemory::default(),
-        &|| true,
+        &mut |_| Boundary::Cancel,
     )
     .unwrap();
     assert_eq!(payloads(driver.events()), payloads(&log));
+}
+
+// Phase 1.5b: a caller that pauses at a boundary gets the run back open, with
+// nothing recorded for the pause, and can resume it from its log later.
+#[test]
+fn a_pause_at_a_boundary_leaves_the_run_open() {
+    let spec = roomy();
+    let mut driver = Driver::boot(spec.clone()).unwrap();
+    let mut decider = ScriptedDecider::new([tool_call(1), tool_call(2), complete()]);
+    let echo = EchoTool;
+    let mut seen = Vec::new();
+    let mut at_boundary = |driver: &Driver| {
+        seen.push(driver.events().len());
+        if seen.len() > 1 {
+            Boundary::Pause
+        } else {
+            Boundary::Continue
+        }
+    };
+    run_until(
+        &mut driver,
+        &mut decider,
+        &[&echo],
+        &Echoing,
+        &InMemory::default(),
+        &mut at_boundary,
+    )
+    .unwrap();
+    let log = driver.events().to_vec();
+    assert_eq!(seen, [1, log.len()]);
+    assert!(!driver.state().harness.is_terminal());
+    assert_eq!(decisions(&log), 1);
+
+    let mut again = Driver::resume(spec, log).unwrap();
+    let mut rest = ScriptedDecider::new([tool_call(2), complete()]);
+    run_until(
+        &mut again,
+        &mut rest,
+        &[&echo],
+        &Echoing,
+        &InMemory::default(),
+        &mut |_| Boundary::Continue,
+    )
+    .unwrap();
+    assert!(matches!(
+        again.events().last().map(|event| &event.payload),
+        Some(EventPayload::RunCompleted { .. })
+    ));
+    assert_eq!(decisions(again.events()), 3);
 }

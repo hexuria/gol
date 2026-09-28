@@ -672,7 +672,7 @@ fn run_with_jev(
     (driver.events().to_vec(), outcome)
 }
 
-fn jev_client(base_url: &str) -> Result<typesafe_sdk::blocking::Client, String> {
+pub(crate) fn jev_client(base_url: &str) -> Result<typesafe_sdk::blocking::Client, String> {
     typesafe_sdk::blocking::Client::builder()
         .api_key("gol")
         .base_url(base_url)

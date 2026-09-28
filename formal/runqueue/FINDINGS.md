@@ -15,7 +15,8 @@ Writers:
   - claims a run: one script moves it to processing and leases it with `SET NX PX` (`CLAIM`, `queue.rs:103`; `claim`, `:303`). A run already leased (queued again while held) is dropped from the list instead;
   - loads the run (`Claim::prepare`, `worker.rs:243`). An open run counts a start (`START`, `queue.rs:114`). A claim that cannot load or start its run releases it: one script, which acts only while the claim still holds the lease, moves it off processing, onto the back of the runs list, and deletes the lease (`RELEASE`, `queue.rs:122`);
   - runs the harness (`Open::execute`, `worker.rs:310`), renewing the lease every heartbeat (`:371`; `RENEW`, `queue.rs:132`);
-  - records the harness's events in one append (`Executed::record`, `worker.rs:338`; `RunStore::append_events`), which the store refuses once the log is terminal;
+  - stores the run as it goes (Phase 1.5b, `Worker::store_as_it_goes` and `run_from` in `worker.rs`): the scheduling ladder, then each step's events at its boundary, then the tail that ends the run, each with `RunStore::append_events_after`, which the store refuses once the log is terminal or no longer as long as the worker saw. The run log's side of this is `formal/runlog` (`WAppend`); to this model the steps before the tail are no write, and the tail is `Record`;
+  - when other writers keep moving the log (more than three reloads), stores no end and releases the run instead of acknowledging it (`Done::ack` on `Append::Moved`): the `Release` action, taken from `ran`;
   - acknowledges: one script removes the run from processing, clears its start count and releases the lease if it still holds it (`ACK`, `queue.rs:141`; `Done::ack`, `worker.rs:360`).
   - Only a `Done` can acknowledge, and only `record`, or a `prepare` that finds nothing to run, makes one. So the ack of a stored run comes after its terminal event by construction. A run that is not stored is acknowledged without one, and dropped with an error.
 - **The reaper** (`reap_forever`, `worker.rs:394`): one script moves every run in processing whose lease is gone back to the front of the runs list (`REAP`, `queue.rs:152`).
@@ -25,7 +26,7 @@ Each Redis command, each script and each append is one atomic step. The producer
 
 A worker may crash at any point after its claim; its lease stays until it expires. A lease also expires under a live worker that misses its heartbeats. That is bounded by `MaxSlow`, and it is the case where two workers run one run.
 
-A worker's load may fail, at most `MaxReleases` times; it then releases its claim.
+A worker's load may fail, or (Phase 1.5b) its run may keep moving under it; either way it releases its claim, at most `MaxReleases` times in all.
 
 `Design = "new"` is C4. The negative controls:
 - `Design = "rpop"` pops the run, with no processing list and no lease: the control for `NoOrphan`.
@@ -73,8 +74,10 @@ java -XX:+UseParallelGC -jar ~/.local/tla/tla2tools.jar -workers auto -lncheck f
 ```
 
 TLC2 Version 2.19 of 08 August 2024, from tla2tools v1.7.4, which `scripts/install-tla.sh` pins. The command has no `-deadlock`, so TLC checked deadlock. Every invariant and property passed, and no state is a deadlock. `Done` is the only stuttering step.
-- `RunQueue.cfg`: 795 states generated, 339 distinct, depth 19 (before C6: 793, 337, depth 17).
-- `RunQueueCrash.cfg`: 1,591 states generated, 678 distinct, depth 20.
+- `RunQueue.cfg`: 863 states generated, 339 distinct, depth 19. Before Phase 1.5b let `Release` act after `Run` too: 795 generated, 339 distinct, depth 19; before C6: 793, 337, depth 17.
+- `RunQueueCrash.cfg`: 1,727 states generated, 678 distinct, depth 20 (before Phase 1.5b: 1,591 generated, 678 distinct).
+
+Checked again on 2026-09-29 for Phase 1.5b. The only change is that `Release` is enabled from `ran` as well as `claimed`, so no new state is reachable, only new transitions between the same states. Every invariant and property still passes.
 
 Larger bounds; the first two rows are `RunQueueCrash.cfg` (`MaxProducerDeaths = 1`) with the constants changed:
 

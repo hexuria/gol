@@ -234,6 +234,59 @@ fn json(error: serde_json::Error) -> StoreError {
     StoreError::new(format!("json: {error}"))
 }
 
+impl PostgresStore {
+    /// `append_events`, and with `seen` also refused as `Moved` unless the
+    /// log is `seen` events long: all under the run row's lock.
+    fn append_checked(
+        &self,
+        id: RunId,
+        seen: Option<usize>,
+        events: Vec<Event>,
+    ) -> Result<Append, StoreError> {
+        let rows = EventRows::new(&events)?;
+        let id = id.as_uuid();
+        self.with_client(|client| {
+            // Read committed whatever the session default: each statement
+            // after the row lock sees what the lock's last holder committed.
+            let mut tx = read_committed(client)?;
+            let locked = tx
+                .query_opt("select 1 from runs where id = $1 for update", &[&id])
+                .map_err(sql)?;
+            if locked.is_none() {
+                return Ok(Append::Missing);
+            }
+            // Two index lookups: the partial index answers the first, the
+            // primary key the second.
+            let ended = tx
+                .query_opt(
+                    "select 1 from run_events where run_id = $1 and terminal",
+                    &[&id],
+                )
+                .map_err(sql)?;
+            if ended.is_some() {
+                return Ok(Append::Terminal);
+            }
+            let last = tx
+                .query_opt(
+                    "select seq from run_events where run_id = $1 order by seq desc limit 1",
+                    &[&id],
+                )
+                .map_err(sql)?;
+            let last: i64 = match last {
+                Some(row) => row.try_get(0).map_err(sql)?,
+                None => 0,
+            };
+            // Rows are numbered from 1 with no gaps, so the last is the length.
+            if seen.is_some_and(|seen| i64::try_from(seen) != Ok(last)) {
+                return Ok(Append::Moved);
+            }
+            rows.insert(&mut tx, id, last)?;
+            tx.commit().map_err(sql)?;
+            Ok(Append::Appended)
+        })
+    }
+}
+
 /// An `agents` row read as `manifest, owner_issuer, owner_subject, owner_tenant`.
 fn stored_agent(row: &postgres::Row) -> Result<StoredAgent, StoreError> {
     Ok(StoredAgent {
@@ -336,43 +389,16 @@ impl RunStore for PostgresStore {
     /// take turns: each sees every event committed before it, checks for a
     /// terminal one, and only then inserts.
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
-        let rows = EventRows::new(&events)?;
-        let id = id.as_uuid();
-        self.with_client(|client| {
-            // Read committed whatever the session default: each statement
-            // after the row lock sees what the lock's last holder committed.
-            let mut tx = read_committed(client)?;
-            let locked = tx
-                .query_opt("select 1 from runs where id = $1 for update", &[&id])
-                .map_err(sql)?;
-            if locked.is_none() {
-                return Ok(Append::Missing);
-            }
-            // Two index lookups: the partial index answers the first, the
-            // primary key the second.
-            let ended = tx
-                .query_opt(
-                    "select 1 from run_events where run_id = $1 and terminal",
-                    &[&id],
-                )
-                .map_err(sql)?;
-            if ended.is_some() {
-                return Ok(Append::Terminal);
-            }
-            let last = tx
-                .query_opt(
-                    "select seq from run_events where run_id = $1 order by seq desc limit 1",
-                    &[&id],
-                )
-                .map_err(sql)?;
-            let last = match last {
-                Some(row) => row.try_get(0).map_err(sql)?,
-                None => 0,
-            };
-            rows.insert(&mut tx, id, last)?;
-            tx.commit().map_err(sql)?;
-            Ok(Append::Appended)
-        })
+        self.append_checked(id, None, events)
+    }
+
+    fn append_events_after(
+        &self,
+        id: RunId,
+        seen: usize,
+        events: Vec<Event>,
+    ) -> Result<Append, StoreError> {
+        self.append_checked(id, Some(seen), events)
     }
 
     fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {

@@ -40,6 +40,14 @@ impl RunStore for DownStore {
     fn append_events(&self, _id: RunId, _events: Vec<Event>) -> Result<Append, StoreError> {
         down()
     }
+    fn append_events_after(
+        &self,
+        _id: RunId,
+        _seen: usize,
+        _events: Vec<Event>,
+    ) -> Result<Append, StoreError> {
+        down()
+    }
 
     fn run(&self, _id: RunId) -> Result<Option<StoredRun>, StoreError> {
         down()
@@ -205,6 +213,15 @@ impl RunStore for PartlyDown {
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
         self.check("append_events")?;
         self.inner.append_events(id, events)
+    }
+    fn append_events_after(
+        &self,
+        id: RunId,
+        seen: usize,
+        events: Vec<Event>,
+    ) -> Result<Append, StoreError> {
+        self.check("append_events")?;
+        self.inner.append_events_after(id, seen, events)
     }
 
     fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {
