@@ -77,6 +77,35 @@ fn start_marker_is_not_counter_zero() {
     assert_ne!(spawn_history, zero_history);
 }
 
+/// The agent `SpawnThenCount` spawns, named by id.
+const CHILD: &str = "00000000-0000-4000-8000-00000000c41d";
+
+/// Starts every child it is asked for.
+struct Starts;
+
+impl harness::AgentSpawner for Starts {
+    fn start(&self, request: harness::ChildRequest<'_>) -> Result<harness::StartedChild, String> {
+        Ok(harness::StartedChild {
+            run_id: protocol::RunId::new(),
+            limits: request.limits,
+        })
+    }
+}
+
+fn parent() -> protocol::RunSpec {
+    protocol::RunSpec::builder()
+        .owner(protocol::Owner::new("local", "runtime-tokio", "local"))
+        .agent(protocol::AgentId::new(), "1")
+        .input("hello")
+        .placement(protocol::ExecutionPlacement::Local)
+        .work_model(protocol::WorkModel {
+            provider: protocol::ModelProvider::OpenAI,
+            model_name: "gpt-test".to_string(),
+            credential: protocol::CredentialSource::PlatformGateway,
+        })
+        .build()
+}
+
 /// Spawns a child agent, then branches on a counter.
 struct SpawnThenCount;
 
@@ -85,7 +114,7 @@ impl WorkflowDriver for SpawnThenCount {
         let program = WorkflowProgram {
             root: Decision::Seq(vec![
                 Decision::SpawnAgent {
-                    agent: "child".to_string(),
+                    agent: CHILD.to_string(),
                     input: String::new(),
                 },
                 counter_program().root,
@@ -106,12 +135,15 @@ fn a_workflow_that_spawns_then_counts_completes() {
         calls.set(calls.get() + 1);
         0
     };
+    let parent = parent();
     let mut commands = Vec::new();
     for _ in 0..3 {
         let (step, _) = replay(
             &SpawnThenCount,
             &WorkflowContext,
             &mut journal,
+            &parent,
+            &Starts,
             &mut stand_in,
         )
         .unwrap();
@@ -120,7 +152,7 @@ fn a_workflow_that_spawns_then_counts_completes() {
     assert_eq!(
         commands,
         [
-            vec![WorkflowCommand::SpawnAgent(AgentSpec::new("child", ""))],
+            vec![WorkflowCommand::SpawnAgent(AgentSpec::new(CHILD, ""))],
             vec![WorkflowCommand::ExecuteTool(ToolSpec::new("counter", ""))],
             vec![WorkflowCommand::Complete],
         ]
@@ -128,7 +160,7 @@ fn a_workflow_that_spawns_then_counts_completes() {
     assert_eq!(calls.get(), 1);
     assert_eq!(
         journal.history().unwrap(),
-        History::new(vec![spawned("child"), Record::counter(0)])
+        History::new(vec![spawned(CHILD), Record::counter(0)])
     );
 }
 
