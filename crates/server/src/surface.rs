@@ -70,7 +70,7 @@ pub fn ag_ui_events(run_id: RunId, events: &[Event]) -> Vec<Value> {
                 out.push(json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": id, "delta": text}));
                 out.push(json!({"type": "TEXT_MESSAGE_END", "messageId": id}));
             }
-            EventPayload::ModelResponded { message } if !message.text.is_empty() => {
+            EventPayload::ModelResponded { message, .. } if !message.text.is_empty() => {
                 let role = match message.role {
                     MessageRole::Assistant => "assistant",
                     MessageRole::User => "user",

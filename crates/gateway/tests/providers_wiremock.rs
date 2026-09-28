@@ -1,215 +1,182 @@
+//! D1: each provider is called with the platform's key for it, in the header
+//! that provider reads, and its response is parsed into the message and the
+//! tokens the call used. A provider with no key or base URL configured, and a
+//! bring-your-own credential, are refused before any HTTP (decisions 21A,
+//! 22A). A slow provider times out (24A). Each provider is mocked with
+//! wiremock on its own path.
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
-use gateway::{GatewayClient, GatewayError, ModelGateway};
-use protocol::{CredentialSource, MessageRole, ModelProvider, ModelRequest};
+use gateway::{GatewayClient, GatewayError, HttpTransport, ModelGateway, UreqTransport};
+use protocol::{CredentialSource, MessageRole, ModelProvider, ModelRequest, Usage};
+use serde_json::{json, Value};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[test]
-fn anthropic_payload_maps_to_model_message() {
-    let (uri_tx, uri_rx) = mpsc::channel();
-    let (stop_tx, stop_rx) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        runtime.block_on(async move {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/v1/messages"))
-                .and(header("anthropic-version", "2023-06-01"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "content": [{ "type": "text", "text": "anthropic-pong" }]
-                })))
-                .mount(&server)
-                .await;
-            uri_tx.send(server.uri()).expect("uri");
-            let _ = stop_rx.recv();
-        });
-    });
-    let client = GatewayClient::new()
-        .provider(ModelProvider::Anthropic)
-        .credential(CredentialSource::BringYourOwn {
-            secret_ref: "test-key".to_string(),
-        })
-        .base_url(uri_rx.recv().expect("mock uri"));
-    let message = client
-        .complete(&ModelRequest {
-            provider: ModelProvider::Anthropic,
-            model_name: "claude-test".to_string(),
-            prompt: "ping".to_string(),
-        })
-        .expect("mapped message");
-    assert_eq!(message.role, MessageRole::Assistant);
-    assert_eq!(message.text, "anthropic-pong");
-    let _ = stop_tx.send(());
-    worker.join().expect("mock thread");
+fn each_provider_sends_its_key_and_reports_usage() {
+    for kind in PROVIDERS {
+        let text = format!("{kind:?}-pong");
+        let (route, (name, value), body) = case(kind, &text);
+        let mock = provider(
+            route,
+            Some((name, &value)),
+            ResponseTemplate::new(200).set_body_json(body),
+        );
+        let completion = GatewayClient::new()
+            .provider(kind)
+            .credential(CredentialSource::PlatformGateway)
+            .api_key("key-test")
+            .base_url(&mock.uri)
+            .complete(&request(kind))
+            .unwrap_or_else(|error| panic!("{kind:?}: {error}"));
+        assert_eq!(completion.message.role, MessageRole::Assistant);
+        assert_eq!(completion.message.text, text);
+        assert_eq!(
+            completion.usage,
+            Some(Usage {
+                input_tokens: 11,
+                output_tokens: 7,
+            }),
+            "{kind:?}"
+        );
+    }
 }
 
 #[test]
-fn anthropic_http_error_is_gateway_error() {
-    let (uri_tx, uri_rx) = mpsc::channel();
-    let (stop_tx, stop_rx) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        runtime.block_on(async move {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/v1/messages"))
-                .respond_with(ResponseTemplate::new(500))
-                .mount(&server)
-                .await;
-            uri_tx.send(server.uri()).expect("uri");
-            let _ = stop_rx.recv();
-        });
-    });
-    let client = GatewayClient::new()
-        .provider(ModelProvider::Anthropic)
-        .credential(CredentialSource::PlatformGateway)
-        .base_url(uri_rx.recv().expect("mock uri"));
-    let error = client
-        .complete(&ModelRequest {
-            provider: ModelProvider::Anthropic,
-            model_name: "claude-test".to_string(),
-            prompt: "ping".to_string(),
-        })
-        .expect_err("status error");
-    assert!(matches!(error, GatewayError::Transport(_)));
-    let _ = stop_tx.send(());
-    worker.join().expect("mock thread");
+fn an_http_error_is_a_transport_error() {
+    for kind in PROVIDERS {
+        let (route, _, _) = case(kind, "");
+        let mock = provider(route, None, ResponseTemplate::new(500));
+        let error = GatewayClient::new()
+            .provider(kind)
+            .credential(CredentialSource::PlatformGateway)
+            .api_key("key-test")
+            .base_url(&mock.uri)
+            .complete(&request(kind))
+            .expect_err("status error");
+        assert!(matches!(error, GatewayError::Transport(_)), "{kind:?}");
+    }
 }
 
+// A response that reports no usage parses with none.
 #[test]
-fn gemini_payload_maps_to_model_message() {
-    let (uri_tx, uri_rx) = mpsc::channel();
-    let (stop_tx, stop_rx) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        runtime.block_on(async move {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/v1beta/models/gemini-test:generateContent"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "candidates": [{
-                        "content": { "parts": [{ "text": "gemini-pong" }] }
-                    }]
-                })))
-                .mount(&server)
-                .await;
-            uri_tx.send(server.uri()).expect("uri");
-            let _ = stop_rx.recv();
-        });
-    });
-    let client = GatewayClient::new()
-        .provider(ModelProvider::Gemini)
-        .credential(CredentialSource::BringYourOwn {
-            secret_ref: "test-key".to_string(),
-        })
-        .base_url(uri_rx.recv().expect("mock uri"));
-    let message = client
-        .complete(&ModelRequest {
-            provider: ModelProvider::Gemini,
-            model_name: "gemini-test".to_string(),
-            prompt: "ping".to_string(),
-        })
-        .expect("mapped message");
-    assert_eq!(message.role, MessageRole::Assistant);
-    assert_eq!(message.text, "gemini-pong");
-    let _ = stop_tx.send(());
-    worker.join().expect("mock thread");
+fn a_response_without_usage_has_none() {
+    for kind in PROVIDERS {
+        let (route, (name, value), mut body) = case(kind, "no usage");
+        let object = body.as_object_mut().expect("object");
+        object.remove("usage");
+        object.remove("usageMetadata");
+        let mock = provider(
+            route,
+            Some((name, &value)),
+            ResponseTemplate::new(200).set_body_json(body),
+        );
+        let completion = GatewayClient::new()
+            .provider(kind)
+            .credential(CredentialSource::PlatformGateway)
+            .api_key("key-test")
+            .base_url(&mock.uri)
+            .complete(&request(kind))
+            .expect("completion");
+        assert_eq!(completion.message.text, "no usage");
+        assert_eq!(completion.usage, None, "{kind:?}");
+    }
 }
 
+// Decision 21A: the platform pays only with a key it was given for the
+// provider. Without one the call is refused before any HTTP.
 #[test]
-fn gemini_http_error_is_gateway_error() {
-    let (uri_tx, uri_rx) = mpsc::channel();
-    let (stop_tx, stop_rx) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        runtime.block_on(async move {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/v1beta/models/gemini-test:generateContent"))
-                .respond_with(ResponseTemplate::new(500))
-                .mount(&server)
-                .await;
-            uri_tx.send(server.uri()).expect("uri");
-            let _ = stop_rx.recv();
-        });
-    });
-    let client = GatewayClient::new()
-        .provider(ModelProvider::Gemini)
-        .credential(CredentialSource::PlatformGateway)
-        .base_url(uri_rx.recv().expect("mock uri"));
-    let error = client
-        .complete(&ModelRequest {
-            provider: ModelProvider::Gemini,
-            model_name: "gemini-test".to_string(),
-            prompt: "ping".to_string(),
-        })
-        .expect_err("status error");
-    assert!(matches!(error, GatewayError::Transport(_)));
-    let _ = stop_tx.send(());
-    worker.join().expect("mock thread");
+fn a_platform_call_without_a_key_is_refused() {
+    for kind in PROVIDERS {
+        let error = GatewayClient::with_transport(NoHttp)
+            .provider(kind)
+            .credential(CredentialSource::PlatformGateway)
+            .base_url("http://127.0.0.1:9")
+            .complete(&request(kind))
+            .expect_err("no key");
+        assert!(
+            matches!(error, GatewayError::NotConfigured(provider) if provider == kind),
+            "{kind:?}: {error}"
+        );
+        let error = GatewayClient::with_transport(NoHttp)
+            .provider(kind)
+            .credential(CredentialSource::PlatformGateway)
+            .api_key("")
+            .base_url("http://127.0.0.1:9")
+            .complete(&request(kind))
+            .expect_err("an empty key");
+        assert!(matches!(error, GatewayError::NotConfigured(_)), "{kind:?}");
+    }
 }
 
+// Decision 22A: the server cannot resolve a bring-your-own secret, so it
+// sends nothing rather than a call without the caller's key.
 #[test]
-fn system_one_payload_maps_to_model_message() {
-    let (uri_tx, uri_rx) = mpsc::channel();
-    let (stop_tx, stop_rx) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        runtime.block_on(async move {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/v1/chat/completions"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "choices": [{
-                        "message": { "role": "assistant", "content": "systemone-pong" }
-                    }]
-                })))
-                .mount(&server)
-                .await;
-            uri_tx.send(server.uri()).expect("uri");
-            let _ = stop_rx.recv();
-        });
-    });
-    let client = GatewayClient::new()
-        .provider(ModelProvider::SystemOne)
-        .credential(CredentialSource::BringYourOwn {
-            secret_ref: "test-key".to_string(),
-        })
-        .base_url(uri_rx.recv().expect("mock uri"));
-    let message = client
-        .complete(&ModelRequest {
-            provider: ModelProvider::SystemOne,
-            model_name: "jev-test".to_string(),
-            prompt: "ping".to_string(),
-        })
-        .expect("mapped message");
-    assert_eq!(message.role, MessageRole::Assistant);
-    assert_eq!(message.text, "systemone-pong");
-    let _ = stop_tx.send(());
-    worker.join().expect("mock thread");
+fn bring_your_own_is_refused_without_http() {
+    for kind in PROVIDERS {
+        let error = GatewayClient::with_transport(NoHttp)
+            .provider(kind)
+            .credential(CredentialSource::BringYourOwn {
+                secret_ref: "jev-secret-ref".to_string(),
+            })
+            .api_key("key-test")
+            .base_url("http://127.0.0.1:9")
+            .complete(&request(kind))
+            .expect_err("bring your own");
+        assert!(matches!(error, GatewayError::BringYourOwn), "{kind:?}");
+        assert!(!error.to_string().contains("jev-secret-ref"));
+    }
 }
 
+// Decision 24A: a provider that does not answer within the timeout is a
+// transport error, and the call does not wait for it.
 #[test]
-fn system_one_http_error_is_gateway_error() {
+fn a_provider_that_does_not_answer_times_out() {
+    let (route, (name, value), body) = case(ModelProvider::OpenAI, "late");
+    let mock = provider(
+        route,
+        Some((name, &value)),
+        ResponseTemplate::new(200)
+            .set_body_json(body)
+            .set_delay(Duration::from_secs(3)),
+    );
+    let started = Instant::now();
+    let error =
+        GatewayClient::with_transport(UreqTransport::with_timeout(Duration::from_millis(200)))
+            .provider(ModelProvider::OpenAI)
+            .credential(CredentialSource::PlatformGateway)
+            .api_key("key-test")
+            .base_url(&mock.uri)
+            .complete(&request(ModelProvider::OpenAI))
+            .expect_err("timed out");
+    assert!(matches!(error, GatewayError::Transport(_)), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+/// A provider mocked on a thread of its own: requests to `route` carrying
+/// `auth` get `response`. Returns the server's URI and a stop handle.
+struct Provider {
+    uri: String,
+    stop: mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for Provider {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("mock thread");
+        }
+    }
+}
+
+fn provider(route: &str, auth: Option<(&str, &str)>, response: ResponseTemplate) -> Provider {
     let (uri_tx, uri_rx) = mpsc::channel();
-    let (stop_tx, stop_rx) = mpsc::channel();
+    let (stop, stop_rx) = mpsc::channel::<()>();
+    let route = route.to_string();
+    let auth = auth.map(|(name, value)| (name.to_string(), value.to_string()));
     let worker = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -217,27 +184,78 @@ fn system_one_http_error_is_gateway_error() {
             .expect("tokio runtime");
         runtime.block_on(async move {
             let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/v1/chat/completions"))
-                .respond_with(ResponseTemplate::new(500))
-                .mount(&server)
-                .await;
+            let mut mock = Mock::given(method("POST")).and(path(route));
+            if let Some((name, value)) = auth {
+                mock = mock.and(header(name.as_str(), value.as_str()));
+            }
+            mock.respond_with(response).mount(&server).await;
             uri_tx.send(server.uri()).expect("uri");
             let _ = stop_rx.recv();
         });
     });
-    let client = GatewayClient::new()
-        .provider(ModelProvider::SystemOne)
-        .credential(CredentialSource::PlatformGateway)
-        .base_url(uri_rx.recv().expect("mock uri"));
-    let error = client
-        .complete(&ModelRequest {
-            provider: ModelProvider::SystemOne,
-            model_name: "jev-test".to_string(),
-            prompt: "ping".to_string(),
-        })
-        .expect_err("status error");
-    assert!(matches!(error, GatewayError::Transport(_)));
-    let _ = stop_tx.send(());
-    worker.join().expect("mock thread");
+    Provider {
+        uri: uri_rx.recv().expect("mock uri"),
+        stop,
+        worker: Some(worker),
+    }
+}
+
+fn request(provider: ModelProvider) -> ModelRequest {
+    ModelRequest {
+        provider,
+        model_name: "model-test".to_string(),
+        prompt: "ping".to_string(),
+    }
+}
+
+/// Each provider: its route, the header its key goes in, and a response
+/// with `text` that used 11 input and 7 output tokens.
+fn case(provider: ModelProvider, text: &str) -> (&'static str, (&'static str, String), Value) {
+    match provider {
+        ModelProvider::OpenAI | ModelProvider::SystemOne => (
+            "/v1/chat/completions",
+            ("authorization", "Bearer key-test".to_string()),
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": text}}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+            }),
+        ),
+        ModelProvider::Anthropic => (
+            "/v1/messages",
+            ("x-api-key", "key-test".to_string()),
+            json!({
+                "content": [{"type": "text", "text": text}],
+                "usage": {"input_tokens": 11, "output_tokens": 7}
+            }),
+        ),
+        ModelProvider::Gemini => (
+            "/v1beta/models/model-test:generateContent",
+            ("x-goog-api-key", "key-test".to_string()),
+            json!({
+                "candidates": [{"content": {"parts": [{"text": text}]}}],
+                "usageMetadata": {"promptTokenCount": 11, "candidatesTokenCount": 7}
+            }),
+        ),
+    }
+}
+
+const PROVIDERS: [ModelProvider; 4] = [
+    ModelProvider::OpenAI,
+    ModelProvider::Anthropic,
+    ModelProvider::Gemini,
+    ModelProvider::SystemOne,
+];
+
+/// A transport that fails the test if it is called.
+struct NoHttp;
+
+impl HttpTransport for NoHttp {
+    fn post_json(
+        &self,
+        url: &str,
+        _headers: &[(&str, &str)],
+        _body: &Value,
+    ) -> Result<Value, GatewayError> {
+        panic!("http was called: {url}");
+    }
 }

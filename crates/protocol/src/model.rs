@@ -15,6 +15,13 @@ pub struct ModelMessage {
     pub text: String,
 }
 
+/// The tokens a model call used, as its provider reported them (D1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelRequest {
     pub provider: ModelProvider,

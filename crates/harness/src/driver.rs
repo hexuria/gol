@@ -407,10 +407,11 @@ impl Driver {
                         model_name: self.spec.work_model.model_name.clone(),
                         prompt: prompt.clone(),
                     };
-                    match models.complete(&request) {
-                        Ok(message) => {
-                            self.push(EventPayload::ModelResponded { message }, Actor::Gateway)
-                        }
+                    match models.complete_with_usage(&request) {
+                        Ok((message, usage)) => self.push(
+                            EventPayload::ModelResponded { message, usage },
+                            Actor::Gateway,
+                        ),
                         Err(message) => self.push(
                             EventPayload::RunFailed {
                                 class: FailureClass::Dependency,

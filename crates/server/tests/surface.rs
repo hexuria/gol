@@ -45,6 +45,7 @@ fn ag_ui_maps_tool_result_and_completion() {
                         role: MessageRole::Assistant,
                         text: "noted".to_string(),
                     },
+                    usage: None,
                 },
             ),
             event(
@@ -230,6 +231,7 @@ fn reply(run_id: RunId, role: MessageRole, text: &str) -> Event {
                 role,
                 text: text.to_string(),
             },
+            usage: None,
         },
     )
 }

@@ -102,6 +102,10 @@ pub enum EventPayload {
     },
     ModelResponded {
         message: ModelMessage,
+        /// The tokens the call used, when the provider reported them. Logs
+        /// from before D1 have none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<crate::Usage>,
     },
     MemoryRead {
         scope: MemoryScope,

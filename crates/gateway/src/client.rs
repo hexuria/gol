@@ -1,12 +1,10 @@
 use std::marker::PhantomData;
 
-use protocol::{CredentialSource, ModelMessage, ModelProvider, ModelRequest};
+use protocol::{CredentialSource, ModelProvider, ModelRequest};
 
-use crate::openai::{chat_body, parse_chat_completion};
-use crate::providers::{
-    anthropic_body, gemini_body, parse_anthropic, parse_gemini, parse_system_one, system_one_body,
-};
-use crate::{GatewayError, HttpTransport, UreqTransport};
+use crate::openai::chat_body;
+use crate::providers::{anthropic_body, gemini_body, parse, system_one_body};
+use crate::{Completion, GatewayError, HttpTransport, UreqTransport};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Missing;
@@ -17,14 +15,26 @@ pub struct Set;
 pub struct GatewayClient<P, C, T> {
     provider: Option<ModelProvider>,
     credential: Option<CredentialSource>,
+    api_key: Option<String>,
     base_url: String,
     transport: T,
     _state: PhantomData<(P, C)>,
 }
 
+/// Where each provider is reached unless a base URL is configured. System
+/// One has no public host, so it needs one (decision 21A).
+fn default_base_url(provider: ModelProvider) -> &'static str {
+    match provider {
+        ModelProvider::OpenAI => "https://api.openai.com",
+        ModelProvider::Anthropic => "https://api.anthropic.com",
+        ModelProvider::Gemini => "https://generativelanguage.googleapis.com",
+        ModelProvider::SystemOne => "",
+    }
+}
+
 impl GatewayClient<Missing, Missing, UreqTransport> {
     pub fn new() -> Self {
-        Self::with_transport(UreqTransport)
+        Self::with_transport(UreqTransport::default())
     }
 }
 
@@ -39,7 +49,8 @@ impl<T> GatewayClient<Missing, Missing, T> {
         Self {
             provider: None,
             credential: None,
-            base_url: "https://api.openai.com".to_string(),
+            api_key: None,
+            base_url: default_base_url(ModelProvider::OpenAI).to_string(),
             transport,
             _state: PhantomData,
         }
@@ -51,6 +62,7 @@ impl<P, C, T> GatewayClient<P, C, T> {
         GatewayClient {
             provider: self.provider,
             credential: self.credential,
+            api_key: self.api_key,
             base_url: self.base_url,
             transport: self.transport,
             _state: PhantomData,
@@ -61,14 +73,19 @@ impl<P, C, T> GatewayClient<P, C, T> {
         self.base_url = base_url.into();
         self
     }
+
+    /// The platform's API key for this client's provider (decision 21A).
+    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
+    }
 }
 
 impl<C, T> GatewayClient<Missing, C, T> {
+    /// Also resets the base URL to the provider's own host.
     pub fn provider(mut self, provider: ModelProvider) -> GatewayClient<Set, C, T> {
         self.provider = Some(provider);
-        if provider != ModelProvider::OpenAI {
-            self.base_url = String::new();
-        }
+        self.base_url = default_base_url(provider).to_string();
         self.retag()
     }
 }
@@ -81,133 +98,74 @@ impl<P, T> GatewayClient<P, Missing, T> {
 }
 
 impl<T: HttpTransport> GatewayClient<Set, Set, T> {
-    pub fn send(&self, request: &ModelRequest) -> Result<ModelMessage, GatewayError> {
+    /// Sends `request` to the provider with the platform's key for it. A
+    /// bring-your-own credential, a missing key and a missing base URL are
+    /// refused before any HTTP.
+    pub fn send(&self, request: &ModelRequest) -> Result<Completion, GatewayError> {
         let provider = self.provider.expect("typestate recorded the provider");
         let credential = self
             .credential
-            .clone()
+            .as_ref()
             .expect("typestate recorded the credential");
         if request.provider != provider {
             return Err(GatewayError::UnsupportedProvider(request.provider));
         }
-        match provider {
-            ModelProvider::OpenAI => self.openai(request, &credential),
-            ModelProvider::Anthropic => self.anthropic(request, &credential),
-            ModelProvider::Gemini => self.gemini(request, &credential),
-            ModelProvider::SystemOne => self.system_one(request, &credential),
+        let key = match credential {
+            CredentialSource::BringYourOwn { .. } => return Err(GatewayError::BringYourOwn),
+            CredentialSource::PlatformGateway => self
+                .api_key
+                .as_deref()
+                .filter(|key| !key.is_empty())
+                .ok_or(GatewayError::NotConfigured(provider))?,
+        };
+        let base = self.base_url.trim_end_matches('/');
+        if base.is_empty() {
+            return Err(GatewayError::NotConfigured(provider));
         }
-    }
-
-    fn anthropic(
-        &self,
-        request: &ModelRequest,
-        credential: &CredentialSource,
-    ) -> Result<ModelMessage, GatewayError> {
-        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let body = anthropic_body(&request.model_name, &request.prompt);
-        let response = match credential {
-            CredentialSource::BringYourOwn { .. } => {
-                let headers = [
-                    ("content-type", "application/json"),
+        let json = ("content-type", "application/json");
+        let response = match provider {
+            ModelProvider::OpenAI | ModelProvider::SystemOne => {
+                let body = match provider {
+                    ModelProvider::SystemOne => {
+                        system_one_body(&request.model_name, &request.prompt)
+                    }
+                    _ => chat_body(&request.model_name, &request.prompt),
+                };
+                let bearer = format!("Bearer {key}");
+                self.transport.post_json(
+                    &format!("{base}/v1/chat/completions"),
+                    &[json, ("authorization", &bearer)],
+                    &body,
+                )?
+            }
+            ModelProvider::Anthropic => self.transport.post_json(
+                &format!("{base}/v1/messages"),
+                &[
+                    json,
+                    ("x-api-key", key),
                     ("anthropic-version", "2023-06-01"),
-                ];
-                self.transport.post_json(&url, &headers, &body)?
-            }
-            CredentialSource::PlatformGateway => {
-                let headers = [
-                    ("content-type", "application/json"),
-                    ("x-api-key", "platform"),
-                    ("anthropic-version", "2023-06-01"),
-                ];
-                self.transport.post_json(&url, &headers, &body)?
-            }
+                ],
+                &anthropic_body(&request.model_name, &request.prompt),
+            )?,
+            ModelProvider::Gemini => self.transport.post_json(
+                &format!(
+                    "{base}/v1beta/models/{}:generateContent",
+                    request.model_name
+                ),
+                &[json, ("x-goog-api-key", key)],
+                &gemini_body(&request.prompt),
+            )?,
         };
-        parse_anthropic(&response)
-    }
-
-    fn gemini(
-        &self,
-        request: &ModelRequest,
-        credential: &CredentialSource,
-    ) -> Result<ModelMessage, GatewayError> {
-        let url = format!(
-            "{}/v1beta/models/{}:generateContent",
-            self.base_url.trim_end_matches('/'),
-            request.model_name
-        );
-        let body = gemini_body(&request.prompt);
-        let response = match credential {
-            CredentialSource::BringYourOwn { .. } => {
-                let headers = [("content-type", "application/json")];
-                self.transport.post_json(&url, &headers, &body)?
-            }
-            CredentialSource::PlatformGateway => {
-                let headers = [
-                    ("content-type", "application/json"),
-                    ("x-goog-api-key", "platform"),
-                ];
-                self.transport.post_json(&url, &headers, &body)?
-            }
-        };
-        parse_gemini(&response)
-    }
-
-    fn system_one(
-        &self,
-        request: &ModelRequest,
-        credential: &CredentialSource,
-    ) -> Result<ModelMessage, GatewayError> {
-        let url = format!(
-            "{}/v1/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
-        let body = system_one_body(&request.model_name, &request.prompt);
-        let response = match credential {
-            CredentialSource::BringYourOwn { .. } => {
-                let headers = [("content-type", "application/json")];
-                self.transport.post_json(&url, &headers, &body)?
-            }
-            CredentialSource::PlatformGateway => {
-                let headers = [
-                    ("content-type", "application/json"),
-                    ("authorization", "Bearer platform"),
-                ];
-                self.transport.post_json(&url, &headers, &body)?
-            }
-        };
-        parse_system_one(&response)
-    }
-
-    fn openai(
-        &self,
-        request: &ModelRequest,
-        credential: &CredentialSource,
-    ) -> Result<ModelMessage, GatewayError> {
-        let url = format!(
-            "{}/v1/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
-        let body = chat_body(&request.model_name, &request.prompt);
-        let response = match credential {
-            CredentialSource::BringYourOwn { .. } => {
-                let headers = [("content-type", "application/json")];
-                self.transport.post_json(&url, &headers, &body)?
-            }
-            CredentialSource::PlatformGateway => {
-                let headers = [("content-type", "application/json")];
-                self.transport.post_json(&url, &headers, &body)?
-            }
-        };
-        parse_chat_completion(&response)
+        parse(provider, &response)
     }
 }
 
 pub trait ModelGateway {
-    fn complete(&self, request: &ModelRequest) -> Result<ModelMessage, GatewayError>;
+    fn complete(&self, request: &ModelRequest) -> Result<Completion, GatewayError>;
 }
 
 impl<T: HttpTransport> ModelGateway for GatewayClient<Set, Set, T> {
-    fn complete(&self, request: &ModelRequest) -> Result<ModelMessage, GatewayError> {
+    fn complete(&self, request: &ModelRequest) -> Result<Completion, GatewayError> {
         self.send(request)
     }
 }
@@ -267,7 +225,7 @@ mod tests {
         provider: ModelProvider,
         credential: CredentialSource,
         base_url_first: Option<&str>,
-    ) -> RecordedPost {
+    ) -> Result<RecordedPost, GatewayError> {
         let posts = Arc::new(Mutex::new(Vec::new()));
         let client = GatewayClient::with_transport(RecordingTransport {
             posts: Arc::clone(&posts),
@@ -279,22 +237,23 @@ mod tests {
         client
             .provider(provider)
             .credential(credential)
+            .api_key("key-test")
             .send(&ModelRequest {
                 provider,
                 model_name: "model".to_string(),
                 prompt: "hi".to_string(),
-            })
-            .expect("recorded send");
+            })?;
         let mut posts = posts.lock().expect("recording");
         assert_eq!(posts.len(), 1, "{provider:?} posted once");
-        posts.pop().expect("one post")
+        Ok(posts.pop().expect("one post"))
     }
 
     #[test]
     fn provider_mismatch_does_not_call_http() {
         let client = GatewayClient::with_transport(PanicTransport)
             .provider(ModelProvider::Anthropic)
-            .credential(CredentialSource::PlatformGateway);
+            .credential(CredentialSource::PlatformGateway)
+            .api_key("key-test");
         let error = client
             .send(&ModelRequest {
                 provider: ModelProvider::OpenAI,
@@ -308,71 +267,81 @@ mod tests {
         ));
     }
 
+    // Decision 22A: a bring-your-own credential is refused before any HTTP,
+    // so its secret reference is never sent anywhere.
     #[test]
-    fn bring_your_own_header_omits_secret_ref() {
-        let secret_ref = "jev-secret-ref";
+    fn bring_your_own_is_refused_before_http() {
         for provider in [
             ModelProvider::OpenAI,
             ModelProvider::Anthropic,
             ModelProvider::Gemini,
             ModelProvider::SystemOne,
         ] {
-            let post = send_recorded(
-                provider,
-                CredentialSource::BringYourOwn {
-                    secret_ref: secret_ref.to_string(),
-                },
-                None,
-            );
-            for (name, value) in &post.headers {
-                assert!(
-                    !value.contains(secret_ref),
-                    "{provider:?} header {name} contained {secret_ref}: {value}"
-                );
-            }
+            let error = GatewayClient::with_transport(PanicTransport)
+                .provider(provider)
+                .credential(CredentialSource::BringYourOwn {
+                    secret_ref: "jev-secret-ref".to_string(),
+                })
+                .api_key("key-test")
+                .base_url("http://127.0.0.1:9")
+                .send(&ModelRequest {
+                    provider,
+                    model_name: "model".to_string(),
+                    prompt: "hi".to_string(),
+                })
+                .unwrap_err();
+            assert!(matches!(error, GatewayError::BringYourOwn), "{provider:?}");
         }
     }
 
+    // Each provider has its own host; System One has none, so it needs a
+    // configured base URL (decision 21A).
     #[test]
     fn provider_drops_openai_host_for_other_providers() {
         let cases = [
-            (ModelProvider::Anthropic, "/v1/messages"),
+            (
+                ModelProvider::Anthropic,
+                "https://api.anthropic.com/v1/messages",
+            ),
             (
                 ModelProvider::Gemini,
-                "/v1beta/models/model:generateContent",
+                "https://generativelanguage.googleapis.com/v1beta/models/model:generateContent",
             ),
-            (ModelProvider::SystemOne, "/v1/chat/completions"),
         ];
-        for (provider, suffix) in cases {
-            let post = send_recorded(provider, CredentialSource::PlatformGateway, None);
-            assert!(
-                !post.url.contains("https://api.openai.com"),
-                "{provider:?} kept the OpenAI host: {}",
-                post.url
-            );
-            assert!(
-                post.url.ends_with(suffix),
-                "{provider:?} url {} does not end with {suffix}",
-                post.url
-            );
+        for (provider, url) in cases {
+            let post =
+                send_recorded(provider, CredentialSource::PlatformGateway, None).expect("sent");
+            assert_eq!(post.url, url, "{provider:?}");
         }
+        assert!(matches!(
+            send_recorded(
+                ModelProvider::SystemOne,
+                CredentialSource::PlatformGateway,
+                None
+            ),
+            Err(GatewayError::NotConfigured(ModelProvider::SystemOne))
+        ));
     }
 
+    // Choosing the provider resets the base URL to its host.
     #[test]
     fn base_url_before_provider_does_not_keep_the_mock() {
         let mock = "http://127.0.0.1:9";
-        let cases = [
-            (ModelProvider::Anthropic, "/v1/messages"),
-            (
-                ModelProvider::Gemini,
-                "/v1beta/models/model:generateContent",
+        let post = send_recorded(
+            ModelProvider::Anthropic,
+            CredentialSource::PlatformGateway,
+            Some(mock),
+        )
+        .expect("sent");
+        assert_eq!(post.url, "https://api.anthropic.com/v1/messages");
+        assert!(matches!(
+            send_recorded(
+                ModelProvider::SystemOne,
+                CredentialSource::PlatformGateway,
+                Some(mock)
             ),
-            (ModelProvider::SystemOne, "/v1/chat/completions"),
-        ];
-        for (provider, path) in cases {
-            let post = send_recorded(provider, CredentialSource::PlatformGateway, Some(mock));
-            assert_eq!(post.url, path, "{provider:?} kept {mock}");
-        }
+            Err(GatewayError::NotConfigured(ModelProvider::SystemOne))
+        ));
     }
 
     #[test]
@@ -381,7 +350,11 @@ mod tests {
             ModelProvider::OpenAI,
             CredentialSource::PlatformGateway,
             None,
-        );
+        )
+        .expect("sent");
         assert_eq!(post.url, "https://api.openai.com/v1/chat/completions");
+        assert!(post
+            .headers
+            .contains(&("authorization".to_string(), "Bearer key-test".to_string())));
     }
 }

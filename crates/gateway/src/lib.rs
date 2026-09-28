@@ -7,4 +7,5 @@ mod transport;
 
 pub use client::{GatewayClient, Missing, ModelGateway, Set};
 pub use error::GatewayError;
-pub use transport::{HttpTransport, UreqTransport};
+pub use providers::{parse, Completion};
+pub use transport::{HttpTransport, UreqTransport, DEFAULT_TIMEOUT};

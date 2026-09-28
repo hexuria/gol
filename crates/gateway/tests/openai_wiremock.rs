@@ -3,7 +3,7 @@ use std::thread;
 
 use gateway::{GatewayClient, ModelGateway};
 use protocol::{CredentialSource, MessageRole, ModelProvider, ModelRequest};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[test]
@@ -19,6 +19,7 @@ fn openai_payload_maps_to_model_message() {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/v1/chat/completions"))
+                .and(header("authorization", "Bearer key-test"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "choices": [{
                         "message": { "role": "assistant", "content": "pong" }
@@ -35,16 +36,17 @@ fn openai_payload_maps_to_model_message() {
     let client = GatewayClient::new()
         .provider(ModelProvider::OpenAI)
         .credential(CredentialSource::PlatformGateway)
+        .api_key("key-test")
         .base_url(uri);
-    let message = client
+    let completion = client
         .complete(&ModelRequest {
             provider: ModelProvider::OpenAI,
             model_name: "gpt-test".to_string(),
             prompt: "ping".to_string(),
         })
         .expect("mapped message");
-    assert_eq!(message.role, MessageRole::Assistant);
-    assert_eq!(message.text, "pong");
+    assert_eq!(completion.message.role, MessageRole::Assistant);
+    assert_eq!(completion.message.text, "pong");
 
     let _ = stop_tx.send(());
     worker.join().expect("mock thread");

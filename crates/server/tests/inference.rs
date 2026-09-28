@@ -688,7 +688,7 @@ async fn four_modes_only_let_the_server_post_in_gateway_mode() {
             let model_at = events
                 .iter()
                 .position(|event| {
-                    matches!(&event.payload, EventPayload::ModelResponded { message } if message.text == GATEWAY_TEXT)
+                    matches!(&event.payload, EventPayload::ModelResponded { message, .. } if message.text == GATEWAY_TEXT)
                 })
                 .expect("model");
             assert!(user_at < model_at);
@@ -940,7 +940,7 @@ fn an_event_stored_after_run_returns_stays_ahead_of_the_completion() {
     ));
     assert!(matches!(
         &events[4].payload,
-        EventPayload::ModelResponded { message }
+        EventPayload::ModelResponded { message, .. }
             if message.role == MessageRole::Assistant && message.text == "fixture assistant text"
     ));
     assert!(matches!(
