@@ -630,3 +630,156 @@ async fn a_worker_that_lost_its_lease_stops_at_the_next_boundary() {
         assert_eq!(server.received_requests().await.expect("requests").len(), 0);
     }
 }
+
+/// Steals `spec`'s lease on queue `key` for another worker.
+fn steal_lease(key: &str, spec: &RunSpec) {
+    let mut redis = redis::Client::open(REDIS_URL)
+        .expect("client")
+        .get_connection()
+        .expect("connect");
+    redis::cmd("SET")
+        .arg(format!("{{{key}}}:lease:{}", spec.run_id))
+        .arg("another-worker")
+        .query::<()>(&mut redis)
+        .expect("steal the lease");
+}
+
+// Review of #69: the lease is lost while Jev decides the step that would end
+// the run (a completion, or a decider error). run_until returns without a
+// boundary, so the write that ends the run must check the lease too: this
+// worker stores no end, and leaves the run in processing for its new holder.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_that_lost_its_lease_during_the_last_step_does_not_end_the_run() {
+    for which in 0..2 {
+        for fails in [false, true] {
+            let server = MockServer::start().await;
+            let response = if fails {
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200).set_body_json(answer("complete"))
+            };
+            Mock::given(method("POST"))
+                .and(path("/v1/systemone"))
+                .respond_with(response.set_delay(std::time::Duration::from_millis(600)))
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            blocking(move || {
+                let store = stores().swap_remove(which);
+                let spec = spec();
+                store
+                    .put_run(StoredRun {
+                        spec: spec.clone(),
+                        events: queued_events(&spec),
+                    })
+                    .expect("put run");
+                let key = format!("gol:test:{}", RunId::new());
+                let queue = RedisRunQueue::with_key(REDIS_URL, &key);
+                queue.push(spec.run_id).expect("push");
+                let worker = worker(store.clone(), &key, &uri);
+                let worked = std::thread::scope(|scope| {
+                    let running = scope.spawn(|| worker.work_one());
+                    // Jev is answering the first decision.
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    steal_lease(&key, &spec);
+                    running.join().expect("worker")
+                });
+                assert_eq!(worked.expect("work"), Some(spec.run_id));
+                let events = store.run(spec.run_id).expect("read").expect("run").events;
+                assert_eq!(count(&events, is_terminal), 0, "{:?}", payloads(&events));
+                assert_eq!(queue.processing().expect("processing"), [spec.run_id]);
+            });
+        }
+    }
+}
+
+// Review of #69: a resumed run first performs what its log left pending (here
+// a delegation cut after its authorization). A worker whose lease is already
+// gone must not perform it: no child run is started, nothing is stored, and
+// the run stays with its new holder.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_without_its_lease_does_not_redo_a_pending_effect() {
+    for which in 0..2 {
+        let server = jev(&["complete"]).await;
+        let uri = server.uri();
+        blocking(move || {
+            let store = stores().swap_remove(which);
+            let owner = Owner::new("https://issuer.test", format!("user-{}", RunId::new()), "t");
+            let writer = AgentId::new();
+            store
+                .put_agent(server::StoredAgent {
+                    manifest: server::AgentManifest {
+                        id: writer,
+                        version: "1".to_string(),
+                        name: "writer".to_string(),
+                        description: String::new(),
+                        instructions: "Write.".to_string(),
+                        tools: Vec::new(),
+                        required_capabilities: Vec::new(),
+                    },
+                    owner: owner.clone(),
+                })
+                .expect("put agent");
+            let mut spec = spec();
+            spec.owner = owner;
+            // Room to give a child two steps and two model calls.
+            spec.limits = Limits {
+                max_steps: 8,
+                max_model_calls: 4,
+            };
+            spec.capabilities
+                .push(protocol::Capability::new("agent.delegate"));
+            // The log a worker left when it died after authorizing the
+            // delegation and before starting the child.
+            let mut events = queued_events(&spec);
+            for payload in [
+                EventPayload::RunScheduled,
+                EventPayload::RunProvisioning,
+                EventPayload::RunStarting,
+            ] {
+                events.push(event(&spec, payload));
+            }
+            let mut driver = Driver::resume(spec.clone(), events).expect("resume");
+            let mut decider = ScriptedDecider::new([Effect::Delegate {
+                agent_id: writer,
+                input: "draft".to_string(),
+            }]);
+            let _ = run_until(
+                &mut driver,
+                &mut decider,
+                &[],
+                &harness::UnavailableModel,
+                &InMemory::default(),
+                &mut |_| Boundary::Continue,
+            );
+            let authorized = driver
+                .events()
+                .iter()
+                .position(|event| matches!(event.payload, EventPayload::EffectAuthorized { .. }))
+                .expect("authorized");
+            let stored = driver.events()[..=authorized].to_vec();
+            store
+                .put_run(StoredRun {
+                    spec: spec.clone(),
+                    events: stored.clone(),
+                })
+                .expect("put run");
+            let key = format!("gol:test:{}", RunId::new());
+            let queue = RedisRunQueue::with_key(REDIS_URL, &key);
+            queue.push(spec.run_id).expect("push");
+            let worker = worker(store.clone(), &key, &uri);
+            let claim = worker.claim().expect("claim").expect("a run");
+            let server::Prepared::Open(open) = claim.prepare().expect("prepare") else {
+                panic!("the run is open");
+            };
+            steal_lease(&key, &spec);
+            let done = open.execute().record().expect("record");
+            done.ack().expect("ack");
+            let events = store.run(spec.run_id).expect("read").expect("run").events;
+            assert_eq!(payloads(&events), payloads(&stored));
+            assert_eq!(queue.queued().expect("queued"), []);
+            assert_eq!(queue.processing().expect("processing"), [spec.run_id]);
+        });
+        assert_eq!(server.received_requests().await.expect("requests").len(), 0);
+    }
+}

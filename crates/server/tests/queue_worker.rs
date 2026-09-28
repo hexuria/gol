@@ -181,10 +181,9 @@ async fn crash_after_claim(uri: String, setup: fn() -> Setup) {
 }
 
 // Forced: worker A loads the run, its lease runs out, and B claims, runs and
-// acknowledges it; then A executes. A's first append (the scheduling ladder)
-// is refused because the log is terminal, so A stores nothing and never asks
-// Jev (Phase 1.5b: before, A ran the whole run and its one append was
-// refused). The store keeps one terminal event, and A's acknowledgement
+// acknowledges it; then A executes. A's first write (the scheduling ladder)
+// finds its lease gone, so A stores nothing and never asks Jev (Phase 1.5b:
+// before, A ran the whole run and its one append was refused as terminal). The store keeps one terminal event, and A's acknowledgement
 // leaves the queue empty.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_workers_one_terminal() {
@@ -211,7 +210,9 @@ async fn two_workers(uri: String, setup: fn() -> Setup) {
         assert_eq!(setup.queue.reap().expect("reap"), [setup.run_id]);
         assert_eq!(b.work_one().expect("work"), Some(setup.run_id));
         let done = open.execute().record().expect("record");
-        assert_eq!(done.recorded(), Some(Append::Terminal));
+        // A's lease ran out, so its first write stops at the lease check and
+        // stores nothing (reported as `Moved`; its release does nothing).
+        assert_eq!(done.recorded(), Some(Append::Moved));
         done.ack().expect("ack");
         assert_eq!(terminals(setup.store.as_ref(), setup.run_id).len(), 1);
         assert_eq!(setup.queue.processing().expect("processing"), []);

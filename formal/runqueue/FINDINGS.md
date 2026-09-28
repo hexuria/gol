@@ -11,16 +11,16 @@ Writers:
   - marks the run pending: one script adds it to the pending set, scored by the Redis clock (`:350`; `PEND`, `crates/server/src/queue.rs:80`; `pend`, `:215`). With Redis down it fails here, and nothing is stored;
   - stores the run as created and queued (`:352`);
   - pushes it: one script queues it and takes it off pending (`:369`; `PUSH`, `queue.rs:87`; `push`, `:226`).
-- **Workers** (`Worker::work_one`, `crates/server/src/worker.rs:186`), `GOL_WORKERS` of them in the server process. Each one:
+- **Workers** (`Worker::work_one`, `crates/server/src/worker.rs:232`), `GOL_WORKERS` of them in the server process. Each one:
   - claims a run: one script moves it to processing and leases it with `SET NX PX` (`CLAIM`, `queue.rs:103`; `claim`, `:303`). A run already leased (queued again while held) is dropped from the list instead;
-  - loads the run (`Claim::prepare`, `worker.rs:243`). An open run counts a start (`START`, `queue.rs:114`). A claim that cannot load or start its run releases it: one script, which acts only while the claim still holds the lease, moves it off processing, onto the back of the runs list, and deletes the lease (`RELEASE`, `queue.rs:122`);
-  - runs the harness (`Open::execute`, `worker.rs:310`), renewing the lease every heartbeat (`:371`; `RENEW`, `queue.rs:132`);
+  - loads the run (`Claim::prepare`, `worker.rs:289`). An open run counts a start (`START`, `queue.rs:114`). A claim that cannot load or start its run releases it: one script, which acts only while the claim still holds the lease, moves it off processing, onto the back of the runs list, and deletes the lease (`RELEASE`, `queue.rs:122`);
+  - runs the harness (`Open::execute`, `worker.rs:357`), renewing the lease every heartbeat (`:585`; `RENEW`, `queue.rs:132`);
   - stores the run as it goes (Phase 1.5b, `Worker::store_as_it_goes` and `run_from` in `worker.rs`): the scheduling ladder, then each step's events at its boundary, then the tail that ends the run, each with `RunStore::append_events_after`, which the store refuses once the log is terminal or no longer as long as the worker saw. The run log's side of this is `formal/runlog` (`WAppend`); to this model the steps before the tail are no write, and the tail is `Record`;
   - when other writers keep moving the log (more than three reloads), stores no end and releases the run instead of acknowledging it (`Done::ack` on `Append::Moved`): the `Release` action, taken from `ran`;
-  - acknowledges: one script removes the run from processing, clears its start count and releases the lease if it still holds it (`ACK`, `queue.rs:141`; `Done::ack`, `worker.rs:360`).
+  - acknowledges: one script removes the run from processing, clears its start count and releases the lease if it still holds it (`ACK`, `queue.rs:141`; `Done::ack`, `worker.rs:568`).
   - Only a `Done` can acknowledge, and only `record`, or a `prepare` that finds nothing to run, makes one. So the ack of a stored run comes after its terminal event by construction. A run that is not stored is acknowledged without one, and dropped with an error.
-- **The reaper** (`reap_forever`, `worker.rs:394`): one script moves every run in processing whose lease is gone back to the front of the runs list (`REAP`, `queue.rs:152`).
-- **The sweep** (`sweep`, `worker.rs:419`), in the reaper's loop: for each run pending for at least `sweep_after` (60 s; `PENDING_FOR`, `queue.rs:94`), it loads the run. A run still created and queued is pushed with the producer's script; a run that has started or ended is taken off pending (`unpend`, `queue.rs:270`). A run not in the store yet stays pending, since its put may still be in flight, until it has been pending for `forget_after` (24 h), when it is dropped.
+- **The reaper** (`reap_forever`, `worker.rs:608`): one script moves every run in processing whose lease is gone back to the front of the runs list (`REAP`, `queue.rs:152`).
+- **The sweep** (`sweep`, `worker.rs:633`), in the reaper's loop: for each run pending for at least `sweep_after` (60 s; `PENDING_FOR`, `queue.rs:94`), it loads the run. A run still created and queued is pushed with the producer's script; a run that has started or ended is taken off pending (`unpend`, `queue.rs:270`). A run not in the store yet stays pending, since its put may still be in flight, until it has been pending for `forget_after` (24 h), when it is dropped.
 
 Each Redis command, each script and each append is one atomic step. The producer's pend, store and push are three steps, and the server process may die between them (`ProducerDies`, at most `MaxProducerDeaths` times).
 
@@ -77,7 +77,7 @@ TLC2 Version 2.19 of 08 August 2024, from tla2tools v1.7.4, which `scripts/insta
 - `RunQueue.cfg`: 863 states generated, 339 distinct, depth 19. Before Phase 1.5b let `Release` act after `Run` too: 795 generated, 339 distinct, depth 19; before C6: 793, 337, depth 17.
 - `RunQueueCrash.cfg`: 1,727 states generated, 678 distinct, depth 20 (before Phase 1.5b: 1,591 generated, 678 distinct).
 
-Checked again on 2026-09-29 for Phase 1.5b. The only change is that `Release` is enabled from `ran` as well as `claimed`, so no new state is reachable, only new transitions between the same states. Every invariant and property still passes. Load-failure releases and hand-backs share `MaxReleases`, so at the PR constants a release after `Run` is explored within the same budget of two.
+Checked again on 2026-09-29 for Phase 1.5b. The only change is that `Release` is enabled from `ran` as well as `claimed`, so no new state is reachable, only new transitions between the same states. Every invariant and property still passes. Load-failure releases and hand-backs share `MaxReleases`, which is 1 in both PR configs, so a behavior holds at most one release, from `claimed` or from `ran`.
 
 Larger bounds; the first two rows are `RunQueueCrash.cfg` (`MaxProducerDeaths = 1`) with the constants changed:
 
@@ -117,8 +117,8 @@ Tests in `crates/server/tests/queue_worker.rs`, against Redis and Postgres (the 
 - **`AtMostOneTerminal`**, the `OneWorkerPerRun` trace forced: `two_workers_one_terminal`.
   - A's lease runs out after A loads the run.
   - B claims, runs and acknowledges.
-  - A runs Jev too, so there are two Jev calls.
-  - A's record is refused (`Append::Terminal`), one terminal event stays, and both acknowledgements leave the queue empty.
+  - A executes. Since Phase 1.5b, its first write (the scheduling ladder) finds its lease gone, so A stores nothing and never asks Jev: one Jev call per store (`recorded()` is `Moved`, and its release does nothing). Before 1.5b, A ran Jev too, and its one append was refused as terminal.
+  - One terminal event stays, and both acknowledgements leave the queue empty.
 - **`AckAfterTerminal`:** the claim's types (`Done` alone acknowledges) and `a_failed_record_is_not_acknowledged`.
   - `an_ended_run_is_acknowledged_without_jev` covers the found-ended path (owner decision 3A).
 - **The start cap:** `a_run_started_too_often_is_failed`, on both stores. It checks the boundary (with a cap of 2, the second start still runs, and the third is failed) and that the ack clears the count. A store outage uses no starts: `a_load_error_releases_the_claim_without_counting`. A run that can never load does not hold up the queue: `an_unloadable_run_does_not_hold_up_the_queue`.

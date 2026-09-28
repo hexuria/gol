@@ -397,9 +397,10 @@ impl Worker {
     fn store_as_it_goes(&self, stored: StoredRun, token: &str) -> Result<Append, String> {
         let spec = stored.spec;
         let mut events = stored.events;
-        for reload in 0..=RELOADS {
+        let mut reloads = 0;
+        loop {
             match self.run_from(&spec, events, token)? {
-                Stopped::Store(Append::Moved) if reload < RELOADS => {}
+                Stopped::Store(Append::Moved) if reloads < RELOADS => reloads += 1,
                 Stopped::Store(other) => return Ok(other),
                 Stopped::LostLease => return Ok(Append::Moved),
             }
@@ -408,7 +409,6 @@ impl Worker {
                 None => return Ok(Append::Missing),
             };
         }
-        Ok(Append::Moved)
     }
 
     /// Runs `spec`'s run from `events`, its stored log, appending as it goes.
@@ -427,7 +427,20 @@ impl Worker {
         }
         let run_id = spec.run_id;
         let mut seen = events.len();
+        // Every write first checks that this claim still holds the lease: a
+        // lease can run out during a long step (a Jev or model call), and the
+        // write after it may be the one that ends the run. A Redis error
+        // keeps going, as the heartbeat does.
+        let holds = || {
+            !matches!(
+                self.queue.renew(run_id, token, self.timing.lease),
+                Ok(false)
+            )
+        };
         let append = |seen: usize, new: Vec<Event>| {
+            if !holds() {
+                return Ok(Stopped::LostLease);
+            }
             self.store
                 .append_events_after(run_id, seen, new)
                 .map(Stopped::Store)
@@ -454,6 +467,11 @@ impl Worker {
                 return append(seen, vec![failed]);
             }
         };
+        // run_until first finishes the step the log was cut in, which can
+        // perform an effect (a tool call, a delegation) before any boundary.
+        if !holds() {
+            return Ok(Stopped::LostLease);
+        }
         let (spawner, targets) = self.delegation(spec);
         driver = driver.with_spawner(spawner, targets);
         let mut decider = match jev_client(&self.jev_base_url) {
@@ -478,13 +496,6 @@ impl Worker {
             &UnavailableModel,
             &memory,
             &mut |driver| {
-                // A worker whose lease ran out stops writing here: another
-                // may already be running the run (a Redis error keeps going,
-                // as the heartbeat does).
-                if let Ok(false) = self.queue.renew(run_id, token, self.timing.lease) {
-                    refused = Some(Ok(Stopped::LostLease));
-                    return Boundary::Pause;
-                }
                 let new = &driver.events()[seen..];
                 if new.is_empty() {
                     return Boundary::Continue;
