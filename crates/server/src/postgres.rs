@@ -142,7 +142,13 @@ impl PostgresStore {
             ));
         }
         let mut config: postgres::Config = url.parse().map_err(sql)?;
-        let timeout = *config.get_connect_timeout().unwrap_or(&CONNECT_TIMEOUT);
+        // Zero means "wait indefinitely" to libpq; the parser drops it today,
+        // and r2d2 refuses a zero wait by panicking, so zero counts as unset.
+        let timeout = config
+            .get_connect_timeout()
+            .copied()
+            .filter(|timeout| !timeout.is_zero())
+            .unwrap_or(CONNECT_TIMEOUT);
         config.connect_timeout(timeout);
         // A caller waits for a free connection at most this long, whatever
         // the URL's connect_timeout: requests should not queue for a day.

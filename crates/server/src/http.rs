@@ -533,6 +533,7 @@ async fn get_run(
 const EVENTS_PAGE_MAX: usize = 500;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EventsQuery {
     /// How many events the caller has already seen.
     #[serde(default)]

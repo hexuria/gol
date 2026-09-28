@@ -1469,3 +1469,79 @@ fn connect_panic_in_this_process() {
     tx.rollback().expect("rollback");
     blocked.join().unwrap().expect("put");
 }
+
+// libpq reads connect_timeout=0 as "wait indefinitely": the store treats it
+// as unset instead of handing r2d2 a zero wait, which it refuses by panicking.
+#[test]
+fn a_zero_connect_timeout_is_not_a_panic() {
+    let url = format!("{POSTGRES_URL}?connect_timeout=0");
+    let store = PostgresStore::connect(&url).expect("connect");
+    assert_eq!(store.run(RunId::new()).map(|run| run.is_none()), Ok(true));
+}
+
+// A batch ends at its terminal event: one after it is refused, in Postgres.
+#[test]
+fn an_event_after_a_terminal_in_one_batch_is_refused_in_postgres() {
+    let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+    let spec = spec();
+    let batch = vec![
+        completed(&spec, 2, "done".to_string()),
+        user_message(&spec, 3),
+    ];
+    assert!(store
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: batch.clone(),
+        })
+        .is_err());
+    store
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: vec![user_message(&spec, 1)],
+        })
+        .expect("put run");
+    assert!(store.append_events(spec.run_id, batch).is_err());
+    assert_eq!(reconnect(spec.run_id).events.len(), 1);
+}
+
+// The events route pages a Postgres log by count, as it does in memory.
+#[tokio::test]
+async fn the_events_route_pages_a_postgres_log() {
+    let spec = spec();
+    let run_id = spec.run_id;
+    let events: Vec<Event> = (1..=5).map(|at| user_message(&spec, at)).collect();
+    let expected = events.clone();
+    let store = tokio::task::spawn_blocking(move || {
+        let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
+        store.put_run(StoredRun { spec, events }).expect("put run");
+        store
+    })
+    .await
+    .expect("connect thread");
+    let app = server::router(
+        Arc::new(store),
+        "http://127.0.0.1:9",
+        common::authenticator(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let page = |query: &'static str| async move {
+        reqwest::Client::new()
+            .get(format!("http://{addr}/v1/runs/{run_id}/events{query}"))
+            .header("authorization", common::bearer())
+            .send()
+            .await
+            .expect("get")
+            .json::<Vec<Event>>()
+            .await
+            .expect("events")
+    };
+    assert_eq!(page("?after=1&limit=2").await, expected[1..3]);
+    assert_eq!(page("?after=3").await, expected[3..5]);
+    assert_eq!(page("").await, expected);
+}

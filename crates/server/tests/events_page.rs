@@ -143,7 +143,7 @@ async fn events_paginate_after_seq() {
     let (status, body) = get(url("?after=5&limit=500"), "user-1").await;
     assert_eq!((status, page_texts(&body).len()), (200, 0));
 
-    for bad in ["?limit=0", "?limit=501", "?after=-1", "?limit=x"] {
+    for bad in ["?limit=0", "?limit=501", "?after=-1", "?limit=x", "?aftr=1"] {
         assert_eq!(get(url(bad), "user-1").await.0, 400, "{bad}");
     }
     assert_eq!(get(url("?after=0&limit=2"), "bob").await.0, 404);

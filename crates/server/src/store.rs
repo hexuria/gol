@@ -67,17 +67,16 @@ pub fn is_terminal(payload: &EventPayload) -> bool {
     )
 }
 
-/// A batch of events, as `put_run` and `append_events` take it, holds at most
-/// one terminal event: the log ends at the first.
+/// A batch of events, as `put_run` and `append_events` take it, ends at its
+/// terminal event, if it has one: the log ends at the first.
 pub(crate) fn check_one_terminal(events: &[Event]) -> Result<(), StoreError> {
-    if events
+    let after_terminal = events
         .iter()
-        .filter(|event| is_terminal(&event.payload))
-        .count()
-        > 1
-    {
+        .position(|event| is_terminal(&event.payload))
+        .is_some_and(|at| at + 1 < events.len());
+    if after_terminal {
         return Err(StoreError::new(
-            "a batch holds more than one terminal event",
+            "a batch holds an event after its terminal event",
         ));
     }
     Ok(())
@@ -93,11 +92,11 @@ pub trait RunStore: Send + Sync {
     fn agent(&self, id: AgentId) -> Result<Option<StoredAgent>, StoreError>;
     /// Store a new run. A run already stored under that id keeps its spec and
     /// events, so a redelivered put cannot drop anything appended since. A
-    /// batch with more than one terminal event is refused.
+    /// batch with an event after its terminal event is refused.
     fn put_run(&self, run: StoredRun) -> Result<(), StoreError>;
     /// Append `events` onto the stored run in one atomic step, unless the
     /// stored log is already terminal or the run is missing. `spec` and the
-    /// events already stored never change. A batch with more than one
+    /// events already stored never change. A batch with an event after its
     /// terminal event is refused.
     fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError>;
     fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError>;
@@ -269,6 +268,45 @@ mod tests {
                 outcome: outcome.to_string(),
             },
         )
+    }
+
+    // A batch ends at its terminal event: one after it is refused.
+    #[test]
+    fn an_event_after_a_terminal_in_one_batch_is_refused() {
+        let store = InMemoryStore::default();
+        let spec = spec();
+        let message = Event::record(
+            protocol::EventSource::new(
+                spec.run_id,
+                spec.agent_id,
+                &spec.agent_version,
+                protocol::Actor::System,
+                protocol::Timestamp::now(),
+            ),
+            EventPayload::UserMessage {
+                text: "late".to_string(),
+            },
+        );
+        let batch = vec![completed(&spec, "done"), message];
+        assert!(store
+            .put_run(StoredRun {
+                spec: spec.clone(),
+                events: batch.clone(),
+            })
+            .is_err());
+        store
+            .put_run(StoredRun {
+                spec: spec.clone(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        assert!(store.append_events(spec.run_id, batch).is_err());
+        assert_eq!(
+            store
+                .run(spec.run_id)
+                .map(|run| run.map(|run| run.events.len())),
+            Ok(Some(0))
+        );
     }
 
     // A batch may hold one terminal event: the log ends at it.
