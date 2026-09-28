@@ -64,6 +64,7 @@ jobs:
           INVARIANT NoOrphan
           INVARIANT AckAfterTerminal
           INVARIANT AtMostOneTerminal
+          INVARIANT WaitingUnleased
           PROPERTY EveryRunEnds
           CFG
           java -XX:+UseParallelGC -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet \

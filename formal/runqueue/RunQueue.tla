@@ -191,6 +191,10 @@ AtMostOneTerminal == \A r \in Runs : terminals[r] <= 1
 
 EveryRunEnds == <>(ended = Runs)
 
+\* No run waiting on the list holds a lease, so a claim's SET NX never finds
+\* one in Design "new".
+WaitingUnleased == \A r \in waiting : lease[r] = None
+
 \* A control, not checked by RunQueue.cfg: no two workers ever hold one run.
 \* It fails once a slow worker's lease expires, so the model does reach the
 \* two-workers case that AtMostOneTerminal guards.

@@ -7,9 +7,9 @@ Checked on 2026-09-28. `RunQueue.tla` is the Redis run queue, its workers and it
 Resources: the Redis runs list, the processing list, the per-run lease keys, and the run log.
 
 Writers:
-- **The producer:** `create_run` (`crates/server/src/http.rs:341`) stores the run as created and queued, then pushes it (`:364`, `RedisRunQueue::push`, `crates/server/src/queue.rs:159`). Both happen in one blocking task, so a client going away cannot separate them.
+- **The producer:** `create_run` (`crates/server/src/http.rs:341`) stores the run as created and queued, then pushes it (`:364`, `RedisRunQueue::push`, `crates/server/src/queue.rs:167`). Both happen in one blocking task, so a client going away cannot separate them.
 - **Workers** (`Worker::work_one`, `crates/server/src/worker.rs:186`), `GOL_WORKERS` of them in the server process. Each one:
-  - claims a run: one script moves it to processing and leases it with `SET NX PX` (`CLAIM`, `queue.rs:62`; `claim`, `:187`). A run already leased (queued again while held) is dropped from the list instead;
+  - claims a run: one script moves it to processing and leases it with `SET NX PX` (`CLAIM`, `queue.rs:62`; `claim`, `:195`). A run already leased (queued again while held) is dropped from the list instead;
   - loads the run (`Claim::prepare`, `worker.rs:243`). An open run counts a start (`START`, `queue.rs:73`). A claim that cannot load or start its run releases it: one script, which acts only while the claim still holds the lease, moves it off processing, onto the back of the runs list, and deletes the lease (`RELEASE`, `queue.rs:81`);
   - runs the harness (`Open::execute`, `worker.rs:310`), renewing the lease every heartbeat (`:371`; `RENEW`, `queue.rs:91`);
   - records the harness's events in one append (`Executed::record`, `worker.rs:338`; `RunStore::append_events`), which the store refuses once the log is terminal;
@@ -28,7 +28,7 @@ A worker's load may fail, at most `MaxReleases` times; it then releases its clai
 - `Design = "early"` acknowledges before recording: the control for `AckAfterTerminal`.
 - `Design = "loose"` releases without holding the lease, as the release script of 9511c0e did: a second control for `NoOrphan`.
 
-In `Design = "new"` no queued run holds a lease, so the `SET NX` branch of `Claim` is only taken in `loose`. The code needs it for an id queued twice, which a model of lists as sets cannot express; `a_run_queued_twice_is_claimed_once` tests it.
+In `Design = "new"` no queued run holds a lease (`WaitingUnleased`, checked by `RunQueue.cfg`; it fails in `loose`), so the `SET NX` branch of `Claim` is only taken in `loose`. The code needs it for an id queued twice, which a model of lists as sets cannot express; `a_run_queued_twice_is_claimed_once` tests it.
 
 `RunQueue.cfg` checks `Design = "new"` with `Workers = {"w1", "w2"}`, `Runs = {"r1"}`, `MaxCrashes = 1`, `MaxSlow = 1` and `MaxReleases = 1`.
 
