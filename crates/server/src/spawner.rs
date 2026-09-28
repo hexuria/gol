@@ -9,7 +9,7 @@ use protocol::{FailureClass, RunId, RunSpec, SESSION_ID};
 
 use crate::inference::{queued_events, run_failed_event};
 use crate::queue::RedisRunQueue;
-use crate::store::{PutRun, RunStore, StoredRun};
+use crate::store::{is_terminal, PutRun, RunStore, StoredRun};
 
 /// Why `enqueue` did not queue a run.
 #[derive(Debug)]
@@ -56,6 +56,14 @@ pub(crate) fn enqueue(
         }
     }
     Ok(put)
+}
+
+/// Whether a stored log ended before a worker ever scheduled it.
+fn never_ran(events: &[protocol::Event]) -> bool {
+    events.iter().any(|event| is_terminal(&event.payload))
+        && !events
+            .iter()
+            .any(|event| matches!(event.payload, protocol::EventPayload::RunScheduled))
 }
 
 fn end(store: &dyn RunStore, spec: &RunSpec, message: String) {
@@ -128,7 +136,20 @@ impl AgentSpawner for OwnedSpawner {
             .child_of(parent, request.step)
             .build();
         match enqueue(self.store.as_ref(), queue, &spec) {
-            Ok(_) => Ok(spec.run_id),
+            Ok(PutRun::Stored) => Ok(spec.run_id),
+            // Asked for before: the same child. One that ended before any
+            // worker scheduled it (its push failed) will never run, so it is
+            // not reported as started.
+            Ok(PutRun::Existed) => match self.store.run(spec.run_id) {
+                Ok(Some(child)) if never_ran(&child.events) => {
+                    Err("the child could not be started".to_string())
+                }
+                Ok(_) => Ok(spec.run_id),
+                Err(error) => {
+                    eprintln!("gol: delegate from run {}: {error}", parent.run_id);
+                    Err("store unavailable".to_string())
+                }
+            },
             Err(error) => {
                 eprintln!("gol: delegate from run {}: {error:?}", parent.run_id);
                 Err(match error {

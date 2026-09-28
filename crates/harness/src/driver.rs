@@ -424,7 +424,9 @@ impl Driver {
             state.model_calls,
             state.given_model_calls,
         );
-        let refused = if state.children >= MAX_CHILDREN {
+        let refused = if !matches!(state.harness, HarnessState::Running { .. }) {
+            Err("the run is not running".to_string())
+        } else if state.children >= MAX_CHILDREN {
             Err(format!("already started {MAX_CHILDREN} children"))
         } else if steps_left < 2 || model_calls_left < 2 {
             Err("not enough budget left to give a child".to_string())

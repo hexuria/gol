@@ -207,3 +207,40 @@ fn delegate_without_the_queue_is_refused() {
         Err("delegation needs the run queue".to_string())
     );
 }
+
+// A child that was stored but could not be queued was ended before it ever
+// ran. Asking for it again does not report it as started.
+#[test]
+fn a_child_that_could_not_be_queued_is_not_started_again() {
+    for store in stores() {
+        let queue = queue();
+        let agent = agent_of(store.as_ref(), owner());
+        let parent = parent();
+        let child = RunSpec::builder()
+            .owner(owner())
+            .agent(agent, "7")
+            .input("draft")
+            .placement(parent.placement)
+            .work_model(parent.work_model.clone())
+            .child_of(&parent, 2)
+            .build();
+        let mut events = server::queued_events(&child);
+        events.push(server::run_failed_event(
+            &child,
+            protocol::FailureClass::Infrastructure,
+            "queue push failed: down".to_string(),
+        ));
+        store
+            .put_run(server::StoredRun {
+                spec: child.clone(),
+                events,
+            })
+            .expect("put ended child");
+        let spawner = OwnedSpawner::new(store.clone(), Some(queue.clone()));
+        assert_eq!(
+            spawner.start(request(&parent, agent)),
+            Err("the child could not be started".to_string())
+        );
+        assert_eq!(queue.queued().expect("queued"), []);
+    }
+}

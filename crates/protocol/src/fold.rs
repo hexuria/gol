@@ -30,6 +30,8 @@ pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
     let mut children = 0;
     let mut given_steps: u32 = 0;
     let mut given_model_calls: u32 = 0;
+    // The same request decided again names the same child: count it once.
+    let mut started = std::collections::HashSet::new();
 
     for event in events {
         match &event.payload {
@@ -45,7 +47,7 @@ pub fn fold(spec: &RunSpec, events: &[Event]) -> RunState {
             } => {
                 model_calls += 1;
             }
-            EventPayload::ChildStarted { limits, .. } => {
+            EventPayload::ChildStarted { run_id, limits, .. } if started.insert(*run_id) => {
                 children += 1;
                 given_steps = given_steps.saturating_add(limits.max_steps);
                 given_model_calls = given_model_calls.saturating_add(limits.max_model_calls);
@@ -124,6 +126,31 @@ mod tests {
         let state = fold(&spec, &events);
         assert_eq!(state.children, 2);
         assert_eq!((state.given_steps, state.given_model_calls), (4, 3));
+    }
+
+    // A child recorded twice (the same request decided again in one step
+    // names the same run) is counted, and its budget spent, once.
+    #[test]
+    fn a_child_recorded_twice_counts_once() {
+        let spec = sample_spec();
+        let child = crate::RunId::new();
+        let started = |steps| {
+            ev(
+                &spec,
+                EventPayload::ChildStarted {
+                    run_id: child,
+                    agent_id: crate::AgentId::new(),
+                    limits: crate::Limits {
+                        max_steps: steps,
+                        max_model_calls: 1,
+                    },
+                },
+            )
+        };
+        let events = vec![ev(&spec, EventPayload::RunStarted), started(3), started(2)];
+        let state = fold(&spec, &events);
+        assert_eq!(state.children, 1);
+        assert_eq!((state.given_steps, state.given_model_calls), (3, 1));
     }
 
     // A Complete that cannot finish the run (a tool call is outstanding) is a

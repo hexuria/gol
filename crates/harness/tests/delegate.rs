@@ -362,3 +362,57 @@ fn a_parent_keeps_only_the_model_calls_it_did_not_give() {
         }
     ));
 }
+
+/// A spawner that names the same child for every request, as the owned
+/// spawner does for the same request.
+struct SameChild(RunId);
+
+impl AgentSpawner for SameChild {
+    fn start(&self, _request: ChildRequest<'_>) -> Result<RunId, String> {
+        Ok(self.0)
+    }
+}
+
+// The same delegation decided twice names one child: it is counted, and its
+// budget given, once.
+#[test]
+fn the_same_child_twice_is_counted_once() {
+    let agent = AgentId::new();
+    let mut driver = Driver::boot(limited(8, 4))
+        .unwrap()
+        .with_spawner(Arc::new(SameChild(RunId::new())));
+    let mut decider = ScriptedDecider::new(vec![delegate(agent), delegate(agent), complete()]);
+    run_to_completion(
+        &mut driver,
+        &mut decider,
+        &[],
+        &UnavailableModel,
+        &InMemory::default(),
+    )
+    .unwrap();
+    assert_eq!(started(&driver).len(), 2);
+    let state = driver.state();
+    assert_eq!(state.children, 1);
+    assert_eq!((state.given_steps, state.given_model_calls), (3, 2));
+}
+
+// Performing a delegation when the run is not running starts nothing.
+#[test]
+fn a_delegate_performed_while_not_running_is_refused() {
+    let fake = Fake::new(Ok(()));
+    let mut driver = Driver::boot(limited(8, 4))
+        .unwrap()
+        .with_spawner(fake.clone());
+    driver.cancel();
+    driver.perform(
+        &[delegate(AgentId::new())],
+        &[],
+        &UnavailableModel,
+        &InMemory::default(),
+    );
+    assert!(fake.asked.lock().unwrap().is_empty());
+    assert_eq!(
+        refusals(&driver),
+        vec!["the run is not running".to_string()]
+    );
+}
