@@ -58,8 +58,10 @@ impl Driver {
     /// log from before the harness started gets its `RunStarted`. A log cut
     /// after an effect was authorized and before its result was recorded
     /// performs that effect again when `run_until` goes on, a tool with the
-    /// same invocation (decision 1.5a-3A). A harness that completed without
-    /// its `RunCompleted` gets it now, as `decide` would have recorded it.
+    /// same invocation (decision 1.5a-3A). A harness that completed while
+    /// the log holds no terminal event gets its `RunCompleted` now, as
+    /// `decide` would have recorded it. A log another writer already ended
+    /// (a cancel, say) keeps that end: a second terminal event is refused.
     pub fn resume(spec: RunSpec, events: Vec<Event>) -> Result<Self, BootError> {
         match spec.placement {
             ExecutionPlacement::Local | ExecutionPlacement::Reverse | ExecutionPlacement::Box => {}

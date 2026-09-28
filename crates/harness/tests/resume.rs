@@ -132,11 +132,30 @@ fn resumed(spec: &RunSpec, script: &[Effect], log: &[Event]) -> Vec<Event> {
     driver.events().to_vec()
 }
 
+/// A tool the run holds no capability for: the policy denies it.
+fn unheld_tool() -> Effect {
+    Effect::ToolCall {
+        name: "nope".into(),
+        input: "x".into(),
+        invocation: InvocationId::from_uuid(uuid::Uuid::from_u128(99)),
+    }
+}
+
+/// A delegation without `agent.delegate`: the policy denies it.
+fn delegation() -> Effect {
+    Effect::Delegate {
+        agent_id: AgentId::from_uuid(uuid::Uuid::from_u128(5)),
+        input: "draft".into(),
+    }
+}
+
 fn effect() -> impl Strategy<Value = Effect> {
     prop_oneof![
         (1u128..6).prop_map(tool_call),
         Just(model_call()),
         Just(complete()),
+        Just(unheld_tool()),
+        Just(delegation()),
     ]
 }
 
