@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use protocol::{
-    applicable, authorize, fold, Actor, AgentId, Effect, Event, EventPayload, ExecutionPlacement,
-    FailureClass, HarnessState, InvocationId, Limits, MemoryScope, PolicyDecision, RunSpec,
-    RunState, Timestamp, ToolDescriptor, MAX_CHILDREN,
+    applicable, authorize, fold, Actor, AgentId, DispatchPhase, Effect, Event, EventPayload,
+    ExecutionPlacement, FailureClass, HarnessState, InvocationId, Limits, MemoryScope,
+    PolicyDecision, RunSpec, RunState, Timestamp, ToolDescriptor, MAX_CHILDREN,
 };
 
 use crate::{
@@ -16,6 +16,16 @@ pub enum BootError {
     UnsupportedPlacement(ExecutionPlacement),
 }
 
+/// Why `Driver::resume` would not rebuild a run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResumeError {
+    UnsupportedPlacement(ExecutionPlacement),
+    /// A log from before the harness started, whose dispatch is not one that
+    /// `RunStarted` starts (`Created` or `Starting`). A queued run is
+    /// scheduled first, as a worker records it.
+    NotStartable(DispatchPhase),
+}
+
 pub struct Driver {
     spec: RunSpec,
     events: Vec<Event>,
@@ -23,6 +33,15 @@ pub struct Driver {
     loaded: Option<Vec<Box<dyn Tool>>>,
     spawner: Option<Arc<dyn AgentSpawner>>,
     targets: Vec<DelegateTarget>,
+    /// Effects the log authorized and holds no result for, performed first
+    /// by `run_until`: the tail of a step a resumed run was cut in.
+    pending: Vec<Effect>,
+    /// A decision the log recorded and never authorized, with the harness
+    /// state it was made in: `run_until` authorizes it first.
+    undecided: Option<(HarnessState, Effect)>,
+    /// Rebuilt by `resume` and not yet run: `run_until` first finishes the
+    /// step the log was cut in.
+    resumed: bool,
 }
 
 impl Driver {
@@ -37,8 +56,80 @@ impl Driver {
             loaded: None,
             spawner: None,
             targets: Vec::new(),
+            pending: Vec::new(),
+            undecided: None,
+            resumed: false,
         };
         driver.push(EventPayload::RunStarted, Actor::System);
+        Ok(driver)
+    }
+
+    /// Rebuilds a driver from a stored log and picks up where it stopped.
+    ///
+    /// - A log that already holds a terminal event (`is_run_end`) is left as
+    ///   it is: nothing is appended and `run_until` decides nothing, even
+    ///   when the harness fold never saw the end (a run failed or cancelled
+    ///   before it started, or cancelled after its `Complete` was
+    ///   authorized). A second terminal event would be refused.
+    /// - A log from before the harness started gets its `RunStarted` when
+    ///   its dispatch is `Created` or `Starting`; a queued log that no worker
+    ///   scheduled is refused with `NotStartable`.
+    /// - A log cut after a decision and before its authorization is
+    ///   authorized by `run_until`; one cut after an effect was authorized
+    ///   and before its result performs that effect again, a tool with the
+    ///   same invocation (decision 1.5a-3A).
+    /// - A harness that completed with no terminal event in the log gets its
+    ///   `RunCompleted`, as `decide` would have recorded it.
+    pub fn resume(spec: RunSpec, events: Vec<Event>) -> Result<Self, ResumeError> {
+        match spec.placement {
+            ExecutionPlacement::Local | ExecutionPlacement::Reverse | ExecutionPlacement::Box => {}
+        }
+        let started = events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::RunStarted));
+        let ended = events.iter().any(|event| is_run_end(&event.payload));
+        let mut driver = Self {
+            spec,
+            events,
+            skills: Vec::new(),
+            loaded: None,
+            spawner: None,
+            targets: Vec::new(),
+            pending: Vec::new(),
+            undecided: None,
+            resumed: false,
+        };
+        if ended {
+            return Ok(driver);
+        }
+        let state = driver.state();
+        if !started {
+            return match state.dispatch {
+                DispatchPhase::Created | DispatchPhase::Starting => {
+                    driver.push(EventPayload::RunStarted, Actor::System);
+                    Ok(driver)
+                }
+                other => Err(ResumeError::NotStartable(other)),
+            };
+        }
+        driver.resumed = true;
+        match state.harness {
+            HarnessState::Completed { outcome } => {
+                driver.push(EventPayload::RunCompleted { outcome }, Actor::System);
+            }
+            harness if !harness.is_terminal() => match driver.events.last() {
+                Some(Event {
+                    payload: EventPayload::EffectDecided { effect },
+                    ..
+                }) => {
+                    let before = &driver.events[..driver.events.len() - 1];
+                    let prior = fold(&driver.spec, before).harness;
+                    driver.undecided = Some((prior, effect.clone()));
+                }
+                _ => driver.pending = effects_of_last(&driver.spec, &driver.events),
+            },
+            _ => {}
+        }
         Ok(driver)
     }
 
@@ -76,6 +167,11 @@ impl Driver {
         self.spawner = Some(spawner);
         self.targets = targets;
         self
+    }
+
+    /// Whether the log holds a terminal event.
+    fn log_ended(&self) -> bool {
+        self.events.iter().any(|event| is_run_end(&event.payload))
     }
 
     pub fn events(&self) -> &[Event] {
@@ -192,16 +288,27 @@ impl Driver {
             Actor::Agent,
         );
 
+        Ok(self.authorize_decided(&state.harness, effect, tools))
+    }
+
+    /// Authorizes the effect the log just recorded as decided, from the
+    /// harness state before that decision, and returns what to perform.
+    fn authorize_decided(
+        &mut self,
+        harness: &HarnessState,
+        effect: Effect,
+        tools: &[ToolDescriptor],
+    ) -> Vec<Effect> {
         match authorize(&self.spec, &effect, tools) {
             // Allowed, but the harness would not act on it now: deny it with
             // the reason rather than authorize an effect `reduce` drops. The
             // decision above already cost a step, so the budget still ends a
             // decider that keeps proposing such effects.
-            PolicyDecision::Allow if !applicable(&state.harness, &effect, &self.spec) => {
+            PolicyDecision::Allow if !applicable(harness, &effect, &self.spec) => {
                 // The policy allowed it; the harness state is what refuses it.
-                let reason = format!("not applicable while {}", describe(&state.harness));
+                let reason = format!("not applicable while {}", describe(harness));
                 self.push(EventPayload::EffectDenied { effect, reason }, Actor::System);
-                Ok(Vec::new())
+                Vec::new()
             }
             PolicyDecision::Allow => {
                 self.push(
@@ -220,11 +327,11 @@ impl Driver {
                         );
                     }
                 }
-                Ok(effects_of_last(&self.spec, &self.events))
+                effects_of_last(&self.spec, &self.events)
             }
             PolicyDecision::Deny { reason } => {
                 self.push(EventPayload::EffectDenied { effect, reason }, Actor::Policy);
-                Ok(Vec::new())
+                Vec::new()
             }
             PolicyDecision::RequireApproval
             | PolicyDecision::Modify
@@ -237,7 +344,7 @@ impl Driver {
                     },
                     Actor::Policy,
                 );
-                Ok(Vec::new())
+                Vec::new()
             }
         }
     }
@@ -490,9 +597,38 @@ pub fn run_to_completion(
     models: &dyn ModelCompletion,
     memory: &dyn Memory,
 ) -> Result<(), DeciderError> {
+    run_until(driver, decider, tools, models, memory, &|| false)
+}
+
+/// Runs step by step until the run ends. `should_stop` is read at each step
+/// boundary, before the next decision; when it answers yes the run is
+/// cancelled there (decision 1.5a-2A). Effects a resumed log left pending are
+/// performed first.
+pub fn run_until(
+    driver: &mut Driver,
+    decider: &mut dyn Decider,
+    tools: &[&dyn Tool],
+    models: &dyn ModelCompletion,
+    memory: &dyn Memory,
+    should_stop: &dyn Fn() -> bool,
+) -> Result<(), DeciderError> {
     let descriptors: Vec<ToolDescriptor> = tools.iter().map(|tool| tool.descriptor()).collect();
+    let mut pending = std::mem::take(&mut driver.pending);
+    if let Some((harness, effect)) = driver.undecided.take() {
+        pending = driver.authorize_decided(&harness, effect, &descriptors);
+    }
+    if std::mem::take(&mut driver.resumed) {
+        driver.perform(&pending, tools, models, memory);
+        driver.advance_answered_step();
+    }
     loop {
-        if driver.state().harness.is_terminal() {
+        // A log another writer ended stays ended, whatever the harness fold
+        // says (see `Driver::resume`).
+        if driver.state().harness.is_terminal() || driver.log_ended() {
+            return Ok(());
+        }
+        if should_stop() {
+            driver.cancel();
             return Ok(());
         }
         let effects = driver.decide(decider, &descriptors)?;
@@ -518,6 +654,17 @@ fn describe(state: &HarnessState) -> &'static str {
             "finished"
         }
     }
+}
+
+/// Whether `payload` ends the run's log.
+fn is_run_end(payload: &EventPayload) -> bool {
+    matches!(
+        payload,
+        EventPayload::RunCompleted { .. }
+            | EventPayload::RunFailed { .. }
+            | EventPayload::RunCancelled
+            | EventPayload::RunExpired
+    )
 }
 
 fn effects_of_last(spec: &RunSpec, events: &[Event]) -> Vec<Effect> {
