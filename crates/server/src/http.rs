@@ -344,14 +344,18 @@ async fn create_run(
         let store = state.store.clone();
         let spec_for_queue = spec.clone();
         tokio::task::spawn_blocking(move || {
-            crate::spawner::enqueue(store.as_ref(), &queue, &spec_for_queue).map_err(|error| {
-                match error {
-                    crate::spawner::EnqueueError::Queue(error) => {
-                        ApiError::Decider(format!("queue unavailable: {error}"))
-                    }
-                    crate::spawner::EnqueueError::Store(error) => ApiError::from(error),
-                    crate::spawner::EnqueueError::Push(error) => ApiError::Decider(error),
+            crate::spawner::enqueue(
+                store.as_ref(),
+                &queue,
+                &spec_for_queue,
+                crate::spawner::OnPushFailure::End,
+            )
+            .map_err(|error| match error {
+                crate::spawner::EnqueueError::Queue(error) => {
+                    ApiError::Decider(format!("queue unavailable: {error}"))
                 }
+                crate::spawner::EnqueueError::Store(error) => ApiError::from(error),
+                crate::spawner::EnqueueError::Push(error) => ApiError::Decider(error),
             })
         })
         .await

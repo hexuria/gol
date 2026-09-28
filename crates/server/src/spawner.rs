@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use harness::{AgentSpawner, ChildRequest, StoreError};
+use harness::{AgentSpawner, ChildRequest, StartedChild, StoreError};
 use protocol::{FailureClass, RunId, RunSpec, SESSION_ID};
 
 use crate::inference::{queued_events, run_failed_event};
@@ -22,15 +22,27 @@ pub(crate) enum EnqueueError {
     Push(String),
 }
 
+/// What `enqueue` does when the push fails after the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OnPushFailure {
+    /// End the run and report the error: `create_run`, whose id is fresh and
+    /// whose client is told the create failed.
+    End,
+    /// Leave the run stored and pending for the sweep to push, and report it
+    /// stored: a child, whose id is fixed by its request and could never be
+    /// started again once ended.
+    LeaveToSweep,
+}
+
 /// Queues `spec` as a new run. The run is pending before it is stored, so a
 /// process that dies between the store and the push leaves it to the sweep
-/// (C6). A run already stored under this id is not pushed again; its pending
-/// entry is left for the sweep, which pushes it if it is still waiting and
-/// drops the entry if it has moved on.
+/// (C6). A run already stored under this id is not pushed again: see
+/// `settle_existing`.
 pub(crate) fn enqueue(
     store: &dyn RunStore,
     queue: &RedisRunQueue,
     spec: &RunSpec,
+    on_push_failure: OnPushFailure,
 ) -> Result<PutRun, EnqueueError> {
     let run_id = spec.run_id;
     queue.pend(run_id).map_err(EnqueueError::Queue)?;
@@ -49,13 +61,44 @@ pub(crate) fn enqueue(
     };
     if put == PutRun::Stored {
         if let Err(error) = queue.push(run_id) {
-            // Stored but never to be picked up: end it, so it is not left
-            // open. Its pending entry stays; the sweep finds it ended.
-            end(store, spec, format!("queue push failed: {error}"));
-            return Err(EnqueueError::Push(error));
+            match on_push_failure {
+                // Stored but never to be picked up: end it, so it is not left
+                // open. Its pending entry stays; the sweep finds it ended.
+                OnPushFailure::End => {
+                    end(store, spec, format!("queue push failed: {error}"));
+                    return Err(EnqueueError::Push(error));
+                }
+                OnPushFailure::LeaveToSweep => {
+                    eprintln!("gol: push run {run_id} failed, left to the sweep: {error}");
+                }
+            }
         }
     }
     Ok(put)
+}
+
+/// After an `enqueue` found `spec`'s run already stored, and put it on the
+/// pending set again: take it off pending if it is already queued, claimed or
+/// past waiting, so no sweep pushes it a second time. A run still waiting and
+/// on no list lost its producer between the store and the push; its entry
+/// stays for the sweep.
+fn settle_existing(
+    queue: &RedisRunQueue,
+    run_id: RunId,
+    events: &[protocol::Event],
+) -> Result<(), String> {
+    let waiting = events.iter().all(|event| {
+        matches!(
+            event.payload,
+            protocol::EventPayload::RunCreated
+                | protocol::EventPayload::RunQueued
+                | protocol::EventPayload::UserMessage { .. }
+        )
+    });
+    if !waiting || queue.queued_or_claimed(run_id)? {
+        queue.unpend(run_id)?;
+    }
+    Ok(())
 }
 
 /// Whether a stored log ended before a worker ever scheduled it.
@@ -94,7 +137,7 @@ impl AgentSpawner for OwnedSpawner {
     /// The reasons of a refusal go into the parent's run log, which clients
     /// read: they are fixed words, and a store or queue error's detail goes
     /// to stderr only.
-    fn start(&self, request: ChildRequest<'_>) -> Result<RunId, String> {
+    fn start(&self, request: ChildRequest<'_>) -> Result<StartedChild, String> {
         let queue = self
             .queue
             .as_ref()
@@ -135,16 +178,33 @@ impl AgentSpawner for OwnedSpawner {
             .metadata(metadata)
             .child_of(parent, request.step)
             .build();
-        match enqueue(self.store.as_ref(), queue, &spec) {
-            Ok(PutRun::Stored) => Ok(spec.run_id),
-            // Asked for before: the same child. One that ended before any
-            // worker scheduled it (its push failed) will never run, so it is
-            // not reported as started.
+        match enqueue(
+            self.store.as_ref(),
+            queue,
+            &spec,
+            OnPushFailure::LeaveToSweep,
+        ) {
+            Ok(PutRun::Stored) => Ok(StartedChild {
+                run_id: spec.run_id,
+                limits: spec.limits,
+            }),
+            // Asked for before: the same child, with the limits it was stored
+            // with. One that ended before any worker scheduled it will never
+            // run, so it is not reported as started.
             Ok(PutRun::Existed) => match self.store.run(spec.run_id) {
                 Ok(Some(child)) if never_ran(&child.events) => {
                     Err("the child could not be started".to_string())
                 }
-                Ok(_) => Ok(spec.run_id),
+                Ok(Some(child)) => {
+                    if let Err(error) = settle_existing(queue, spec.run_id, &child.events) {
+                        eprintln!("gol: delegate from run {}: {error}", parent.run_id);
+                    }
+                    Ok(StartedChild {
+                        run_id: spec.run_id,
+                        limits: child.spec.limits,
+                    })
+                }
+                Ok(None) => Err("store unavailable".to_string()),
                 Err(error) => {
                     eprintln!("gol: delegate from run {}: {error}", parent.run_id);
                     Err("store unavailable".to_string())

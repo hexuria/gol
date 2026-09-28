@@ -3,6 +3,8 @@
 //! parent's placement, work model and session, and the budget the driver
 //! carved. A request asked twice starts one child. Needs Postgres and Redis,
 //! as `queue_worker.rs` does.
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -100,7 +102,9 @@ fn a_delegate_starts_an_owned_child_run() {
         let agent = agent_of(store.as_ref(), owner());
         let parent = parent();
         let spawner = OwnedSpawner::new(store.clone(), Some(queue.clone()));
-        let child_id = spawner.start(request(&parent, agent)).expect("started");
+        let started = spawner.start(request(&parent, agent)).expect("started");
+        assert_eq!(started.limits, given());
+        let child_id = started.run_id;
 
         let child = store.run(child_id).expect("read").expect("stored").spec;
         let expected_id = RunSpec::builder()
@@ -191,7 +195,9 @@ fn a_redelivered_parent_starts_one_child() {
         let first = spawner.start(request(&parent, agent)).expect("first");
         let second = spawner.start(request(&parent, agent)).expect("second");
         assert_eq!(first, second);
-        assert_eq!(queue.queued().expect("queued"), [first]);
+        assert_eq!(queue.queued().expect("queued"), [first.run_id]);
+        // Not left pending, where a sweep would push it a second time.
+        assert_eq!(queue.pending().expect("pending"), []);
     }
 }
 
@@ -242,5 +248,101 @@ fn a_child_that_could_not_be_queued_is_not_started_again() {
             Err("the child could not be started".to_string())
         );
         assert_eq!(queue.queued().expect("queued"), []);
+    }
+}
+
+// A retry reports the limits the stored child actually has, not the carve it
+// asked for this time (the parent may have spent more since).
+#[test]
+fn a_retry_reports_the_stored_childs_limits() {
+    for store in stores() {
+        let queue = queue();
+        let agent = agent_of(store.as_ref(), owner());
+        let parent = parent();
+        let spawner = OwnedSpawner::new(store.clone(), Some(queue.clone()));
+        let first = spawner.start(request(&parent, agent)).expect("first");
+        let mut smaller = request(&parent, agent);
+        smaller.limits = Limits {
+            max_steps: 1,
+            max_model_calls: 1,
+        };
+        let second = spawner.start(smaller).expect("second");
+        assert_eq!(second.run_id, first.run_id);
+        assert_eq!(second.limits, given());
+    }
+}
+
+// A push that fails leaves the child stored and pending for the sweep; it is
+// not ended, since its id is fixed and a retry could never start it again.
+#[test]
+fn a_child_whose_push_failed_is_left_to_the_sweep() {
+    let proxy = common::redis_proxy::RedisProxy::start();
+    let key = format!("gol:test:{}", RunId::new());
+    let direct = RedisRunQueue::with_key(REDIS_URL, &key);
+    let store: Arc<dyn RunStore> = Arc::new(GoesDownAfterPut {
+        inner: InMemoryStore::default(),
+        proxy: proxy.clone(),
+    });
+    let agent = agent_of(store.as_ref(), owner());
+    let parent = parent();
+    let through_proxy = Arc::new(RedisRunQueue::with_key(proxy.url(0), &key));
+    let spawner = OwnedSpawner::new(store.clone(), Some(through_proxy));
+    let started = spawner
+        .start(request(&parent, agent))
+        .expect("left to the sweep");
+    let child = store.run(started.run_id).expect("read").expect("stored");
+    assert!(child
+        .events
+        .iter()
+        .all(|event| !server::is_terminal(&event.payload)));
+    assert_eq!(direct.pending().expect("pending"), [started.run_id]);
+    assert_eq!(direct.queued().expect("queued"), []);
+    assert_eq!(
+        server::sweep(
+            &direct,
+            store.as_ref(),
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO
+        ),
+        Ok(vec![started.run_id])
+    );
+}
+
+/// An in-memory store whose Redis goes away as soon as a run is put.
+struct GoesDownAfterPut {
+    inner: InMemoryStore,
+    proxy: common::redis_proxy::RedisProxy,
+}
+
+impl RunStore for GoesDownAfterPut {
+    fn put_agent(&self, agent: StoredAgent) -> Result<server::PutAgent, server::StoreError> {
+        self.inner.put_agent(agent)
+    }
+    fn agent(&self, id: AgentId) -> Result<Option<StoredAgent>, server::StoreError> {
+        self.inner.agent(id)
+    }
+    fn put_run(&self, run: server::StoredRun) -> Result<server::PutRun, server::StoreError> {
+        let put = self.inner.put_run(run)?;
+        self.proxy.go_down();
+        Ok(put)
+    }
+    fn append_events(
+        &self,
+        id: RunId,
+        events: Vec<protocol::Event>,
+    ) -> Result<server::Append, server::StoreError> {
+        self.inner.append_events(id, events)
+    }
+    fn run(&self, id: RunId) -> Result<Option<server::StoredRun>, server::StoreError> {
+        self.inner.run(id)
+    }
+    fn put_artifact(&self, artifact: server::StoredArtifact) -> Result<(), server::StoreError> {
+        self.inner.put_artifact(artifact)
+    }
+    fn artifact(
+        &self,
+        id: protocol::ArtifactId,
+    ) -> Result<Option<server::StoredArtifact>, server::StoreError> {
+        self.inner.artifact(id)
     }
 }

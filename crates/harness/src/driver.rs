@@ -445,14 +445,15 @@ impl Driver {
                 .spawner
                 .clone()
                 .ok_or_else(|| "no agent spawner is configured".to_string())?;
-            let run_id = spawner.start(ChildRequest {
+            let started = spawner.start(ChildRequest {
                 parent: &self.spec,
                 step,
                 agent_id,
                 input,
                 limits: given,
             })?;
-            Ok((run_id, given))
+            // The stored child's limits, which are what this run has given.
+            Ok((started.run_id, started.limits))
         });
         let payload = match started {
             Ok((run_id, limits)) => EventPayload::ChildStarted {

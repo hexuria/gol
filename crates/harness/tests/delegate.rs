@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use harness::{
-    run_to_completion, AgentSpawner, ChildRequest, Driver, InMemory, ScriptedDecider,
+    run_to_completion, AgentSpawner, ChildRequest, Driver, InMemory, ScriptedDecider, StartedChild,
     UnavailableModel,
 };
 use protocol::{
@@ -146,7 +146,7 @@ impl Fake {
 }
 
 impl AgentSpawner for Fake {
-    fn start(&self, request: ChildRequest<'_>) -> Result<RunId, String> {
+    fn start(&self, request: ChildRequest<'_>) -> Result<StartedChild, String> {
         self.asked.lock().unwrap().push((
             request.parent.run_id,
             request.step,
@@ -154,7 +154,10 @@ impl AgentSpawner for Fake {
             request.input.to_string(),
             request.limits,
         ));
-        self.answer.clone().map(|()| RunId::new())
+        self.answer.clone().map(|()| StartedChild {
+            run_id: RunId::new(),
+            limits: request.limits,
+        })
     }
 }
 
@@ -364,12 +367,29 @@ fn a_parent_keeps_only_the_model_calls_it_did_not_give() {
 }
 
 /// A spawner that names the same child for every request, as the owned
-/// spawner does for the same request.
-struct SameChild(RunId);
+/// spawner does for the same request, and reports the limits that child was
+/// first stored with.
+struct SameChild {
+    run_id: RunId,
+    stored: Mutex<Option<Limits>>,
+}
+
+impl SameChild {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            run_id: RunId::new(),
+            stored: Mutex::new(None),
+        })
+    }
+}
 
 impl AgentSpawner for SameChild {
-    fn start(&self, _request: ChildRequest<'_>) -> Result<RunId, String> {
-        Ok(self.0)
+    fn start(&self, request: ChildRequest<'_>) -> Result<StartedChild, String> {
+        let limits = *self.stored.lock().unwrap().get_or_insert(request.limits);
+        Ok(StartedChild {
+            run_id: self.run_id,
+            limits,
+        })
     }
 }
 
@@ -380,7 +400,7 @@ fn the_same_child_twice_is_counted_once() {
     let agent = AgentId::new();
     let mut driver = Driver::boot(limited(8, 4))
         .unwrap()
-        .with_spawner(Arc::new(SameChild(RunId::new())));
+        .with_spawner(SameChild::new());
     let mut decider = ScriptedDecider::new(vec![delegate(agent), delegate(agent), complete()]);
     run_to_completion(
         &mut driver,
@@ -415,4 +435,50 @@ fn a_delegate_performed_while_not_running_is_refused() {
         refusals(&driver),
         vec!["the run is not running".to_string()]
     );
+}
+
+// A parent run again from an empty log (its first run crashed after the
+// child was started) may reach the same child after a longer prefix and ask
+// for a smaller carve. It records the child's stored limits, so its budget
+// still counts what the child really has.
+#[test]
+fn a_replayed_parent_records_the_stored_childs_limits() {
+    let agent = AgentId::new();
+    let spawner = SameChild::new();
+    let wait = Effect::Wait {
+        reason: "w".to_string(),
+    };
+    let first = {
+        let mut driver = Driver::boot(limited(8, 4))
+            .unwrap()
+            .with_spawner(spawner.clone());
+        let mut decider = ScriptedDecider::new(vec![delegate(agent), complete()]);
+        run_to_completion(
+            &mut driver,
+            &mut decider,
+            &[],
+            &UnavailableModel,
+            &InMemory::default(),
+        )
+        .unwrap();
+        driver.state().given_steps
+    };
+    assert_eq!(first, 3);
+    let mut again = Driver::boot(limited(8, 4)).unwrap().with_spawner(spawner);
+    let mut decider = ScriptedDecider::new(vec![
+        wait.clone(),
+        wait.clone(),
+        wait,
+        delegate(agent),
+        complete(),
+    ]);
+    run_to_completion(
+        &mut again,
+        &mut decider,
+        &[],
+        &UnavailableModel,
+        &InMemory::default(),
+    )
+    .unwrap();
+    assert_eq!(again.state().given_steps, 3);
 }

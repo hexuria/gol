@@ -12,8 +12,18 @@ pub struct ChildRequest<'a> {
     pub limits: Limits,
 }
 
-/// Starts child runs. The driver records the child's id as `ChildStarted`,
-/// or the error as the reason of `DelegateRefused`.
+/// A child a spawner started, or had already started for the same request:
+/// its id, and the limits it was stored with. Those can differ from the
+/// request's when the child already existed, and they are what the parent
+/// has given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartedChild {
+    pub run_id: RunId,
+    pub limits: Limits,
+}
+
+/// Starts child runs. The driver records the child as `ChildStarted`, or the
+/// error as the reason of `DelegateRefused`.
 pub trait AgentSpawner: Send + Sync {
-    fn start(&self, request: ChildRequest<'_>) -> Result<RunId, String>;
+    fn start(&self, request: ChildRequest<'_>) -> Result<StartedChild, String>;
 }
