@@ -784,9 +784,9 @@ async fn a_worker_without_its_lease_does_not_redo_a_pending_effect() {
     }
 }
 
-// Phase 2.2 (decision 35A): the worker has no message deliverer, so a queued
-// run's ask is refused and the run goes on; no queued run waits for a reply
-// before park and wake. Here the stored log was cut after the ask was
+// A worker built without a messages store has no message deliverer, so a
+// queued run's ask is refused and the run goes on (as every worker did in
+// Phase 2.2, decision 35A). Here the stored log was cut after the ask was
 // authorized, so the resumed worker performs it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_queued_runs_ask_is_refused_and_the_run_goes_on() {

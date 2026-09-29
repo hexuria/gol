@@ -625,6 +625,8 @@ impl Driver {
         let starts_task = reply_to.is_none() || expects_reply;
         let sent = if !matches!(state.harness, HarnessState::Running { .. }) {
             Err("the run is not running".to_string())
+        } else if self.deliverer.is_none() {
+            Err("no message deliverer is configured".to_string())
         } else if starts_task {
             self.carve(&state).map(Some)
         } else {
