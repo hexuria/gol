@@ -137,6 +137,11 @@ The desktop chooses Local (start the local image with Docker) or Box (the server
   - A worker cancels a covered run before it runs it, and at its next step boundary.
   - Delegation and messages refuse new work under a stopped run (`the chain is stopped`).
   - A run that ends by itself while being stopped keeps whichever terminal event the store takes first. Another principal's run or thread is 404.
+- `POST /v1/triggers` makes a trigger of one of the caller's agents: what it starts (`input`, `placement`, `work_model`, `limits`) and when (`kind`). A `{"schedule": {"cron", "time_zone"}}` trigger fires on a schedule. The scheduler, and the checking of the cron expression beyond its shape, come with Phase 4.2. A `"webhook"` trigger fires on a signed request (Phase 4.3). Its secret is derived from the server's `GOL_WEBHOOK_KEY`, the trigger and its rotation, and is never stored. It is shown in the create's answer and in `POST /v1/triggers/{id}/rotate`'s, which also makes the old one stop working. Without `GOL_WEBHOOK_KEY` there are no webhook triggers (503). `missed` says what a schedule does about ticks it missed while no server ran: `run_once_late` (the default) or `skip`.
+  - `GET /v1/triggers` lists the caller's triggers, oldest first. `POST /v1/triggers/{id}/pause` and `/resume` stop and restart its fires, and `DELETE /v1/triggers/{id}` removes it. Another principal's trigger is 404.
+  - A fire starts an ordinary queued run of the trigger's agent, at the version its owner keeps now, with the trigger's input, in the trigger's own thread (`trigger-<id>`), so every fire is a card on one board. A paused trigger does not fire.
+  - `POST /v1/stop` also pauses every trigger the caller has, and answers how many (`paused_triggers`).
+  - The server marks a trigger's runs with the metadata key `gol.trigger`; a caller that sends it is refused.
 - Postgres keeps each run's owner, thread, parent and creation time in columns of `runs`, written once. A database from before these columns gets them added and filled from each run's spec at connect; each connect also fills any an older server left empty during a rolling deploy.
 
 `Reverse` and `Box` run the same loop as `Local`. The execution crate runs each placement on a worker thread.

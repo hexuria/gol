@@ -13,7 +13,7 @@ use crate::store::{
     check_one_terminal, created_ms, is_terminal, principal_hint_of, thread_of, Append, Hint,
     HintStream, Hints, MessageStore, OutboxEntry, OutboxPage, OutboxStore, PutAgent, PutMessage,
     PutRun, RunStore, StopScope, StopStore, StoredAgent, StoredArtifact, StoredMessage, StoredRun,
-    ThreadStore, ThreadSummary, ALL,
+    StoredTrigger, ThreadStore, ThreadSummary, TriggerId, TriggerStore, ALL,
 };
 
 /// The run store in Postgres over a pool of connections (C2, owner decision
@@ -199,6 +199,19 @@ create table if not exists stops (
     primary key (owner_issuer, owner_subject, kind, key)
 );
 
+-- A principal's triggers (Phase 4.1): the trigger as JSON, with its owner,
+-- whether it runs, and when the scheduler fires it next (Phase 4.2) as
+-- columns, which the stored JSON's copies of them never override.
+create table if not exists triggers (
+    id uuid primary key,
+    owner_issuer text not null,
+    owner_subject text not null,
+    body jsonb not null,
+    enabled boolean not null,
+    next_fire_ms bigint,
+    created_ms bigint not null
+);
+
 create table if not exists messages (
     id uuid primary key,
     from_run uuid not null,
@@ -221,7 +234,7 @@ create table if not exists artifacts (
 
 /// Indexes created once, each as (table, name, statement): an existing one
 /// is found in the catalog, not by `create index if not exists`.
-const INDEXES: [(&str, &str, &str); 7] = [
+const INDEXES: [(&str, &str, &str); 8] = [
     // A stop check reads a principal's stops, and walks runs by parent.
     (
         "stops",
@@ -232,6 +245,12 @@ const INDEXES: [(&str, &str, &str); 7] = [
         "runs",
         "runs_by_parent",
         "create index runs_by_parent on runs (parent_run)",
+    ),
+    // A principal's triggers, oldest first.
+    (
+        "triggers",
+        "triggers_by_owner",
+        "create index triggers_by_owner on triggers (owner_issuer, owner_subject, created_ms)",
     ),
     // A principal's threads, and a thread's runs in order.
     (
@@ -351,6 +370,8 @@ fn ensure_schema(client: &mut postgres::Client) -> Result<(), StoreError> {
     tx.batch_execute("select pruned from outbox_counters limit 0")
         .map_err(sql)?;
     tx.batch_execute("select requested_seq from stops limit 0")
+        .map_err(sql)?;
+    tx.batch_execute("select enabled, next_fire_ms from triggers limit 0")
         .map_err(sql)?;
     // Resolved like the queries resolve `runs`, whatever the role may see.
     let events_column = tx
@@ -1287,6 +1308,139 @@ impl RunStore for PostgresStore {
 
     fn stops(&self) -> Option<&dyn StopStore> {
         Some(self)
+    }
+
+    fn triggers(&self) -> Option<&dyn TriggerStore> {
+        Some(self)
+    }
+}
+
+/// A trigger from its row: the stored JSON, with the row's `enabled` and
+/// `next_fire_ms`, which the JSON's copies never override.
+fn trigger_row(row: &postgres::Row) -> Result<StoredTrigger, StoreError> {
+    let body: serde_json::Value = row.try_get("body").map_err(sql)?;
+    let mut trigger: StoredTrigger = serde_json::from_value(body).map_err(json)?;
+    trigger.enabled = row.try_get("enabled").map_err(sql)?;
+    trigger.next_fire_ms = row.try_get("next_fire_ms").map_err(sql)?;
+    Ok(trigger)
+}
+
+impl TriggerStore for PostgresStore {
+    fn put_trigger(&self, trigger: &StoredTrigger) -> Result<(), StoreError> {
+        let body = serde_json::to_value(trigger).map_err(json)?;
+        self.with_client(|client| {
+            client
+                .execute(
+                    "insert into triggers
+                         (id, owner_issuer, owner_subject, body, enabled, next_fire_ms, created_ms)
+                     values ($1, $2, $3, $4, $5, $6, $7)",
+                    &[
+                        &trigger.id.as_uuid(),
+                        &trigger.owner.issuer,
+                        &trigger.owner.subject,
+                        &body,
+                        &trigger.enabled,
+                        &trigger.next_fire_ms,
+                        &trigger.created_ms,
+                    ],
+                )
+                .map(|_| ())
+                .map_err(sql)
+        })
+    }
+
+    fn triggers_of(&self, owner: &Owner) -> Result<Vec<StoredTrigger>, StoreError> {
+        let rows = self.with_client(|client| {
+            client
+                .query(
+                    "select body, enabled, next_fire_ms from triggers
+                     where owner_issuer = $1 and owner_subject = $2
+                     order by created_ms, id",
+                    &[&owner.issuer, &owner.subject],
+                )
+                .map_err(sql)
+        })?;
+        rows.iter().map(trigger_row).collect()
+    }
+
+    fn trigger(&self, owner: &Owner, id: TriggerId) -> Result<Option<StoredTrigger>, StoreError> {
+        let row = self.with_client(|client| {
+            client
+                .query_opt(
+                    "select body, enabled, next_fire_ms from triggers
+                     where id = $1 and owner_issuer = $2 and owner_subject = $3",
+                    &[&id.as_uuid(), &owner.issuer, &owner.subject],
+                )
+                .map_err(sql)
+        })?;
+        row.as_ref().map(trigger_row).transpose()
+    }
+
+    fn set_enabled(
+        &self,
+        owner: &Owner,
+        id: TriggerId,
+        enabled: bool,
+    ) -> Result<Option<StoredTrigger>, StoreError> {
+        let row = self.with_client(|client| {
+            client
+                .query_opt(
+                    "update triggers set enabled = $4
+                     where id = $1 and owner_issuer = $2 and owner_subject = $3
+                     returning body, enabled, next_fire_ms",
+                    &[&id.as_uuid(), &owner.issuer, &owner.subject, &enabled],
+                )
+                .map_err(sql)
+        })?;
+        row.as_ref().map(trigger_row).transpose()
+    }
+
+    /// One statement: the rotation read and bumped under the row's lock.
+    fn rotate_webhook(
+        &self,
+        owner: &Owner,
+        id: TriggerId,
+    ) -> Result<Option<StoredTrigger>, StoreError> {
+        let row = self.with_client(|client| {
+            client
+                .query_opt(
+                    "update triggers
+                     set body = jsonb_set(body, '{kind,webhook,rotation}',
+                         to_jsonb((body->'kind'->'webhook'->>'rotation')::bigint + 1))
+                     where id = $1 and owner_issuer = $2 and owner_subject = $3
+                       and body->'kind' ? 'webhook'
+                     returning body, enabled, next_fire_ms",
+                    &[&id.as_uuid(), &owner.issuer, &owner.subject],
+                )
+                .map_err(sql)
+        })?;
+        row.as_ref().map(trigger_row).transpose()
+    }
+
+    fn delete_trigger(&self, owner: &Owner, id: TriggerId) -> Result<bool, StoreError> {
+        self.with_client(|client| {
+            client
+                .execute(
+                    "delete from triggers
+                     where id = $1 and owner_issuer = $2 and owner_subject = $3",
+                    &[&id.as_uuid(), &owner.issuer, &owner.subject],
+                )
+                .map(|deleted| deleted > 0)
+                .map_err(sql)
+        })
+    }
+
+    fn pause_triggers(&self, owner: &Owner) -> Result<usize, StoreError> {
+        self.with_client(|client| {
+            client
+                .execute(
+                    "update triggers set enabled = false
+                     where owner_issuer = $1 and owner_subject = $2 and enabled",
+                    &[&owner.issuer, &owner.subject],
+                )
+                .map(|paused| usize::try_from(paused).unwrap_or(usize::MAX))
+                .map_err(sql)
+        })
     }
 }
 

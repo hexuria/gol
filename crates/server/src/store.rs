@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use harness::StoreError;
 use protocol::{
-    AgentId, ArtifactId, Capability, Event, EventPayload, MessageId, Owner, RunId, RunSpec,
-    Timestamp,
+    AgentId, ArtifactId, Capability, Event, EventPayload, ExecutionPlacement, Limits, MessageId,
+    Owner, RunId, RunSpec, Timestamp, WorkModel,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -162,6 +162,10 @@ pub trait RunStore: Send + Sync {
     }
     /// The stops this store keeps, if it keeps them (Phase 3.4).
     fn stops(&self) -> Option<&dyn StopStore> {
+        None
+    }
+    /// The triggers this store keeps, if it keeps them (Phase 4.1).
+    fn triggers(&self) -> Option<&dyn TriggerStore> {
         None
     }
 }
@@ -489,6 +493,110 @@ fn stop_names(scope: &StopScope, stop: u64, run: &StoredRun, stored: u64) -> boo
 /// in the store's order.
 type StopEntry = ((String, String), StopScope, u64);
 
+/// A trigger's id (Phase 4.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct TriggerId(uuid::Uuid);
+
+impl TriggerId {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+
+    pub fn as_uuid(self) -> uuid::Uuid {
+        self.0
+    }
+}
+
+impl std::fmt::Display for TriggerId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::str::FromStr for TriggerId {
+    type Err = uuid::Error;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        text.parse().map(Self)
+    }
+}
+
+/// What starts a trigger's runs.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerKind {
+    /// A cron expression in a time zone. Checked for shape only here; the
+    /// scheduler (Phase 4.2) parses it.
+    Schedule { cron: String, time_zone: String },
+    /// A signed request to `/hooks/{id}` (Phase 4.3). Its secret is derived
+    /// from the server's webhook key, the trigger id and `rotation`, and is
+    /// never stored (decision 73A); a rotation bumps `rotation`.
+    Webhook { rotation: u32 },
+}
+
+/// What a schedule does about ticks it missed while no server ran it
+/// (decision 70A).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Missed {
+    /// Fires once, late, for all it missed.
+    #[default]
+    RunOnceLate,
+    /// Fires at the next tick.
+    Skip,
+}
+
+/// A principal's trigger: what it starts (its agent, input and run
+/// template) and when.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredTrigger {
+    pub id: TriggerId,
+    pub owner: Owner,
+    pub agent_id: AgentId,
+    pub kind: TriggerKind,
+    pub input: String,
+    pub placement: ExecutionPlacement,
+    pub work_model: WorkModel,
+    pub limits: Option<Limits>,
+    pub missed: Missed,
+    pub enabled: bool,
+    /// When the scheduler fires it next (Phase 4.2); none until then.
+    pub next_fire_ms: Option<i64>,
+    pub created_ms: i64,
+}
+
+/// The triggers a store keeps (Phase 4.1), each its owner's alone: every
+/// read and write names the owner, and another principal's trigger is not
+/// found.
+pub trait TriggerStore: Send + Sync {
+    /// Stores a new trigger.
+    fn put_trigger(&self, trigger: &StoredTrigger) -> Result<(), StoreError>;
+    /// `owner`'s principal's triggers, oldest first.
+    fn triggers_of(&self, owner: &Owner) -> Result<Vec<StoredTrigger>, StoreError>;
+    fn trigger(&self, owner: &Owner, id: TriggerId) -> Result<Option<StoredTrigger>, StoreError>;
+    /// Pauses or resumes one trigger; none when it is not the principal's.
+    fn set_enabled(
+        &self,
+        owner: &Owner,
+        id: TriggerId,
+        enabled: bool,
+    ) -> Result<Option<StoredTrigger>, StoreError>;
+    /// Bumps a webhook trigger's rotation, in one step; none when it is not
+    /// the principal's webhook trigger.
+    fn rotate_webhook(
+        &self,
+        owner: &Owner,
+        id: TriggerId,
+    ) -> Result<Option<StoredTrigger>, StoreError>;
+    /// Whether it was the principal's, and is now gone.
+    fn delete_trigger(&self, owner: &Owner, id: TriggerId) -> Result<bool, StoreError>;
+    /// Pauses every trigger of the principal's, and says how many were
+    /// running.
+    fn pause_triggers(&self, owner: &Owner) -> Result<usize, StoreError>;
+}
+
 /// The in-memory store. A poisoned lock (a writer panicked holding it) still
 /// serves reads, since every write completes before its guard drops; a write
 /// under a poisoned lock is refused as a StoreError (owner decision 3A).
@@ -511,6 +619,8 @@ pub struct InMemoryStore {
     order: std::sync::atomic::AtomicU64,
     /// Each run's number in that order. Taken only while `runs` is held.
     stored: Mutex<HashMap<RunId, u64>>,
+    /// Every principal's triggers, oldest first. Taken alone.
+    triggers: Mutex<Vec<StoredTrigger>>,
     hints: Hints,
 }
 
@@ -713,6 +823,86 @@ impl RunStore for InMemoryStore {
 
     fn stops(&self) -> Option<&dyn StopStore> {
         Some(self)
+    }
+
+    fn triggers(&self) -> Option<&dyn TriggerStore> {
+        Some(self)
+    }
+}
+
+impl TriggerStore for InMemoryStore {
+    fn put_trigger(&self, trigger: &StoredTrigger) -> Result<(), StoreError> {
+        write(&self.triggers, "triggers")?.push(trigger.clone());
+        Ok(())
+    }
+
+    fn triggers_of(&self, owner: &Owner) -> Result<Vec<StoredTrigger>, StoreError> {
+        Ok(read(&self.triggers)
+            .iter()
+            .filter(|trigger| trigger.owner.is(owner))
+            .cloned()
+            .collect())
+    }
+
+    fn trigger(&self, owner: &Owner, id: TriggerId) -> Result<Option<StoredTrigger>, StoreError> {
+        Ok(read(&self.triggers)
+            .iter()
+            .find(|trigger| trigger.id == id && trigger.owner.is(owner))
+            .cloned())
+    }
+
+    fn set_enabled(
+        &self,
+        owner: &Owner,
+        id: TriggerId,
+        enabled: bool,
+    ) -> Result<Option<StoredTrigger>, StoreError> {
+        let mut triggers = write(&self.triggers, "triggers")?;
+        Ok(triggers
+            .iter_mut()
+            .find(|trigger| trigger.id == id && trigger.owner.is(owner))
+            .map(|trigger| {
+                trigger.enabled = enabled;
+                trigger.clone()
+            }))
+    }
+
+    fn rotate_webhook(
+        &self,
+        owner: &Owner,
+        id: TriggerId,
+    ) -> Result<Option<StoredTrigger>, StoreError> {
+        let mut triggers = write(&self.triggers, "triggers")?;
+        Ok(triggers
+            .iter_mut()
+            .find(|trigger| trigger.id == id && trigger.owner.is(owner))
+            .and_then(|trigger| match &mut trigger.kind {
+                TriggerKind::Webhook { rotation } => {
+                    *rotation += 1;
+                    Some(trigger.clone())
+                }
+                TriggerKind::Schedule { .. } => None,
+            }))
+    }
+
+    fn delete_trigger(&self, owner: &Owner, id: TriggerId) -> Result<bool, StoreError> {
+        let mut triggers = write(&self.triggers, "triggers")?;
+        let before = triggers.len();
+        triggers.retain(|trigger| !(trigger.id == id && trigger.owner.is(owner)));
+        Ok(triggers.len() < before)
+    }
+
+    fn pause_triggers(&self, owner: &Owner) -> Result<usize, StoreError> {
+        let mut triggers = write(&self.triggers, "triggers")?;
+        let mut paused = 0;
+        for trigger in triggers
+            .iter_mut()
+            .filter(|trigger| trigger.owner.is(owner) && trigger.enabled)
+        {
+            trigger.enabled = false;
+            paused += 1;
+        }
+        Ok(paused)
     }
 }
 

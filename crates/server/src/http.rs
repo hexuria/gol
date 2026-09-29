@@ -29,10 +29,12 @@ use crate::inference::{
 use crate::models::ModelsConfig;
 use crate::queue::RedisRunQueue;
 use crate::store::{
-    is_terminal, AgentManifest, Append, PutAgent, RunStore, StopScope, StoredAgent, StoredRun,
+    is_terminal, AgentManifest, Append, Missed, PutAgent, RunStore, StopScope, StoredAgent,
+    StoredRun, StoredTrigger, TriggerId, TriggerKind, TriggerStore,
 };
 use crate::stream::{outbox_stream, run_stream, SseBody, Streams};
 use crate::surface::{ag_ui_events, json_render_spec};
+use crate::triggers::{trigger_thread, webhook_secret, TRIGGER_KEY};
 
 #[derive(Clone)]
 struct AppState {
@@ -48,6 +50,9 @@ struct AppState {
     auth: Arc<dyn Authenticator>,
     /// The streams each principal has open (Phase 3.2).
     streams: Arc<Streams>,
+    /// The key webhook triggers' secrets are derived from (decision 73A);
+    /// without it there are no webhook triggers.
+    webhook_key: Option<Arc<[u8]>>,
 }
 
 /// `POST /v1/runs`. Capabilities come from the stored manifest, so the body
@@ -156,6 +161,7 @@ pub fn router_with_queue(
         sandbox: sandbox_from_env(),
         auth,
         streams: Arc::default(),
+        webhook_key: webhook_key_from_env(),
     })
 }
 
@@ -185,6 +191,7 @@ pub fn router_with_sandbox(
         sandbox,
         auth,
         streams: Arc::default(),
+        webhook_key: webhook_key_from_env(),
     })
 }
 
@@ -211,12 +218,44 @@ pub fn router_with_memory(
         sandbox: sandbox_from_env(),
         auth,
         streams: Arc::default(),
+        webhook_key: webhook_key_from_env(),
     })
 }
 
 /// The run queue at `redis_url`, one connection shared by every request.
 fn open_queue(redis_url: String) -> Arc<RedisRunQueue> {
     Arc::new(RedisRunQueue::open(redis_url))
+}
+
+/// `router_with_queue`, with `webhook_key` for webhook triggers' secrets
+/// (Phase 4.1, decision 73A) in place of `GOL_WEBHOOK_KEY`.
+pub fn router_with_webhooks(
+    store: Arc<dyn RunStore>,
+    jev_base_url: impl Into<String>,
+    redis_url: Option<String>,
+    webhook_key: Option<Vec<u8>>,
+    auth: Arc<dyn Authenticator>,
+) -> Router {
+    router_with_state(AppState {
+        store,
+        memory: Arc::new(InMemory::default()),
+        jev_base_url: jev_base_url.into(),
+        models: Arc::new(ModelsConfig::default()),
+        queue: redis_url.map(open_queue),
+        poster: Arc::new(HttpGatewayPoster::from_env()),
+        sandbox: sandbox_from_env(),
+        auth,
+        streams: Arc::default(),
+        webhook_key: webhook_key.map(Arc::from),
+    })
+}
+
+/// `GOL_WEBHOOK_KEY`, when set and not empty.
+fn webhook_key_from_env() -> Option<Arc<[u8]>> {
+    std::env::var("GOL_WEBHOOK_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+        .map(|key| Arc::from(key.into_bytes()))
 }
 
 fn router_with_state(state: AppState) -> Router {
@@ -236,6 +275,11 @@ fn router_with_state(state: AppState) -> Router {
         .route("/v1/runs/{id}/reply", post(reply_run))
         .route("/v1/threads/{id}/stop", post(stop_thread))
         .route("/v1/stop", post(stop_owner))
+        .route("/v1/triggers", post(create_trigger).get(list_triggers))
+        .route("/v1/triggers/{id}", axum::routing::delete(delete_trigger))
+        .route("/v1/triggers/{id}/pause", post(pause_trigger))
+        .route("/v1/triggers/{id}/resume", post(resume_trigger))
+        .route("/v1/triggers/{id}/rotate", post(rotate_trigger))
         .route("/v1/coworker/turns", post(create_coworker_turn))
         .route(
             "/v1/coworker/turns/{id}/completion",
@@ -844,12 +888,13 @@ async fn follow_up(
             placement: root.placement,
             work_model: root.work_model,
             limits: Some(body.limits.unwrap_or(root.limits)),
-            // A thread begun by a background turn: the follow-up is a run,
-            // not a turn, and the marker is the server's to set.
+            // A thread begun by a background turn or a trigger: the
+            // follow-up is a run the caller asked for, and the markers are
+            // the server's to set.
             metadata: root
                 .metadata
                 .into_iter()
-                .filter(|(key, _)| key != TURN_KEY)
+                .filter(|(key, _)| key != TURN_KEY && key != TRIGGER_KEY)
                 .collect(),
         },
     )
@@ -1319,7 +1364,255 @@ async fn stop_owner(
     Authenticated(principal): Authenticated,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    stop(&state, owner_of(&principal), StopScope::Owner).await
+    // The principal's triggers are paused first, so none starts new work
+    // while the stop cancels what is there (Phase 4.1).
+    let (store, owner) = (state.store.clone(), owner_of(&principal));
+    let paused = tokio::task::spawn_blocking(move || {
+        store
+            .triggers()
+            .map(|triggers| triggers.pause_triggers(&owner))
+            .transpose()
+    })
+    .await
+    .map_err(|error| ApiError::Store(error.to_string()))?
+    .map_err(ApiError::from)?
+    .unwrap_or(0);
+    let Json(mut body) = stop(&state, owner_of(&principal), StopScope::Owner).await?;
+    body["paused_triggers"] = serde_json::json!(paused);
+    Ok(Json(body))
+}
+
+/// A trigger's kind, as a create request names it.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum KindBody {
+    Schedule { cron: String, time_zone: String },
+    Webhook,
+}
+
+/// `POST /v1/triggers` (Phase 4.1): what a fire starts, and when.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TriggerBody {
+    agent_id: AgentId,
+    kind: KindBody,
+    input: String,
+    placement: ExecutionPlacement,
+    work_model: WorkModel,
+    limits: Option<Limits>,
+    missed: Option<Missed>,
+}
+
+/// A trigger as the API shows it. Never its webhook secret, which only
+/// its create and its rotation answer with.
+fn trigger_view(trigger: &StoredTrigger) -> serde_json::Value {
+    serde_json::json!({
+        "id": trigger.id,
+        "agent_id": trigger.agent_id,
+        "kind": trigger.kind,
+        "input": trigger.input,
+        "placement": trigger.placement,
+        "work_model": trigger.work_model,
+        "limits": trigger.limits,
+        "missed": trigger.missed,
+        "enabled": trigger.enabled,
+        "thread_id": trigger_thread(trigger.id),
+        "next_fire_at": trigger.next_fire_ms,
+        "created_at": trigger.created_ms,
+    })
+}
+
+/// `view` with the webhook secret of `trigger` added, when it has one.
+fn with_secret(
+    state: &AppState,
+    trigger: &StoredTrigger,
+    mut view: serde_json::Value,
+) -> serde_json::Value {
+    if let Some(secret) = state
+        .webhook_key
+        .as_deref()
+        .and_then(|key| webhook_secret(key, trigger))
+    {
+        view["secret"] = serde_json::json!(secret);
+    }
+    view
+}
+
+/// Runs `work` on the caller's triggers off the async workers: 503 when the
+/// store keeps none.
+async fn with_triggers<T: Send + 'static>(
+    state: &AppState,
+    work: impl FnOnce(&dyn RunStore, &dyn TriggerStore) -> Result<Result<T, ApiError>, StoreError>
+        + Send
+        + 'static,
+) -> Result<T, ApiError> {
+    let store = state.store.clone();
+    tokio::task::spawn_blocking(move || {
+        let Some(triggers) = store.triggers() else {
+            return Ok(Err(ApiError::Unavailable("triggers are not available")));
+        };
+        work(store.as_ref(), triggers)
+    })
+    .await
+    .map_err(|error| ApiError::Store(error.to_string()))?
+    .map_err(ApiError::from)?
+}
+
+/// `POST /v1/triggers`: a trigger of the caller's agent, enabled. A webhook
+/// trigger's answer carries its secret, once (decision 73A).
+async fn create_trigger(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+    body: Result<Json<TriggerBody>, JsonRejection>,
+) -> Result<axum::response::Response, ApiError> {
+    let Json(body) = body.map_err(body_rejection)?;
+    let kind = match body.kind {
+        KindBody::Schedule { cron, time_zone } => {
+            let shaped = |text: &str, most: usize| !text.trim().is_empty() && text.len() <= most;
+            if !shaped(&cron, 256) || !shaped(&time_zone, 64) {
+                return Err(ApiError::BadRequest(
+                    "a schedule needs a cron expression and a time zone",
+                ));
+            }
+            TriggerKind::Schedule { cron, time_zone }
+        }
+        KindBody::Webhook => {
+            if state.webhook_key.is_none() {
+                return Err(ApiError::Unavailable("webhooks are not available"));
+            }
+            TriggerKind::Webhook { rotation: 0 }
+        }
+    };
+    if let Some(limits) = body.limits {
+        let bounded = 1..=MAX_LIMIT;
+        if !bounded.contains(&limits.max_steps) || !bounded.contains(&limits.max_model_calls) {
+            return Err(ApiError::BadRequest("limits must be between 1 and 64"));
+        }
+    }
+    let trigger = StoredTrigger {
+        id: TriggerId::new(),
+        owner: owner_of(&principal),
+        agent_id: body.agent_id,
+        kind,
+        input: body.input,
+        placement: body.placement,
+        work_model: body.work_model,
+        limits: body.limits,
+        missed: body.missed.unwrap_or_default(),
+        enabled: true,
+        next_fire_ms: None,
+        created_ms: Timestamp::now().as_unix_millis(),
+    };
+    let stored = trigger.clone();
+    with_triggers(&state, move |store, triggers| {
+        let owned = store
+            .agent(stored.agent_id)?
+            .is_some_and(|agent| agent.owner.is(&stored.owner));
+        if !owned {
+            return Ok(Err(ApiError::AgentNotFound));
+        }
+        triggers.put_trigger(&stored)?;
+        Ok(Ok(()))
+    })
+    .await?;
+    let view = with_secret(&state, &trigger, trigger_view(&trigger));
+    Ok((StatusCode::CREATED, Json(view)).into_response())
+}
+
+/// `GET /v1/triggers`: the caller's triggers, oldest first.
+async fn list_triggers(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let owner = owner_of(&principal);
+    let triggers = with_triggers(&state, move |_, triggers| {
+        Ok(Ok(triggers.triggers_of(&owner)?))
+    })
+    .await?;
+    Ok(Json(serde_json::json!({
+        "triggers": triggers.iter().map(trigger_view).collect::<Vec<_>>(),
+    })))
+}
+
+async fn set_trigger_enabled(
+    state: &AppState,
+    principal: &Principal,
+    id: TriggerId,
+    enabled: bool,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let owner = owner_of(principal);
+    let trigger = with_triggers(state, move |_, triggers| {
+        Ok(triggers
+            .set_enabled(&owner, id, enabled)?
+            .ok_or(ApiError::TriggerNotFound))
+    })
+    .await?;
+    Ok(Json(trigger_view(&trigger)))
+}
+
+/// `POST /v1/triggers/{id}/pause`: it fires no more until resumed.
+async fn pause_trigger(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<TriggerId>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    set_trigger_enabled(&state, &principal, id, false).await
+}
+
+/// `POST /v1/triggers/{id}/resume`.
+async fn resume_trigger(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<TriggerId>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    set_trigger_enabled(&state, &principal, id, true).await
+}
+
+/// `POST /v1/triggers/{id}/rotate`: a webhook trigger's new secret, shown
+/// once; the old one no longer checks (decision 73A).
+async fn rotate_trigger(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<TriggerId>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.webhook_key.is_none() {
+        return Err(ApiError::Unavailable("webhooks are not available"));
+    }
+    let owner = owner_of(&principal);
+    let trigger = with_triggers(&state, move |_, triggers| {
+        match triggers.trigger(&owner, id)? {
+            None => return Ok(Err(ApiError::TriggerNotFound)),
+            Some(trigger) if matches!(trigger.kind, TriggerKind::Schedule { .. }) => {
+                return Ok(Err(ApiError::Conflict(
+                    "only a webhook trigger has a secret",
+                )));
+            }
+            Some(_) => {}
+        }
+        Ok(triggers
+            .rotate_webhook(&owner, id)?
+            .ok_or(ApiError::TriggerNotFound))
+    })
+    .await?;
+    Ok(Json(with_secret(&state, &trigger, trigger_view(&trigger))))
+}
+
+/// `DELETE /v1/triggers/{id}`.
+async fn delete_trigger(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<TriggerId>,
+) -> Result<StatusCode, ApiError> {
+    let owner = owner_of(&principal);
+    let deleted = with_triggers(&state, move |_, triggers| {
+        Ok(Ok(triggers.delete_trigger(&owner, id)?))
+    })
+    .await?;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::TriggerNotFound)
+    }
 }
 
 async fn get_ag_ui(
@@ -1476,6 +1769,9 @@ fn build_spec(
     if core.metadata.contains_key(TURN_KEY) {
         return Err(ApiError::BadRequest("gol.turn is set by the server"));
     }
+    if core.metadata.contains_key(TRIGGER_KEY) {
+        return Err(ApiError::BadRequest("gol.trigger is set by the server"));
+    }
     Ok(RunSpec::builder()
         .owner(owner)
         .agent(core.agent_id, core.agent_version)
@@ -1512,6 +1808,7 @@ enum ApiError {
     /// names none of them: 409 with each task's label and question.
     WhichTask(Vec<WaitingTask>),
     ThreadNotFound,
+    TriggerNotFound,
     /// The store keeps no threads.
     NoThreads,
     /// The store keeps no stops.
@@ -1573,6 +1870,11 @@ impl axum::response::IntoResponse for ApiError {
             Self::NoThreads => (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "threads are not available" })),
+            )
+                .into_response(),
+            Self::TriggerNotFound => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "trigger not found" })),
             )
                 .into_response(),
             Self::ThreadNotFound => (
