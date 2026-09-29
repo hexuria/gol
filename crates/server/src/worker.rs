@@ -27,7 +27,9 @@ use protocol::{
     RunId, RunSpec, Timestamp,
 };
 
-use crate::deliverer::{ask_state, deliver, task_answer, AskState, IfUnsent, OwnedDeliverer};
+use crate::deliverer::{
+    ask_state, deliver, is_user_question, task_answer, AskState, IfUnsent, OwnedDeliverer,
+};
 use crate::http::{jev_client, Delegation};
 use crate::inference::{dispatch_events, run_cancelled_event, run_failed_event};
 use crate::models::ModelsConfig;
@@ -583,7 +585,8 @@ impl Worker {
             return Ok(Stopped::LostLease);
         }
         let (spawner, targets) = self.delegation(spec);
-        driver = driver.with_spawner(spawner, targets);
+        // A queued run can wait for its user's answer: it is parked.
+        driver = driver.with_spawner(spawner, targets).with_user_questions();
         if let Some(messages) = &self.messages {
             driver = driver.with_deliverer(Arc::new(
                 OwnedDeliverer::builder()
@@ -863,13 +866,14 @@ pub fn sweep_asks(
 ) -> Result<Vec<RunId>, String> {
     let mut swept = Vec::new();
     for (run_id, ask) in queue.parked()? {
-        let waits = match store.run(run_id) {
-            Ok(Some(run)) => {
+        let (waits, question) = match store.run(run_id) {
+            Ok(Some(run)) => (
                 ask_state(&run.events, ask) == AskState::Open
-                    && !run.events.iter().any(|event| is_terminal(&event.payload))
-            }
+                    && !run.events.iter().any(|event| is_terminal(&event.payload)),
+                is_user_question(&run.events, ask),
+            ),
             // A parked run the store lost is woken: a worker acknowledges it.
-            Ok(None) => false,
+            Ok(None) => (false, false),
             Err(error) => {
                 eprintln!("gol: ask sweep: load run {run_id}: {error}");
                 continue;
@@ -877,6 +881,10 @@ pub fn sweep_asks(
         };
         let result = if !waits {
             queue.wake(run_id, ask).map(|_| true)
+        } else if question {
+            // A question to the user has no timeout (decision 57A): it
+            // waits for the answer, or a stop.
+            continue;
         } else {
             let timed_out = EventPayload::AskTimedOut { message_id: ask };
             let answer = match messages.message(ask) {

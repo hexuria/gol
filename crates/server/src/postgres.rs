@@ -611,7 +611,7 @@ impl ThreadStore for PostgresStore {
                 .query(
                     "select id, spec from runs
                      where owner_issuer = $1 and owner_subject = $2 and thread_id = $3
-                     order by created_ms, id
+                     order by created_ms, stored_seq, id
                      limit $4",
                     &[&owner.issuer, &owner.subject, &thread, &limit],
                 )

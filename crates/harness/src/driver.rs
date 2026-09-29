@@ -33,6 +33,8 @@ pub struct Driver {
     loaded: Option<Vec<Box<dyn Tool>>>,
     spawner: Option<Arc<dyn AgentSpawner>>,
     deliverer: Option<Arc<dyn MessageDeliverer>>,
+    /// Questions to the user are put, and the run waits for the answer.
+    user_questions: bool,
     targets: Vec<DelegateTarget>,
     /// Effects the log authorized and holds no result for, performed first
     /// by `run_until`: the tail of a step a resumed run was cut in.
@@ -57,6 +59,7 @@ impl Driver {
             loaded: None,
             spawner: None,
             deliverer: None,
+            user_questions: false,
             targets: Vec::new(),
             pending: Vec::new(),
             undecided: None,
@@ -97,6 +100,7 @@ impl Driver {
             loaded: None,
             spawner: None,
             deliverer: None,
+            user_questions: false,
             targets: Vec::new(),
             pending: Vec::new(),
             undecided: None,
@@ -166,6 +170,15 @@ impl Driver {
     /// Without one, they are refused.
     pub fn with_deliverer(mut self, deliverer: Arc<dyn MessageDeliverer>) -> Self {
         self.deliverer = Some(deliverer);
+        self
+    }
+
+    /// Questions this run is allowed to put to its user are put
+    /// (`UserAsked`), and the asking step waits for the answer: its worker
+    /// parks the run (Phase 3.5). Without this they are refused, since a run
+    /// carried out inside its request cannot wait.
+    pub fn with_user_questions(mut self) -> Self {
+        self.user_questions = true;
         self
     }
 
@@ -266,6 +279,7 @@ impl Driver {
                 skills,
                 agents: &self.targets,
                 messaging: self.deliverer.is_some(),
+                asking: self.user_questions,
                 steps_exhausted: steps_spent,
                 model_calls_exhausted: model_calls_spent,
             };
@@ -484,9 +498,9 @@ impl Driver {
                     reply_to,
                     timeout_secs,
                 } => self.send_message(*to, body, *expects_reply, *reply_to, *timeout_secs),
+                Effect::AskUser { prompt } => self.ask_user(prompt),
                 Effect::Complete { .. }
                 | Effect::Execute { .. }
-                | Effect::AskUser { .. }
                 | Effect::RequestApproval { .. }
                 | Effect::Wait { .. }
                 | Effect::PublishArtifact { .. } => {}
@@ -613,6 +627,22 @@ impl Driver {
     /// or a new ask starts a task, whose budget is carved as for a
     /// delegation (decision 33A) and recorded as `ChildStarted`; a reply
     /// starts none. An accepted ask moves the harness to `WaitingForMessage`.
+    /// Puts a question to the run's user, or refuses it when the run cannot
+    /// wait for the answer.
+    fn ask_user(&mut self, prompt: &str) {
+        let payload = if self.user_questions {
+            EventPayload::UserAsked {
+                message_id: MessageId::new(),
+                prompt: prompt.to_string(),
+            }
+        } else {
+            EventPayload::UserAskRefused {
+                reason: "the run cannot wait for an answer".to_string(),
+            }
+        };
+        self.push(payload, Actor::System);
+    }
+
     fn send_message(
         &mut self,
         to: AgentId,

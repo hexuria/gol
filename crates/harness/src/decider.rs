@@ -21,6 +21,9 @@ pub struct DecisionView<'a> {
     pub agents: &'a [DelegateTarget],
     /// A message deliverer is present: without one every message is refused.
     pub messaging: bool,
+    /// The run can wait for its user's answer: a question is put, not
+    /// refused (Phase 3.5).
+    pub asking: bool,
     /// The run has spent its step budget. Only a `Complete` that finishes the
     /// run is still allowed; any other decision fails the run with `Budget`.
     /// While a tool call is outstanding even a `Complete` cannot finish the

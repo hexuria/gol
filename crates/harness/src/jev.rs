@@ -1,6 +1,6 @@
 use protocol::{
-    AgentId, Capability, Effect, HarnessState, InvocationId, MAX_CHILDREN, MAX_DELEGATION_HOPS,
-    MAX_MESSAGE_BYTES,
+    AgentId, Capability, Effect, EventPayload, HarnessState, InvocationId, MessageRole,
+    MAX_CHILDREN, MAX_DELEGATION_HOPS, MAX_MESSAGE_BYTES,
 };
 use serde_json::{json, Value};
 use typesafe_sdk::blocking::Client;
@@ -19,6 +19,7 @@ const COMPLETE: &str = "complete";
 const DELEGATE: &str = "delegate:";
 const TELL: &str = "tell:";
 const ASK: &str = "ask:";
+const ASK_USER: &str = "ask_user";
 
 /// How long an ask Jev chooses waits for its answer (decision 28A): the
 /// ask's task usually answers first, when it ends (decision 31A).
@@ -115,6 +116,7 @@ pub fn jev_choices(view: &DecisionView<'_>) -> Vec<(String, Option<String>)> {
         .filter(|tool| {
             tool.name != MODEL
                 && tool.name != COMPLETE
+                && tool.name != ASK_USER
                 && ![DELEGATE, TELL, ASK]
                     .iter()
                     .any(|prefix| tool.name.starts_with(prefix))
@@ -131,6 +133,12 @@ pub fn jev_choices(view: &DecisionView<'_>) -> Vec<(String, Option<String>)> {
             .into_iter()
             .map(|(label, description, _, _)| (label, Some(description))),
     );
+    if asks_user(view) {
+        choices.push((
+            ASK_USER.to_string(),
+            Some("Ask the user a question, and wait for the answer.".to_string()),
+        ));
+    }
     if !view.model_calls_exhausted {
         choices.push((
             MODEL.to_string(),
@@ -203,6 +211,46 @@ fn message_choices(view: &DecisionView<'_>) -> Vec<(String, String, AgentId, boo
                 .map(|(label, description, agent)| (label, description, agent, true)),
         )
         .collect()
+}
+
+/// Whether a question to the user could be put now: the run holds
+/// `user.ask`, can wait for the answer, and its step is not yet answered.
+fn asks_user(view: &DecisionView<'_>) -> bool {
+    view.asking
+        && view
+            .spec
+            .capabilities
+            .contains(&Capability::new("user.ask"))
+        && matches!(
+            view.state.harness,
+            HarnessState::Running {
+                answered: false,
+                ..
+            }
+        )
+}
+
+/// What `ask_user` asks (decision 59A): the run's last non-empty assistant
+/// text, else its input, cut to `MAX_MESSAGE_BYTES` at a char boundary.
+fn question(view: &DecisionView<'_>) -> String {
+    let text = view
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.payload {
+            EventPayload::ModelResponded { message, .. }
+                if message.role == MessageRole::Assistant && !message.text.trim().is_empty() =>
+            {
+                Some(message.text.as_str())
+            }
+            _ => None,
+        })
+        .unwrap_or(&view.spec.input);
+    let mut end = text.len().min(MAX_MESSAGE_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 /// Whether a decision could start a task in another agent now: the run
@@ -331,6 +379,9 @@ impl Decider for JevDecider {
             });
         }
         Ok(match choice.as_str() {
+            ASK_USER => Effect::AskUser {
+                prompt: question(view),
+            },
             MODEL => Effect::ModelCall {
                 prompt: view.spec.input.clone(),
             },

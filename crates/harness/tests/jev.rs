@@ -339,6 +339,7 @@ fn view<'a>(
         skills,
         agents: &[],
         messaging: false,
+        asking: false,
         steps_exhausted: false,
         model_calls_exhausted: false,
     }
@@ -812,6 +813,127 @@ async fn tell_and_ask_choices_map_to_messages() {
                 timeout_secs,
             }),
             "{label}"
+        );
+    }
+}
+
+fn asking(input: &str) -> RunSpec {
+    let mut spec = spec_with_input(limits(8, 4), input);
+    spec.capabilities.push(Capability::new("user.ask"));
+    spec
+}
+
+// Phase 3.5: `ask_user` is offered only while the run holds user.ask, can
+// wait for the answer, and its step is not yet answered.
+#[test]
+fn jev_offers_ask_user_only_when_allowed() {
+    let with = asking("hi");
+    let without = spec(limits(8, 4));
+    for (spec, can_wait, offered) in [
+        (&with, true, true),
+        (&with, false, false),
+        (&without, true, false),
+    ] {
+        let driver = Driver::boot(spec.clone()).unwrap();
+        let state = driver.state();
+        let mut offered_view = view(spec, &state, driver.events(), &[], &[]);
+        offered_view.asking = can_wait;
+        assert_eq!(
+            labels(&offered_view).contains(&"ask_user".to_string()),
+            offered,
+            "can_wait={can_wait}"
+        );
+    }
+    let driver = Driver::boot(with.clone()).unwrap();
+    let mut state = driver.state();
+    state.harness = protocol::HarnessState::Running {
+        step: 1,
+        attempt: 0,
+        answered: true,
+    };
+    let mut answered = view(&with, &state, driver.events(), &[], &[]);
+    answered.asking = true;
+    assert!(!labels(&answered).contains(&"ask_user".to_string()));
+    // A tool named ask_user would be ambiguous: it is left out.
+    let mut tool = EchoTool.descriptor();
+    tool.name = "ask_user".into();
+    let tools = [tool];
+    let fresh = driver.state();
+    let mut named = view(&with, &fresh, driver.events(), &tools, &[]);
+    named.asking = true;
+    assert_eq!(
+        labels(&named)
+            .iter()
+            .filter(|label| *label == "ask_user")
+            .count(),
+        1
+    );
+}
+
+fn responded(spec: &RunSpec, role: protocol::MessageRole, text: &str) -> Event {
+    Event::record(
+        protocol::EventSource::for_spec(spec, protocol::Actor::Gateway, protocol::Timestamp::now()),
+        protocol::EventPayload::ModelResponded {
+            message: protocol::ModelMessage {
+                role,
+                text: text.to_string(),
+            },
+            usage: None,
+        },
+    )
+}
+
+// 59A: the question is the run's last non-empty assistant text, else its
+// input.
+#[tokio::test]
+async fn an_ask_user_choice_asks_the_last_assistant_text_else_the_input() {
+    for (texts, expected) in [
+        (vec![], "book a flight"),
+        (
+            vec![("assistant", "Which airport?"), ("assistant", "   ")],
+            "Which airport?",
+        ),
+        (
+            vec![
+                ("assistant", "first"),
+                ("assistant", "Which day?"),
+                ("user", "not this"),
+            ],
+            "Which day?",
+        ),
+    ] {
+        let server = jev(&["ask_user"]).await;
+        let base_url = server.uri();
+        let effect = tokio::task::spawn_blocking(move || {
+            let client = typesafe_sdk::blocking::Client::builder()
+                .api_key("gol")
+                .base_url(base_url)
+                .retry(typesafe_sdk::RetryPolicy::disabled())
+                .build()
+                .unwrap();
+            let spec = asking("book a flight");
+            let driver = Driver::boot(spec.clone()).unwrap();
+            let state = driver.state();
+            let mut events = driver.events().to_vec();
+            for (role, text) in texts {
+                let role = if role == "assistant" {
+                    protocol::MessageRole::Assistant
+                } else {
+                    protocol::MessageRole::User
+                };
+                events.push(responded(&spec, role, text));
+            }
+            let mut offered = view(&spec, &state, &events, &[], &[]);
+            offered.asking = true;
+            JevDecider::new(client).decide(&offered)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            effect,
+            Ok(Effect::AskUser {
+                prompt: expected.to_string(),
+            })
         );
     }
 }
