@@ -1097,9 +1097,10 @@ fn a_reply_before_its_ask_is_logged_is_refused_and_retried() {
 }
 
 // Owner decision on #74, follow-up: an ask answered by its task's end
-// carries the task's last non-empty assistant response when there is one (a
-// Jev task's outcome is the fixed word "done"), cut to a message's 32 KiB
-// (30A) at a character boundary.
+// carries the task's last non-blank assistant response when it completed (a
+// Jev task's outcome is the fixed word "done"); a task that failed, was
+// cancelled or expired says so instead, whatever it answered before. Every
+// answer is cut to a message's 32 KiB (30A) at a character boundary.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_task_answers_with_its_last_model_response() {
     let max = protocol::MAX_MESSAGE_BYTES;
@@ -1135,6 +1136,12 @@ async fn a_task_answers_with_its_last_model_response() {
             completed(),
             "a first thought".to_string(),
         ),
+        (
+            MessageRole::System,
+            "not an answer".to_string(),
+            completed(),
+            "a first thought".to_string(),
+        ),
         (assistant, "a".repeat(max), completed(), "a".repeat(max)),
         (assistant, "a".repeat(max + 1), completed(), "a".repeat(max)),
         // 1 + 2 * 20,000 bytes: the cap falls inside a two-byte character.
@@ -1153,6 +1160,16 @@ async fn a_task_answers_with_its_last_model_response() {
                 message: "decider: down".to_string(),
             },
             "the task failed: decider: down".to_string(),
+        ),
+        // The failure text is cut as a response is.
+        (
+            assistant,
+            "almost".to_string(),
+            EventPayload::RunFailed {
+                class: FailureClass::Dependency,
+                message: "x".repeat(max),
+            },
+            format!("the task failed: {}", "x".repeat(max))[..max].to_string(),
         ),
         (
             assistant,

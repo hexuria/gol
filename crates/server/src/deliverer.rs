@@ -346,7 +346,7 @@ pub(crate) fn deliver(
 }
 
 /// The reply a task gives `ask` when it ends (decision 31A): its last
-/// non-empty assistant response if it completed after one (a Jev task's
+/// non-blank assistant response if it completed after one (a Jev task's
 /// outcome is the fixed word "done"), else its outcome, or that it failed, was cancelled or
 /// expired. `None` while it runs. The body is cut to `MAX_MESSAGE_BYTES`,
 /// as a message's is (30A).
