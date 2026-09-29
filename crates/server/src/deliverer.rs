@@ -161,19 +161,21 @@ pub(crate) fn deliver(
         );
         "store unavailable".to_string()
     };
+    // An asker that is not stored, or already ended, needs no answer: the
+    // ask is closed, so the sweep does not retry it.
     let asker = store
         .run(ask.from_run)
-        .map_err(|error| failed(error.to_string()))?
-        .ok_or_else(|| failed("the asking run is not stored".to_string()))?;
-    let event = Event::record(
-        EventSource::for_spec(&asker.spec, Actor::System, Timestamp::now()),
-        answer,
-    );
-    match store.append_events(ask.from_run, vec![event]) {
-        // An asker that already ended needs no answer.
-        Ok(Append::Appended | Append::Terminal) => {}
-        Ok(other) => return Err(failed(format!("{other:?}"))),
-        Err(error) => return Err(failed(error.to_string())),
+        .map_err(|error| failed(error.to_string()))?;
+    if let Some(asker) = asker {
+        let event = Event::record(
+            EventSource::for_spec(&asker.spec, Actor::System, Timestamp::now()),
+            answer,
+        );
+        match store.append_events(ask.from_run, vec![event]) {
+            Ok(Append::Appended | Append::Terminal | Append::Missing) => {}
+            Ok(other) => return Err(failed(format!("{other:?}"))),
+            Err(error) => return Err(failed(error.to_string())),
+        }
     }
     messages
         .answer(ask.id)

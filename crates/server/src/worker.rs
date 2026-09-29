@@ -226,10 +226,10 @@ impl Worker {
             self.store.clone(),
             Some(self.queue.clone()),
         ));
-        if !spec
-            .capabilities
-            .contains(&Capability::new("agent.delegate"))
-        {
+        // The owner's agents are the targets of a delegation and of a
+        // message (decision 32A).
+        let reaches = |capability| spec.capabilities.contains(&Capability::new(capability));
+        if !reaches("agent.delegate") && !reaches("agent.message") {
             return (spawner, Vec::new());
         }
         let targets = match self.store.agents_of(&spec.owner) {
