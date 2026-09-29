@@ -710,7 +710,9 @@ impl Done<'_> {
         let run_id = claim.run_id();
         // Waiting on an ask: parked while this claim holds the lease, then
         // woken at once if the answer came before the park (decision 34A,
-        // `formal/runqueue` `Park` then `Recheck`).
+        // `formal/runqueue` `Park` then `Recheck`), or a stop did: a stop
+        // that found the run neither queued nor parked yet left it to this
+        // worker, and a woken stopped run is cancelled when it is claimed.
         if let Some(ask) = self.waiting {
             let queue = &claim.worker.queue;
             if queue.park(run_id, &claim.token, ask)? {
@@ -721,7 +723,7 @@ impl Done<'_> {
                     .map_err(|error| error.to_string())?
                     .map(|run| run.events)
                     .unwrap_or_default();
-                if ask_state(&events, ask) != AskState::Open {
+                if ask_state(&events, ask) != AskState::Open || claim.worker.stopped(run_id) {
                     queue.wake(run_id, ask)?;
                 }
             }
@@ -883,8 +885,17 @@ pub fn sweep_asks(
             queue.wake(run_id, ask).map(|_| true)
         } else if question {
             // A question to the user has no timeout (decision 57A): it
-            // waits for the answer, or a stop.
-            continue;
+            // waits for the answer, or a stop. A stopped one is woken, and
+            // cancelled when it is claimed; one whose stop cannot be read
+            // now is looked at again by the next sweep.
+            match store.stops().map(|stops| stops.stopped(run_id)) {
+                Some(Ok(true)) => queue.wake(run_id, ask).map(|_| true),
+                Some(Ok(false)) | None => continue,
+                Some(Err(error)) => {
+                    eprintln!("gol: ask sweep: stop check of run {run_id}: {error}");
+                    continue;
+                }
+            }
         } else {
             let timed_out = EventPayload::AskTimedOut { message_id: ask };
             let answer = match messages.message(ask) {

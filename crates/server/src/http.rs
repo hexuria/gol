@@ -14,8 +14,8 @@ use harness::{
 };
 use protocol::{
     fold, Actor, AgentId, Capability, DispatchPhase, Event, EventPayload, EventSource,
-    ExecutionPlacement, FailureClass, HarnessState, Limits, Owner, RunId, RunSpec, RunState,
-    Timestamp, WorkModel, MAX_MESSAGE_BYTES, SESSION_ID,
+    ExecutionPlacement, FailureClass, HarnessState, Limits, MessageId, Owner, RunId, RunSpec,
+    RunState, Timestamp, WorkModel, MAX_MESSAGE_BYTES, SESSION_ID,
 };
 use serde::{Deserialize, Serialize};
 
@@ -743,8 +743,13 @@ async fn follow_up(
             None if waiting.len() == 1 => (&waiting[0], body.input.as_str()),
             None => return Err(ApiError::WhichTask(waiting)),
         };
+        if body.limits.is_some() {
+            return Err(ApiError::BadRequest(
+                "an answer takes no limits: they are for a follow-up",
+            ));
+        }
         let run_id = task.run_id;
-        answer_question(&state, run_id, text).await?;
+        answer_question(&state, run_id, text, Some(task.question_id)).await?;
         return Ok(Json(serde_json::json!({
             "thread_id": id,
             "answered": { "label": format!("T{}", task.label), "run_id": run_id },
@@ -776,6 +781,7 @@ struct WaitingTask {
     /// Its number in the thread: "T<label>" (decision 60A).
     label: usize,
     run_id: RunId,
+    question_id: MessageId,
     question: String,
 }
 
@@ -785,9 +791,10 @@ fn waiting_on_user(runs: &[StoredRun]) -> Vec<WaitingTask> {
     runs.iter()
         .enumerate()
         .filter_map(|(at, run)| {
-            open_question(&run.spec, &run.events).map(|(_, question)| WaitingTask {
+            open_question(&run.spec, &run.events).map(|(question_id, question)| WaitingTask {
                 label: at + 1,
                 run_id: run.spec.run_id,
+                question_id,
                 question,
             })
         })
@@ -815,7 +822,12 @@ fn addressed(input: &str) -> Option<(usize, &str)> {
 /// moved in between is read again, up to three times; a run that no longer
 /// waits on its user is 409. A failed wake is left to the ask sweep, which
 /// wakes a parked run whose log no longer waits.
-async fn answer_question(state: &AppState, run_id: RunId, text: &str) -> Result<(), ApiError> {
+async fn answer_question(
+    state: &AppState,
+    run_id: RunId,
+    text: &str,
+    asked: Option<MessageId>,
+) -> Result<(), ApiError> {
     if text.trim().is_empty() {
         return Err(ApiError::BadRequest("the answer is empty"));
     }
@@ -824,6 +836,10 @@ async fn answer_question(state: &AppState, run_id: RunId, text: &str) -> Result<
     }
     let (store, queue, text) = (state.store.clone(), state.queue.clone(), text.to_string());
     tokio::task::spawn_blocking(move || {
+        // The question answered: the one the caller saw, else the one first
+        // read. A task that went on to another question is not answered
+        // with text meant for this one.
+        let mut asked = asked;
         for _ in 0..3 {
             let Some(run) = store.run(run_id)? else {
                 return Ok(Err(ApiError::NotFound));
@@ -831,6 +847,11 @@ async fn answer_question(state: &AppState, run_id: RunId, text: &str) -> Result<
             let Some((question, _)) = open_question(&run.spec, &run.events) else {
                 return Ok(Err(ApiError::Conflict("the task is not waiting for you")));
             };
+            if *asked.get_or_insert(question) != question {
+                return Ok(Err(ApiError::Conflict(
+                    "the task is waiting on another question",
+                )));
+            }
             let answer = Event::record(
                 EventSource::for_spec(&run.spec, Actor::System, Timestamp::now()),
                 EventPayload::UserAnswered {
@@ -848,7 +869,10 @@ async fn answer_question(state: &AppState, run_id: RunId, text: &str) -> Result<
                     return Ok(Ok(()));
                 }
                 Append::Moved => continue,
-                _ => return Ok(Err(ApiError::Conflict("the task is not waiting for you"))),
+                Append::Missing => return Ok(Err(ApiError::NotFound)),
+                Append::Terminal => {
+                    return Ok(Err(ApiError::Conflict("the task is not waiting for you")))
+                }
             }
         }
         Ok::<_, StoreError>(Err(ApiError::Store(
@@ -864,6 +888,9 @@ async fn answer_question(state: &AppState, run_id: RunId, text: &str) -> Result<
 #[serde(deny_unknown_fields)]
 struct ReplyBody {
     text: String,
+    /// The question answered, as its card showed it; without it, the one
+    /// the run waits on when the reply is read.
+    question_id: Option<MessageId>,
 }
 
 /// `POST /v1/runs/{id}/reply`: the user's answer to the question the run
@@ -876,7 +903,7 @@ async fn reply_run(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let Json(body) = body.map_err(body_rejection)?;
     owned_run_page(&state, id, &principal, 0, 1).await?;
-    answer_question(&state, id, &body.text).await?;
+    answer_question(&state, id, &body.text, body.question_id).await?;
     Ok(Json(serde_json::json!({ "answered": id })))
 }
 
@@ -987,10 +1014,11 @@ fn card(label: usize, run: &StoredRun) -> (CardState, serde_json::Value) {
             .find(|event| wanted(&event.payload))
             .map(|event| event.envelope.at)
     };
-    let question = open_question(&run.spec, &run.events).map(|(_, question)| question);
+    let question = open_question(&run.spec, &run.events);
     let card = serde_json::json!({
         "label": format!("T{label}"),
-        "question": question,
+        "question_id": question.as_ref().map(|(id, _)| *id),
+        "question": question.map(|(_, question)| question),
         "run_id": run.spec.run_id,
         "agent_id": run.spec.agent_id,
         "parent": run.spec.lineage.parent,
@@ -1462,6 +1490,7 @@ impl axum::response::IntoResponse for ApiError {
                         .map(|task| serde_json::json!({
                             "label": format!("T{}", task.label),
                             "run_id": task.run_id,
+                            "question_id": task.question_id,
                             "question": task.question,
                         }))
                         .collect::<Vec<_>>(),

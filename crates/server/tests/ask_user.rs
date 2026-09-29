@@ -196,13 +196,26 @@ async fn an_ambiguous_answer_asks_which_task() {
         let (status, body) = say(&server, &user, &thread, "SFO").await;
         assert_eq!(status, 409, "{body}");
         assert_eq!(body["error"], "which task?");
+        let (q1, q2) = (
+            questions(&store, &first).await[0].0,
+            questions(&store, &second).await[0].0,
+        );
         assert_eq!(
             body["waiting"],
             json!([
-                {"label": "T1", "run_id": first, "question": "flights"},
-                {"label": "T2", "run_id": second, "question": "hotels"},
+                {"label": "T1", "run_id": first, "question_id": q1, "question": "flights"},
+                {"label": "T2", "run_id": second, "question_id": q2, "question": "hotels"},
             ])
         );
+        // An answer takes no limits.
+        let (status, body) = server
+            .post(
+                &format!("/v1/threads/{thread}/messages"),
+                &user,
+                json!({"input": "T2: SFO", "limits": {"max_steps": 4, "max_model_calls": 1}}),
+            )
+            .await;
+        assert_eq!(status, 400, "{body}");
         let (status, body) = say(&server, &user, &thread, "T2: SFO").await;
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["answered"], json!({"label": "T2", "run_id": second}));
@@ -217,7 +230,10 @@ async fn an_ambiguous_answer_asks_which_task() {
         assert_eq!(answers(&store, &first).await, ["LAX"]);
         while server.work().await.is_some() {}
         assert!(completed(&store, &first).await && completed(&store, &second).await);
-        // Labels never change as the thread grows (60A).
+        // Labels never change as the thread grows (60A): a third run is T3.
+        let (status, body) = say(&server, &user, &thread, "trains").await;
+        assert_eq!(status, 200, "{body}");
+        let third = body["run"]["run_id"].as_str().expect("run").to_string();
         let labels: Vec<(String, String)> = board(&server, &user, &thread)
             .await
             .into_iter()
@@ -225,7 +241,11 @@ async fn an_ambiguous_answer_asks_which_task() {
             .collect();
         assert_eq!(
             labels,
-            [("T1".to_string(), first), ("T2".to_string(), second)]
+            [
+                ("T1".to_string(), first),
+                ("T2".to_string(), second),
+                ("T3".to_string(), third)
+            ]
         );
     }
 }
@@ -246,6 +266,14 @@ async fn replies_that_cannot_answer_are_refused() {
         assert!(server.work().await.is_some());
         let (status, _) = reply(&server, &bob, &run, "mine").await;
         assert_eq!(status, 404);
+        let (status, body) = server
+            .post(
+                &format!("/v1/runs/{run}/reply"),
+                &alice,
+                json!({"text": "SFO", "question_id": MessageId::new()}),
+            )
+            .await;
+        assert_eq!(status, 409, "another question: {body}");
         let (status, _) = reply(&server, &alice, &run, "   ").await;
         assert_eq!(status, 400);
         let long = "x".repeat(protocol::MAX_MESSAGE_BYTES + 1);
@@ -320,12 +348,15 @@ async fn a_stop_ends_a_waiting_question() {
 /// and its answer.
 struct Racing {
     inner: InMemoryStore,
-    armed: Mutex<Option<EventPayload>>,
+    armed: Mutex<Vec<EventPayload>>,
+    /// Records a stop of the run just after its question is stored: a stop
+    /// that lands before the worker parks the run.
+    stop_after_question: Mutex<bool>,
 }
 
 impl Racing {
-    fn arm(&self, payload: EventPayload) {
-        *self.armed.lock().expect("armed") = Some(payload);
+    fn arm(&self, payloads: Vec<EventPayload>) {
+        *self.armed.lock().expect("armed") = payloads;
     }
 }
 
@@ -351,18 +382,33 @@ impl RunStore for Racing {
         seen: usize,
         events: Vec<Event>,
     ) -> Result<Append, StoreError> {
-        if let Some(payload) = self.armed.lock().expect("armed").take() {
+        let armed = std::mem::take(&mut *self.armed.lock().expect("armed"));
+        if !armed.is_empty() {
             let spec = self.inner.run(id)?.expect("stored").spec;
-            let late = Event::record(
-                EventSource::for_spec(&spec, Actor::System, Timestamp::now()),
-                payload,
-            );
-            assert_eq!(
-                self.inner.append_events(id, vec![late]),
-                Ok(Append::Appended)
-            );
+            let late = armed
+                .into_iter()
+                .map(|payload| {
+                    Event::record(
+                        EventSource::for_spec(&spec, Actor::System, Timestamp::now()),
+                        payload,
+                    )
+                })
+                .collect();
+            assert_eq!(self.inner.append_events(id, late), Ok(Append::Appended));
         }
-        self.inner.append_events_after(id, seen, events)
+        let asks = events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::UserAsked { .. }));
+        let appended = self.inner.append_events_after(id, seen, events)?;
+        if asks
+            && appended == Append::Appended
+            && std::mem::take(&mut *self.stop_after_question.lock().expect("stop"))
+        {
+            let owner = self.inner.run(id)?.expect("stored").spec.owner;
+            let stops = self.inner.stops().expect("stops");
+            stops.put_stop(&owner, &server::StopScope::Run(id))?;
+        }
+        Ok(appended)
     }
     fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {
         self.inner.run(id)
@@ -391,7 +437,8 @@ async fn racing(db: u8) -> (Arc<Racing>, Server, String, String, MessageId) {
 async fn racing_in_thread(db: u8) -> (Arc<Racing>, Server, String, String, String, MessageId) {
     let racing = Arc::new(Racing {
         inner: InMemoryStore::default(),
-        armed: Mutex::new(None),
+        armed: Mutex::new(Vec::new()),
+        stop_after_question: Mutex::new(false),
     });
     let store: Store = racing.clone();
     let jev = jev(&["ask_user", "complete"]).await;
@@ -410,10 +457,10 @@ async fn racing_in_thread(db: u8) -> (Arc<Racing>, Server, String, String, Strin
 #[tokio::test(flavor = "multi_thread")]
 async fn two_replies_race_one_answer() {
     let (racing, server, user, run, question) = racing(7).await;
-    racing.arm(EventPayload::UserAnswered {
+    racing.arm(vec![EventPayload::UserAnswered {
         message_id: question,
         text: "first".to_string(),
-    });
+    }]);
     let (status, body) = reply(&server, &user, &run, "second").await;
     assert_eq!(status, 409, "{body}");
     assert_eq!(answers(&server.store, &run).await, ["first"]);
@@ -424,7 +471,7 @@ async fn two_replies_race_one_answer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reply_racing_a_stop_keeps_one_outcome() {
     let (racing, server, user, run, _) = racing(8).await;
-    racing.arm(EventPayload::RunCancelled);
+    racing.arm(vec![EventPayload::RunCancelled]);
     let (status, body) = reply(&server, &user, &run, "SFO").await;
     assert_eq!(status, 409, "{body}");
     assert_eq!(answers(&server.store, &run).await, Vec::<String>::new());
@@ -497,9 +544,9 @@ async fn an_inline_run_is_not_offered_a_question() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_run_that_ended_while_waiting_asks_nothing() {
     let (racing, server, user, thread, run, _) = racing_in_thread(9).await;
-    racing.arm(EventPayload::RunCompleted {
+    racing.arm(vec![EventPayload::RunCompleted {
         outcome: "done elsewhere".to_string(),
-    });
+    }]);
     let (status, body) = reply(&server, &user, &run, "SFO").await;
     assert_eq!(status, 409, "{body}");
     assert_eq!(answers(&server.store, &run).await, Vec::<String>::new());
@@ -553,4 +600,100 @@ async fn an_answer_whose_wake_was_lost_is_woken_by_the_sweep() {
         assert!(server.work().await.is_some(), "woken");
         assert!(completed(&store, &run).await);
     }
+}
+
+// A stop that lands after the question is stored and before the park (so
+// the stop found the run neither queued nor parked) is seen at the park:
+// the run is woken, and its worker cancels it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_before_the_park_still_ends_the_question() {
+    let racing = Arc::new(Racing {
+        inner: InMemoryStore::default(),
+        armed: Mutex::new(Vec::new()),
+        stop_after_question: Mutex::new(true),
+    });
+    let store: Store = racing.clone();
+    let jev = jev(&["ask_user", "complete"]).await;
+    let server = serve(store.clone(), &jev, 11).await;
+    let user = fresh_user();
+    let agent = server.agent(&user, "planner", &["user.ask"]).await;
+    let (_, run) = server.start(&user, agent, "plan").await;
+    assert!(
+        server.work().await.is_some(),
+        "asks, and is woken at the park"
+    );
+    assert_eq!(parked_and_queued(&server).await.0, Vec::new());
+    assert!(server.work().await.is_some(), "claimed and cancelled");
+    let ends: Vec<EventPayload> = log(&store, &run)
+        .await
+        .into_iter()
+        .filter(server::is_terminal)
+        .collect();
+    assert_eq!(ends, [EventPayload::RunCancelled]);
+}
+
+// A parked question whose run is stopped without the stop cancelling it
+// (as when the stop could not reach it) is woken by the ask sweep and
+// cancelled: a stop ends a question even without a timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sweep_wakes_a_stopped_question() {
+    for (store, messages) in stores_with_messages() {
+        let jev = jev(&["ask_user", "complete"]).await;
+        let server = serve(store.clone(), &jev, 12)
+            .await
+            .with_messages(messages.clone());
+        let user = fresh_user();
+        let agent = server.agent(&user, "planner", &["user.ask"]).await;
+        let (_, run) = server.start(&user, agent, "plan").await;
+        assert!(server.work().await.is_some());
+        let id: RunId = run.parse().expect("id");
+        let runs = store.clone();
+        blocking(move || {
+            let owner = runs.run(id).expect("read").expect("stored").spec.owner;
+            runs.stops()
+                .expect("stops")
+                .put_stop(&owner, &server::StopScope::Run(id))
+                .expect("stop");
+        })
+        .await;
+        let (runs, url) = (store.clone(), server.redis.clone());
+        let swept = blocking(move || {
+            server::sweep_asks(
+                &RedisRunQueue::open(url),
+                runs.as_ref(),
+                messages.as_ref(),
+                Timestamp::now(),
+            )
+            .expect("sweep")
+        })
+        .await;
+        assert!(swept.contains(&id), "{swept:?}");
+        assert!(server.work().await.is_some());
+        assert!(log(&store, &run)
+            .await
+            .contains(&EventPayload::RunCancelled));
+    }
+}
+
+// Between a reply's read and its append the task was answered elsewhere and
+// went on to ask another question (forced): the reply, meant for the first
+// question, is refused rather than taken as the answer to the second.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_does_not_answer_the_next_question() {
+    let (racing, server, user, run, question) = racing(13).await;
+    let next = MessageId::new();
+    racing.arm(vec![
+        EventPayload::UserAnswered {
+            message_id: question,
+            text: "from another tab".to_string(),
+        },
+        EventPayload::StepAdvanced,
+        EventPayload::UserAsked {
+            message_id: next,
+            prompt: "Which day?".to_string(),
+        },
+    ]);
+    let (status, body) = reply(&server, &user, &run, "SFO").await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(answers(&server.store, &run).await, ["from another tab"]);
 }
