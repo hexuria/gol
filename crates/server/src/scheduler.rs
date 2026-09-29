@@ -51,11 +51,77 @@ pub fn next_tick(cron: &str, time_zone: &str, after_ms: i64) -> Result<i64, Stri
             .find_next_occurrence(&after, false)
             .map_err(|error| format!("no next tick: {error}"))?;
         if is_tick(&cron, zone, &candidate)? {
-            return Ok(candidate.timestamp_millis());
+            // croner steps over a gap whose skipped times a list or a step
+            // names: such a gap's end comes first.
+            let tick = candidate.timestamp_millis();
+            return Ok(gap_tick(&cron, zone, after_ms, tick)?.unwrap_or(tick));
         }
         after = candidate;
     }
     Err("no next tick".to_string())
+}
+
+/// The first instant strictly between `after_ms` and `before_ms` where the
+/// clocks jump forward over a wall-clock time the pattern names: a skipped
+/// time runs once, when the clocks resume.
+fn gap_tick(
+    cron: &croner::Cron,
+    zone: chrono_tz::Tz,
+    after_ms: i64,
+    before_ms: i64,
+) -> Result<Option<i64>, String> {
+    use chrono::{Offset, TimeZone};
+    let offset = |ms: i64| -> i64 {
+        let utc = chrono::DateTime::from_timestamp_millis(ms)
+            .unwrap_or_default()
+            .naive_utc();
+        i64::from(zone.offset_from_utc_datetime(&utc).fix().local_minus_utc()) * 1000
+    };
+    const MINUTE: i64 = 60_000;
+    const STEP: i64 = 60 * MINUTE;
+    let mut from = after_ms;
+    while from < before_ms {
+        let to = (from + STEP).min(before_ms);
+        let (old, new) = (offset(from), offset(to));
+        if new > old {
+            // The clocks go forward in (from, to]: the first minute on the
+            // new offset is where they resume.
+            let (mut low, mut high) = (from, to);
+            while high - low > MINUTE {
+                let middle = low + (high - low) / 2;
+                if offset(middle) > old {
+                    high = middle;
+                } else {
+                    low = middle;
+                }
+            }
+            let resume = high - high.rem_euclid(MINUTE);
+            let resume = if offset(resume) > old {
+                resume
+            } else {
+                resume + MINUTE
+            };
+            if resume > after_ms && resume < before_ms {
+                // The wall-clock minutes skipped: from `resume` on the old
+                // offset up to it on the new one.
+                let mut skipped = resume + old;
+                while skipped < resume + new {
+                    let wall = chrono::DateTime::from_timestamp_millis(skipped)
+                        .unwrap_or_default()
+                        .naive_utc();
+                    if cron
+                        .is_time_matching(&chrono::Utc.from_utc_datetime(&wall))
+                        .map_err(|error| error.to_string())?
+                    {
+                        return Ok(Some(resume));
+                    }
+                    skipped += MINUTE;
+                }
+            }
+        }
+        from = to;
+    }
+    Ok(None)
 }
 
 /// Whether croner's `candidate` is a tick: its wall-clock time matches the
@@ -129,10 +195,22 @@ fn pass(
         .map_err(|error| error.to_string())?
     {
         if let TriggerKind::Schedule { cron, time_zone } = &trigger.kind {
-            let first = next_tick(cron, time_zone, now_ms).ok();
-            triggers
-                .advance_trigger(trigger.id, None, first)
-                .map_err(|error| error.to_string())?;
+            match next_tick(cron, time_zone, now_ms) {
+                Ok(first) => {
+                    triggers
+                        .advance_trigger(trigger.id, None, Some(first))
+                        .map_err(|error| error.to_string())?;
+                }
+                // A schedule Phase 4.1 took without parsing it, that has no
+                // tick: paused, so it neither fires nor fills this batch
+                // again. Its owner's resume says why (400).
+                Err(error) => {
+                    eprintln!("gol: scheduler: trigger {} paused: {error}", trigger.id);
+                    triggers
+                        .set_enabled(&trigger.owner, trigger.id, false)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
         }
     }
     let due = triggers

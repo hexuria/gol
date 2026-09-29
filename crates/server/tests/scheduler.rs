@@ -45,6 +45,7 @@ fn trigger(
         enabled: true,
         next_fire_ms: Some(next),
         created_ms: 1,
+        generation: 0,
     }
 }
 
@@ -319,6 +320,28 @@ fn ticks_follow_the_time_zone_through_daylight_saving() {
         tick("30 2 * * *", "America/New_York", 1_772_946_000_000),
         1_772_953_200_000
     );
+    // A list or a step inside the gap runs once, when the clocks resume, and
+    // the next day as usual (New York 02:00-03:00; Lord Howe 02:00-02:30).
+    for cron in ["0,30 2 * * *", "*/30 2 * * *"] {
+        assert_eq!(
+            tick(cron, "America/New_York", 1_772_946_000_000),
+            1_772_953_200_000,
+            "{cron}"
+        );
+        assert_eq!(
+            tick(cron, "America/New_York", 1_772_953_200_000),
+            1_773_036_000_000,
+            "{cron}"
+        );
+    }
+    assert_eq!(
+        tick("0,15 2 * * *", "Australia/Lord_Howe", 1_791_034_200_000),
+        1_791_041_400_000
+    );
+    assert_eq!(
+        tick("0,15 2 * * *", "Australia/Lord_Howe", 1_791_041_400_000),
+        1_791_126_000_000
+    );
     // Fall back: 01:30 EDT (05:30Z) runs, 01:30 EST (06:30Z) does not.
     assert_eq!(
         tick("30 1 * * *", "America/New_York", 1_793_511_000_000 - 1),
@@ -392,6 +415,16 @@ async fn a_tick_fired_twice_is_one_run_pushed_once() {
         let url = server.redis.clone();
         let queued = blocking(move || RedisRunQueue::open(url).queued().expect("queued")).await;
         assert_eq!(queued.iter().filter(|queued| **queued == run).count(), 1);
+        // Once run, a third fire of the tick leaves it: not queued again.
+        while server.work().await.is_some() {}
+        let (runs, url, id, who) = (store.clone(), server.redis.clone(), due.id, owner.clone());
+        let queued = blocking(move || {
+            let queue = RedisRunQueue::open(url);
+            fire_trigger_at(runs.as_ref(), &queue, &who, id, 20 * HOUR).expect("fire");
+            queue.queued().expect("queued")
+        })
+        .await;
+        assert!(!queued.contains(&run), "an ended run is not queued again");
         forget(&store, &owner, &[due.id]).await;
     }
 }
@@ -545,9 +578,10 @@ impl server::TriggerStore for FailingRead {
     }
 }
 
-// A fire whose second read of its trigger fails leaves its run stored and
-// unpushed, and the tick unmoved; the next pass fires the tick again, finds
-// the run, and pushes it: the tick runs, once.
+// A fire whose second read of its trigger fails leaves its run stored,
+// unpushed and pending, and the tick unmoved. The queue sweep settles it
+// through the same gate and pushes it; the next pass fires the tick again,
+// finds it queued, and leaves it: the tick runs, once.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_second_read_is_finished_by_the_next_pass() {
     let _turn = SERIAL.lock().await;
@@ -565,10 +599,30 @@ async fn a_failed_second_read_is_finished_by_the_next_pass() {
         stored(&store, &owner, due.id).await.next_fire_ms,
         Some(10 * HOUR)
     );
-    assert_eq!(server.work().await, None, "not pushed");
+    // Kept pending, and both the queue sweep and the next pass settle it:
+    // pushed once.
+    let (runs, url) = (store.clone(), server.redis.clone());
+    let swept = blocking(move || {
+        server::sweep(
+            &RedisRunQueue::open(url),
+            runs.as_ref(),
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(3600),
+        )
+        .expect("sweep")
+    })
+    .await;
+    assert_eq!(swept.len(), 1, "the sweep pushed it, past its gate");
     let again = pass(&server, now, &[due.id]).await;
-    assert_eq!(again.len(), 1);
-    assert_eq!(server.work().await, Some(again[0]), "pushed now");
+    assert_eq!(again, swept, "the same run");
+    let url = server.redis.clone();
+    let queued = blocking(move || RedisRunQueue::open(url).queued().expect("queued")).await;
+    assert_eq!(
+        queued.iter().filter(|queued| **queued == swept[0]).count(),
+        1,
+        "queued once"
+    );
+    assert_eq!(server.work().await, Some(swept[0]));
     let cards = fired(&server, &user, due.id).await;
     assert_eq!(cards.len(), 1);
     assert_eq!(cards[0]["state"], "completed");
@@ -627,4 +681,71 @@ async fn resuming_a_running_trigger_keeps_its_tick() {
         stored(&store, &owner, due.id).await.next_fire_ms,
         Some(60_000)
     );
+}
+
+// A resume of a trigger that is already running (a second, late resume)
+// changes nothing: its tick and generation stay. A 4.1 schedule the scheduler
+// cannot read (no tick) is paused, so it neither fires nor holds up the
+// others.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_resume_changes_nothing_and_a_bad_schedule_is_paused() {
+    let _turn = SERIAL.lock().await;
+    for store in stores() {
+        let (server, user, owner, agent) = setup(&store, 10).await;
+        let running = trigger(&owner, agent, "0 * * * *", 40 * HOUR, Missed::RunOnceLate);
+        put(&store, &running).await;
+        server
+            .post(
+                &format!("/v1/triggers/{}/pause", running.id),
+                &user,
+                json!({}),
+            )
+            .await;
+        let (_, first) = server
+            .post(
+                &format!("/v1/triggers/{}/resume", running.id),
+                &user,
+                json!({}),
+            )
+            .await;
+        let (_, second) = server
+            .post(
+                &format!("/v1/triggers/{}/resume", running.id),
+                &user,
+                json!({}),
+            )
+            .await;
+        assert_eq!(second["next_fire_at"], first["next_fire_at"]);
+        assert_eq!(stored(&store, &owner, running.id).await.generation, 1);
+        // The store's resume leaves a running trigger as it is, whoever calls
+        // it (two resumes that both read it paused).
+        let (runs, who, id) = (store.clone(), owner.clone(), running.id);
+        let again = blocking(move || {
+            runs.triggers()
+                .expect("triggers")
+                .resume_trigger(&who, id, Some(1))
+                .expect("resume")
+                .expect("found")
+        })
+        .await;
+        assert_eq!(again.generation, 1);
+        assert_eq!(
+            again.next_fire_ms.map(serde_json::Value::from),
+            Some(first["next_fire_at"].clone())
+        );
+
+        let mut bad = trigger(&owner, agent, "every morning", 0, Missed::RunOnceLate);
+        bad.next_fire_ms = None;
+        put(&store, &bad).await;
+        for _ in 0..50 {
+            pass(&server, 40 * HOUR, &[bad.id]).await;
+            if !stored(&store, &owner, bad.id).await.enabled {
+                break;
+            }
+        }
+        let bad_now = stored(&store, &owner, bad.id).await;
+        assert!(!bad_now.enabled, "paused");
+        assert_eq!(bad_now.next_fire_ms, None);
+        forget(&store, &owner, &[running.id, bad.id]).await;
+    }
 }

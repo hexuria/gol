@@ -565,6 +565,10 @@ pub struct StoredTrigger {
     /// When the scheduler fires it next (Phase 4.2); none until then.
     pub next_fire_ms: Option<i64>,
     pub created_ms: i64,
+    /// Bumped by each resume: a fire that read the trigger before a pause
+    /// and a resume finds another generation at its gate, and holds its run.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// The triggers a store keeps (Phase 4.1), each its owner's alone: every
@@ -596,9 +600,11 @@ pub trait TriggerStore: Send + Sync {
     /// Pauses every trigger of the principal's, and says how many were
     /// running.
     fn pause_triggers(&self, owner: &Owner) -> Result<usize, StoreError>;
-    /// Resumes one trigger, with its next tick (none for a webhook), in one
-    /// step: a scheduler never sees it running with the tick it had when
-    /// paused. None when it is not the principal's.
+    /// Resumes one paused trigger, with its next tick (none for a webhook),
+    /// and bumps its generation, in one step: a scheduler never sees it
+    /// running with the tick it had when paused. A trigger that is running
+    /// is left as it is. The trigger as it is now; none when it is not the
+    /// principal's.
     fn resume_trigger(
         &self,
         owner: &Owner,
@@ -942,8 +948,11 @@ impl TriggerStore for InMemoryStore {
             .iter_mut()
             .find(|trigger| trigger.id == id && trigger.owner.is(owner))
             .map(|trigger| {
-                trigger.enabled = true;
-                trigger.next_fire_ms = next_fire_ms;
+                if !trigger.enabled {
+                    trigger.enabled = true;
+                    trigger.next_fire_ms = next_fire_ms;
+                    trigger.generation += 1;
+                }
                 trigger.clone()
             }))
     }

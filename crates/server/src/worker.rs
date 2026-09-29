@@ -957,14 +957,16 @@ pub fn sweep(
     let mut pushed = Vec::new();
     for run_id in queue.pending_for(after)? {
         match store.run(run_id) {
-            // A trigger's run is its fire's to push, after its gate (Phase
-            // 4.2): the tick's next try pushes it.
+            // A trigger's run is pushed only past its gate (Phase 4.2):
+            // settled as its fire settles it, pushed once or held.
             Ok(Some(run))
                 if waiting(&run)
                     && run.spec.metadata.contains_key(crate::triggers::TRIGGER_KEY) =>
             {
-                if let Err(error) = queue.unpend(run_id) {
-                    eprintln!("gol: queue sweep: unpend run {run_id}: {error}");
+                match crate::triggers::settle_fired_run(queue, store, &run.spec) {
+                    Ok(crate::spawner::Fire::Pushed) => pushed.push(run_id),
+                    Ok(_) => {}
+                    Err(error) => eprintln!("gol: queue sweep: settle run {run_id}: {error}"),
                 }
             }
             Ok(Some(run)) if waiting(&run) => match queue.push(run_id) {

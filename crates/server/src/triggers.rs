@@ -9,12 +9,18 @@ use std::cell::Cell;
 use harness::StoreError;
 
 use crate::queue::RedisRunQueue;
-use crate::spawner::{enqueue_fire, EnqueueError, Fire, Gate};
-use crate::store::{RunStore, StoredTrigger, TriggerId, TriggerKind};
+use crate::spawner::{enqueue_fire, settle_fire, EnqueueError, Fire, Gate};
+use crate::store::{RunStore, StoredTrigger, TriggerId, TriggerKind, TriggerStore};
 
 /// The metadata key the server sets on a run a trigger started (decision
 /// 68A): its trigger's id. A caller that sends it is refused.
 pub const TRIGGER_KEY: &str = "gol.trigger";
+
+/// The trigger's generation a fire read (Phase 4.2), on its run.
+const GENERATION_KEY: &str = "gol.generation";
+
+/// The tick a scheduled fire fired (Phase 4.2), on its run.
+const TICK_KEY: &str = "gol.tick";
 
 /// The thread every run of trigger `id` belongs to, so its fires are the
 /// cards of one board.
@@ -128,27 +134,15 @@ fn fire(
         agent.manifest.version,
         agent.manifest.required_capabilities,
     );
-    if let Some((run_id, _)) = tick {
+    if let Some((run_id, at)) = tick {
         // A top-level run: its lineage names no root, so the id is its own.
         spec.run_id = run_id;
+        spec.metadata.insert(TICK_KEY.to_string(), at.to_string());
     }
     let run = spec.run_id;
     // Why the run was held, if it was.
     let held: Cell<Option<Fired>> = Cell::new(None);
-    let gate = || match triggers.trigger(owner, id) {
-        Ok(Some(trigger)) if trigger.enabled => Gate::Open,
-        Ok(found) => {
-            held.set(Some(if found.is_some() {
-                Fired::Paused
-            } else {
-                Fired::NotFound
-            }));
-            Gate::Shut
-        }
-        Err(error) => Gate::Unknown(format!(
-            "the trigger could not be read again, so the run was not pushed: {error}"
-        )),
-    };
+    let gate = || gate_of(triggers, owner, id, trigger.generation, &held);
     let fired = enqueue_fire(store, queue, &spec, &gate).map_err(|error| match error {
         EnqueueError::Queue(message) => FireError::NotStored(message),
         EnqueueError::Push(message) | EnqueueError::Held(message) => {
@@ -165,6 +159,68 @@ fn fire(
     })
 }
 
+/// The gate of a fire of trigger `id` that read it at `generation` (Phase
+/// 4.2): open while the trigger runs at that generation; shut (the run is
+/// held) once it is paused, resumed since (a resumed trigger owes nothing
+/// for the ticks it was paused) or gone. `held` says which.
+fn gate_of(
+    triggers: &dyn TriggerStore,
+    owner: &Owner,
+    id: TriggerId,
+    generation: u64,
+    held: &Cell<Option<Fired>>,
+) -> Gate {
+    match triggers.trigger(owner, id) {
+        Ok(Some(trigger)) if trigger.enabled && trigger.generation == generation => Gate::Open,
+        Ok(Some(trigger)) => {
+            held.set(Some(if trigger.enabled {
+                Fired::Moved
+            } else {
+                Fired::Paused
+            }));
+            Gate::Shut
+        }
+        Ok(None) => {
+            held.set(Some(Fired::NotFound));
+            Gate::Shut
+        }
+        Err(error) => Gate::Unknown(format!(
+            "the trigger could not be read again, so the run was not pushed: {error}"
+        )),
+    }
+}
+
+/// Settles a trigger's stored run the queue sweep found pending (Phase
+/// 4.2): gated as its fire gates it, by the generation it recorded, then
+/// pushed once or held. A run a server cannot place (its trigger or
+/// generation unreadable) is held.
+pub(crate) fn settle_fired_run(
+    queue: &RedisRunQueue,
+    store: &dyn RunStore,
+    spec: &RunSpec,
+) -> Result<Fire, String> {
+    let triggers = store
+        .triggers()
+        .ok_or_else(|| "the store keeps no triggers".to_string())?;
+    let id = spec
+        .metadata
+        .get(TRIGGER_KEY)
+        .and_then(|id| id.parse::<TriggerId>().ok());
+    let generation = spec
+        .metadata
+        .get(GENERATION_KEY)
+        .and_then(|generation| generation.parse::<u64>().ok());
+    let (Some(id), Some(generation)) = (id, generation) else {
+        return settle_fire(store, queue, spec, &|| Gate::Shut)
+            .map_err(|error| format!("{error:?}"));
+    };
+    let held = Cell::new(None);
+    settle_fire(store, queue, spec, &|| {
+        gate_of(triggers, &spec.owner, id, generation, &held)
+    })
+    .map_err(|error| format!("{error:?}"))
+}
+
 /// The run a fire of `trigger` starts.
 fn run_of(
     trigger: &StoredTrigger,
@@ -174,6 +230,7 @@ fn run_of(
     let metadata: BTreeMap<String, String> = [
         (SESSION_ID.to_string(), trigger_thread(trigger.id)),
         (TRIGGER_KEY.to_string(), trigger.id.to_string()),
+        (GENERATION_KEY.to_string(), trigger.generation.to_string()),
     ]
     .into_iter()
     .collect();

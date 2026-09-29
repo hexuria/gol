@@ -914,7 +914,7 @@ async fn follow_up(
             metadata: root
                 .metadata
                 .into_iter()
-                .filter(|(key, _)| key != TURN_KEY && key != TRIGGER_KEY)
+                .filter(|(key, _)| !key.starts_with("gol."))
                 .collect(),
         },
     )
@@ -1540,6 +1540,7 @@ async fn create_trigger(
         missed: body.missed.unwrap_or_default(),
         enabled: true,
         next_fire_ms: first_tick(&kind_of_new)?,
+        generation: 0,
         created_ms: Timestamp::now().as_unix_millis(),
     };
     let stored = trigger.clone();
@@ -1852,6 +1853,11 @@ fn build_spec(
     }
     if core.metadata.contains_key(TRIGGER_KEY) {
         return Err(ApiError::BadRequest("gol.trigger is set by the server"));
+    }
+    // Every `gol.` key is the server's to set (a turn, a trigger, a fire's
+    // generation and tick).
+    if core.metadata.keys().any(|key| key.starts_with("gol.")) {
+        return Err(ApiError::BadRequest("gol. metadata is set by the server"));
     }
     Ok(RunSpec::builder()
         .owner(owner)
