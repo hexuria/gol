@@ -500,12 +500,22 @@ pub fn auth_from_env(vars: &BTreeMap<String, String>) -> Result<Arc<dyn Authenti
 /// A JWKS URL must be https with a host, or http on 127.0.0.1, localhost or
 /// [::1], so the key set cannot be swapped in transit.
 fn check_jwks_url(url: &str) -> Result<(), String> {
-    let refused = || {
-        format!(
-            "GOL_OIDC_JWKS_URL must be an https URL, or http on 127.0.0.1, localhost or [::1], not {url:?}"
-        )
+    if is_safe_endpoint(url) {
+        return Ok(());
+    }
+    Err(format!(
+        "GOL_OIDC_JWKS_URL must be an https URL, or http on 127.0.0.1, localhost or [::1], not {url:?}"
+    ))
+}
+
+/// Whether `url`, as a URL parser reads it, is https with a host, or http on
+/// 127.0.0.1, localhost or [::1], and carries no credentials: what the
+/// server requires of an endpoint it sends a secret to (a JWKS fetch, a
+/// model provider's key).
+pub(crate) fn is_safe_endpoint(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
     };
-    let parsed = url::Url::parse(url).map_err(|_| refused())?;
     let loopback = matches!(
         parsed.host(),
         Some(url::Host::Domain("localhost"))
@@ -514,9 +524,9 @@ fn check_jwks_url(url: &str) -> Result<(), String> {
     );
     let credentials = !parsed.username().is_empty() || parsed.password().is_some();
     match parsed.scheme() {
-        "https" if parsed.host().is_some() && !credentials => Ok(()),
-        "http" if loopback && !credentials => Ok(()),
-        _ => Err(refused()),
+        "https" => parsed.host().is_some() && !credentials,
+        "http" => loopback && !credentials,
+        _ => false,
     }
 }
 

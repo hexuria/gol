@@ -64,13 +64,28 @@ fn models_config_reads_keys_base_urls_and_the_timeout() {
     );
     // A plain-HTTP base URL would send the key in the clear; only a local
     // host (a mock or a proxy on this machine) may use one.
-    for local in ["http://127.0.0.1:9", "http://localhost:9", "http://[::1]:9"] {
+    for local in [
+        "http://127.0.0.1:9",
+        "http://localhost:9",
+        "http://[::1]:9",
+        "https://api.example.com",
+    ] {
         assert!(
             ModelsConfig::from_env(&env(&[("GOL_OPENAI_BASE_URL", local)])).is_ok(),
             "{local}"
         );
     }
-    for remote in ["http://api.example.com", "ftp://x", "api.example.com"] {
+    // Review of #71: the host is the one a URL parser finds, so userinfo that
+    // looks like a local host does not make a remote host local.
+    for remote in [
+        "http://api.example.com",
+        "ftp://x",
+        "api.example.com",
+        "http://127.0.0.1:9@evil.com",
+        "http://localhost:9@evil.com",
+        "http://[::1]:9@evil.com",
+        "https://user:pass@api.example.com",
+    ] {
         assert!(
             ModelsConfig::from_env(&env(&[("GOL_OPENAI_BASE_URL", remote)])).is_err(),
             "{remote}"
@@ -283,8 +298,8 @@ async fn system_one_without_a_base_url_fails_the_run() {
                 payloads.last(),
                 Some(EventPayload::RunFailed {
                     class: FailureClass::Dependency,
-                    ..
-                })
+                    message,
+                }) if message.contains("no platform key or base URL")
             ),
             "{:?}",
             payloads.last()

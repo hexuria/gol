@@ -75,7 +75,7 @@ impl ModelsConfig {
                 config.keys.insert(provider, key);
             }
             if let Some(url) = set(format!("GOL_{name}_BASE_URL")) {
-                if !is_safe_base_url(&url) {
+                if !crate::auth::is_safe_endpoint(&url) {
                     return Err(format!(
                         "GOL_{name}_BASE_URL must be https://, or http:// to a local host, not {url:?}"
                     ));
@@ -135,23 +135,6 @@ impl ModelsConfig {
         }
         GatewayModel { provider, client }
     }
-}
-
-/// Whether `url` keeps the key off the network in the clear: `https://`, or
-/// `http://` to this machine.
-fn is_safe_base_url(url: &str) -> bool {
-    if url.starts_with("https://") {
-        return true;
-    }
-    let Some(rest) = url.strip_prefix("http://") else {
-        return false;
-    };
-    let host = if rest.starts_with('[') {
-        rest.split_inclusive(']').next().unwrap_or("")
-    } else {
-        rest.split([':', '/']).next().unwrap_or("")
-    };
-    matches!(host, "127.0.0.1" | "localhost" | "[::1]")
 }
 
 /// A run's work model over the gateway.
