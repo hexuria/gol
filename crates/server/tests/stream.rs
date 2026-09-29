@@ -241,8 +241,9 @@ async fn a_stream_shows_only_the_callers_work() {
         let his = spec(&bob);
         put(&store, &hers, messages(&hers, 1, 2)).await;
         put(&store, &his, messages(&his, 1, 2)).await;
-        let mut stream = Reader::new(open(&base, "/v1/stream", &alice, None).await);
-        let events = stream.take(3, Duration::from_millis(500)).await;
+        let mut stream = Reader::new(open(&base, "/v1/stream?after=0", &alice, None).await);
+        let mut events = stream.take(2, Duration::from_secs(5)).await;
+        events.extend(stream.take(1, Duration::from_millis(500)).await);
         assert_eq!(ids(&events), [1, 2]);
         assert!(events
             .iter()
@@ -263,7 +264,7 @@ async fn a_lagging_stream_catches_up_from_the_outbox() {
         let user = fresh_user();
         let spec = spec(&user);
         put(&store, &spec, messages(&spec, 1, 1200)).await;
-        let mut stream = Reader::new(open(&base, "/v1/stream", &user, None).await);
+        let mut stream = Reader::new(open(&base, "/v1/stream", &user, Some(0)).await);
         let backlog = stream.take(1200, Duration::from_secs(2)).await;
         assert_eq!(ids(&backlog), (1..=1200).collect::<Vec<u64>>());
         let writer = {
@@ -297,7 +298,70 @@ async fn a_stale_cursor_gets_a_reset() {
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0].name, "reset");
     assert_eq!(events[0].data["pruned_through"], 3);
+    // Its id is where to resume once reloaded: a browser's EventSource
+    // reconnects from it rather than from the stale number.
+    assert_eq!(events[0].id, Some(3));
     assert!(stream.ended, "the stream ends after the reset");
+    let mut resumed = Reader::new(open(&base, "/v1/stream", &user, Some(3)).await);
+    append(&(memory.clone() as Store), &spec, messages(&spec, 4, 1)).await;
+    assert_eq!(ids(&resumed.take(1, Duration::from_secs(5)).await), [4]);
+}
+
+// The same on Postgres. The pruned state is made by hand for this principal
+// alone, so no store-wide prune reaches another test's rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_cursor_gets_a_reset_on_postgres() {
+    let store = postgres(&POSTGRES);
+    let base = serve(store.clone()).await;
+    let user = fresh_user();
+    let spec = spec(&user);
+    put(&store, &spec, messages(&spec, 1, 3)).await;
+    let owner = spec.owner.clone();
+    blocking(move || {
+        let mut admin = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("admin");
+        admin
+            .execute(
+                "delete from outbox where owner_issuer = $1 and owner_subject = $2 and seq <= 2",
+                &[&owner.issuer, &owner.subject],
+            )
+            .expect("prune by hand");
+        admin
+            .execute(
+                "update outbox_counters set pruned = 2
+                 where owner_issuer = $1 and owner_subject = $2",
+                &[&owner.issuer, &owner.subject],
+            )
+            .expect("mark pruned");
+    })
+    .await;
+    let mut stream = Reader::new(open(&base, "/v1/stream", &user, Some(1)).await);
+    let events = stream.take(2, Duration::from_secs(5)).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].name, "reset");
+    assert_eq!(events[0].id, Some(2));
+    assert_eq!(events[0].data["pruned_through"], 2);
+    assert!(stream.ended);
+}
+
+// A client with no cursor starts at the end: it gets what is stored from
+// now on, not the retained history, which `?after=0` asks for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_without_a_cursor_starts_at_the_end() {
+    for store in stores() {
+        let base = serve(store.clone()).await;
+        let user = fresh_user();
+        let spec = spec(&user);
+        put(&store, &spec, messages(&spec, 1, 3)).await;
+        let mut stream = Reader::new(open(&base, "/v1/stream", &user, None).await);
+        assert_eq!(
+            ids(&stream.take(1, Duration::from_millis(500)).await),
+            Vec::<u64>::new()
+        );
+        append(&store, &spec, messages(&spec, 4, 1)).await;
+        assert_eq!(ids(&stream.take(1, Duration::from_secs(5)).await), [4]);
+        let mut history = Reader::new(open(&base, "/v1/stream?after=2", &user, None).await);
+        assert_eq!(ids(&history.take(2, Duration::from_secs(5)).await), [3, 4]);
+    }
 }
 
 // Decision 40A: a write through another connection (another server, here
@@ -310,14 +374,18 @@ async fn a_notify_wakes_a_waiting_stream() {
     let user = fresh_user();
     let spec = spec(&user);
     put(&writing, &spec, messages(&spec, 1, 1)).await;
-    let mut stream = Reader::new(open(&base, "/v1/stream", &user, None).await);
+    let mut stream = Reader::new(open(&base, "/v1/stream", &user, Some(0)).await);
     assert_eq!(ids(&stream.take(1, Duration::from_secs(5)).await), [1]);
-    // Let the stream reach its wait before the write.
+    // A probe: once it arrives, the listener is up (its first wake-up comes
+    // right after LISTEN), so the next write can only arrive by NOTIFY
+    // inside the poll floor.
+    append(&writing, &spec, messages(&spec, 2, 1)).await;
+    assert_eq!(ids(&stream.take(1, Duration::from_secs(10)).await), [2]);
     tokio::time::sleep(Duration::from_millis(300)).await;
     let wrote = std::time::Instant::now();
-    append(&writing, &spec, messages(&spec, 2, 1)).await;
+    append(&writing, &spec, messages(&spec, 3, 1)).await;
     let woken = stream.take(1, Duration::from_millis(1500)).await;
-    assert_eq!(ids(&woken), [2]);
+    assert_eq!(ids(&woken), [3]);
     assert!(
         wrote.elapsed() < Duration::from_secs(2),
         "{:?}",
@@ -350,6 +418,10 @@ async fn the_run_stream_ends_after_the_terminal_event() {
         assert_eq!(ids(&rest), [3, 4]);
         assert_eq!(rest[1].name, "run.completed");
         assert!(stream.ended, "the stream ends after the terminal event");
+        // A browser reconnects from the terminal event: nothing more comes,
+        // and 204 tells it to stop. A cursor past the log is refused.
+        assert_eq!(open(&base, &path, &user, Some(4)).await.status(), 204);
+        assert_eq!(open(&base, &path, &user, Some(9)).await.status(), 400);
     }
 }
 
@@ -373,4 +445,18 @@ async fn a_seventeenth_stream_is_refused() {
             .status(),
         200
     );
+    // A client that goes away gives its slot back.
+    drop(open_streams.pop());
+    let mut status = 0;
+    for _ in 0..50 {
+        status = open(&base, "/v1/stream", &user, None)
+            .await
+            .status()
+            .as_u16();
+        if status == 200 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(status, 200);
 }

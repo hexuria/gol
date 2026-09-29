@@ -14,17 +14,21 @@ use protocol::{Event, Owner, RunId};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::store::{is_terminal, principal_hint, Hint, OutboxEntry, RunStore, ALL};
+use crate::store::{is_terminal, principal_hint, Hint, HintStream, OutboxEntry, RunStore, ALL};
 
-/// Events per read, and the most a client's task holds before the client
-/// takes them (decision 43A): a slow client stalls only its own stream.
+/// Events per read (decision 43A). A client's task holds at most two pages
+/// for a client that stops reading, the channel's and the page in hand; a
+/// slow client stalls only its own stream.
 pub(crate) const PAGE: usize = 500;
 
 /// Open streams per principal (decision 45A).
 pub(crate) const MAX_STREAMS: usize = 16;
 
-/// A waiting stream re-reads this often without a hint (decision 40A).
-const POLL: Duration = Duration::from_secs(5);
+/// A waiting stream re-reads this often without a hint: while hints from
+/// every writer arrive, a floor for one lost after a commit (decision 46A),
+/// and while they do not (the listener is down), often (decision 40A).
+const POLL_LIVE: Duration = Duration::from_secs(30);
+const POLL_DOWN: Duration = Duration::from_secs(5);
 
 /// A comment this often keeps proxies from closing an idle stream.
 const HEARTBEAT: Duration = Duration::from_secs(15);
@@ -95,9 +99,13 @@ fn event(id: u64, run_id: RunId, run_seq: u64, event: &Event) -> SseEvent {
 }
 
 /// Waits for a reason to read again: `hint` or `ALL`, a lag (hints were
-/// dropped), or `POLL` without one. True when the client went away.
-async fn wait(hints: Option<&mut broadcast::Receiver<Hint>>, hint: Hint, sender: &Sender) -> bool {
-    let poll = tokio::time::sleep(POLL);
+/// dropped), or the poll without one. True when the client went away.
+async fn wait(hints: Option<&mut HintStream>, hint: Hint, sender: &Sender) -> bool {
+    let every = match &hints {
+        Some(hints) if hints.live() => POLL_LIVE,
+        _ => POLL_DOWN,
+    };
+    let poll = tokio::time::sleep(every);
     tokio::pin!(poll);
     let Some(hints) = hints else {
         return tokio::select! {
@@ -109,7 +117,7 @@ async fn wait(hints: Option<&mut broadcast::Receiver<Hint>>, hint: Hint, sender:
         tokio::select! {
             _ = sender.closed() => return true,
             _ = &mut poll => return false,
-            got = hints.recv() => match got {
+            got = hints.receiver.recv() => match got {
                 Ok(got) if got == hint || got == ALL => return false,
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(_)) => return false,
@@ -125,9 +133,12 @@ async fn wait(hints: Option<&mut broadcast::Receiver<Hint>>, hint: Hint, sender:
 }
 
 /// `owner`'s outbox after `resume`, then as it grows. A client with no
-/// cursor starts after what was pruned; one whose cursor is below it is sent
-/// `reset` with `pruned_through`, and the stream ends (decision 41A). A store
-/// error ends the stream; the client resumes from its last event.
+/// cursor starts at the end, with what is stored from now on (`?after=0`
+/// asks for the retained history). One whose cursor is below what was pruned
+/// is sent `reset`, with `pruned_through` as its data and its id, and the
+/// stream ends (decision 41A): a browser reconnects from that id once it has
+/// reloaded. A store error ends the stream; the client resumes from its last
+/// event.
 pub(crate) fn outbox_stream(
     store: Arc<dyn RunStore>,
     owner: Owner,
@@ -143,11 +154,16 @@ pub(crate) fn outbox_stream(
         let mut cursor = resume;
         loop {
             let read = {
-                let (store, owner, after) = (store.clone(), owner.clone(), cursor.unwrap_or(0));
+                // With no cursor yet, only the page's marks: where the end is.
+                let (after, limit) = match cursor {
+                    Some(after) => (after, PAGE),
+                    None => (u64::MAX, 0),
+                };
+                let (store, owner) = (store.clone(), owner.clone());
                 tokio::task::spawn_blocking(move || {
                     store
                         .outbox()
-                        .map(|outbox| outbox.outbox_after(&owner, after, PAGE))
+                        .map(|outbox| outbox.outbox_after(&owner, after, limit))
                 })
                 .await
             };
@@ -161,14 +177,21 @@ pub(crate) fn outbox_stream(
             };
             match cursor {
                 Some(after) if after < page.pruned_through => {
-                    let reset = SseEvent::default().event("reset").data(
-                        serde_json::json!({ "pruned_through": page.pruned_through }).to_string(),
-                    );
+                    let reset = SseEvent::default()
+                        .id(page.pruned_through.to_string())
+                        .event("reset")
+                        .data(
+                            serde_json::json!({ "pruned_through": page.pruned_through })
+                                .to_string(),
+                        );
                     let _ = sender.send(Ok(reset)).await;
                     return;
                 }
                 Some(_) => {}
-                None => cursor = Some(page.pruned_through),
+                None => {
+                    cursor = Some(page.last);
+                    continue;
+                }
             }
             let full = page.entries.len() == PAGE;
             for OutboxEntry {

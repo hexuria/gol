@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use harness::StoreError;
 use protocol::{
@@ -244,26 +245,70 @@ pub(crate) fn principal_hint_of(issuer: &str, subject: &str) -> Hint {
 
 /// Where a store publishes its hints: every stream of this process
 /// subscribes. A receiver that falls behind is told it lagged and re-reads.
-pub(crate) struct Hints(tokio::sync::broadcast::Sender<Hint>);
-
-impl Default for Hints {
-    fn default() -> Self {
-        Self(tokio::sync::broadcast::channel(1024).0)
-    }
+/// `live` says whether hints from other processes arrive (Postgres: the
+/// listener is connected); streams poll faster while it is false.
+pub(crate) struct Hints {
+    sender: tokio::sync::broadcast::Sender<Hint>,
+    live: Arc<AtomicBool>,
 }
 
 impl Hints {
-    pub(crate) fn send(&self, hint: Hint) {
-        // No subscriber is not an error: no stream is waiting.
-        let _ = self.0.send(hint);
+    /// Hints for a store that is the only writer (in memory): always live.
+    pub(crate) fn local() -> Self {
+        Self::new(true)
     }
 
-    pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Hint> {
-        self.0.subscribe()
+    /// Hints that are live once a listener says so.
+    pub(crate) fn listened() -> Self {
+        Self::new(false)
+    }
+
+    fn new(live: bool) -> Self {
+        Self {
+            sender: tokio::sync::broadcast::channel(1024).0,
+            live: Arc::new(AtomicBool::new(live)),
+        }
+    }
+
+    pub(crate) fn send(&self, hint: Hint) {
+        // No subscriber is not an error: no stream is waiting.
+        let _ = self.sender.send(hint);
+    }
+
+    pub(crate) fn subscribe(&self) -> HintStream {
+        HintStream {
+            receiver: self.sender.subscribe(),
+            live: self.live.clone(),
+        }
     }
 
     pub(crate) fn sender(&self) -> tokio::sync::broadcast::Sender<Hint> {
-        self.0.clone()
+        self.sender.clone()
+    }
+
+    pub(crate) fn live(&self) -> Arc<AtomicBool> {
+        self.live.clone()
+    }
+}
+
+impl Default for Hints {
+    fn default() -> Self {
+        Self::local()
+    }
+}
+
+/// A stream's subscription to its store's hints.
+pub struct HintStream {
+    pub receiver: tokio::sync::broadcast::Receiver<Hint>,
+    live: Arc<AtomicBool>,
+}
+
+impl HintStream {
+    /// Whether hints from every writer arrive now. Relaxed is enough: the
+    /// flag orders nothing, it only picks how often a waiting stream polls,
+    /// and a stale read costs at most one slower or faster poll.
+    pub fn live(&self) -> bool {
+        self.live.load(Ordering::Relaxed)
     }
 }
 
@@ -274,6 +319,8 @@ impl Hints {
 pub struct OutboxPage {
     pub entries: Vec<OutboxEntry>,
     pub pruned_through: u64,
+    /// The principal's last number: a stream with no cursor starts after it.
+    pub last: u64,
 }
 
 /// The per-owner outbox that every event a run store keeps is numbered in,
@@ -295,7 +342,7 @@ pub trait OutboxStore: Send + Sync {
     fn prune_outbox(&self, before: Timestamp) -> Result<u64, StoreError>;
     /// Hints of new entries, from this store and (Postgres) from any other
     /// process writing the same database, from now on.
-    fn hints(&self) -> tokio::sync::broadcast::Receiver<Hint>;
+    fn hints(&self) -> HintStream;
 }
 
 /// An outbox row: what `OutboxEntry` reads through to the run's log.
@@ -538,7 +585,7 @@ impl OutboxStore for InMemoryStore {
         limit: usize,
     ) -> Result<OutboxPage, StoreError> {
         let principal = principal(owner);
-        let (rows, pruned_through) = {
+        let (rows, pruned_through, last) = {
             let outbox = read(&self.outbox);
             let rows: Vec<(u64, RunId, u64)> = outbox
                 .rows
@@ -547,7 +594,11 @@ impl OutboxStore for InMemoryStore {
                 .take(limit)
                 .map(|row| (row.seq, row.run_id, row.run_seq))
                 .collect();
-            (rows, outbox.pruned.get(&principal).copied().unwrap_or(0))
+            (
+                rows,
+                outbox.pruned.get(&principal).copied().unwrap_or(0),
+                outbox.counts.get(&principal).copied().unwrap_or(0),
+            )
         };
         // Numbered under the runs lock with their events, so every row's
         // event is stored.
@@ -571,10 +622,11 @@ impl OutboxStore for InMemoryStore {
         Ok(OutboxPage {
             entries,
             pruned_through,
+            last,
         })
     }
 
-    fn hints(&self) -> tokio::sync::broadcast::Receiver<Hint> {
+    fn hints(&self) -> HintStream {
         self.hints.subscribe()
     }
 
