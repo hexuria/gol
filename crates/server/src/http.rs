@@ -27,7 +27,9 @@ use crate::inference::{
 };
 use crate::models::ModelsConfig;
 use crate::queue::RedisRunQueue;
-use crate::store::{is_terminal, AgentManifest, PutAgent, RunStore, StoredAgent, StoredRun};
+use crate::store::{
+    is_terminal, AgentManifest, Append, PutAgent, RunStore, StopScope, StoredAgent, StoredRun,
+};
 use crate::stream::{outbox_stream, run_stream, SseBody, Streams};
 use crate::surface::{ag_ui_events, json_render_spec};
 
@@ -226,6 +228,9 @@ fn router_with_state(state: AppState) -> Router {
         .route("/v1/threads", post(create_thread).get(list_threads))
         .route("/v1/threads/{id}/messages", post(follow_up))
         .route("/v1/threads/{id}/board", get(get_board))
+        .route("/v1/runs/{id}/stop", post(stop_run))
+        .route("/v1/threads/{id}/stop", post(stop_thread))
+        .route("/v1/stop", post(stop_owner))
         .route("/v1/coworker/turns", post(create_coworker_turn))
         .route(
             "/v1/coworker/turns/{id}/completion",
@@ -921,6 +926,141 @@ async fn get_board(
     Ok(Json(board))
 }
 
+/// Records `owner`'s stop of `scope` (Phase 3.4) and cancels the covered
+/// runs no worker holds (decision 55A): those still queued, and those parked
+/// on an ask, which it also wakes so their worker acknowledges them. A run a
+/// worker holds is cancelled by that worker at its next step boundary.
+///
+/// The cancel appends only onto the log it read, so a worker that moved the
+/// run on in between is left to cancel it itself (`formal/runlog`'s
+/// conditional append). Without a queue a run is carried out inside its
+/// request and is never queued or parked: the stop is recorded and nothing
+/// is cancelled here. Subscription turns do not run through the worker and
+/// are not stopped. A run that could not be cancelled here, or a failed read
+/// of the parked runs, answers 503 after the rest are done: the stop is
+/// recorded, and asking again is safe.
+async fn stop(
+    state: &AppState,
+    owner: Owner,
+    scope: StopScope,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (store, queue) = (state.store.clone(), state.queue.clone());
+    let cancelled = tokio::task::spawn_blocking(move || {
+        let Some(stops) = store.stops() else {
+            return Ok(Err(ApiError::NoStops));
+        };
+        stops.put_stop(&owner, &scope)?;
+        let Some(queue) = queue else {
+            return Ok(Ok(Vec::new()));
+        };
+        let mut failed = false;
+        let parked = queue.parked().unwrap_or_else(|error| {
+            eprintln!("gol: stop: parked runs: {error}");
+            failed = true;
+            Vec::new()
+        });
+        let mut cancelled = Vec::new();
+        for run in stops.open_runs_under(&owner, &scope)? {
+            let run_id = run.spec.run_id;
+            let ask = parked
+                .iter()
+                .find(|(parked, _)| *parked == run_id)
+                .map(|(_, ask)| *ask);
+            let queued = matches!(
+                fold(&run.spec, &run.events).dispatch,
+                DispatchPhase::Created | DispatchPhase::Queued
+            );
+            if !queued && ask.is_none() {
+                continue;
+            }
+            // A thread or owner stop does not cover a run stored after it.
+            match stops.stopped(run_id) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    eprintln!("gol: stop: run {run_id}: {error}");
+                    failed = true;
+                    continue;
+                }
+            }
+            let appended = store.append_events_after(
+                run_id,
+                run.events.len(),
+                vec![crate::inference::run_cancelled_event(&run.spec)],
+            );
+            match appended {
+                Ok(Append::Appended) => {
+                    cancelled.push(run_id);
+                    if let Some(ask) = ask {
+                        if let Err(error) = queue.wake(run_id, ask) {
+                            eprintln!("gol: stop: wake run {run_id}: {error}");
+                            failed = true;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("gol: stop: cancel run {run_id}: {error}");
+                    failed = true;
+                }
+            }
+        }
+        if failed {
+            return Ok(Err(ApiError::Store(
+                "a stop could not cancel every run".to_string(),
+            )));
+        }
+        Ok::<_, StoreError>(Ok(cancelled))
+    })
+    .await
+    .map_err(|error| ApiError::Store(error.to_string()))?
+    .map_err(ApiError::from)??;
+    Ok(Json(serde_json::json!({ "cancelled": cancelled })))
+}
+
+/// `POST /v1/runs/{id}/stop`: the run and every run under it.
+async fn stop_run(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<RunId>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    owned_run_page(&state, id, &principal, 0, 1).await?;
+    stop(&state, owner_of(&principal), StopScope::Run(id)).await
+}
+
+/// `POST /v1/threads/{id}/stop`: every run of the thread.
+async fn stop_thread(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let owner = owner_of(&principal);
+    let (store, thread_owner, thread) = (state.store.clone(), owner.clone(), id.clone());
+    let found = tokio::task::spawn_blocking(move || {
+        store
+            .threads()
+            .map(|threads| threads.thread_root(&thread_owner, &thread))
+            .transpose()
+    })
+    .await
+    .map_err(|error| ApiError::Store(error.to_string()))?
+    .map_err(ApiError::from)?;
+    match found {
+        None => return Err(ApiError::NoThreads),
+        Some(None) => return Err(ApiError::ThreadNotFound),
+        Some(Some(_)) => {}
+    }
+    stop(&state, owner, StopScope::Thread(id)).await
+}
+
+/// `POST /v1/stop`: everything the caller's principal owns.
+async fn stop_owner(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    stop(&state, owner_of(&principal), StopScope::Owner).await
+}
+
 async fn get_ag_ui(
     Authenticated(principal): Authenticated,
     State(state): State<AppState>,
@@ -1102,6 +1242,8 @@ enum ApiError {
     ThreadNotFound,
     /// The store keeps no threads.
     NoThreads,
+    /// The store keeps no stops.
+    NoStops,
     /// The store keeps no outbox, so there is nothing to stream.
     NoStreams,
 }
@@ -1149,6 +1291,11 @@ impl axum::response::IntoResponse for ApiError {
             Self::NoStreams => (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "streams are not available" })),
+            )
+                .into_response(),
+            Self::NoStops => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "stops are not available" })),
             )
                 .into_response(),
             Self::NoThreads => (

@@ -160,6 +160,10 @@ pub trait RunStore: Send + Sync {
     fn threads(&self) -> Option<&dyn ThreadStore> {
         None
     }
+    /// The stops this store keeps, if it keeps them (Phase 3.4).
+    fn stops(&self) -> Option<&dyn StopStore> {
+        None
+    }
 }
 
 /// A message between agents (Phase 2), as its deliverer stored it: from
@@ -424,6 +428,64 @@ pub trait ThreadStore: Send + Sync {
     fn thread_root(&self, owner: &Owner, thread: &str) -> Result<Option<RunSpec>, StoreError>;
 }
 
+/// What a stop covers (Phase 3.4, decision 52A): a run and every run under
+/// it, a thread, or everything its principal owns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StopScope {
+    Run(RunId),
+    Thread(String),
+    Owner,
+}
+
+impl StopScope {
+    /// The scope's kind and key, as a stop is stored.
+    pub(crate) fn kind_and_key(&self) -> (&'static str, String) {
+        match self {
+            Self::Run(run) => ("run", run.to_string()),
+            Self::Thread(thread) => ("thread", thread.clone()),
+            Self::Owner => ("owner", String::new()),
+        }
+    }
+}
+
+/// Stop requests (Phase 3.4, decisions 53A and 54A). A stop covers the runs
+/// its scope names that existed when it was made, and every run under them
+/// whenever those start: a run is stopped when a stop by its principal names
+/// it or a run above it, or names that run's thread or the principal and
+/// was made after that run was stored. "After" is the store's own order (a
+/// Postgres sequence both writes take a number from), not any server's
+/// clock. A stop of the same scope again replaces the earlier one: a later
+/// stop covers everything an earlier one did.
+pub trait StopStore: Send + Sync {
+    /// Records `owner`'s stop of `scope`, now.
+    fn put_stop(&self, owner: &Owner, scope: &StopScope) -> Result<(), StoreError>;
+    /// Whether a stop covers the stored run `run`. False for a run not stored.
+    fn stopped(&self, run: RunId) -> Result<bool, StoreError>;
+    /// The runs of `owner`'s principal that `scope` covers and that have not
+    /// ended: the run and every run under it, the thread's, or all of them.
+    fn open_runs_under(
+        &self,
+        owner: &Owner,
+        scope: &StopScope,
+    ) -> Result<Vec<StoredRun>, StoreError>;
+}
+
+/// Whether a stop of `scope`, numbered `stop` in the store's order, covers
+/// `run` itself (not the runs under it), numbered `stored`. A run stop names
+/// a run that exists; a thread or owner stop covers the runs stored before
+/// it.
+fn stop_names(scope: &StopScope, stop: u64, run: &StoredRun, stored: u64) -> bool {
+    match scope {
+        StopScope::Run(id) => *id == run.spec.run_id,
+        StopScope::Thread(thread) => stop > stored && thread_of(&run.spec) == Some(thread.as_str()),
+        StopScope::Owner => stop > stored,
+    }
+}
+
+/// A stop as the in-memory store keeps it: its principal, scope and number
+/// in the store's order.
+type StopEntry = ((String, String), StopScope, u64);
+
 /// The in-memory store. A poisoned lock (a writer panicked holding it) still
 /// serves reads, since every write completes before its guard drops; a write
 /// under a poisoned lock is refused as a StoreError (owner decision 3A).
@@ -437,6 +499,15 @@ pub struct InMemoryStore {
     /// A writer takes it only while holding `runs`, after it: the run, then
     /// the count. Reads and prunes take it alone.
     outbox: Mutex<Outbox>,
+    /// The latest stop per principal and scope. Taken alone.
+    stops: Mutex<Vec<StopEntry>>,
+    /// The store's order: each put run and each stop takes the next number.
+    /// Only the numbers matter, and `fetch_add`s on one atomic are totally
+    /// ordered by its modification order under any `Ordering`. It orders no
+    /// other memory: the runs and the stops are guarded by their mutexes.
+    order: std::sync::atomic::AtomicU64,
+    /// Each run's number in that order. Taken only while `runs` is held.
+    stored: Mutex<HashMap<RunId, u64>>,
     hints: Hints,
 }
 
@@ -596,6 +667,8 @@ impl RunStore for InMemoryStore {
             std::collections::hash_map::Entry::Occupied(_) => Ok(PutRun::Existed),
             std::collections::hash_map::Entry::Vacant(slot) => {
                 self.number(&run.spec.owner, run.spec.run_id, 0, run.events.len())?;
+                let order = self.order.fetch_add(1, Ordering::SeqCst) + 1;
+                write(&self.stored, "run order")?.insert(run.spec.run_id, order);
                 slot.insert(run);
                 Ok(PutRun::Stored)
             }
@@ -633,6 +706,73 @@ impl RunStore for InMemoryStore {
     }
     fn threads(&self) -> Option<&dyn ThreadStore> {
         Some(self)
+    }
+
+    fn stops(&self) -> Option<&dyn StopStore> {
+        Some(self)
+    }
+}
+
+impl StopStore for InMemoryStore {
+    fn put_stop(&self, owner: &Owner, scope: &StopScope) -> Result<(), StoreError> {
+        let mut stops = write(&self.stops, "stop")?;
+        let key = principal(owner);
+        stops.retain(|(principal, stopped, _)| !(*principal == key && stopped == scope));
+        let order = self.order.fetch_add(1, Ordering::SeqCst) + 1;
+        stops.push((key, scope.clone(), order));
+        Ok(())
+    }
+
+    fn stopped(&self, run: RunId) -> Result<bool, StoreError> {
+        let stops = read(&self.stops).clone();
+        let runs = read(&self.runs);
+        let stored = read(&self.stored);
+        // The run, then each run above it, up its lineage.
+        let mut next = Some(run);
+        while let Some(id) = next {
+            let Some(member) = runs.get(&id) else {
+                break;
+            };
+            let key = principal(&member.spec.owner);
+            let number = stored.get(&id).copied().unwrap_or(0);
+            if stops.iter().any(|(owner, scope, stop)| {
+                *owner == key && stop_names(scope, *stop, member, number)
+            }) {
+                return Ok(true);
+            }
+            next = member.spec.lineage.parent;
+        }
+        Ok(false)
+    }
+
+    fn open_runs_under(
+        &self,
+        owner: &Owner,
+        scope: &StopScope,
+    ) -> Result<Vec<StoredRun>, StoreError> {
+        let runs = read(&self.runs);
+        // Whether `id` is `under` or a run below it.
+        let within = |id: RunId, under: RunId| {
+            let mut next = Some(id);
+            while let Some(current) = next {
+                if current == under {
+                    return true;
+                }
+                next = runs.get(&current).and_then(|run| run.spec.lineage.parent);
+            }
+            false
+        };
+        Ok(runs
+            .values()
+            .filter(|run| run.spec.owner.is(owner))
+            .filter(|run| !run.events.iter().any(|event| is_terminal(&event.payload)))
+            .filter(|run| match scope {
+                StopScope::Run(under) => within(run.spec.run_id, *under),
+                StopScope::Thread(thread) => thread_of(&run.spec) == Some(thread.as_str()),
+                StopScope::Owner => true,
+            })
+            .cloned()
+            .collect())
     }
 }
 

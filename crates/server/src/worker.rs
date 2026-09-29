@@ -29,7 +29,7 @@ use protocol::{
 
 use crate::deliverer::{ask_state, deliver, task_answer, AskState, IfUnsent, OwnedDeliverer};
 use crate::http::{jev_client, Delegation};
-use crate::inference::{dispatch_events, run_failed_event};
+use crate::inference::{dispatch_events, run_cancelled_event, run_failed_event};
 use crate::models::ModelsConfig;
 use crate::queue::{QueueTiming, RedisRunQueue};
 use crate::spawner::OwnedSpawner;
@@ -504,6 +504,19 @@ impl Worker {
         }
     }
 
+    /// Whether a stop covers run `run`. A store that cannot say is taken as
+    /// no stop: the run goes on, and the next boundary asks again.
+    fn stopped(&self, run: RunId) -> bool {
+        match self.store.stops().map(|stops| stops.stopped(run)) {
+            Some(Ok(stopped)) => stopped,
+            Some(Err(error)) => {
+                eprintln!("gol: queue worker: stop check of run {run}: {error}");
+                false
+            }
+            None => false,
+        }
+    }
+
     /// Runs `spec`'s run from `events`, its stored log, appending as it goes.
     /// Stops at the first append the store refuses, and reports it, or at
     /// the first step boundary where `token` no longer holds the run's lease:
@@ -539,6 +552,10 @@ impl Worker {
                 .map(Stopped::Store)
                 .map_err(|error| error.to_string())
         };
+        // A stop covers the run (Phase 3.4): it ends cancelled, unrun.
+        if self.stopped(run_id) {
+            return append(seen, vec![run_cancelled_event(spec)]);
+        }
         // A queued run is scheduled first, as one append.
         if fold(spec, &events).dispatch == DispatchPhase::Queued {
             let ladder = dispatch_events(spec);
@@ -599,6 +616,11 @@ impl Worker {
             &models,
             &memory,
             &mut |driver| {
+                // A stop made while the run ran ends it here: the step's
+                // events and its RunCancelled are stored as the tail.
+                if self.stopped(run_id) {
+                    return Boundary::Cancel;
+                }
                 let new = &driver.events()[seen..];
                 if new.is_empty() {
                     return Boundary::Continue;

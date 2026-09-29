@@ -152,6 +152,16 @@ impl OwnedSpawner {
             return Err("delegation needs the run queue".to_string());
         }
         let parent = request.parent;
+        // No new work under a stopped run (Phase 3.4): no late child escapes
+        // a stop of its chain.
+        match self.store.stops().map(|stops| stops.stopped(parent.run_id)) {
+            Some(Ok(true)) => return Err("the chain is stopped".to_string()),
+            Some(Err(error)) => {
+                eprintln!("gol: delegate from run {}: {error}", parent.run_id);
+                return Err("store unavailable".to_string());
+            }
+            _ => {}
+        }
         let agent = match self.store.agent(request.agent_id) {
             Ok(Some(agent)) => agent,
             Ok(None) => return Err("no such agent".to_string()),

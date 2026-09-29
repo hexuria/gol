@@ -36,8 +36,8 @@ pub use queue::{QueueTiming, RedisRunQueue};
 pub use spawner::OwnedSpawner;
 pub use store::{
     is_terminal, thread_of, AgentManifest, Append, InMemoryStore, MessageStore, OutboxEntry,
-    OutboxStore, PutAgent, PutMessage, PutRun, RunStore, StoredAgent, StoredArtifact,
-    StoredMessage, StoredRun, ThreadStore, ThreadSummary,
+    OutboxStore, PutAgent, PutMessage, PutRun, RunStore, StopScope, StopStore, StoredAgent,
+    StoredArtifact, StoredMessage, StoredRun, ThreadStore, ThreadSummary,
 };
 pub use stores::{stores_from_env, Stores};
 pub use surface::{ag_ui_events, json_render_spec};
