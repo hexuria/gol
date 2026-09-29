@@ -546,10 +546,11 @@ impl Driver {
         );
     }
 
-    /// Starts a child through the spawner, with half of what this run has
-    /// left, and records what happened. The run goes on either way.
-    fn delegate(&mut self, agent_id: AgentId, input: &str) {
-        let state = self.state();
+    /// The budget to give a child (a delegation, or the task a tell or a new
+    /// ask starts): half of the steps and model calls this run has left.
+    /// Refused when the run is not running, has `MAX_CHILDREN` children, or
+    /// has fewer than 2 of either left.
+    fn carve(&self, state: &RunState) -> Result<Limits, String> {
         let limits = self.spec.limits;
         let left = |max: u32, used: u32, given: u32| max.saturating_sub(used.saturating_add(given));
         let steps_left = left(limits.max_steps, state.steps, state.given_steps);
@@ -558,7 +559,7 @@ impl Driver {
             state.model_calls,
             state.given_model_calls,
         );
-        let refused = if !matches!(state.harness, HarnessState::Running { .. }) {
+        if !matches!(state.harness, HarnessState::Running { .. }) {
             Err("the run is not running".to_string())
         } else if state.children >= MAX_CHILDREN {
             Err(format!("already started {MAX_CHILDREN} children"))
@@ -569,7 +570,14 @@ impl Driver {
                 max_steps: steps_left / 2,
                 max_model_calls: model_calls_left / 2,
             })
-        };
+        }
+    }
+
+    /// Starts a child through the spawner, with half of what this run has
+    /// left, and records what happened. The run goes on either way.
+    fn delegate(&mut self, agent_id: AgentId, input: &str) {
+        let state = self.state();
+        let refused = self.carve(&state);
         let step = match state.harness {
             HarnessState::Running { step, .. } => step,
             _ => 0,
@@ -600,8 +608,10 @@ impl Driver {
         self.push(payload, Actor::System);
     }
 
-    /// Hands a message to the deliverer and records what happened. An
-    /// accepted ask moves the harness to `WaitingForMessage`.
+    /// Hands a message to the deliverer and records what happened. A tell
+    /// or a new ask starts a task, whose budget is carved as for a
+    /// delegation (decision 33A) and recorded as `ChildStarted`; a reply
+    /// starts none. An accepted ask moves the harness to `WaitingForMessage`.
     fn send_message(
         &mut self,
         to: AgentId,
@@ -611,35 +621,55 @@ impl Driver {
         timeout_secs: Option<u32>,
     ) {
         let state = self.state();
-        // The decision that sent it: fold's count of decisions, the same
-        // when a resumed run performs it again.
-        let decision = matches!(state.harness, HarnessState::Running { .. }).then_some(state.steps);
-        let sent = decision
-            .ok_or_else(|| "the run is not running".to_string())
-            .and_then(|decision| {
-                let deliverer = self
-                    .deliverer
-                    .clone()
-                    .ok_or_else(|| "no message deliverer is configured".to_string())?;
-                deliverer.send(MessageRequest {
-                    from: &self.spec,
-                    decision,
-                    to,
-                    body,
-                    expects_reply,
-                    reply_to,
-                    timeout_secs,
-                })
-            });
-        let payload = match sent {
-            Ok(message_id) => EventPayload::MessageSent {
-                message_id,
+        let starts_task = reply_to.is_none() || expects_reply;
+        let sent = if !matches!(state.harness, HarnessState::Running { .. }) {
+            Err("the run is not running".to_string())
+        } else if starts_task {
+            self.carve(&state).map(Some)
+        } else {
+            Ok(None)
+        }
+        .and_then(|limits| {
+            let deliverer = self
+                .deliverer
+                .clone()
+                .ok_or_else(|| "no message deliverer is configured".to_string())?;
+            deliverer.send(MessageRequest {
+                from: &self.spec,
+                // The decision that sent it: fold's count of decisions, the
+                // same when a resumed run performs it again.
+                decision: state.steps,
                 to,
+                body,
                 expects_reply,
-            },
-            Err(reason) => EventPayload::MessageRefused { to, reason },
-        };
-        self.push(payload, Actor::System);
+                reply_to,
+                timeout_secs,
+                limits,
+            })
+        });
+        match sent {
+            Ok(sent) => {
+                if let Some(task) = sent.task {
+                    self.push(
+                        EventPayload::ChildStarted {
+                            run_id: task.run_id,
+                            agent_id: to,
+                            limits: task.limits,
+                        },
+                        Actor::System,
+                    );
+                }
+                self.push(
+                    EventPayload::MessageSent {
+                        message_id: sent.message_id,
+                        to,
+                        expects_reply,
+                    },
+                    Actor::System,
+                );
+            }
+            Err(reason) => self.push(EventPayload::MessageRefused { to, reason }, Actor::System),
+        }
     }
 
     fn push(&mut self, payload: EventPayload, actor: Actor) {

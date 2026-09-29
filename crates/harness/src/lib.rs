@@ -17,6 +17,6 @@ pub use driver::{run_to_completion, run_until, BootError, Boundary, Driver, Resu
 pub use echo::{EchoTool, Tool};
 pub use jev::{jev_choices, jev_state, JevDecider, MAX_EVENT_TEXT, RECENT_EVENTS};
 pub use memory::{InMemory, Memory, MemoryKey, RunMemory, StoreError};
-pub use message::{MessageDeliverer, MessageRequest};
+pub use message::{MessageDeliverer, MessageRequest, SentMessage};
 pub use model::{ModelCompletion, UnavailableModel};
 pub use spawner::{AgentSpawner, ChildRequest, DelegateTarget, StartedChild};
