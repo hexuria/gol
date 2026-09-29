@@ -575,6 +575,41 @@ mod tests {
         assert_eq!(store.run(spec.run_id).unwrap().unwrap().spec, spec);
     }
 
+    // Decision 38A across clock skew, in the in-memory store: an entry
+    // stored with an earlier time than the one numbered before it takes that
+    // one with it, so what stays is a suffix of the principal's numbers.
+    #[test]
+    fn pruning_takes_a_prefix_across_clock_skew() {
+        let store = InMemoryStore::default();
+        let spec = spec();
+        let message = |text: &str| {
+            Event::record(
+                protocol::EventSource::for_spec(&spec, protocol::Actor::System, Timestamp::now()),
+                EventPayload::UserMessage {
+                    text: text.to_string(),
+                },
+            )
+        };
+        let run = StoredRun {
+            spec: spec.clone(),
+            events: vec![message("a"), message("b"), message("c")],
+        };
+        assert_eq!(store.put_run(run), Ok(PutRun::Stored));
+        for row in &mut store.outbox.lock().unwrap().rows {
+            row.stored_ms = if row.seq == 2 { 1_000 } else { 9_000 };
+        }
+        assert_eq!(store.prune_outbox(Timestamp::unix_millis(5_000)), Ok(2));
+        let page = store.outbox_after(&spec.owner, 0, usize::MAX).unwrap();
+        assert_eq!(page.pruned_through, 2);
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<Vec<_>>(),
+            [3]
+        );
+    }
+
     // Owner decision 3A: a writer that panicked holding the lock leaves reads
     // working and refuses later writes as a StoreError.
     #[test]

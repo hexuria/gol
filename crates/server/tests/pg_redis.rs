@@ -1530,8 +1530,13 @@ fn forced_number_after_a_counter_holder(extra: &str) -> Vec<u64> {
     assert_eq!(taken, 2);
     tx.execute(
         "insert into outbox (owner_issuer, owner_subject, seq, run_id, run_seq, stored_ms)
-         values ($1, $2, 2, $3, 1, 0)",
-        &[&owner.issuer, &owner.subject, &spec.run_id.as_uuid()],
+         values ($1, $2, 2, $3, 1, $4)",
+        &[
+            &owner.issuer,
+            &owner.subject,
+            &spec.run_id.as_uuid(),
+            &Timestamp::now().as_unix_millis(),
+        ],
     )
     .expect("held entry");
     let waiter = {
