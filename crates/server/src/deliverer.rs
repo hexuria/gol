@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use harness::{ChildRequest, MessageDeliverer, MessageRequest, SentMessage};
 use protocol::{
-    Actor, AgentId, Event, EventPayload, EventSource, MessageId, RunId, Timestamp,
+    Actor, AgentId, Event, EventPayload, EventSource, MessageId, MessageRole, RunId, Timestamp,
     MAX_DELEGATION_HOPS, MAX_MESSAGE_BYTES,
 };
 
@@ -345,9 +345,9 @@ pub(crate) fn deliver(
     Ok(true)
 }
 
-/// The reply a task gives `ask` when it ends (decision 31A): its last model
-/// response if it completed after one (a Jev task's outcome is the fixed
-/// word "done"), else its outcome, or that it failed, was cancelled or
+/// The reply a task gives `ask` when it ends (decision 31A): its last
+/// non-empty assistant response if it completed after one (a Jev task's
+/// outcome is the fixed word "done"), else its outcome, or that it failed, was cancelled or
 /// expired. `None` while it runs. The body is cut to `MAX_MESSAGE_BYTES`,
 /// as a message's is (30A).
 pub(crate) fn task_answer(
@@ -358,7 +358,11 @@ pub(crate) fn task_answer(
 ) -> Option<EventPayload> {
     let responded = || {
         events.iter().rev().find_map(|event| match &event.payload {
-            EventPayload::ModelResponded { message, .. } => Some(message.text.clone()),
+            EventPayload::ModelResponded { message, .. }
+                if message.role == MessageRole::Assistant && !message.text.trim().is_empty() =>
+            {
+                Some(message.text.clone())
+            }
             _ => None,
         })
     };

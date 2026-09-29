@@ -14,7 +14,7 @@ use protocol::{
 };
 use serde_json::json;
 use server::{
-    is_terminal, queued_events, sweep_asks, AgentManifest, InMemoryStore, MessageStore,
+    is_terminal, queued_events, sweep_asks, AgentManifest, Append, InMemoryStore, MessageStore,
     OwnedDeliverer, OwnedSpawner, PostgresStore, Prepared, PutMessage, QueueTiming, RedisRunQueue,
     RunStore, StoreError, StoredAgent, StoredMessage, StoredRun, Worker,
 };
@@ -1097,16 +1097,31 @@ fn a_reply_before_its_ask_is_logged_is_refused_and_retried() {
 }
 
 // Owner decision on #74, follow-up: an ask answered by its task's end
-// carries the task's last model response when there is one (a Jev task's
-// outcome is the fixed word "done"), cut to a message's 32 KiB (30A).
+// carries the task's last non-empty assistant response when there is one (a
+// Jev task's outcome is the fixed word "done"), cut to a message's 32 KiB
+// (30A) at a character boundary.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_task_answers_with_its_last_model_response() {
-    for (which, text) in [
-        (0, "the plan is to ship on Friday".to_string()),
-        (1, "the plan is to ship on Friday".to_string()),
-        (0, "é".repeat(20_000)),
-        (1, "é".repeat(20_000)),
-    ] {
+    let max = protocol::MAX_MESSAGE_BYTES;
+    let cases = [
+        (
+            "the plan is to ship on Friday".to_string(),
+            "the plan is to ship on Friday".to_string(),
+        ),
+        // An empty response answers nothing: the one before it does.
+        (String::new(), "a first thought".to_string()),
+        ("a".repeat(max), "a".repeat(max)),
+        ("a".repeat(max + 1), "a".repeat(max)),
+        // 1 + 2 * 20,000 bytes: the cap falls inside a two-byte character.
+        (
+            format!("a{}", "é".repeat(20_000)),
+            format!("a{}", "é".repeat((max - 1) / 2)),
+        ),
+    ];
+    for (which, (text, expected)) in cases
+        .into_iter()
+        .flat_map(|case| [(0, case.clone()), (1, case)])
+    {
         let server = jev(&["ask:writer", "complete"]).await;
         let uri = server.uri();
         blocking(move || {
@@ -1131,7 +1146,7 @@ async fn a_task_answers_with_its_last_model_response() {
                 },
                 usage: None,
             };
-            setup
+            let appended = setup
                 .runs
                 .append_events(
                     task,
@@ -1144,6 +1159,7 @@ async fn a_task_answers_with_its_last_model_response() {
                     ],
                 )
                 .expect("append");
+            assert_eq!(appended, Append::Appended);
 
             let swept = sweep_asks(
                 &setup.queue,
@@ -1158,11 +1174,7 @@ async fn a_task_answers_with_its_last_model_response() {
                 panic!("one answer: {answers:?}")
             };
             assert_eq!(*answered, ask);
-            if text.len() <= protocol::MAX_MESSAGE_BYTES {
-                assert_eq!(*body, text);
-            } else {
-                assert_eq!(*body, "é".repeat(protocol::MAX_MESSAGE_BYTES / 2));
-            }
+            assert_eq!(*body, expected);
         });
     }
 }
