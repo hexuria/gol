@@ -134,4 +134,33 @@ Tests in `crates/server/tests/queue_worker.rs`, against Redis and Postgres (the 
   - Beyond the grace assumption: `a_sweep_between_store_and_push_runs_the_run_once`, the sweep forced into the producer's gap. The run is pushed twice and runs once.
 - **`EveryRunEnds`:** unlinked.
 
+## Phase 2.3: park and wake
+
+Checked on 2026-09-29. With `Mail = TRUE` a run may ask another agent and wait for the reply without holding a worker (decision 34A).
+
+Writers added:
+- **The asking worker** (`Done::ack`, `crates/server/src/worker.rs`): once the run is stored up to its ask (`Stopped::Waiting`), it parks the run instead of acknowledging it. One script, which acts only while the claim still holds the lease, moves the run off processing into the parked hash, deletes its lease and clears its start count (`PARK`, `crates/server/src/queue.rs`; `park`). It then rereads the run's log and wakes the run itself if the answer is already there (`answered` in `crates/server/src/deliverer.rs`). The model's `Ask`, `Park` and `Recheck`.
+- **The replier** (`deliver`, `crates/server/src/deliverer.rs`): appends the answer to the asker's log, marks the ask answered, then wakes the asker. One script moves a parked run back onto the runs list and does nothing to a run that is not parked (`WAKE`; `wake`). The answer is the asked task's end, delivered by the worker that ended it (`Worker::answer_ask`), an explicit reply (`OwnedDeliverer::reply`), or the sweep. The model's `ReplyAppend` then `ReplyWake`.
+- **The ask sweep** (`sweep_asks`, in the reaper's loop): wakes a parked run whose log holds its answer, or that has ended, or that the store no longer has; delivers the end of an ended task nobody delivered; and answers an open ask past its deadline with its task's end, or `AskTimedOut`. Its wake of an answered run is the model's `SweepParked`; its deliveries are `ReplyAppend` and `ReplyWake` with the sweep as the replier.
+
+`RunQueueMail.cfg` (with `RunQueueMail.tla`, which only extends `RunQueue`) checks `Design = "new"` at `RunQueue.cfg`'s constants with `Mail = TRUE`, against every invariant above, `EveryRunEnds`, and `ParkedIsIdle`: a parked run holds no lease and is on no list. `NoOrphan` and `NoStrandedRun` count a parked run as held. `RunQueue.cfg` and `RunQueueCrash.cfg` set `Mail = FALSE` and are unchanged: 339 and 678 distinct.
+
+Same command, `-config RunQueueMail.cfg RunQueueMail.tla`: no error, no deadlock, 7,667 states generated, 2,413 distinct, depth 24.
+
+Fairness added: weak fairness on the asking worker's `Ask`, `Park` and `Recheck` (a live worker finishes its ack), and on each run's `ReplyAppend`, `ReplyWake` and `SweepParked`. That the answer comes at all is an assumption: an asked task ends within its carved budget, or the ask's deadline passes (Jev's asks wait 3600 s). An explicit ask with no timeout waits on its task's end alone.
+
+Negative control, on `RunQueueMail.cfg` with `-workers 1`: `Design = "lostWake"` parks without the reread and has no ask sweep. It deadlocks in a 10-state trace:
+1. Run 1 is pended, stored and pushed, and w1 claims it.
+2. w1 stores its ask (`Ask`).
+3. The reply is appended (`ReplyAppend`), and the replier's wake finds nothing parked (`ReplyWake`).
+4. w1 parks the run (`Park`) and crashes.
+5. The run is parked with its answer in its log, and nothing will wake it: `Done` is never enabled.
+
+Mapping, in `crates/server/tests/asks.rs`, on both stores:
+- **The lostWake trace**, forced: `a_reply_before_the_park_still_wakes_the_asker`. The asking worker records its ask, a second worker runs the task and replies before the park, and the ack's reread wakes the run.
+- **Park, reply, wake:** `a_researcher_asks_the_writer_and_is_woken_by_the_reply` (Jev picks `ask:writer`; the researcher is parked, not acknowledged; the task's end is appended and wakes it; it completes) and `an_explicit_reply_from_the_task_answers_the_ask`.
+- **`SweepParked`** and the sweep as replier: `the_sweep_finishes_an_answer_a_crash_left` (a reply appended with no wake; a task ended with no delivery). The deadline: `an_ask_past_its_deadline_times_out`. An asker the store lost: `an_ask_without_its_asker_is_closed`.
+- **`ParkedIsIdle`:** `a_parked_run_holds_no_lease_and_survives_the_reaper`, `a_claim_without_the_lease_does_not_park` and `a_wake_queues_a_parked_run_once` in `crates/server/tests/park.rs`. That the park and the wake are one step each rests on reading `PARK` and `WAKE`.
+- **`EveryRunEnds` with Mail:** unlinked.
+
 Retire this model if the queue moves to a broker whose API gives leased delivery and acknowledgement directly, such as Redis streams consumer groups with `XAUTOCLAIM`, with its own model.
