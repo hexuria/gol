@@ -1409,6 +1409,7 @@ impl TriggerStore for PostgresStore {
                          to_jsonb((body->'kind'->'webhook'->>'rotation')::bigint + 1))
                      where id = $1 and owner_issuer = $2 and owner_subject = $3
                        and body->'kind' ? 'webhook'
+                       and (body->'kind'->'webhook'->>'rotation')::bigint < 4294967295
                      returning body, enabled, next_fire_ms",
                     &[&id.as_uuid(), &owner.issuer, &owner.subject],
                 )

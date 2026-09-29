@@ -34,7 +34,9 @@ use crate::store::{
 };
 use crate::stream::{outbox_stream, run_stream, SseBody, Streams};
 use crate::surface::{ag_ui_events, json_render_spec};
-use crate::triggers::{trigger_thread, webhook_secret, TRIGGER_KEY};
+use crate::triggers::{
+    trigger_thread, webhook_secret, MAX_TRIGGERS, MIN_WEBHOOK_KEY_BYTES, TRIGGER_KEY,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -246,16 +248,30 @@ pub fn router_with_webhooks(
         sandbox: sandbox_from_env(),
         auth,
         streams: Arc::default(),
-        webhook_key: webhook_key.map(Arc::from),
+        webhook_key: webhook_key.and_then(usable_webhook_key),
     })
 }
 
-/// `GOL_WEBHOOK_KEY`, when set and not empty.
+/// `GOL_WEBHOOK_KEY`, when it is long enough.
 fn webhook_key_from_env() -> Option<Arc<[u8]>> {
     std::env::var("GOL_WEBHOOK_KEY")
         .ok()
-        .filter(|key| !key.is_empty())
-        .map(|key| Arc::from(key.into_bytes()))
+        .and_then(|key| usable_webhook_key(key.into_bytes()))
+}
+
+/// `key`, unless it is shorter than `MIN_WEBHOOK_KEY_BYTES`: then no
+/// webhook triggers, and a warning for the operator.
+fn usable_webhook_key(key: Vec<u8>) -> Option<Arc<[u8]>> {
+    if key.len() < MIN_WEBHOOK_KEY_BYTES {
+        if !key.is_empty() {
+            eprintln!(
+                "gol: the webhook key is shorter than {MIN_WEBHOOK_KEY_BYTES} bytes; \
+                 webhook triggers are off"
+            );
+        }
+        return None;
+    }
+    Some(Arc::from(key))
 }
 
 fn router_with_state(state: AppState) -> Router {
@@ -1365,7 +1381,11 @@ async fn stop_owner(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // The principal's triggers are paused first, so none starts new work
-    // while the stop cancels what is there (Phase 4.1).
+    // while the stop cancels what is there (Phase 4.1). A fire that read its
+    // trigger running before the pause stores its run before the stop, which
+    // then covers it (`fire_trigger`). A pause that failed does not keep the
+    // stop from going on; the stop answers 503 once it is done, and asking
+    // again is safe.
     let (store, owner) = (state.store.clone(), owner_of(&principal));
     let paused = tokio::task::spawn_blocking(move || {
         store
@@ -1374,11 +1394,10 @@ async fn stop_owner(
             .transpose()
     })
     .await
-    .map_err(|error| ApiError::Store(error.to_string()))?
-    .map_err(ApiError::from)?
-    .unwrap_or(0);
+    .map_err(|error| ApiError::Store(error.to_string()))
+    .and_then(|paused| paused.map_err(ApiError::from));
     let Json(mut body) = stop(&state, owner_of(&principal), StopScope::Owner).await?;
-    body["paused_triggers"] = serde_json::json!(paused);
+    body["paused_triggers"] = serde_json::json!(paused?.unwrap_or(0));
     Ok(Json(body))
 }
 
@@ -1449,7 +1468,7 @@ async fn with_triggers<T: Send + 'static>(
     let store = state.store.clone();
     tokio::task::spawn_blocking(move || {
         let Some(triggers) = store.triggers() else {
-            return Ok(Err(ApiError::Unavailable("triggers are not available")));
+            return Ok(Err(ApiError::NoTriggers));
         };
         work(store.as_ref(), triggers)
     })
@@ -1468,7 +1487,9 @@ async fn create_trigger(
     let Json(body) = body.map_err(body_rejection)?;
     let kind = match body.kind {
         KindBody::Schedule { cron, time_zone } => {
-            let shaped = |text: &str, most: usize| !text.trim().is_empty() && text.len() <= most;
+            let shaped = |text: &str, most: usize| {
+                !text.trim().is_empty() && text.len() <= most && !text.contains('\0')
+            };
             if !shaped(&cron, 256) || !shaped(&time_zone, 64) {
                 return Err(ApiError::BadRequest(
                     "a schedule needs a cron expression and a time zone",
@@ -1488,6 +1509,16 @@ async fn create_trigger(
         if !bounded.contains(&limits.max_steps) || !bounded.contains(&limits.max_model_calls) {
             return Err(ApiError::BadRequest("limits must be between 1 and 64"));
         }
+    }
+    if body.input.contains('\0') {
+        return Err(ApiError::BadRequest("the input holds a NUL character"));
+    }
+    if body.input.len() > MAX_MESSAGE_BYTES {
+        return Err(ApiError::TooLarge("the input is over 32 KiB"));
+    }
+    // A trigger fires queued runs; a server without the queue has none.
+    if state.queue.is_none() {
+        return Err(ApiError::Unavailable("triggers need the run queue"));
     }
     let trigger = StoredTrigger {
         id: TriggerId::new(),
@@ -1511,12 +1542,17 @@ async fn create_trigger(
         if !owned {
             return Ok(Err(ApiError::AgentNotFound));
         }
+        if triggers.triggers_of(&stored.owner)?.len() >= MAX_TRIGGERS {
+            return Ok(Err(ApiError::Conflict(
+                "a principal keeps at most 100 triggers",
+            )));
+        }
         triggers.put_trigger(&stored)?;
         Ok(Ok(()))
     })
     .await?;
     let view = with_secret(&state, &trigger, trigger_view(&trigger));
-    Ok((StatusCode::CREATED, Json(view)).into_response())
+    Ok((StatusCode::CREATED, no_store(), Json(view)).into_response())
 }
 
 /// `GET /v1/triggers`: the caller's triggers, oldest first.
@@ -1574,7 +1610,7 @@ async fn rotate_trigger(
     Authenticated(principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<TriggerId>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     if state.webhook_key.is_none() {
         return Err(ApiError::Unavailable("webhooks are not available"));
     }
@@ -1591,10 +1627,16 @@ async fn rotate_trigger(
         }
         Ok(triggers
             .rotate_webhook(&owner, id)?
-            .ok_or(ApiError::TriggerNotFound))
+            .ok_or(ApiError::Conflict("the secret cannot be rotated again")))
     })
     .await?;
-    Ok(Json(with_secret(&state, &trigger, trigger_view(&trigger))))
+    let view = with_secret(&state, &trigger, trigger_view(&trigger));
+    Ok((no_store(), Json(view)).into_response())
+}
+
+/// An answer that carries a webhook secret is not kept by any cache.
+fn no_store() -> [(axum::http::header::HeaderName, &'static str); 1] {
+    [(axum::http::header::CACHE_CONTROL, "no-store")]
 }
 
 /// `DELETE /v1/triggers/{id}`.
@@ -1809,6 +1851,8 @@ enum ApiError {
     WhichTask(Vec<WaitingTask>),
     ThreadNotFound,
     TriggerNotFound,
+    /// The store keeps no triggers.
+    NoTriggers,
     /// The store keeps no threads.
     NoThreads,
     /// The store keeps no stops.
@@ -1870,6 +1914,11 @@ impl axum::response::IntoResponse for ApiError {
             Self::NoThreads => (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "threads are not available" })),
+            )
+                .into_response(),
+            Self::NoTriggers => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "triggers are not available" })),
             )
                 .into_response(),
             Self::TriggerNotFound => (

@@ -44,7 +44,10 @@ pub use store::{
 };
 pub use stores::{stores_from_env, Stores};
 pub use surface::{ag_ui_events, json_render_spec};
-pub use triggers::{fire_trigger, trigger_thread, webhook_secret, Fired, TRIGGER_KEY};
+pub use triggers::{
+    fire_trigger, trigger_thread, webhook_secret, FireError, Fired, MAX_TRIGGERS,
+    MIN_WEBHOOK_KEY_BYTES, TRIGGER_KEY,
+};
 pub use worker::{
     queue_from_env, reap_forever, start_queue, sweep, sweep_asks, Claim, Done, Executed, Open,
     Prepared, QueueSettings, Worker, WorkerBuilder,

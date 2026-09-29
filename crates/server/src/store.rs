@@ -584,7 +584,7 @@ pub trait TriggerStore: Send + Sync {
         enabled: bool,
     ) -> Result<Option<StoredTrigger>, StoreError>;
     /// Bumps a webhook trigger's rotation, in one step; none when it is not
-    /// the principal's webhook trigger.
+    /// the principal's webhook trigger, or its rotation is at `u32::MAX`.
     fn rotate_webhook(
         &self,
         owner: &Owner,
@@ -837,11 +837,14 @@ impl TriggerStore for InMemoryStore {
     }
 
     fn triggers_of(&self, owner: &Owner) -> Result<Vec<StoredTrigger>, StoreError> {
-        Ok(read(&self.triggers)
+        let mut found: Vec<StoredTrigger> = read(&self.triggers)
             .iter()
             .filter(|trigger| trigger.owner.is(owner))
             .cloned()
-            .collect())
+            .collect();
+        // As Postgres orders them.
+        found.sort_by_key(|trigger| (trigger.created_ms, trigger.id.as_uuid()));
+        Ok(found)
     }
 
     fn trigger(&self, owner: &Owner, id: TriggerId) -> Result<Option<StoredTrigger>, StoreError> {
@@ -877,8 +880,10 @@ impl TriggerStore for InMemoryStore {
             .iter_mut()
             .find(|trigger| trigger.id == id && trigger.owner.is(owner))
             .and_then(|trigger| match &mut trigger.kind {
+                // A secret is never given out again: the last rotation is
+                // the last.
                 TriggerKind::Webhook { rotation } => {
-                    *rotation += 1;
+                    *rotation = rotation.checked_add(1)?;
                     Some(trigger.clone())
                 }
                 TriggerKind::Schedule { .. } => None,

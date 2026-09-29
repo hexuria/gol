@@ -4,6 +4,9 @@ use std::collections::BTreeMap;
 
 use protocol::{Limits, Owner, RunId, RunSpec, SESSION_ID};
 
+use harness::StoreError;
+
+use crate::inference::run_cancelled_event;
 use crate::queue::RedisRunQueue;
 use crate::spawner::{enqueue, EnqueueError, OnPushFailure};
 use crate::store::{RunStore, StoredTrigger, TriggerId, TriggerKind};
@@ -31,23 +34,38 @@ pub enum Fired {
     AgentNotFound,
 }
 
+/// Why a fire failed, for its caller to retry or not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FireError {
+    /// Nothing was stored: firing again is safe.
+    NotStored(String),
+    /// The store failed after the run may have been stored; a stored run is
+    /// pending, and the queue sweep pushes it.
+    MaybeStored(String),
+}
+
 /// Fires `owner`'s trigger `id` (decision 68A): an ordinary queued run of
 /// its agent, at the version the owner keeps now, with its input and run
 /// template, in the trigger's thread and marked `TRIGGER_KEY`. Queued the
-/// way `POST /v1/runs` queues a run. A paused trigger does not fire.
+/// way a child run is: pending before it is stored, and left to the queue
+/// sweep if the push fails. A paused trigger does not fire.
+///
+/// The trigger is read again once the run is stored. A trigger paused in
+/// between (the owner's stop pauses before it records itself) has its run
+/// cancelled: without that, a run stored after the stop would escape it.
+/// A pause after that read comes before the stop, which then covers the
+/// run.
 pub fn fire_trigger(
     store: &dyn RunStore,
     queue: &RedisRunQueue,
     owner: &Owner,
     id: TriggerId,
-) -> Result<Fired, String> {
+) -> Result<Fired, FireError> {
+    let unread = |error: StoreError| FireError::NotStored(error.to_string());
     let triggers = store
         .triggers()
-        .ok_or_else(|| "the store keeps no triggers".to_string())?;
-    let Some(trigger) = triggers
-        .trigger(owner, id)
-        .map_err(|error| error.to_string())?
-    else {
+        .ok_or_else(|| FireError::NotStored("the store keeps no triggers".to_string()))?;
+    let Some(trigger) = triggers.trigger(owner, id).map_err(unread)? else {
         return Ok(Fired::NotFound);
     };
     if !trigger.enabled {
@@ -55,7 +73,7 @@ pub fn fire_trigger(
     }
     let Some(agent) = store
         .agent(trigger.agent_id)
-        .map_err(|error| error.to_string())?
+        .map_err(unread)?
         .filter(|agent| agent.owner.is(&trigger.owner))
     else {
         return Ok(Fired::AgentNotFound);
@@ -65,10 +83,21 @@ pub fn fire_trigger(
         agent.manifest.version,
         agent.manifest.required_capabilities,
     );
-    enqueue(store, queue, &spec, OnPushFailure::End).map_err(|error| match error {
-        EnqueueError::Queue(error) | EnqueueError::Push(error) => error,
-        EnqueueError::Store(error) => error.to_string(),
+    enqueue(store, queue, &spec, OnPushFailure::LeaveToSweep).map_err(|error| match error {
+        EnqueueError::Queue(error) => FireError::NotStored(error),
+        EnqueueError::Push(error) => FireError::MaybeStored(error),
+        EnqueueError::Store(error) => FireError::MaybeStored(error.to_string()),
     })?;
+    let paused = triggers
+        .trigger(owner, id)
+        .map_err(|error| FireError::MaybeStored(error.to_string()))?
+        .is_some_and(|trigger| !trigger.enabled);
+    if paused {
+        store
+            .append_events(spec.run_id, vec![run_cancelled_event(&spec)])
+            .map_err(|error| FireError::MaybeStored(error.to_string()))?;
+        return Ok(Fired::Paused);
+    }
     Ok(Fired::Run(spec.run_id))
 }
 
@@ -99,16 +128,25 @@ fn run_of(
         .build()
 }
 
-/// A webhook trigger's secret (decision 73A): HMAC-SHA256 of its id and
-/// rotation under the server's webhook key, as lowercase hex. Never stored:
-/// shown once when made or rotated, and derived again to check a request.
-/// `None` for a schedule trigger.
+/// The shortest webhook key the server takes: every owner sees a message and
+/// its tag (their trigger's id and secret), so a short key could be found
+/// offline, and every trigger's secret with it.
+pub const MIN_WEBHOOK_KEY_BYTES: usize = 32;
+
+/// The most triggers one principal keeps.
+pub const MAX_TRIGGERS: usize = 100;
+
+/// A webhook trigger's secret (decision 73A): HMAC-SHA256, under the
+/// server's webhook key, of `gol-webhook-v1:<trigger id>:<rotation>`, as
+/// lowercase hex. Never stored: shown once when made or rotated, and derived
+/// again to check a request. `None` for a schedule trigger.
 pub fn webhook_secret(key: &[u8], trigger: &StoredTrigger) -> Option<String> {
     let TriggerKind::Webhook { rotation } = trigger.kind else {
         return None;
     };
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
-    let tag = ring::hmac::sign(&key, format!("{}:{rotation}", trigger.id).as_bytes());
+    let message = format!("gol-webhook-v1:{}:{rotation}", trigger.id);
+    let tag = ring::hmac::sign(&key, message.as_bytes());
     Some(
         tag.as_ref()
             .iter()
