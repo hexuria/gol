@@ -13,8 +13,9 @@ use harness::{
     JevDecider, Memory, RunMemory, StoreError,
 };
 use protocol::{
-    fold, AgentId, Capability, Event, EventPayload, ExecutionPlacement, FailureClass, Limits,
-    Owner, RunId, RunSpec, RunState, WorkModel,
+    fold, AgentId, Capability, DispatchPhase, Event, EventPayload, ExecutionPlacement,
+    FailureClass, HarnessState, Limits, Owner, RunId, RunSpec, RunState, Timestamp, WorkModel,
+    SESSION_ID,
 };
 use serde::{Deserialize, Serialize};
 
@@ -222,6 +223,9 @@ fn router_with_state(state: AppState) -> Router {
         .route("/v1/runs/{id}/ui", get(get_ui))
         .route("/v1/runs/{id}/stream", get(get_run_stream))
         .route("/v1/stream", get(get_stream))
+        .route("/v1/threads", post(create_thread).get(list_threads))
+        .route("/v1/threads/{id}/messages", post(follow_up))
+        .route("/v1/threads/{id}/board", get(get_board))
         .route("/v1/coworker/turns", post(create_coworker_turn))
         .route(
             "/v1/coworker/turns/{id}/completion",
@@ -304,13 +308,24 @@ async fn create_run(
 ) -> Result<Json<RunState>, ApiError> {
     // An unknown field (such as `capabilities`), a bad value or bad JSON is a
     // 400; any other rejection (content type, size) keeps its own status.
-    let Json(body) = body.map_err(|rejection| match rejection {
+    let Json(body) = body.map_err(body_rejection)?;
+    Ok(Json(start_run(&state, owner_of(&principal), body).await?))
+}
+
+/// A rejected JSON body: an unknown field, a bad value or bad JSON is a 400;
+/// any other rejection (content type, size) keeps its own status.
+fn body_rejection(rejection: JsonRejection) -> ApiError {
+    match rejection {
         JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_) => {
             ApiError::InvalidBody(rejection.body_text())
         }
         other => ApiError::Rejected(other),
-    })?;
-    let owner = owner_of(&principal);
+    }
+}
+
+/// Starts a run of one of `owner`'s agents, as `POST /v1/runs` does: queued
+/// when the server has a queue, else run to its end here.
+async fn start_run(state: &AppState, owner: Owner, body: RunBody) -> Result<RunState, ApiError> {
     let store = state.store.clone();
     let agent_id = body.agent_id;
     let agent = tokio::task::spawn_blocking(move || store.agent(agent_id))
@@ -365,7 +380,7 @@ async fn create_run(
         })
         .await
         .map_err(|error| ApiError::Decider(error.to_string()))??;
-        return Ok(Json(fold(&spec, &queued)));
+        return Ok(fold(&spec, &queued));
     }
 
     let jev_base_url = state.jev_base_url.clone();
@@ -407,7 +422,7 @@ async fn create_run(
         Ok(Err(RunStartError::Store(error))) => return Err(ApiError::from(error)),
         Err(error) => return Err(ApiError::Decider(error.to_string())),
     };
-    Ok(Json(fold(&stored.spec, &stored.events)))
+    Ok(fold(&stored.spec, &stored.events))
 }
 
 async fn create_coworker_turn(
@@ -643,6 +658,233 @@ async fn get_run_stream(
     let owner = owner_of(&principal);
     let slot = state.streams.take(&owner).ok_or(ApiError::TooManyStreams)?;
     Ok(run_stream(state.store.clone(), owner, id, resume, slot).into_response())
+}
+
+/// `POST /v1/threads`: starts a thread (Phase 3.3, decision 47A), the first
+/// coordinator run of the agent named, in a new session the server chooses.
+async fn create_thread(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+    body: Result<Json<RunBody>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Json(mut body) = body.map_err(body_rejection)?;
+    if body.metadata.contains_key(SESSION_ID) {
+        return Err(ApiError::BadRequest(
+            "a thread's session is the server's to choose",
+        ));
+    }
+    let thread_id = uuid::Uuid::new_v4().to_string();
+    body.metadata
+        .insert(SESSION_ID.to_string(), thread_id.clone());
+    let run = start_run(&state, owner_of(&principal), body).await?;
+    Ok(Json(
+        serde_json::json!({ "thread_id": thread_id, "run": run }),
+    ))
+}
+
+/// `POST /v1/threads/{id}/messages`: a follow-up, the next coordinator run
+/// of the thread's agent in its session, with the thread's placement, work
+/// model and limits unless the body gives limits.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FollowUpBody {
+    input: String,
+    limits: Option<Limits>,
+}
+
+/// The most runs a board reads for one thread.
+const BOARD_RUNS: usize = 1000;
+
+/// The most threads, or cards, in a page (decision 50A).
+const THREADS_PAGE_MAX: usize = 50;
+
+/// `owner`'s thread `id`'s runs, oldest first; none for a thread that is not
+/// the principal's, which is reported exactly like a missing one.
+async fn thread_runs(
+    state: &AppState,
+    owner: &Owner,
+    id: &str,
+) -> Result<Vec<StoredRun>, ApiError> {
+    let (store, owner, id) = (state.store.clone(), owner.clone(), id.to_string());
+    let runs = tokio::task::spawn_blocking(move || {
+        store
+            .threads()
+            .map(|threads| threads.runs_of_thread(&owner, &id, BOARD_RUNS))
+    })
+    .await
+    .map_err(|error| ApiError::Store(error.to_string()))?
+    .ok_or(ApiError::NotFound)?
+    .map_err(ApiError::from)?;
+    if runs.is_empty() {
+        return Err(ApiError::NotFound);
+    }
+    Ok(runs)
+}
+
+async fn follow_up(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Result<Json<FollowUpBody>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Json(body) = body.map_err(body_rejection)?;
+    let owner = owner_of(&principal);
+    let runs = thread_runs(&state, &owner, &id).await?;
+    // The coordinator: the thread's first run with no parent.
+    let root = runs
+        .iter()
+        .find(|run| run.spec.lineage.parent.is_none())
+        .unwrap_or(&runs[0]);
+    let run = start_run(
+        &state,
+        owner,
+        RunBody {
+            agent_id: root.spec.agent_id,
+            agent_version: root.spec.agent_version.clone(),
+            input: body.input,
+            placement: root.spec.placement,
+            work_model: root.spec.work_model.clone(),
+            limits: Some(body.limits.unwrap_or(root.spec.limits)),
+            metadata: root.spec.metadata.clone(),
+        },
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "thread_id": id, "run": run })))
+}
+
+/// A page of threads or cards: `after` of them seen, at most `limit`.
+#[derive(Debug, Deserialize)]
+struct PageQuery {
+    after: Option<usize>,
+    limit: Option<usize>,
+    state: Option<String>,
+}
+
+fn page_bounds(query: &PageQuery) -> Result<(usize, usize), ApiError> {
+    let limit = query.limit.unwrap_or(THREADS_PAGE_MAX);
+    if limit == 0 || limit > THREADS_PAGE_MAX {
+        return Err(ApiError::BadRequest("limit must be between 1 and 50"));
+    }
+    Ok((query.after.unwrap_or(0), limit))
+}
+
+/// `GET /v1/threads`: the caller's threads, newest first.
+async fn list_threads(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+    query: Result<Query<PageQuery>, QueryRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::BadRequest("after and limit must be counts"))?;
+    let (after, limit) = page_bounds(&query)?;
+    let (store, owner) = (state.store.clone(), owner_of(&principal));
+    let threads = tokio::task::spawn_blocking(move || {
+        store
+            .threads()
+            .map(|threads| threads.threads_of(&owner, after, limit))
+    })
+    .await
+    .map_err(|error| ApiError::Store(error.to_string()))?
+    .ok_or(ApiError::NotFound)?
+    .map_err(ApiError::from)?;
+    Ok(Json(serde_json::json!({
+        "threads": threads.iter().map(|thread| serde_json::json!({
+            "thread_id": thread.thread_id,
+            "agent_id": thread.agent_id,
+            "runs": thread.runs,
+            "started_at": Timestamp::unix_millis(thread.started_ms),
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+/// A card's state, from the fold of its run's log.
+fn card_state(state: &RunState) -> &'static str {
+    match &state.dispatch {
+        DispatchPhase::Created | DispatchPhase::Queued => "queued",
+        DispatchPhase::Completed { .. } => "completed",
+        DispatchPhase::Failed { .. } => "failed",
+        DispatchPhase::Cancelled => "cancelled",
+        DispatchPhase::Expired => "expired",
+        DispatchPhase::Waiting { .. }
+        | DispatchPhase::AwaitingApproval { .. }
+        | DispatchPhase::Paused => "waiting",
+        _ if matches!(state.harness, HarnessState::WaitingForMessage { .. }) => "waiting",
+        _ => "running",
+    }
+}
+
+const CARD_STATES: [&str; 7] = [
+    "queued",
+    "running",
+    "waiting",
+    "completed",
+    "failed",
+    "cancelled",
+    "expired",
+];
+
+/// One run's card on a board.
+fn card(run: &StoredRun) -> serde_json::Value {
+    let state = fold(&run.spec, &run.events);
+    let children: Vec<RunId> = run
+        .events
+        .iter()
+        .filter_map(|event| match event.payload {
+            EventPayload::ChildStarted { run_id, .. } => Some(run_id),
+            _ => None,
+        })
+        .collect();
+    let outcome = match &state.dispatch {
+        DispatchPhase::Completed { outcome } => Some(outcome.clone()),
+        _ => None,
+    };
+    serde_json::json!({
+        "run_id": run.spec.run_id,
+        "agent_id": run.spec.agent_id,
+        "parent": run.spec.lineage.parent,
+        "children": children,
+        "state": card_state(&state),
+        "outcome": outcome,
+        "steps": state.steps,
+        "model_calls": state.model_calls,
+        "started_at": run.events.first().map(|event| event.envelope.at),
+        "ended_at": run
+            .events
+            .iter()
+            .find(|event| is_terminal(&event.payload))
+            .map(|event| event.envelope.at),
+    })
+}
+
+/// `GET /v1/threads/{id}/board`: a card per run of the thread (every
+/// coordinator run and every task at any depth), oldest first, filtered by
+/// `?state=` and paged.
+async fn get_board(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    query: Result<Query<PageQuery>, QueryRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::BadRequest("after and limit must be counts"))?;
+    let (after, limit) = page_bounds(&query)?;
+    if let Some(wanted) = &query.state {
+        if !CARD_STATES.contains(&wanted.as_str()) {
+            return Err(ApiError::BadRequest("state is not a card state"));
+        }
+    }
+    let runs = thread_runs(&state, &owner_of(&principal), &id).await?;
+    let cards: Vec<serde_json::Value> = runs
+        .iter()
+        .map(card)
+        .filter(|card| {
+            query
+                .state
+                .as_deref()
+                .is_none_or(|wanted| card["state"] == wanted)
+        })
+        .skip(after)
+        .take(limit)
+        .collect();
+    Ok(Json(serde_json::json!({ "cards": cards })))
 }
 
 async fn get_ag_ui(
