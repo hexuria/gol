@@ -697,6 +697,8 @@ fn append_completion(spec: &RunSpec, events: &mut Vec<Event>, text: &str) {
                 role: MessageRole::Assistant,
                 text: text.to_string(),
             },
+            // A coworker turn's completion arrives as text alone.
+            usage: None,
         },
     );
     push(

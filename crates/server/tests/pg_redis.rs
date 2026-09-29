@@ -277,6 +277,7 @@ fn completion_pair(spec: &RunSpec, text: &str, at: i64) -> (Event, Event) {
                     role: MessageRole::Assistant,
                     text: text.to_string(),
                 },
+                usage: None,
             },
         ),
         record(

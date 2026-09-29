@@ -214,6 +214,7 @@ fn payloads(max_steps: u32) -> Vec<EventPayload> {
                 role: MessageRole::Assistant,
                 text: "t".to_string(),
             },
+            usage: None,
         },
         EventPayload::MemoryRead {
             scope: MemoryScope::Run,

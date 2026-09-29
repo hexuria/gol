@@ -16,7 +16,7 @@ The coworker desktop picks the computer and the credential. Subscription model H
 | --- | --- |
 | `protocol` | Ids, `RunSpec`, effects, events, `HarnessState`, `DispatchPhase`, `fold`, `reduce`, the authorizer |
 | `harness` | `Decider`, the driver, the echo tool, in-memory `Memory` |
-| `gateway` | `ModelGateway` and the OpenAI chat-completion adapter |
+| `gateway` | `ModelGateway` for OpenAI, Anthropic, Gemini and System One: the platform's key per provider, a whole-call timeout, and the tokens each call used |
 | `server` | Axum routes and `RunStore`. Gateway mode is the only path that posts to the fixture proxy. |
 | `proxy` | Local fixture stand-in for Claude, Codex, Grok, and the platform gateway. No vendor HTTP. |
 
