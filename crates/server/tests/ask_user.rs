@@ -161,7 +161,8 @@ async fn a_reply_resumes_it() {
         let agent = server.agent(&user, "planner", &["user.ask"]).await;
         let (thread, run) = server.start(&user, agent, "plan a trip").await;
         assert!(server.work().await.is_some());
-        let (status, body) = reply(&server, &user, &run, "SFO").await;
+        // Stored trimmed, as a thread message's answer is.
+        let (status, body) = reply(&server, &user, &run, "  SFO \n").await;
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["answered"], json!(run));
         assert_eq!(answers(&store, &run).await, ["SFO"]);
@@ -224,7 +225,8 @@ async fn an_ambiguous_answer_asks_which_task() {
         // A label that does not wait is refused while one does.
         let (status, body) = say(&server, &user, &thread, "T2: again").await;
         assert_eq!(status, 409, "{body}");
-        let (status, body) = say(&server, &user, &thread, "LAX").await;
+        // A bare answer is trimmed, as a labelled one is.
+        let (status, body) = say(&server, &user, &thread, "  LAX \n").await;
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["answered"], json!({"label": "T1", "run_id": first}));
         assert_eq!(answers(&store, &first).await, ["LAX"]);

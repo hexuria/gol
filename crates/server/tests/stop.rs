@@ -850,3 +850,223 @@ fn a_stop_covers_a_child_an_older_server_stored() {
         .expect("stop");
     assert_eq!(stops.stopped(child.run_id), Ok(true));
 }
+
+// Runs an older server stored have no owner, thread or parent columns until
+// the next connect fills them (51A). Every stop scope still reads them,
+// through their spec, so the stop cancels them at once rather than leaving
+// them to a worker's claim. Postgres only.
+#[test]
+fn every_stop_reads_the_runs_an_older_server_stored() {
+    let store = common::queued::POSTGRES
+        .get_or_init(|| {
+            Arc::new(server::PostgresStore::connect(common::queued::POSTGRES_URL).expect("connect"))
+                as Store
+        })
+        .clone();
+    // This binary's other Postgres store connects now, not while the
+    // older server's rows below must stay unfilled.
+    drop(stores_with_messages());
+    let owner = Owner::new(common::ISSUER, fresh_user(), "tenant-1");
+    let thread = format!("old-{}", RunId::new());
+    let other_thread = format!("old-{}", RunId::new());
+    let bob = Owner::new(common::ISSUER, fresh_user(), "tenant-1");
+    let spec_of = |owner: &Owner, thread: &str, parent: Option<&RunSpec>| {
+        let builder = RunSpec::builder()
+            .owner(owner.clone())
+            .agent(AgentId::new(), "1")
+            .input("x")
+            .placement(protocol::ExecutionPlacement::Local)
+            .work_model(protocol::WorkModel {
+                provider: protocol::ModelProvider::OpenAI,
+                model_name: "gpt-test".to_string(),
+                credential: protocol::CredentialSource::PlatformGateway,
+            })
+            .metadata(
+                [(protocol::SESSION_ID.to_string(), thread.to_string())]
+                    .into_iter()
+                    .collect(),
+            );
+        match parent {
+            Some(parent) => builder.child_of(parent, 1).build(),
+            None => builder.build(),
+        }
+    };
+    let spec = |parent: Option<&RunSpec>| spec_of(&owner, &thread, parent);
+    // A parent this server stored, its child and a root an older one did;
+    // in another thread an older server's root and its child; and another
+    // principal's run in the first thread, which no stop of this one reads.
+    let parent = spec(None);
+    let child = spec(Some(&parent));
+    let root = spec(None);
+    let old_root = spec_of(&owner, &other_thread, None);
+    let old_child = spec_of(&owner, &other_thread, Some(&old_root));
+    let bobs = spec_of(&bob, &thread, None);
+    assert_eq!(
+        store.put_run(StoredRun {
+            events: server::queued_events(&parent),
+            spec: parent.clone(),
+        }),
+        Ok(PutRun::Stored)
+    );
+    let mut admin =
+        postgres::Client::connect(common::queued::POSTGRES_URL, postgres::NoTls).expect("admin");
+    for old in [&child, &root, &old_root, &old_child, &bobs] {
+        admin
+            .execute(
+                "insert into runs (id, spec) values ($1, $2)",
+                &[
+                    &old.run_id.as_uuid(),
+                    &serde_json::to_value(old).expect("spec"),
+                ],
+            )
+            .expect("an older server's insert");
+    }
+    let stops = store.stops().expect("stops");
+    let read = |scope: StopScope| {
+        let mut ids: Vec<RunId> = stops
+            .open_runs_under(&owner, &scope)
+            .expect("read")
+            .iter()
+            .map(|run| run.spec.run_id)
+            .collect();
+        ids.sort_by_key(|id| id.as_uuid());
+        ids
+    };
+    let sorted = |mut ids: Vec<RunId>| {
+        ids.sort_by_key(|id| id.as_uuid());
+        ids
+    };
+    assert_eq!(
+        read(StopScope::Run(parent.run_id)),
+        sorted(vec![parent.run_id, child.run_id])
+    );
+    assert_eq!(
+        read(StopScope::Thread(thread.clone())),
+        sorted(vec![parent.run_id, child.run_id, root.run_id])
+    );
+    assert_eq!(
+        read(StopScope::Owner),
+        sorted(vec![
+            parent.run_id,
+            child.run_id,
+            root.run_id,
+            old_root.run_id,
+            old_child.run_id
+        ])
+    );
+    // A run stop from an older server's root reaches its child.
+    assert_eq!(
+        read(StopScope::Run(old_root.run_id)),
+        sorted(vec![old_root.run_id, old_child.run_id])
+    );
+    // Its root is not a thread root a follow-up could start from: a
+    // follow-up reads only filled rows (the stop button's own fallback is
+    // tested over HTTP below).
+    let found = store
+        .threads()
+        .expect("threads")
+        .thread_root(&owner, &other_thread)
+        .expect("root");
+    assert_eq!(found, None);
+    // A thread stop covers the older server's root, through its session.
+    assert_eq!(stops.stopped(root.run_id), Ok(false));
+    stops
+        .put_stop(&owner, &StopScope::Thread(thread.clone()))
+        .expect("stop");
+    assert_eq!(stops.stopped(root.run_id), Ok(true));
+    // The older server's rows stayed unfilled throughout, so the spec
+    // branches, not the columns, answered: a connect elsewhere in this
+    // binary (51A) could have filled them.
+    let olds: Vec<uuid::Uuid> = [&child, &root, &old_root, &old_child, &bobs]
+        .iter()
+        .map(|old| old.run_id.as_uuid())
+        .collect();
+    let unfilled: i64 = admin
+        .query_one(
+            "select count(*) from runs where id = any($1) and owner_issuer is null",
+            &[&olds],
+        )
+        .expect("count")
+        .get(0);
+    assert_eq!(unfilled, 5, "a connect filled the rows mid-test");
+}
+
+// A thread an older server started, before its columns are filled: its stop
+// button finds it through its open runs and cancels them, and a message to
+// it is 404, not a second coordinator beside a run it cannot see. Postgres
+// only.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thread_an_older_server_started_can_be_stopped_not_followed_up() {
+    // This binary's Postgres stores connect now, not while the row below
+    // must stay unfilled.
+    drop(blocking(stores_with_messages).await);
+    let store = stores().pop().expect("postgres");
+    let jev = jev(&["complete"]).await;
+    let server = serve(store.clone(), &jev, 14).await;
+    let user = fresh_user();
+    let owner = Owner::new(common::ISSUER, user.clone(), "tenant-1");
+    let thread = format!("old-{}", RunId::new());
+    let root = RunSpec::builder()
+        .owner(owner)
+        .agent(AgentId::new(), "1")
+        .input("x")
+        .placement(protocol::ExecutionPlacement::Local)
+        .work_model(protocol::WorkModel {
+            provider: protocol::ModelProvider::OpenAI,
+            model_name: "gpt-test".to_string(),
+            credential: protocol::CredentialSource::PlatformGateway,
+        })
+        .metadata(
+            [(protocol::SESSION_ID.to_string(), thread.clone())]
+                .into_iter()
+                .collect(),
+        )
+        .build();
+    let (id, spec) = (root.run_id, serde_json::to_value(&root).expect("spec"));
+    // Each admin connection lives and drops inside its blocking call: the
+    // Postgres client cannot be dropped on a Tokio worker.
+    let admin =
+        || postgres::Client::connect(common::queued::POSTGRES_URL, postgres::NoTls).expect("admin");
+    blocking(move || {
+        admin()
+            .execute(
+                "insert into runs (id, spec) values ($1, $2)",
+                &[&id.as_uuid(), &spec],
+            )
+            .expect("an older server's insert");
+    })
+    .await;
+    let (status, body) = server
+        .post(
+            &format!("/v1/threads/{thread}/messages"),
+            &user,
+            json!({"input": "more"}),
+        )
+        .await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = server
+        .post(&format!("/v1/threads/{thread}/stop"), &user, json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["cancelled"], json!([id]));
+    // Another principal's stop of that thread finds nothing of theirs.
+    let (status, _) = server
+        .post(
+            &format!("/v1/threads/{thread}/stop"),
+            &fresh_user(),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 404);
+    let unfilled: i64 = blocking(move || {
+        admin()
+            .query_one(
+                "select count(*) from runs where id = $1 and owner_issuer is null",
+                &[&id.as_uuid()],
+            )
+            .expect("count")
+            .get(0)
+    })
+    .await;
+    assert_eq!(unfilled, 1, "a connect filled the row mid-test");
+}
