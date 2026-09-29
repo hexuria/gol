@@ -2,6 +2,7 @@
 //! (Ed25519, ES256) or read from the committed test-only RSA fixture.
 #![allow(dead_code)]
 
+pub mod queued;
 pub mod redis_proxy;
 
 use std::sync::{Arc, OnceLock};

@@ -12,8 +12,8 @@ use harness::StoreError;
 use crate::store::{
     check_one_terminal, created_ms, is_terminal, principal_hint_of, thread_of, Append, Hint,
     HintStream, Hints, MessageStore, OutboxEntry, OutboxPage, OutboxStore, PutAgent, PutMessage,
-    PutRun, RunStore, StoredAgent, StoredArtifact, StoredMessage, StoredRun, ThreadStore,
-    ThreadSummary, ALL,
+    PutRun, RunStore, StopScope, StopStore, StoredAgent, StoredArtifact, StoredMessage, StoredRun,
+    ThreadStore, ThreadSummary, ALL,
 };
 
 /// The run store in Postgres over a pool of connections (C2, owner decision
@@ -181,6 +181,16 @@ create table if not exists outbox (
     primary key (owner_issuer, owner_subject, seq)
 );
 
+-- Stop requests (Phase 3.4): a principal's stop of a run, a thread, or all
+-- of its runs, and when it was made.
+create table if not exists stops (
+    owner_issuer text not null,
+    owner_subject text not null,
+    kind text not null,
+    key text not null,
+    requested_ms bigint not null
+);
+
 create table if not exists messages (
     id uuid primary key,
     from_run uuid not null,
@@ -203,7 +213,18 @@ create table if not exists artifacts (
 
 /// Indexes created once, each as (table, name, statement): an existing one
 /// is found in the catalog, not by `create index if not exists`.
-const INDEXES: [(&str, &str, &str); 5] = [
+const INDEXES: [(&str, &str, &str); 7] = [
+    // A stop check reads a principal's stops, and walks runs by parent.
+    (
+        "stops",
+        "stops_by_owner",
+        "create index stops_by_owner on stops (owner_issuer, owner_subject)",
+    ),
+    (
+        "runs",
+        "runs_by_parent",
+        "create index runs_by_parent on runs (parent_run)",
+    ),
     // A principal's threads, and a thread's runs in order.
     (
         "runs",
@@ -585,27 +606,7 @@ impl ThreadStore for PostgresStore {
             tx.commit().map_err(sql)?;
             Ok((specs, events))
         })?;
-        let mut by_run: std::collections::HashMap<uuid::Uuid, Vec<Event>> =
-            std::collections::HashMap::new();
-        for row in &events {
-            let id: uuid::Uuid = row.try_get(0).map_err(sql)?;
-            let body: serde_json::Value = row.try_get(1).map_err(sql)?;
-            by_run
-                .entry(id)
-                .or_default()
-                .push(serde_json::from_value(body).map_err(json)?);
-        }
-        specs
-            .iter()
-            .map(|row| {
-                let id: uuid::Uuid = row.try_get(0).map_err(sql)?;
-                let spec: serde_json::Value = row.try_get(1).map_err(sql)?;
-                Ok(StoredRun {
-                    spec: serde_json::from_value(spec).map_err(json)?,
-                    events: by_run.remove(&id).unwrap_or_default(),
-                })
-            })
-            .collect()
+        runs_with_events(&specs, &events)
     }
 
     fn thread_root(&self, owner: &Owner, thread: &str) -> Result<Option<RunSpec>, StoreError> {
@@ -627,6 +628,141 @@ impl ThreadStore for PostgresStore {
         })
         .transpose()
     }
+}
+
+impl StopStore for PostgresStore {
+    fn put_stop(&self, owner: &Owner, scope: &StopScope, at: Timestamp) -> Result<(), StoreError> {
+        let (kind, key) = scope.kind_and_key();
+        self.with_client(|client| {
+            client
+                .execute(
+                    "insert into stops (owner_issuer, owner_subject, kind, key, requested_ms)
+                     values ($1, $2, $3, $4, $5)",
+                    &[
+                        &owner.issuer,
+                        &owner.subject,
+                        &kind,
+                        &key,
+                        &at.as_unix_millis(),
+                    ],
+                )
+                .map(|_| ())
+                .map_err(sql)
+        })
+    }
+
+    /// One statement: the run and each run above it, up `parent_run`, each
+    /// against its principal's stops.
+    fn stopped(&self, run: RunId) -> Result<bool, StoreError> {
+        let run = run.as_uuid();
+        self.with_client(|client| {
+            client
+                .query_one(
+                    "with recursive chain as (
+                         select id, parent_run, thread_id, created_ms,
+                                coalesce(owner_issuer, spec->'owner'->>'issuer') as issuer,
+                                coalesce(owner_subject, spec->'owner'->>'subject') as subject
+                         from runs where id = $1
+                         union all
+                         select runs.id, runs.parent_run, runs.thread_id, runs.created_ms,
+                                coalesce(runs.owner_issuer, runs.spec->'owner'->>'issuer'),
+                                coalesce(runs.owner_subject, runs.spec->'owner'->>'subject')
+                         from runs join chain on runs.id = chain.parent_run
+                     )
+                     select exists (
+                         select 1 from chain join stops
+                           on stops.owner_issuer = chain.issuer
+                          and stops.owner_subject = chain.subject
+                         where stops.requested_ms >= coalesce(chain.created_ms, 0)
+                           and ((stops.kind = 'run' and stops.key = chain.id::text)
+                                or (stops.kind = 'thread' and stops.key = chain.thread_id)
+                                or stops.kind = 'owner'))",
+                    &[&run],
+                )
+                .and_then(|row| row.try_get(0))
+                .map_err(sql)
+        })
+    }
+
+    /// One snapshot: the covered runs that have not ended, then their events.
+    fn open_runs_under(
+        &self,
+        owner: &Owner,
+        scope: &StopScope,
+    ) -> Result<Vec<StoredRun>, StoreError> {
+        let (kind, key) = scope.kind_and_key();
+        let (specs, events) = self.with_client(|client| {
+            let mut tx = client
+                .build_transaction()
+                .read_only(true)
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()
+                .map_err(sql)?;
+            let specs = tx
+                .query(
+                    "with recursive tree as (
+                         select id from runs
+                         where $3 = 'run' and id::text = $4
+                           and owner_issuer = $1 and owner_subject = $2
+                         union all
+                         select runs.id from runs join tree on runs.parent_run = tree.id
+                     )
+                     select runs.id, runs.spec from runs
+                     where owner_issuer = $1 and owner_subject = $2
+                       and (($3 = 'run' and runs.id in (select id from tree))
+                            or ($3 = 'thread' and thread_id = $4)
+                            or $3 = 'owner')
+                       and not exists (
+                           select 1 from run_events
+                           where run_events.run_id = runs.id and run_events.terminal)",
+                    &[&owner.issuer, &owner.subject, &kind, &key],
+                )
+                .map_err(sql)?;
+            let ids: Vec<uuid::Uuid> = specs
+                .iter()
+                .map(|row| row.try_get(0))
+                .collect::<Result<_, _>>()
+                .map_err(sql)?;
+            let events = tx
+                .query(
+                    "select run_id, body from run_events where run_id = any($1) order by run_id, seq",
+                    &[&ids],
+                )
+                .map_err(sql)?;
+            tx.commit().map_err(sql)?;
+            Ok((specs, events))
+        })?;
+        runs_with_events(&specs, &events)
+    }
+}
+
+/// Stored runs from `specs` rows (id, spec), in their order, with their
+/// events from `events` rows (run_id, body), in each run's order.
+fn runs_with_events(
+    specs: &[postgres::Row],
+    events: &[postgres::Row],
+) -> Result<Vec<StoredRun>, StoreError> {
+    let mut by_run: std::collections::HashMap<uuid::Uuid, Vec<Event>> =
+        std::collections::HashMap::new();
+    for row in events {
+        let id: uuid::Uuid = row.try_get(0).map_err(sql)?;
+        let body: serde_json::Value = row.try_get(1).map_err(sql)?;
+        by_run
+            .entry(id)
+            .or_default()
+            .push(serde_json::from_value(body).map_err(json)?);
+    }
+    specs
+        .iter()
+        .map(|row| {
+            let id: uuid::Uuid = row.try_get(0).map_err(sql)?;
+            let spec: serde_json::Value = row.try_get(1).map_err(sql)?;
+            Ok(StoredRun {
+                spec: serde_json::from_value(spec).map_err(json)?,
+                events: by_run.remove(&id).unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 impl OutboxStore for PostgresStore {
@@ -1084,6 +1220,10 @@ impl RunStore for PostgresStore {
     }
 
     fn threads(&self) -> Option<&dyn ThreadStore> {
+        Some(self)
+    }
+
+    fn stops(&self) -> Option<&dyn StopStore> {
         Some(self)
     }
 }

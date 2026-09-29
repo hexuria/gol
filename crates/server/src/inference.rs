@@ -680,6 +680,14 @@ pub(crate) fn dispatch_events(spec: &RunSpec) -> Vec<Event> {
 
 /// The terminal event for a run the server could not finish. Appending it ends
 /// the run, so a failure never leaves the run open.
+/// The event that ends a stopped run (Phase 3.4).
+pub fn run_cancelled_event(spec: &RunSpec) -> Event {
+    Event::record(
+        EventSource::for_spec(spec, Actor::System, Timestamp::now()),
+        EventPayload::RunCancelled,
+    )
+}
+
 pub fn run_failed_event(spec: &RunSpec, class: FailureClass, message: String) -> Event {
     Event::record(
         EventSource::for_spec(spec, Actor::System, Timestamp::now()),
