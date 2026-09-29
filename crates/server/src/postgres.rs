@@ -639,19 +639,10 @@ impl ThreadStore for PostgresStore {
         let row = self.with_client(|client| {
             client
                 .query_opt(
-                    "select spec, created_ms, id from runs
+                    "select spec from runs
                      where owner_issuer = $1 and owner_subject = $2 and thread_id = $3
                        and parent_run is null
-                     union all
-                     -- A root an older server stored, before its columns
-                     -- are filled (51A): by its spec, after any filled one.
-                     select spec, created_ms, id from runs
-                     where owner_issuer is null
-                       and spec->'owner'->>'issuer' = $1
-                       and spec->'owner'->>'subject' = $2
-                       and spec->'metadata'->>'session_id' = $3
-                       and spec->'lineage'->>'parent' is null
-                     order by created_ms nulls last, id
+                     order by created_ms, id
                      limit 1",
                     &[&owner.issuer, &owner.subject, &thread],
                 )

@@ -828,18 +828,16 @@ async fn answer_question(
     text: &str,
     asked: Option<MessageId>,
 ) -> Result<(), ApiError> {
-    if text.trim().is_empty() {
+    // Checked and stored trimmed, however it came: a reply or a thread
+    // message.
+    let text = text.trim();
+    if text.is_empty() {
         return Err(ApiError::BadRequest("the answer is empty"));
     }
     if text.len() > MAX_MESSAGE_BYTES {
         return Err(ApiError::TooLarge("the answer is too long"));
     }
-    // Stored trimmed, however it came: a reply or a thread message.
-    let (store, queue, text) = (
-        state.store.clone(),
-        state.queue.clone(),
-        text.trim().to_string(),
-    );
+    let (store, queue, text) = (state.store.clone(), state.queue.clone(), text.to_string());
     tokio::task::spawn_blocking(move || {
         // The question answered: the one the caller saw, else the one first
         // read. A task that went on to another question is not answered
@@ -1204,19 +1202,32 @@ async fn stop_thread(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let owner = owner_of(&principal);
     let (store, thread_owner, thread) = (state.store.clone(), owner.clone(), id.clone());
+    // The thread is the principal's if its root is, or, while an older
+    // server's rows wait for their columns (51A), if it has open runs a
+    // thread stop reads through their spec. A follow-up reads only filled
+    // rows, so `thread_root` stays that way.
     let found = tokio::task::spawn_blocking(move || {
-        store
-            .threads()
-            .map(|threads| threads.thread_root(&thread_owner, &thread))
-            .transpose()
+        let Some(threads) = store.threads() else {
+            return Ok(None);
+        };
+        if threads.thread_root(&thread_owner, &thread)?.is_some() {
+            return Ok(Some(true));
+        }
+        let open = match store.stops() {
+            Some(stops) => !stops
+                .open_runs_under(&thread_owner, &StopScope::Thread(thread))?
+                .is_empty(),
+            None => false,
+        };
+        Ok::<_, StoreError>(Some(open))
     })
     .await
     .map_err(|error| ApiError::Store(error.to_string()))?
     .map_err(ApiError::from)?;
     match found {
         None => return Err(ApiError::NoThreads),
-        Some(None) => return Err(ApiError::ThreadNotFound),
-        Some(Some(_)) => {}
+        Some(false) => return Err(ApiError::ThreadNotFound),
+        Some(true) => {}
     }
     stop(&state, owner, StopScope::Thread(id)).await
 }

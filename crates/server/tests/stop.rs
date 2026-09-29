@@ -959,15 +959,15 @@ fn every_stop_reads_the_runs_an_older_server_stored() {
         read(StopScope::Run(old_root.run_id)),
         sorted(vec![old_root.run_id, old_child.run_id])
     );
-    // A thread whose root an older server stored is found, so its stop
-    // button is not 404.
+    // Its root is not a thread root a follow-up could start from: a
+    // follow-up reads only filled rows (the stop button's own fallback is
+    // tested over HTTP below).
     let found = store
         .threads()
         .expect("threads")
         .thread_root(&owner, &other_thread)
-        .expect("root")
-        .map(|spec| spec.run_id);
-    assert_eq!(found, Some(old_root.run_id));
+        .expect("root");
+    assert_eq!(found, None);
     // A thread stop covers the older server's root, through its session.
     assert_eq!(stops.stopped(root.run_id), Ok(false));
     stops
@@ -989,4 +989,84 @@ fn every_stop_reads_the_runs_an_older_server_stored() {
         .expect("count")
         .get(0);
     assert_eq!(unfilled, 5, "a connect filled the rows mid-test");
+}
+
+// A thread an older server started, before its columns are filled: its stop
+// button finds it through its open runs and cancels them, and a message to
+// it is 404, not a second coordinator beside a run it cannot see. Postgres
+// only.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thread_an_older_server_started_can_be_stopped_not_followed_up() {
+    // This binary's Postgres stores connect now, not while the row below
+    // must stay unfilled.
+    drop(blocking(stores_with_messages).await);
+    let store = stores().pop().expect("postgres");
+    let jev = jev(&["complete"]).await;
+    let server = serve(store.clone(), &jev, 14).await;
+    let user = fresh_user();
+    let owner = Owner::new(common::ISSUER, user.clone(), "tenant-1");
+    let thread = format!("old-{}", RunId::new());
+    let root = RunSpec::builder()
+        .owner(owner)
+        .agent(AgentId::new(), "1")
+        .input("x")
+        .placement(protocol::ExecutionPlacement::Local)
+        .work_model(protocol::WorkModel {
+            provider: protocol::ModelProvider::OpenAI,
+            model_name: "gpt-test".to_string(),
+            credential: protocol::CredentialSource::PlatformGateway,
+        })
+        .metadata(
+            [(protocol::SESSION_ID.to_string(), thread.clone())]
+                .into_iter()
+                .collect(),
+        )
+        .build();
+    let (id, spec) = (root.run_id, serde_json::to_value(&root).expect("spec"));
+    // Each admin connection lives and drops inside its blocking call: the
+    // Postgres client cannot be dropped on a Tokio worker.
+    let admin =
+        || postgres::Client::connect(common::queued::POSTGRES_URL, postgres::NoTls).expect("admin");
+    blocking(move || {
+        admin()
+            .execute(
+                "insert into runs (id, spec) values ($1, $2)",
+                &[&id.as_uuid(), &spec],
+            )
+            .expect("an older server's insert");
+    })
+    .await;
+    let (status, body) = server
+        .post(
+            &format!("/v1/threads/{thread}/messages"),
+            &user,
+            json!({"input": "more"}),
+        )
+        .await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = server
+        .post(&format!("/v1/threads/{thread}/stop"), &user, json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["cancelled"], json!([id]));
+    // Another principal's stop of that thread finds nothing of theirs.
+    let (status, _) = server
+        .post(
+            &format!("/v1/threads/{thread}/stop"),
+            &fresh_user(),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 404);
+    let unfilled: i64 = blocking(move || {
+        admin()
+            .query_one(
+                "select count(*) from runs where id = $1 and owner_issuer is null",
+                &[&id.as_uuid()],
+            )
+            .expect("count")
+            .get(0)
+    })
+    .await;
+    assert_eq!(unfilled, 1, "a connect filled the row mid-test");
 }
