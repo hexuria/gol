@@ -22,12 +22,12 @@ url = "2.5"
 r2d2 = "0.8"
 memory = { path = "../memory" }
 tokio-stream = "0.1"
+ring = "0.17"
 
 [dev-dependencies]
 jsonwebtoken = { version = "9.3.1", features = ["use_pem"] }
 base64 = "0.22"
 proxy = { path = "../proxy" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-ring = "0.17"
 wiremock = "0.6"
 proptest = "1.6"

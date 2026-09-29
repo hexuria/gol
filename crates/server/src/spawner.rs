@@ -7,9 +7,9 @@ use std::sync::Arc;
 use harness::{AgentSpawner, ChildRequest, StartedChild, StoreError};
 use protocol::{FailureClass, RunId, RunSpec, SESSION_ID};
 
-use crate::inference::{queued_events, run_failed_event};
+use crate::inference::{queued_events, run_cancelled_event, run_failed_event};
 use crate::queue::RedisRunQueue;
-use crate::store::{is_terminal, PutRun, RunStore, StoredRun};
+use crate::store::{is_terminal, Append, PutRun, RunStore, StoredRun};
 
 /// Why `enqueue` did not queue a run.
 #[derive(Debug)]
@@ -20,6 +20,9 @@ pub(crate) enum EnqueueError {
     Store(StoreError),
     /// The run is stored but the push failed; the run was ended.
     Push(String),
+    /// The run is stored and was held, but could not be cancelled: it is
+    /// open, never pushed, and off the pending set unless that failed too.
+    Held(String),
 }
 
 /// What `enqueue` does when the push fails after the store.
@@ -44,6 +47,34 @@ pub(crate) fn enqueue(
     spec: &RunSpec,
     on_push_failure: OnPushFailure,
 ) -> Result<PutRun, EnqueueError> {
+    match enqueue_unless(store, queue, spec, on_push_failure, &|| false)? {
+        Gated::Queued(put) => Ok(put),
+        Gated::Held => unreachable!("an open gate holds nothing"),
+    }
+}
+
+/// What `enqueue_unless` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Gated {
+    /// Queued, as `enqueue` does.
+    Queued(PutRun),
+    /// Stored, then held: cancelled before any worker could see it, and
+    /// never pushed.
+    Held,
+}
+
+/// `enqueue`, with `hold` asked once the run is stored and before it is
+/// pushed: a run it holds is cancelled and not pushed, so no worker ever
+/// claims it (a fire whose trigger a stop paused meanwhile, Phase 4.1). A
+/// held run whose cancel fails is taken off the pending set, so the sweep
+/// does not push it either, and the error names it.
+pub(crate) fn enqueue_unless(
+    store: &dyn RunStore,
+    queue: &RedisRunQueue,
+    spec: &RunSpec,
+    on_push_failure: OnPushFailure,
+    hold: &dyn Fn() -> bool,
+) -> Result<Gated, EnqueueError> {
     let run_id = spec.run_id;
     queue.pend(run_id).map_err(EnqueueError::Queue)?;
     let put = match store.put_run(StoredRun {
@@ -59,6 +90,20 @@ pub(crate) fn enqueue(
             return Err(EnqueueError::Store(error));
         }
     };
+    if put == PutRun::Stored && hold() {
+        return match store.append_events(run_id, vec![run_cancelled_event(spec)]) {
+            Ok(Append::Appended | Append::Terminal) => Ok(Gated::Held),
+            Ok(Append::Missing | Append::Moved) => Err(EnqueueError::Held(
+                "a held run was not stored to cancel".to_string(),
+            )),
+            Err(error) => {
+                if let Err(unpend) = queue.unpend(run_id) {
+                    eprintln!("gol: held run {run_id} stays pending: {unpend}");
+                }
+                Err(EnqueueError::Held(error.to_string()))
+            }
+        };
+    }
     if put == PutRun::Stored {
         if let Err(error) = queue.push(run_id) {
             match on_push_failure {
@@ -74,7 +119,7 @@ pub(crate) fn enqueue(
             }
         }
     }
-    Ok(put)
+    Ok(Gated::Queued(put))
 }
 
 /// After an `enqueue` found `spec`'s run already stored, and put it on the
@@ -252,6 +297,7 @@ impl OwnedSpawner {
                     EnqueueError::Queue(_) => "queue unavailable",
                     EnqueueError::Store(_) => "store unavailable",
                     EnqueueError::Push(_) => "queue push failed",
+                    EnqueueError::Held(_) => "held",
                 }
                 .to_string())
             }

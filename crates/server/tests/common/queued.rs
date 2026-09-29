@@ -7,7 +7,7 @@ use harness::InMemory;
 use protocol::{AgentId, Capability, RunId};
 use serde_json::{json, Value};
 use server::{
-    router_with_queue, AgentManifest, GatewayPoster, InMemoryStore, MessageStore, PostgresStore,
+    router_with_webhooks, AgentManifest, GatewayPoster, InMemoryStore, MessageStore, PostgresStore,
     RedisRunQueue, RunStore, SandboxHost, StoredAgent, Worker,
 };
 use wiremock::matchers::{method, path};
@@ -107,11 +107,22 @@ pub struct Server {
 }
 
 pub async fn serve(store: Store, jev: &MockServer, db: u8) -> Server {
+    serve_with_webhooks(store, jev, db, None).await
+}
+
+/// `serve`, with `webhook_key` for webhook triggers' secrets (Phase 4.1).
+pub async fn serve_with_webhooks(
+    store: Store,
+    jev: &MockServer,
+    db: u8,
+    webhook_key: Option<Vec<u8>>,
+) -> Server {
     let url = blocking(move || redis_url(db)).await;
-    let app = router_with_queue(
+    let app = router_with_webhooks(
         store.clone(),
         jev.uri(),
         Some(url.clone()),
+        webhook_key,
         super::authenticator(),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

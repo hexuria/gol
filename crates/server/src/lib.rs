@@ -13,6 +13,7 @@ mod store;
 mod stores;
 mod stream;
 mod surface;
+mod triggers;
 mod worker;
 
 pub use auth::{
@@ -22,6 +23,7 @@ pub use auth::{
 pub use deliverer::{OwnedDeliverer, OwnedDelivererBuilder};
 pub use http::{
     router, router_with_gateway, router_with_memory, router_with_queue, router_with_sandbox,
+    router_with_webhooks,
 };
 pub use inference::{
     accept_subscription_completion, box_container_name, box_workspace_volume, computer_plan,
@@ -35,12 +37,17 @@ pub use postgres::{PoolOptions, PostgresStore};
 pub use queue::{QueueTiming, RedisRunQueue};
 pub use spawner::OwnedSpawner;
 pub use store::{
-    is_terminal, thread_of, AgentManifest, Append, InMemoryStore, MessageStore, OutboxEntry,
-    OutboxStore, PutAgent, PutMessage, PutRun, RunStore, StopScope, StopStore, StoredAgent,
-    StoredArtifact, StoredMessage, StoredRun, ThreadStore, ThreadSummary,
+    is_terminal, thread_of, AgentManifest, Append, InMemoryStore, MessageStore, Missed,
+    OutboxEntry, OutboxStore, PutAgent, PutMessage, PutRun, RunStore, StopScope, StopStore,
+    StoredAgent, StoredArtifact, StoredMessage, StoredRun, StoredTrigger, ThreadStore,
+    ThreadSummary, TriggerId, TriggerKind, TriggerStore,
 };
 pub use stores::{stores_from_env, Stores};
 pub use surface::{ag_ui_events, json_render_spec};
+pub use triggers::{
+    fire_trigger, trigger_thread, webhook_secret, FireError, Fired, MAX_TRIGGERS,
+    MIN_WEBHOOK_KEY_BYTES, TRIGGER_KEY,
+};
 pub use worker::{
     queue_from_env, reap_forever, start_queue, sweep, sweep_asks, Claim, Done, Executed, Open,
     Prepared, QueueSettings, Worker, WorkerBuilder,
