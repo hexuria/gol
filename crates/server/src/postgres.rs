@@ -1,4 +1,6 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
+
+use postgres::fallible_iterator::FallibleIterator;
 use std::time::Duration;
 
 use postgres::{IsolationLevel, NoTls};
@@ -8,8 +10,9 @@ use serde_json::Value;
 use harness::StoreError;
 
 use crate::store::{
-    check_one_terminal, is_terminal, Append, MessageStore, OutboxEntry, OutboxPage, OutboxStore,
-    PutAgent, PutMessage, PutRun, RunStore, StoredAgent, StoredArtifact, StoredMessage, StoredRun,
+    check_one_terminal, is_terminal, principal_hint_of, Append, Hint, Hints, MessageStore,
+    OutboxEntry, OutboxPage, OutboxStore, PutAgent, PutMessage, PutRun, RunStore, StoredAgent,
+    StoredArtifact, StoredMessage, StoredRun, ALL,
 };
 
 /// The run store in Postgres over a pool of connections (C2, owner decision
@@ -19,6 +22,49 @@ use crate::store::{
 /// (C1 decision 2A).
 pub struct PostgresStore {
     pool: r2d2::Pool<Connections>,
+    /// The listener's own connection, outside the pool (decision 40A).
+    listen: postgres::Config,
+    hints: Hints,
+    listening: std::sync::Once,
+}
+
+/// The channel an append notifies at commit, with its principal's hint.
+const CHANNEL: &str = "gol_outbox";
+
+/// Listens for `CHANNEL` on its own connection and forwards each hint, for
+/// as long as the process runs; reconnects after a second when the
+/// connection fails, and then wakes every stream, since hints may have been
+/// lost while it was down. Streams also re-read every 5 s without a hint.
+fn listen(config: postgres::Config, hints: tokio::sync::broadcast::Sender<Hint>) {
+    loop {
+        match catch_unwind(AssertUnwindSafe(|| config.connect(NoTls))) {
+            Ok(Ok(mut client)) => match client.batch_execute(&format!("listen {CHANNEL}")) {
+                Ok(()) => {
+                    let _ = hints.send(ALL);
+                    let mut notifications = client.notifications();
+                    let mut waiting = notifications.blocking_iter();
+                    loop {
+                        match waiting.next() {
+                            Ok(Some(notification)) => {
+                                if let Ok(hint) = notification.payload().parse::<Hint>() {
+                                    let _ = hints.send(hint);
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(error) => {
+                                eprintln!("gol: outbox listener: {error}");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error) => eprintln!("gol: outbox listener: listen: {error}"),
+            },
+            Ok(Err(error)) => eprintln!("gol: outbox listener: connect: {error}"),
+            Err(_) => eprintln!("gol: outbox listener: connect panicked"),
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 /// Opens and checks the pool's connections. A connect that panics (the
@@ -251,8 +297,15 @@ impl PostgresStore {
             .min_idle(Some(options.min_idle.min(size)))
             .test_on_check_out(true)
             .connection_timeout(wait)
-            .build_unchecked(Connections { config });
-        let store = Self { pool };
+            .build_unchecked(Connections {
+                config: config.clone(),
+            });
+        let store = Self {
+            pool,
+            listen: config,
+            hints: Hints::default(),
+            listening: std::sync::Once::new(),
+        };
         store.with_client(ensure_schema)?;
         Ok(store)
     }
@@ -432,6 +485,20 @@ impl OutboxStore for PostgresStore {
     /// One statement: for each principal, the last number stored before
     /// `before`; its entries up to it deleted, and its counter row marked
     /// pruned through it (taking only that row's lock, never a run row's).
+    fn hints(&self) -> tokio::sync::broadcast::Receiver<Hint> {
+        let receiver = self.hints.subscribe();
+        self.listening.call_once(|| {
+            let (config, hints) = (self.listen.clone(), self.hints.sender());
+            let started = std::thread::Builder::new()
+                .name("gol-outbox-listener".to_string())
+                .spawn(move || listen(config, hints));
+            if let Err(error) = started {
+                eprintln!("gol: outbox listener: {error}");
+            }
+        });
+        receiver
+    }
+
     fn prune_outbox(&self, before: Timestamp) -> Result<u64, StoreError> {
         let deleted: i64 = self.with_client(|client| {
             client
@@ -764,6 +831,10 @@ impl RunStore for PostgresStore {
             body: row.try_get(2).map_err(sql)?,
         }))
     }
+
+    fn outbox(&self) -> Option<&dyn OutboxStore> {
+        Some(self)
+    }
 }
 
 fn read_committed(client: &mut postgres::Client) -> Result<postgres::Transaction<'_>, StoreError> {
@@ -840,6 +911,10 @@ impl EventRows {
             ],
         )
         .map_err(sql)?;
+        // Delivered at commit, to every listening server (decision 40A).
+        let hint = principal_hint_of(&principal.0, &principal.1).to_string();
+        tx.execute("select pg_notify($1, $2)", &[&CHANNEL, &hint])
+            .map_err(sql)?;
         Ok(())
     }
 }

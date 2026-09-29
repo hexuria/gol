@@ -11,6 +11,7 @@ mod queue;
 mod spawner;
 mod store;
 mod stores;
+mod stream;
 mod surface;
 mod worker;
 

@@ -118,6 +118,8 @@ The desktop chooses Local (start the local image with Docker) or Box (the server
 - `POST /v1/runs` accepts a run spec and executes `Local` placement to a terminal harness state.
 - `GET /v1/runs/{id}` returns the folded state.
 - `GET /v1/runs/{id}/events?after=N&limit=L` returns a page of the event log: the events after the first `N` (default 0), at most `L` (1 to 500, default 500). A log longer than 500 events is read in pages.
+- `GET /v1/stream` sends the caller's outbox as server-sent events: every event of every run the caller's principal owns. Each event has `id` set to its outbox number, `event` set to its kind (for example `model.responded`), and `data` set to `{run_id, run_seq, event}`. A client resumes with `Last-Event-ID` (or `?after=`). A client whose number was pruned gets one `reset` event with `pruned_through` and the stream ends; it reloads, then resumes from there. With Postgres, a write on any server wakes the stream (LISTEN/NOTIFY). A stream also re-reads every 5 s, and sends a heartbeat comment every 15 s.
+- `GET /v1/runs/{id}/stream` streams one owned run the same way, with `id` set to the event's place in the run. It ends after the run's terminal event. A principal may have at most 16 streams open; beyond that the server answers 429.
 
 `Reverse` and `Box` run the same loop as `Local`. The execution crate runs each placement on a worker thread.
 

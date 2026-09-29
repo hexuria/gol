@@ -149,6 +149,11 @@ pub trait RunStore: Send + Sync {
     }
     fn put_artifact(&self, artifact: StoredArtifact) -> Result<(), StoreError>;
     fn artifact(&self, id: ArtifactId) -> Result<Option<StoredArtifact>, StoreError>;
+    /// The outbox this store numbers its events in, if it keeps one
+    /// (Phase 3.1); the streams read it (Phase 3.2).
+    fn outbox(&self) -> Option<&dyn OutboxStore> {
+        None
+    }
 }
 
 /// A message between agents (Phase 2), as its deliverer stored it: from
@@ -212,6 +217,56 @@ pub struct OutboxEntry {
     pub event: Event,
 }
 
+/// A hint that a principal's outbox has new entries (Phase 3.2): a stable
+/// hash of the principal, the same in every process, so one server's write
+/// can wake another server's stream. It carries no state: a stream woken by
+/// it re-reads after its cursor, so a lost or extra hint costs a read, not
+/// an event. `ALL` wakes every stream.
+pub type Hint = u64;
+
+/// The hint that wakes every stream, after hints may have been lost.
+pub const ALL: Hint = 0;
+
+/// The hint for `owner`'s principal: FNV-1a over issuer, NUL, subject (the
+/// tenant is not part of the principal, decision 36A). Never `ALL`.
+pub fn principal_hint(owner: &Owner) -> Hint {
+    principal_hint_of(&owner.issuer, &owner.subject)
+}
+
+pub(crate) fn principal_hint_of(issuer: &str, subject: &str) -> Hint {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in issuer.bytes().chain([0]).chain(subject.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash.max(1)
+}
+
+/// Where a store publishes its hints: every stream of this process
+/// subscribes. A receiver that falls behind is told it lagged and re-reads.
+pub(crate) struct Hints(tokio::sync::broadcast::Sender<Hint>);
+
+impl Default for Hints {
+    fn default() -> Self {
+        Self(tokio::sync::broadcast::channel(1024).0)
+    }
+}
+
+impl Hints {
+    pub(crate) fn send(&self, hint: Hint) {
+        // No subscriber is not an error: no stream is waiting.
+        let _ = self.0.send(hint);
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Hint> {
+        self.0.subscribe()
+    }
+
+    pub(crate) fn sender(&self) -> tokio::sync::broadcast::Sender<Hint> {
+        self.0.clone()
+    }
+}
+
 /// A page of an owner's outbox, read at one moment: its entries, and the
 /// number up to which entries were pruned. A reader whose cursor is below
 /// `pruned_through` has lost entries and must reload (Phase 3.2).
@@ -238,6 +293,9 @@ pub trait OutboxStore: Send + Sync {
     /// its numbers even when writers' clocks differ, and its count stays, so
     /// numbers never restart (decision 38A).
     fn prune_outbox(&self, before: Timestamp) -> Result<u64, StoreError>;
+    /// Hints of new entries, from this store and (Postgres) from any other
+    /// process writing the same database, from now on.
+    fn hints(&self) -> tokio::sync::broadcast::Receiver<Hint>;
 }
 
 /// An outbox row: what `OutboxEntry` reads through to the run's log.
@@ -276,6 +334,7 @@ pub struct InMemoryStore {
     /// A writer takes it only while holding `runs`, after it: the run, then
     /// the count. Reads and prunes take it alone.
     outbox: Mutex<Outbox>,
+    hints: Hints,
 }
 
 impl InMemoryStore {
@@ -302,6 +361,8 @@ impl InMemoryStore {
             });
         }
         outbox.counts.insert(principal, first + count as u64 - 1);
+        // A stream woken now re-reads, and waits on `runs` for the events.
+        self.hints.send(principal_hint(owner));
         Ok(())
     }
 
@@ -463,6 +524,10 @@ impl RunStore for InMemoryStore {
     fn artifact(&self, id: ArtifactId) -> Result<Option<StoredArtifact>, StoreError> {
         Ok(read(&self.artifacts).get(&id).cloned())
     }
+
+    fn outbox(&self) -> Option<&dyn OutboxStore> {
+        Some(self)
+    }
 }
 
 impl OutboxStore for InMemoryStore {
@@ -507,6 +572,10 @@ impl OutboxStore for InMemoryStore {
             entries,
             pruned_through,
         })
+    }
+
+    fn hints(&self) -> tokio::sync::broadcast::Receiver<Hint> {
+        self.hints.subscribe()
     }
 
     fn prune_outbox(&self, before: Timestamp) -> Result<u64, StoreError> {
