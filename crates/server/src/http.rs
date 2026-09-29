@@ -471,8 +471,9 @@ async fn create_coworker_turn(
 /// A coworker turn posted with `background: true` (Phase 3.6): stored queued
 /// and marked as a turn (decision 62A), pushed for a worker, and answered 202
 /// at once. A subscription turn's model call is the desktop's, so it has
-/// nothing to run in the background (63A); without a queue there is no
-/// worker to run it (64A).
+/// nothing to run in the background (63A); a Box turn does not run in the
+/// background yet (67A: its sandbox needs a lease fence and a model first);
+/// without a queue there is no worker to run it (64A).
 async fn background_turn(
     state: &AppState,
     principal: Principal,
@@ -486,9 +487,11 @@ async fn background_turn(
             "a subscription turn cannot run in the background",
         ));
     }
-    let Some(queue) = state.queue.clone() else {
-        return Err(ApiError::Unavailable("background turns are not available"));
-    };
+    if body.placement == ExecutionPlacement::Box {
+        return Err(ApiError::BadRequest(
+            "a Box turn cannot run in the background yet",
+        ));
+    }
     let mut spec = build_spec(
         owner_of(&principal),
         SpecCore {
@@ -502,6 +505,9 @@ async fn background_turn(
         },
         body.capabilities,
     )?;
+    let Some(queue) = state.queue.clone() else {
+        return Err(ApiError::Unavailable("background turns are not available"));
+    };
     spec.metadata.insert(TURN_KEY.to_string(), "1".to_string());
     let (store, queued) = (state.store.clone(), spec.clone());
     tokio::task::spawn_blocking(move || {
@@ -513,7 +519,7 @@ async fn background_turn(
         )
     })
     .await
-    .map_err(|error| ApiError::Store(error.to_string()))?
+    .map_err(|error| ApiError::Decider(error.to_string()))?
     .map_err(|error| match error {
         crate::spawner::EnqueueError::Queue(error) => {
             ApiError::Decider(format!("queue unavailable: {error}"))
@@ -838,7 +844,13 @@ async fn follow_up(
             placement: root.placement,
             work_model: root.work_model,
             limits: Some(body.limits.unwrap_or(root.limits)),
-            metadata: root.metadata,
+            // A thread begun by a background turn: the follow-up is a run,
+            // not a turn, and the marker is the server's to set.
+            metadata: root
+                .metadata
+                .into_iter()
+                .filter(|(key, _)| key != TURN_KEY)
+                .collect(),
         },
     )
     .await?;

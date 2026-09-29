@@ -1,9 +1,9 @@
-//! Background coworker turns (Phase 3.6, decisions 62A-66A). A turn posted
-//! with `background: true` is stored queued and answered 202 at once; a
-//! queue worker then runs it as a quick turn runs: a Box sandbox, one
-//! gateway completion, the sandbox removed, then the completion stored. A
-//! quick turn is unchanged. On both stores; needs Postgres and Redis, as
-//! `pg_redis.rs` does.
+//! Background coworker turns (Phase 3.6, decisions 62A-67A). A gateway turn
+//! outside a Box posted with `background: true` is stored queued and
+//! answered 202 at once; a queue worker then runs it as a quick turn runs:
+//! one gateway completion, then the completion stored. A Box turn does not
+//! run in the background yet (67A). A quick turn is unchanged. On both
+//! stores; needs Postgres and Redis, as `pg_redis.rs` does.
 mod common;
 
 use std::sync::{Arc, Mutex};
@@ -11,17 +11,12 @@ use std::sync::{Arc, Mutex};
 use common::queued::{blocking, fresh_user, jev, serve, stores, Server, Store};
 use protocol::{AgentId, EventPayload, FailureClass, RunId};
 use serde_json::{json, Value};
-use server::{
-    box_container_name, GatewayCall, GatewayPoster, InMemoryStore, MemorySandbox, RedisRunQueue,
-    SandboxError, SandboxHost,
-};
+use server::{GatewayCall, GatewayPoster, InMemoryStore, MemorySandbox, RedisRunQueue};
 
-/// A gateway that answers `answer`, and records each call; for a Box turn
-/// it checks the sandbox is up while it is called.
+/// A gateway that answers `answer`, and records each call.
 struct Gateway {
     answer: Result<String, String>,
     calls: Mutex<Vec<GatewayCall>>,
-    sandbox: Option<Arc<dyn SandboxHost>>,
 }
 
 impl Gateway {
@@ -29,7 +24,6 @@ impl Gateway {
         Arc::new(Self {
             answer: Ok(text.to_string()),
             calls: Mutex::new(Vec::new()),
-            sandbox: None,
         })
     }
 
@@ -40,12 +34,6 @@ impl Gateway {
 
 impl GatewayPoster for Gateway {
     fn complete(&self, call: &GatewayCall) -> Result<String, String> {
-        if let Some(sandbox) = &self.sandbox {
-            assert!(
-                sandbox.exists(&box_container_name(call.run_id)),
-                "the gateway is called while the sandbox is up"
-            );
-        }
         self.calls.lock().expect("calls").push(call.clone());
         self.answer.clone()
     }
@@ -209,80 +197,6 @@ async fn a_background_turn_completes_on_the_worker() {
     }
 }
 
-// A Box background turn has its sandbox up while the gateway is called and
-// removed before the turn ends (the completer's order).
-#[tokio::test(flavor = "multi_thread")]
-async fn a_box_background_turn_destroys_its_sandbox_before_it_ends() {
-    for store in stores() {
-        let jev = jev(&["complete"]).await;
-        let sandbox = Arc::new(MemorySandbox::default());
-        let gateway = Arc::new(Gateway {
-            answer: Ok("boxed".to_string()),
-            calls: Mutex::new(Vec::new()),
-            sandbox: Some(sandbox.clone()),
-        });
-        let server = serve(store.clone(), &jev, 4)
-            .await
-            .with_turns(gateway.clone(), sandbox.clone());
-        let user = fresh_user();
-        let (_, body) = post_turn(&server, &user, turn("Box", platform(), Some(true), "s")).await;
-        let run = body["run_id"].as_str().expect("run").to_string();
-        assert!(server.work().await.is_some());
-        let name = box_container_name(run.parse().expect("id"));
-        assert_eq!(sandbox.provisioned(), std::slice::from_ref(&name));
-        assert!(!sandbox.exists(&name), "removed");
-        assert_eq!(
-            kinds(&payloads(&store, &run).await).last(),
-            Some(&"run.completed")
-        );
-    }
-}
-
-/// A sandbox host whose destroy fails.
-#[derive(Default)]
-struct Stuck {
-    inner: MemorySandbox,
-}
-
-impl SandboxHost for Stuck {
-    fn provision(&self, name: &str) -> Result<(), SandboxError> {
-        self.inner.provision(name)
-    }
-    fn destroy(&self, _name: &str) -> Result<(), SandboxError> {
-        Err(SandboxError::Host("the daemon is unreachable".to_string()))
-    }
-    fn exists(&self, name: &str) -> bool {
-        self.inner.exists(name)
-    }
-    fn absent(&self, name: &str) -> Result<bool, SandboxError> {
-        self.inner.absent(name)
-    }
-    fn launches_docker(&self) -> bool {
-        false
-    }
-}
-
-// A sandbox that cannot be removed leaves the turn open (it never ends with
-// its sandbox up), and the worker does not acknowledge it, so it is tried
-// again.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_failed_destroy_leaves_a_background_turn_open() {
-    for store in stores() {
-        let jev = jev(&["complete"]).await;
-        let server = serve(store.clone(), &jev, 5)
-            .await
-            .with_turns(Gateway::answering("boxed"), Arc::new(Stuck::default()));
-        let user = fresh_user();
-        let (_, body) = post_turn(&server, &user, turn("Box", platform(), Some(true), "s")).await;
-        let run = body["run_id"].as_str().expect("run").to_string();
-        let worker = server.worker.clone();
-        let worked = blocking(move || worker.work_one()).await;
-        assert!(worked.is_err(), "not acknowledged: {worked:?}");
-        let log = payloads(&store, &run).await;
-        assert!(!log.iter().any(server::is_terminal), "{:?}", kinds(&log));
-    }
-}
-
 // A gateway failure fails the turn, as a quick turn's does.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_gateway_failure_fails_a_background_turn() {
@@ -291,7 +205,6 @@ async fn a_gateway_failure_fails_a_background_turn() {
         let gateway = Arc::new(Gateway {
             answer: Err("the proxy is down".to_string()),
             calls: Mutex::new(Vec::new()),
-            sandbox: None,
         });
         let server = serve(store.clone(), &jev, 6)
             .await
@@ -339,23 +252,22 @@ async fn a_stopped_background_turn_never_calls_the_gateway() {
     }
 }
 
-// A redelivered turn (65A): a worker died after the turn started, leaving
-// its Box sandbox. The next worker removes the leftover, runs the turn
-// once, and a further delivery changes nothing: one terminal event.
+// A redelivered turn (65A): a worker died after the turn started. The next
+// worker runs it from there, calling the gateway once, and a further
+// delivery changes nothing: one terminal event.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_redelivered_turn_ends_once() {
     for store in stores() {
         let jev = jev(&["complete"]).await;
-        let sandbox = Arc::new(MemorySandbox::default());
-        let gateway = Gateway::answering("boxed");
+        let gateway = Gateway::answering("the memo");
         let server = serve(store.clone(), &jev, 8)
             .await
-            .with_turns(gateway.clone(), sandbox.clone());
+            .with_turns(gateway.clone(), Arc::new(MemorySandbox::default()));
         let user = fresh_user();
-        let (_, body) = post_turn(&server, &user, turn("Box", platform(), Some(true), "s")).await;
+        let (_, body) = post_turn(&server, &user, turn("Local", platform(), Some(true), "s")).await;
         let run = body["run_id"].as_str().expect("run").to_string();
         let id: RunId = run.parse().expect("id");
-        // What the dead worker left: the turn started, its sandbox up.
+        // What the dead worker left: the turn scheduled and started.
         let runs = store.clone();
         blocking(move || {
             let spec = runs.run(id).expect("read").expect("stored").spec;
@@ -383,9 +295,6 @@ async fn a_redelivered_turn_ends_once() {
             );
         })
         .await;
-        sandbox
-            .provision(&box_container_name(id))
-            .expect("the leftover sandbox");
         assert!(server.work().await.is_some());
         assert_eq!(gateway.calls(), 1);
         let url = server.redis.clone();
@@ -400,7 +309,51 @@ async fn a_redelivered_turn_ends_once() {
             1
         );
         assert_eq!(kinds(&log).last(), Some(&"run.completed"));
-        assert!(!sandbox.exists(&box_container_name(id)));
+        assert_eq!(
+            kinds(&log)
+                .iter()
+                .filter(|kind| **kind == "run.started")
+                .count(),
+            1,
+            "started once"
+        );
+    }
+}
+
+// A thread a background turn began takes follow-ups: the follow-up is a
+// run, not a turn (the server's marker is not copied), so it is not refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thread_begun_by_a_background_turn_takes_a_follow_up() {
+    for store in stores() {
+        let jev = jev(&["complete"]).await;
+        let server = serve(store.clone(), &jev, 11).await.with_turns(
+            Gateway::answering("the memo"),
+            Arc::new(MemorySandbox::default()),
+        );
+        let user = fresh_user();
+        let session = format!("s-{}", RunId::new());
+        let agent = server.agent(&user, "solo", &[]).await;
+        let mut body = turn("Local", platform(), Some(true), &session);
+        body["agent_id"] = json!(agent);
+        let (status, _) = post_turn(&server, &user, body).await;
+        assert_eq!(status, 202);
+        let (status, body) = server
+            .post(
+                &format!("/v1/threads/{session}/messages"),
+                &user,
+                json!({"input": "and again"}),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let follow_up = body["run"]["run_id"].as_str().expect("run").to_string();
+        while server.work().await.is_some() {}
+        let log = payloads(&store, &follow_up).await;
+        assert!(
+            kinds(&log).contains(&"effect.decided"),
+            "run through the harness, not as a turn: {:?}",
+            kinds(&log)
+        );
+        assert_eq!(kinds(&log).last(), Some(&"run.completed"));
     }
 }
 
@@ -418,10 +371,18 @@ async fn a_background_turn_is_refused_where_it_cannot_run() {
     let (status, body) =
         post_turn(&server, &user, turn("Local", subscription, Some(true), "s")).await;
     assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        body["error"],
+        "a subscription turn cannot run in the background"
+    );
+    let (status, body) = post_turn(&server, &user, turn("Box", platform(), Some(true), "s")).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"], "a Box turn cannot run in the background yet");
     let mut marked = turn("Local", platform(), Some(true), "s");
     marked["metadata"]["gol.turn"] = json!("1");
     let (status, body) = post_turn(&server, &user, marked).await;
     assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"], "gol.turn is set by the server");
     let agent = server.agent(&user, "solo", &[]).await;
     let (status, body) = server
         .post(
@@ -449,12 +410,33 @@ async fn a_background_turn_is_refused_where_it_cannot_run() {
         .await
         .expect("send");
     assert_eq!(response.status().as_u16(), 503);
+    // A request the server would refuse anyway is 400 first.
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/coworker/turns"))
+        .header("authorization", common::bearer_for(&user))
+        .json(&turn("Box", platform(), Some(true), "s"))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(response.status().as_u16(), 400);
+}
+
+/// What another writer does once a worker starts a turn.
+#[derive(Clone, Copy)]
+enum AfterStart {
+    /// Ends it: a worker whose lease lapsed finishing the same turn.
+    End,
+    /// Stops it: a stop whose cancel found the log moved by the start.
+    Stop,
+    /// Nothing, but the store then cannot take the turn's completion.
+    RefuseCompletion,
 }
 
 /// An in-memory store where, once a worker starts a turn, another writer
-/// ends it at once: a worker whose lease lapsed finishing the same turn.
+/// does `then` at once.
 struct EndedAfterStart {
     inner: InMemoryStore,
+    then: AfterStart,
 }
 
 impl server::RunStore for EndedAfterStart {
@@ -481,6 +463,12 @@ impl server::RunStore for EndedAfterStart {
         id: RunId,
         events: Vec<protocol::Event>,
     ) -> Result<server::Append, server::StoreError> {
+        let completes = events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::RunCompleted { .. }));
+        if completes && matches!(self.then, AfterStart::RefuseCompletion) {
+            return Err(server::StoreError::new("the store is unreachable"));
+        }
         self.inner.append_events(id, events)
     }
     fn append_events_after(
@@ -495,6 +483,14 @@ impl server::RunStore for EndedAfterStart {
         let appended = self.inner.append_events_after(id, seen, events)?;
         if starts && appended == server::Append::Appended {
             let spec = self.inner.run(id)?.expect("stored").spec;
+            if let AfterStart::RefuseCompletion = self.then {
+                return Ok(appended);
+            }
+            if let AfterStart::Stop = self.then {
+                let stops = self.inner.stops().expect("stops");
+                stops.put_stop(&spec.owner, &server::StopScope::Run(id))?;
+                return Ok(appended);
+            }
             let end = protocol::Event::record(
                 protocol::EventSource::for_spec(
                     &spec,
@@ -533,30 +529,76 @@ impl server::RunStore for EndedAfterStart {
 }
 
 // A turn another worker ended just after this one started it (forced) gets
-// no sandbox and no gateway call from this one: a sandbox is never
-// provisioned for an ended turn.
+// no gateway call from this one; one terminal event.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_turn_ended_by_another_worker_gets_no_sandbox() {
+async fn a_turn_ended_by_another_worker_is_not_run_again() {
+    let (store, _server, gateway, run) = started_then(AfterStart::End, 10).await;
+    assert_eq!(gateway.calls(), 0);
+    let ends: Vec<EventPayload> = payloads(&store, &run)
+        .await
+        .into_iter()
+        .filter(server::is_terminal)
+        .collect();
+    assert!(
+        matches!(ends.as_slice(), [EventPayload::RunCompleted { .. }]),
+        "{ends:?}"
+    );
+}
+
+// A stop that lands just after the worker started the turn (forced: the
+// stop's own cancel would have found the log moved) is seen before the
+// gateway call (66A): the turn is cancelled, the gateway never called.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_racing_the_start_cancels_before_the_gateway() {
+    let (store, _server, gateway, run) = started_then(AfterStart::Stop, 12).await;
+    assert_eq!(gateway.calls(), 0);
+    let ends: Vec<EventPayload> = payloads(&store, &run)
+        .await
+        .into_iter()
+        .filter(server::is_terminal)
+        .collect();
+    assert_eq!(ends, [EventPayload::RunCancelled]);
+}
+
+// A completion the store could not take leaves the turn open, and the
+// worker does not acknowledge it, so it is delivered again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_completion_the_store_refused_leaves_the_turn_open() {
     let store: Store = Arc::new(EndedAfterStart {
         inner: InMemoryStore::default(),
+        then: AfterStart::RefuseCompletion,
     });
     let jev = jev(&["complete"]).await;
-    let sandbox = Arc::new(MemorySandbox::default());
-    let gateway = Gateway::answering("boxed");
-    let server = serve(store.clone(), &jev, 10)
+    let gateway = Gateway::answering("the memo");
+    let server = serve(store.clone(), &jev, 13)
         .await
-        .with_turns(gateway.clone(), sandbox.clone());
+        .with_turns(gateway.clone(), Arc::new(MemorySandbox::default()));
     let user = fresh_user();
-    let (_, body) = post_turn(&server, &user, turn("Box", platform(), Some(true), "s")).await;
+    let (_, body) = post_turn(&server, &user, turn("Local", platform(), Some(true), "s")).await;
+    let run = body["run_id"].as_str().expect("run").to_string();
+    let worker = server.worker.clone();
+    let worked = blocking(move || worker.work_one()).await;
+    assert!(worked.is_err(), "not acknowledged: {worked:?}");
+    assert_eq!(gateway.calls(), 1);
+    let log = payloads(&store, &run).await;
+    assert!(!log.iter().any(server::is_terminal), "{:?}", kinds(&log));
+}
+
+/// A background turn run by a worker on an `EndedAfterStart` store that does
+/// `then`: (store, server, gateway, run).
+async fn started_then(then: AfterStart, db: u8) -> (Store, Server, Arc<Gateway>, String) {
+    let store: Store = Arc::new(EndedAfterStart {
+        inner: InMemoryStore::default(),
+        then,
+    });
+    let jev = jev(&["complete"]).await;
+    let gateway = Gateway::answering("the memo");
+    let server = serve(store.clone(), &jev, db)
+        .await
+        .with_turns(gateway.clone(), Arc::new(MemorySandbox::default()));
+    let user = fresh_user();
+    let (_, body) = post_turn(&server, &user, turn("Local", platform(), Some(true), "s")).await;
     let run = body["run_id"].as_str().expect("run").to_string();
     assert!(server.work().await.is_some());
-    assert_eq!(sandbox.provisioned(), Vec::<String>::new());
-    assert_eq!(gateway.calls(), 0);
-    let log = payloads(&store, &run).await;
-    assert_eq!(
-        log.iter()
-            .filter(|payload| server::is_terminal(payload))
-            .count(),
-        1
-    );
+    (store, server, gateway, run)
 }

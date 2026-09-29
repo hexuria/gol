@@ -32,9 +32,8 @@ use crate::deliverer::{
 };
 use crate::http::{jev_client, Delegation};
 use crate::inference::{
-    box_container_name, dispatch_events, finish_turn, is_turn, run_cancelled_event,
-    run_failed_event, sandbox_from_env, system_event, GatewayPoster, HttpGatewayPoster,
-    SandboxHost, TurnError,
+    dispatch_events, finish_turn, is_turn, run_cancelled_event, run_failed_event, sandbox_from_env,
+    system_event, GatewayPoster, HttpGatewayPoster, SandboxHost, TurnError,
 };
 use crate::models::ModelsConfig;
 use crate::queue::{QueueTiming, RedisRunQueue};
@@ -709,21 +708,33 @@ impl Worker {
 impl Worker {
     /// Runs background coworker turn `spec` from its log (`events`, the
     /// first `seen` stored; its user message was stored with it queued):
-    /// starts it, then
-    /// `finish_turn`, which stores the completion or the failure after the
-    /// Box sandbox is gone. A turn a dead worker started is picked up where
-    /// its log stops, its leftover sandbox removed first (decision 65A): the
-    /// gateway is called again. A turn left open (its sandbox could not be
-    /// removed, or the store could not answer) is not acknowledged, so it is
-    /// tried again.
+    /// starts it, then `finish_turn`, which calls the gateway and stores the
+    /// completion, or the failure. Only a gateway turn outside a Box runs in
+    /// the background (decisions 63A, 67A); one stored otherwise is failed,
+    /// not run. A turn a dead worker started is picked up where its log
+    /// stops, and the gateway is called again (65A). A turn left open (the
+    /// store could not answer) is not acknowledged, so it is tried again.
     fn run_turn(
         &self,
         spec: &RunSpec,
         mut events: Vec<Event>,
-        seen: usize,
+        mut seen: usize,
         append: &dyn Fn(usize, Vec<Event>) -> Result<Stopped, String>,
         holds: &dyn Fn() -> bool,
     ) -> Result<Stopped, String> {
+        if spec.placement == protocol::ExecutionPlacement::Box
+            || !matches!(
+                spec.work_model.credential,
+                protocol::CredentialSource::PlatformGateway
+            )
+        {
+            let failed = run_failed_event(
+                spec,
+                FailureClass::Infrastructure,
+                "only a gateway turn outside a Box runs in the background".to_string(),
+            );
+            return append(seen, vec![failed]);
+        }
         let started = events
             .iter()
             .any(|event| matches!(event.payload, EventPayload::RunStarted));
@@ -733,32 +744,30 @@ impl Worker {
                 Stopped::Store(Append::Appended) => {}
                 refused => return Ok(refused),
             }
+            seen += begun.len();
             events.extend(begun);
-        } else if spec.placement == protocol::ExecutionPlacement::Box {
-            let name = box_container_name(spec.run_id);
-            let leftover = !self
-                .sandbox
-                .absent(&name)
-                .map_err(|error| format!("turn sandbox: {error:?}"))?;
-            if leftover {
-                self.sandbox
-                    .destroy(&name)
-                    .map_err(|error| format!("turn sandbox: {error:?}"))?;
-            }
+        }
+        // A stop that read the turn queued and lost the race to this
+        // worker's start (its cancel found the log moved) is seen here,
+        // before the gateway is called (66A).
+        if self.stopped(spec.run_id) {
+            return append(seen, vec![run_cancelled_event(spec)]);
         }
         if !holds() {
             return Ok(Stopped::LostLease);
         }
-        // Read again just before the sandbox goes up: a worker whose lease
-        // lapsed may have ended the turn since this one loaded it, and a
-        // sandbox is not provisioned for an ended turn.
-        let ended = self
+        // Read again just before the gateway call: a worker whose lease
+        // lapsed may have ended the turn since this one loaded it.
+        match self
             .store
             .run(spec.run_id)
             .map_err(|error| error.to_string())?
-            .is_none_or(|run| run.events.iter().any(|event| is_terminal(&event.payload)));
-        if ended {
-            return Ok(Stopped::Store(Append::Terminal));
+        {
+            None => return Ok(Stopped::Store(Append::Missing)),
+            Some(run) if run.events.iter().any(|event| is_terminal(&event.payload)) => {
+                return Ok(Stopped::Store(Append::Terminal));
+            }
+            Some(_) => {}
         }
         match finish_turn(
             self.store.as_ref(),
@@ -770,8 +779,8 @@ impl Worker {
             Ok(_) => Ok(Stopped::Store(Append::Appended)),
             Err(TurnError::Conflict(_)) => Ok(Stopped::Store(Append::Terminal)),
             Err(TurnError::NotFound) => Ok(Stopped::Store(Append::Missing)),
-            // A gateway failure ends the turn failed when its sandbox is
-            // gone; anything else leaves it open.
+            // A gateway failure ends the turn failed; anything else leaves
+            // it open.
             Err(error) => match self.store.run(spec.run_id) {
                 Ok(Some(run)) if run.events.iter().any(|event| is_terminal(&event.payload)) => {
                     Ok(Stopped::Store(Append::Appended))
