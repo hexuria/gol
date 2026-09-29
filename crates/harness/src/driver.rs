@@ -265,6 +265,7 @@ impl Driver {
                 tools,
                 skills,
                 agents: &self.targets,
+                messaging: self.deliverer.is_some(),
                 steps_exhausted: steps_spent,
                 model_calls_exhausted: model_calls_spent,
             };
