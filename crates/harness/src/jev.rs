@@ -21,7 +21,7 @@ const TELL: &str = "tell:";
 const ASK: &str = "ask:";
 
 /// How long an ask Jev chooses waits for its answer (decision 28A): the
-/// ask's task usually answers first, with its outcome (decision 31A).
+/// ask's task usually answers first, when it ends (decision 31A).
 pub const JEV_ASK_TIMEOUT_SECS: u32 = 3600;
 
 pub struct JevDecider {

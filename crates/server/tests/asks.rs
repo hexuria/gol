@@ -9,12 +9,12 @@ use std::sync::Arc;
 use harness::{AgentSpawner, ChildRequest, InMemory, MessageDeliverer, MessageRequest};
 use protocol::{
     Actor, AgentId, Capability, CredentialSource, Event, EventPayload, EventSource,
-    ExecutionPlacement, Limits, MessageId, ModelProvider, Owner, RunId, RunSpec, Timestamp,
-    WorkModel,
+    ExecutionPlacement, Limits, MessageId, MessageRole, ModelMessage, ModelProvider, Owner, RunId,
+    RunSpec, Timestamp, WorkModel,
 };
 use serde_json::json;
 use server::{
-    is_terminal, queued_events, sweep_asks, AgentManifest, InMemoryStore, MessageStore,
+    is_terminal, queued_events, sweep_asks, AgentManifest, Append, InMemoryStore, MessageStore,
     OwnedDeliverer, OwnedSpawner, PostgresStore, Prepared, PutMessage, QueueTiming, RedisRunQueue,
     RunStore, StoreError, StoredAgent, StoredMessage, StoredRun, Worker,
 };
@@ -1093,5 +1093,88 @@ fn a_reply_before_its_ask_is_logged_is_refused_and_retried() {
             setup.answers(),
             [(sent.message_id, Some("the plan".to_string()))]
         );
+    }
+}
+
+// Owner decision on #74, follow-up: an ask answered by its task's end
+// carries the task's last non-empty assistant response when there is one (a
+// Jev task's outcome is the fixed word "done"), cut to a message's 32 KiB
+// (30A) at a character boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_task_answers_with_its_last_model_response() {
+    let max = protocol::MAX_MESSAGE_BYTES;
+    let cases = [
+        (
+            "the plan is to ship on Friday".to_string(),
+            "the plan is to ship on Friday".to_string(),
+        ),
+        // An empty response answers nothing: the one before it does.
+        (String::new(), "a first thought".to_string()),
+        ("a".repeat(max), "a".repeat(max)),
+        ("a".repeat(max + 1), "a".repeat(max)),
+        // 1 + 2 * 20,000 bytes: the cap falls inside a two-byte character.
+        (
+            format!("a{}", "é".repeat(20_000)),
+            format!("a{}", "é".repeat((max - 1) / 2)),
+        ),
+    ];
+    for (which, (text, expected)) in cases
+        .into_iter()
+        .flat_map(|case| [(0, case.clone()), (1, case)])
+    {
+        let server = jev(&["ask:writer", "complete"]).await;
+        let uri = server.uri();
+        blocking(move || {
+            let setup = setup(which);
+            let researcher = setup.researcher.run_id;
+            assert_eq!(
+                setup.worker(&uri, true).work_one().expect("work"),
+                Some(researcher)
+            );
+            let (ask, task) = setup.asked();
+            let task_spec = setup.runs.run(task).expect("read").expect("task").spec;
+            let record = |payload| {
+                Event::record(
+                    EventSource::for_spec(&task_spec, Actor::System, Timestamp::now()),
+                    payload,
+                )
+            };
+            let reply = |text: &str| EventPayload::ModelResponded {
+                message: ModelMessage {
+                    role: MessageRole::Assistant,
+                    text: text.to_string(),
+                },
+                usage: None,
+            };
+            let appended = setup
+                .runs
+                .append_events(
+                    task,
+                    vec![
+                        record(reply("a first thought")),
+                        record(reply(&text)),
+                        record(EventPayload::RunCompleted {
+                            outcome: "done".to_string(),
+                        }),
+                    ],
+                )
+                .expect("append");
+            assert_eq!(appended, Append::Appended);
+
+            let swept = sweep_asks(
+                &setup.queue,
+                setup.runs.as_ref(),
+                setup.messages.as_ref(),
+                Timestamp::now(),
+            )
+            .expect("sweep");
+            assert!(swept.contains(&researcher));
+            let answers = setup.answers();
+            let [(answered, Some(body))] = answers.as_slice() else {
+                panic!("one answer: {answers:?}")
+            };
+            assert_eq!(*answered, ask);
+            assert_eq!(*body, expected);
+        });
     }
 }
