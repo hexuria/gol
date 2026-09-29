@@ -2,14 +2,14 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Duration;
 
 use postgres::{IsolationLevel, NoTls};
-use protocol::{AgentId, ArtifactId, Event, Owner, RunId};
+use protocol::{AgentId, ArtifactId, Event, MessageId, Owner, RunId, Timestamp};
 use serde_json::Value;
 
 use harness::StoreError;
 
 use crate::store::{
-    check_one_terminal, is_terminal, Append, PutAgent, PutRun, RunStore, StoredAgent,
-    StoredArtifact, StoredRun,
+    check_one_terminal, is_terminal, Append, MessageStore, PutAgent, PutMessage, PutRun, RunStore,
+    StoredAgent, StoredArtifact, StoredMessage, StoredRun,
 };
 
 /// The run store in Postgres over a pool of connections (C2, owner decision
@@ -87,6 +87,18 @@ create table if not exists run_events (
     body jsonb not null,
     terminal boolean not null,
     primary key (run_id, seq)
+);
+
+create table if not exists messages (
+    id uuid primary key,
+    from_run uuid not null,
+    decision bigint not null,
+    task_run uuid,
+    expects_reply boolean not null,
+    deadline_ms bigint,
+    answered boolean not null default false,
+    body jsonb not null,
+    unique (from_run, decision)
 );
 
 create table if not exists artifacts (
@@ -285,6 +297,100 @@ impl PostgresStore {
             Ok(Append::Appended)
         })
     }
+}
+
+/// Messages are rows keyed by id and unique per sending run and decision;
+/// the message itself is the `body` column (Phase 2.1).
+impl MessageStore for PostgresStore {
+    fn put_message(&self, message: StoredMessage) -> Result<PutMessage, StoreError> {
+        let body = serde_json::to_value(&message).map_err(json)?;
+        let decision = i64::from(message.decision);
+        let from_run = message.from_run.as_uuid();
+        self.with_client(|client| {
+            let inserted = client
+                .execute(
+                    "insert into messages (id, from_run, decision, task_run, expects_reply, deadline_ms, body)
+                     values ($1, $2, $3, $4, $5, $6, $7)
+                     on conflict (from_run, decision) do nothing",
+                    &[
+                        &message.id.as_uuid(),
+                        &from_run,
+                        &decision,
+                        &message.task_run.map(RunId::as_uuid),
+                        &message.expects_reply,
+                        &message.deadline.map(Timestamp::as_unix_millis),
+                        &body,
+                    ],
+                )
+                .map_err(sql)?;
+            if inserted == 1 {
+                return Ok(PutMessage::Stored);
+            }
+            let row = client
+                .query_one(
+                    "select body from messages where from_run = $1 and decision = $2",
+                    &[&from_run, &decision],
+                )
+                .map_err(sql)?;
+            Ok(PutMessage::Existed(Box::new(message_of(&row)?)))
+        })
+    }
+
+    fn message(&self, id: MessageId) -> Result<Option<StoredMessage>, StoreError> {
+        self.with_client(|client| {
+            client
+                .query_opt("select body from messages where id = $1", &[&id.as_uuid()])
+                .map_err(sql)?
+                .map(|row| message_of(&row))
+                .transpose()
+        })
+    }
+
+    fn ask_of_task(&self, task_run: RunId) -> Result<Option<StoredMessage>, StoreError> {
+        self.with_client(|client| {
+            client
+                .query_opt(
+                    "select body from messages where task_run = $1 and expects_reply",
+                    &[&task_run.as_uuid()],
+                )
+                .map_err(sql)?
+                .map(|row| message_of(&row))
+                .transpose()
+        })
+    }
+
+    fn answer(&self, ask: MessageId) -> Result<bool, StoreError> {
+        self.with_client(|client| {
+            let changed = client
+                .execute(
+                    "update messages set answered = true where id = $1 and not answered",
+                    &[&ask.as_uuid()],
+                )
+                .map_err(sql)?;
+            Ok(changed == 1)
+        })
+    }
+
+    fn open_asks_due(&self, now: Timestamp) -> Result<Vec<StoredMessage>, StoreError> {
+        self.with_client(|client| {
+            client
+                .query(
+                    "select body from messages
+                     where not answered and expects_reply and deadline_ms <= $1
+                     order by id",
+                    &[&now.as_unix_millis()],
+                )
+                .map_err(sql)?
+                .iter()
+                .map(message_of)
+                .collect()
+        })
+    }
+}
+
+/// A `messages` row read as `body`.
+fn message_of(row: &postgres::Row) -> Result<StoredMessage, StoreError> {
+    serde_json::from_value(row.try_get::<_, Value>(0).map_err(sql)?).map_err(json)
 }
 
 /// An `agents` row read as `manifest, owner_issuer, owner_subject, owner_tenant`.
