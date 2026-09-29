@@ -8,7 +8,7 @@ use std::sync::Arc;
 use harness::{ChildRequest, MessageDeliverer, MessageRequest, SentMessage};
 use protocol::{
     Actor, AgentId, Event, EventPayload, EventSource, MessageId, RunId, Timestamp,
-    MAX_DELEGATION_HOPS,
+    MAX_DELEGATION_HOPS, MAX_MESSAGE_BYTES,
 };
 
 use crate::queue::RedisRunQueue;
@@ -345,16 +345,25 @@ pub(crate) fn deliver(
     Ok(true)
 }
 
-/// The reply a task gives `ask` when it ends (decision 31A): its outcome,
-/// or that it failed, was cancelled or expired. `None` while it runs.
+/// The reply a task gives `ask` when it ends (decision 31A): its last model
+/// response if it completed after one (a Jev task's outcome is the fixed
+/// word "done"), else its outcome, or that it failed, was cancelled or
+/// expired. `None` while it runs. The body is cut to `MAX_MESSAGE_BYTES`,
+/// as a message's is (30A).
 pub(crate) fn task_answer(
     task: RunId,
     task_agent: AgentId,
     ask: MessageId,
     events: &[Event],
 ) -> Option<EventPayload> {
+    let responded = || {
+        events.iter().rev().find_map(|event| match &event.payload {
+            EventPayload::ModelResponded { message, .. } => Some(message.text.clone()),
+            _ => None,
+        })
+    };
     let body = events.iter().rev().find_map(|event| match &event.payload {
-        EventPayload::RunCompleted { outcome } => Some(outcome.clone()),
+        EventPayload::RunCompleted { outcome } => Some(responded().unwrap_or(outcome.clone())),
         EventPayload::RunFailed { message, .. } => Some(format!("the task failed: {message}")),
         EventPayload::RunCancelled => Some("the task was cancelled".to_string()),
         EventPayload::RunExpired => Some("the task expired".to_string()),
@@ -364,7 +373,19 @@ pub(crate) fn task_answer(
         message_id: MessageId::new(),
         from_agent: task_agent,
         from_run: task,
-        body,
+        body: capped(body),
         reply_to: Some(ask),
     })
+}
+
+/// `body` cut to at most `MAX_MESSAGE_BYTES`, at a character boundary.
+fn capped(mut body: String) -> String {
+    if body.len() > MAX_MESSAGE_BYTES {
+        let mut end = MAX_MESSAGE_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+    }
+    body
 }
