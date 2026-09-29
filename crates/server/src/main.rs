@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use server::{
     auth_from_env, queue_from_env, router_with_memory, start_queue, stores_from_env,
-    HttpGatewayPoster, RedisRunQueue,
+    HttpGatewayPoster, ModelsConfig, RedisRunQueue,
 };
 
 #[tokio::main]
@@ -25,6 +25,15 @@ async fn main() {
             "gol: WARNING: GOL_AUTH=local-dev accepts a static token; never use it in production"
         );
     }
+    // The platform's key per provider (D2). Without one, that provider's
+    // model calls fail the run.
+    let models = match ModelsConfig::from_env(&env) {
+        Ok(models) => Arc::new(models),
+        Err(message) => {
+            eprintln!("gol: refusing to start: {message}");
+            std::process::exit(2);
+        }
+    };
     let queue = match queue_from_env(&env) {
         Ok(queue) => queue,
         Err(message) => {
@@ -71,6 +80,7 @@ async fn main() {
         jev_base_url.clone(),
         queue.as_ref().map(|queue| queue.redis_url.clone()),
         Arc::new(HttpGatewayPoster::from_env()),
+        models.clone(),
         auth,
     );
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
@@ -79,7 +89,13 @@ async fn main() {
     // Workers start once the port is ours, so a server that cannot bind
     // claims no runs.
     if let Some(queue) = &queue {
-        if let Err(message) = start_queue(queue, stores.runs, stores.memory, &jev_base_url) {
+        if let Err(message) = start_queue(
+            queue,
+            stores.runs,
+            stores.memory,
+            &jev_base_url,
+            models.clone(),
+        ) {
             eprintln!("gol: refusing to start: queue workers: {message}");
             std::process::exit(2);
         }

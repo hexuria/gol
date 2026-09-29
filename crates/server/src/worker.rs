@@ -21,7 +21,6 @@ use std::time::Duration;
 
 use harness::{
     run_until, Boundary, DelegateTarget, Driver, EchoTool, JevDecider, Memory, RunMemory,
-    UnavailableModel,
 };
 use protocol::{
     fold, Capability, DispatchPhase, Event, EventPayload, FailureClass, RunId, RunSpec,
@@ -29,6 +28,7 @@ use protocol::{
 
 use crate::http::{jev_client, Delegation};
 use crate::inference::{dispatch_events, run_failed_event};
+use crate::models::ModelsConfig;
 use crate::queue::{QueueTiming, RedisRunQueue};
 use crate::spawner::OwnedSpawner;
 use crate::store::{is_terminal, Append, RunStore, StoredRun};
@@ -41,6 +41,8 @@ pub struct Worker {
     memory: Arc<dyn Memory>,
     jev_base_url: String,
     timing: QueueTiming,
+    /// The work model each run calls (D2).
+    models: Arc<ModelsConfig>,
 }
 
 /// Builder state: a required input not given yet.
@@ -49,13 +51,14 @@ pub struct Missing;
 pub struct Given;
 
 /// A `Worker` whose queue, store, memory and Jev address are each required
-/// before `build` exists; the timing is optional.
+/// before `build` exists; the timing and the models are optional.
 pub struct WorkerBuilder<Q, S, M, J> {
     queue: Option<RedisRunQueue>,
     store: Option<Arc<dyn RunStore>>,
     memory: Option<Arc<dyn Memory>>,
     jev_base_url: Option<String>,
     timing: QueueTiming,
+    models: Arc<ModelsConfig>,
     states: PhantomData<(Q, S, M, J)>,
 }
 
@@ -67,6 +70,7 @@ impl Worker {
             memory: None,
             jev_base_url: None,
             timing: QueueTiming::default(),
+            models: Arc::new(ModelsConfig::default()),
             states: PhantomData,
         }
     }
@@ -80,12 +84,20 @@ impl<Q, S, M, J> WorkerBuilder<Q, S, M, J> {
             memory: self.memory,
             jev_base_url: self.jev_base_url,
             timing: self.timing,
+            models: self.models,
             states: PhantomData,
         }
     }
 
     pub fn timing(mut self, timing: QueueTiming) -> Self {
         self.timing = timing;
+        self
+    }
+
+    /// The platform's keys for the runs' work models. Without them every
+    /// model call fails.
+    pub fn models(mut self, models: Arc<ModelsConfig>) -> Self {
+        self.models = models;
         self
     }
 }
@@ -131,6 +143,7 @@ impl WorkerBuilder<Given, Given, Given, Given> {
             memory,
             jev_base_url,
             timing: self.timing,
+            models: self.models,
         }
     }
 }
@@ -487,13 +500,14 @@ impl Worker {
             }
         };
         let echo = EchoTool;
+        let models = self.models.model_for(spec);
         let memory = RunMemory::new(self.memory.as_ref());
         let mut refused = None;
         let outcome = run_until(
             &mut driver,
             &mut decider,
             &[&echo],
-            &UnavailableModel,
+            &models,
             &memory,
             &mut |driver| {
                 let new = &driver.events()[seen..];
@@ -703,6 +717,7 @@ pub fn start_queue(
     store: Arc<dyn RunStore>,
     memory: Arc<dyn Memory>,
     jev_base_url: &str,
+    models: Arc<ModelsConfig>,
 ) -> Result<(), String> {
     let timing = QueueTiming::default();
     for index in 0..settings.workers {
@@ -712,6 +727,7 @@ pub fn start_queue(
             .memory(memory.clone())
             .jev(jev_base_url)
             .timing(timing)
+            .models(models.clone())
             .build();
         std::thread::Builder::new()
             .name(format!("gol-worker-{index}"))

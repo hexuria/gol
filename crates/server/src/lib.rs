@@ -4,6 +4,7 @@ pub mod auth;
 mod http;
 mod inference;
 mod local;
+mod models;
 mod postgres;
 mod queue;
 mod spawner;
@@ -26,6 +27,7 @@ pub use inference::{
     SandboxHost, TurnError,
 };
 pub use local::LocalEchoFactory;
+pub use models::{GatewayModel, ModelsConfig};
 pub use postgres::{PoolOptions, PostgresStore};
 pub use queue::{QueueTiming, RedisRunQueue};
 pub use spawner::OwnedSpawner;
