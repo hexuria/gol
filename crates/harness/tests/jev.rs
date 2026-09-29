@@ -705,46 +705,46 @@ fn jev_offers_tell_and_ask_choices_only_when_allowed() {
     assert_eq!(messages(&offered), 6);
 
     // No deliverer.
-    let mut refused = offered.clone();
+    let mut refused = offered;
     refused.messaging = false;
     assert_eq!(messages(&refused), 0);
 
     // No capability: `agent.delegate` alone is not enough.
     let plain = delegating(limits(3, 2));
-    let mut refused = offered.clone();
+    let mut refused = offered;
     refused.spec = &plain;
     assert_eq!(messages(&refused), 0);
 
     // Two steps left: this decision takes one, leaving one to give.
     let short = messaging(limits(2, 2));
-    let mut refused = offered.clone();
+    let mut refused = offered;
     refused.spec = &short;
     assert_eq!(messages(&refused), 0);
 
     // One model call left.
     let short = messaging(limits(3, 1));
-    let mut refused = offered.clone();
+    let mut refused = offered;
     refused.spec = &short;
     assert_eq!(messages(&refused), 0);
 
     // Ten children already.
     let mut full = state.clone();
     full.children = 10;
-    let mut refused = offered.clone();
+    let mut refused = offered;
     refused.state = &full;
     assert_eq!(messages(&refused), 0);
 
     // Already 8 hops deep.
     let mut deep = spec.clone();
     deep.lineage.hop = 8;
-    let mut refused = offered.clone();
+    let mut refused = offered;
     refused.spec = &deep;
     assert_eq!(messages(&refused), 0);
 
     // Not running.
     let mut waiting = state.clone();
     waiting.harness = HarnessState::Cancelled;
-    let mut refused = offered.clone();
+    let mut refused = offered;
     refused.state = &waiting;
     assert_eq!(messages(&refused), 0);
 
@@ -752,7 +752,7 @@ fn jev_offers_tell_and_ask_choices_only_when_allowed() {
     let mut clash = EchoTool.descriptor();
     clash.name = "ask:writer".into();
     let tools = [clash];
-    let mut clashing = offered.clone();
+    let mut clashing = offered;
     clashing.tools = &tools;
     assert_eq!(
         labels(&clashing)
