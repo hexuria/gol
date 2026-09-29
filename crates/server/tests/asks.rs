@@ -384,7 +384,9 @@ async fn an_ask_past_its_deadline_times_out() {
                 )
                 .expect("sweep")
             };
-            assert!(!sweep(59_000).contains(&researcher));
+            // Well inside the deadline, however slow the machine: the ask
+            // was sent with 60 s from its own clock reading, before this one.
+            assert!(!sweep(30_000).contains(&researcher));
             assert_eq!(setup.answers(), []);
             assert!(sweep(61_000).contains(&researcher));
             assert_eq!(setup.answers(), [(ask, None)]);
