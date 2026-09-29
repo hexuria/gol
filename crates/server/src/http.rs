@@ -28,6 +28,7 @@ use crate::inference::{
 };
 use crate::models::ModelsConfig;
 use crate::queue::RedisRunQueue;
+use crate::scheduler::next_tick;
 use crate::store::{
     is_terminal, AgentManifest, Append, Missed, PutAgent, RunStore, StopScope, StoredAgent,
     StoredRun, StoredTrigger, TriggerId, TriggerKind, TriggerStore,
@@ -1493,9 +1494,12 @@ async fn create_trigger(
             let shaped = |text: &str, most: usize| {
                 !text.trim().is_empty() && text.len() <= most && !text.contains('\0')
             };
-            if !shaped(&cron, 256) || !shaped(&time_zone, 64) {
+            if !shaped(&cron, 256)
+                || !shaped(&time_zone, 64)
+                || next_tick(&cron, &time_zone, 0).is_err()
+            {
                 return Err(ApiError::BadRequest(
-                    "a schedule needs a cron expression and a time zone",
+                    "a schedule needs a cron expression and a known time zone",
                 ));
             }
             TriggerKind::Schedule { cron, time_zone }
@@ -1523,6 +1527,7 @@ async fn create_trigger(
     if state.queue.is_none() {
         return Err(ApiError::Unavailable("triggers need the run queue"));
     }
+    let kind_of_new = kind.clone();
     let trigger = StoredTrigger {
         id: TriggerId::new(),
         owner: owner_of(&principal),
@@ -1534,7 +1539,7 @@ async fn create_trigger(
         limits: body.limits,
         missed: body.missed.unwrap_or_default(),
         enabled: true,
-        next_fire_ms: None,
+        next_fire_ms: first_tick(&kind_of_new)?,
         created_ms: Timestamp::now().as_unix_millis(),
     };
     let stored = trigger.clone();
@@ -1598,12 +1603,40 @@ async fn pause_trigger(
 }
 
 /// `POST /v1/triggers/{id}/resume`.
+/// `POST /v1/triggers/{id}/resume`: it fires again from the first tick
+/// after now, and owes nothing for the ticks it was paused.
 async fn resume_trigger(
     Authenticated(principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<TriggerId>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    set_trigger_enabled(&state, &principal, id, true).await
+    let owner = owner_of(&principal);
+    let trigger = with_triggers(&state, move |_, triggers| {
+        let Some(trigger) = triggers.trigger(&owner, id)? else {
+            return Ok(Err(ApiError::TriggerNotFound));
+        };
+        let next = match first_tick(&trigger.kind) {
+            Ok(next) => next,
+            Err(error) => return Ok(Err(error)),
+        };
+        Ok(triggers
+            .resume_trigger(&owner, id, next)?
+            .ok_or(ApiError::TriggerNotFound))
+    })
+    .await?;
+    Ok(Json(trigger_view(&trigger)))
+}
+
+/// A trigger's first tick after now: none for a webhook.
+fn first_tick(kind: &TriggerKind) -> Result<Option<i64>, ApiError> {
+    match kind {
+        TriggerKind::Schedule { cron, time_zone } => {
+            next_tick(cron, time_zone, Timestamp::now().as_unix_millis())
+                .map(Some)
+                .map_err(|_| ApiError::BadRequest("the schedule has no next tick"))
+        }
+        TriggerKind::Webhook { .. } => Ok(None),
+    }
 }
 
 /// `POST /v1/triggers/{id}/rotate`: a webhook trigger's new secret, shown

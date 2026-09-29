@@ -572,6 +572,29 @@ impl server::TriggerStore for ForcedStore {
     fn delete_trigger(&self, owner: &Owner, id: TriggerId) -> Result<bool, server::StoreError> {
         self.inner.delete_trigger(owner, id)
     }
+    fn resume_trigger(
+        &self,
+        owner: &Owner,
+        id: TriggerId,
+        next_fire_ms: Option<i64>,
+    ) -> Result<Option<server::StoredTrigger>, server::StoreError> {
+        self.inner.resume_trigger(owner, id, next_fire_ms)
+    }
+    fn due_triggers(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<server::StoredTrigger>, server::StoreError> {
+        self.inner.due_triggers(now_ms, limit)
+    }
+    fn advance_trigger(
+        &self,
+        id: TriggerId,
+        due_ms: i64,
+        next_ms: i64,
+    ) -> Result<bool, server::StoreError> {
+        self.inner.advance_trigger(id, due_ms, next_ms)
+    }
     fn pause_triggers(&self, owner: &Owner) -> Result<usize, server::StoreError> {
         match self.forced {
             Forced::FailPause => Err(server::StoreError::new("the store is unreachable")),

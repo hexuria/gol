@@ -23,6 +23,9 @@ r2d2 = "0.8"
 memory = { path = "../memory" }
 tokio-stream = "0.1"
 ring = "0.17"
+croner = { version = "4.0.0", default-features = false, features = ["chrono"] }
+chrono-tz = { version = "0.10.4", default-features = false }
+chrono = { version = "0.4.45", default-features = false }
 
 [dev-dependencies]
 jsonwebtoken = { version = "9.3.1", features = ["use_pem"] }

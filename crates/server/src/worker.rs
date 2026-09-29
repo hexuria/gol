@@ -1163,6 +1163,9 @@ pub fn queue_from_env(env: &BTreeMap<String, String>) -> Result<Option<QueueSett
 /// Starts `settings.workers` worker threads and one reaper, which also
 /// sweeps, all running for as long as the process does. Queued runs may
 /// message each other through `messages` (Phase 2.3).
+/// How often each server's scheduler looks for due triggers.
+const SCHEDULE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub fn start_queue(
     settings: &QueueSettings,
     store: Arc<dyn RunStore>,
@@ -1188,6 +1191,15 @@ pub fn start_queue(
             .spawn(move || worker.work_forever())
             .map_err(|error| error.to_string())?;
     }
+    // One scheduler per server fires schedule triggers (Phase 4.2).
+    let (scheduled, scheduler) = (
+        store.clone(),
+        Arc::new(RedisRunQueue::open(&settings.redis_url)),
+    );
+    std::thread::Builder::new()
+        .name("gol-scheduler".to_string())
+        .spawn(move || crate::scheduler::schedule_forever(scheduled, scheduler, SCHEDULE_EVERY))
+        .map_err(|error| error.to_string())?;
     let reaper = RedisRunQueue::open(&settings.redis_url);
     std::thread::Builder::new()
         .name("gol-reaper".to_string())

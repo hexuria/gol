@@ -8,6 +8,7 @@ mod local;
 mod models;
 mod postgres;
 mod queue;
+mod scheduler;
 mod spawner;
 mod store;
 mod stores;
@@ -35,6 +36,7 @@ pub use local::LocalEchoFactory;
 pub use models::{GatewayModel, ModelsConfig};
 pub use postgres::{PoolOptions, PostgresStore};
 pub use queue::{QueueTiming, RedisRunQueue};
+pub use scheduler::{fire_due_trigger, next_tick, schedule_due, schedule_forever, MISSED_AFTER_MS};
 pub use spawner::OwnedSpawner;
 pub use store::{
     is_terminal, thread_of, AgentManifest, Append, InMemoryStore, MessageStore, Missed,
@@ -45,7 +47,7 @@ pub use store::{
 pub use stores::{stores_from_env, Stores};
 pub use surface::{ag_ui_events, json_render_spec};
 pub use triggers::{
-    fire_trigger, trigger_thread, webhook_secret, FireError, Fired, MAX_TRIGGERS,
+    fire_trigger, fire_trigger_at, trigger_thread, webhook_secret, FireError, Fired, MAX_TRIGGERS,
     MIN_WEBHOOK_KEY_BYTES, TRIGGER_KEY,
 };
 pub use worker::{

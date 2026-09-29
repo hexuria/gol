@@ -63,6 +63,38 @@ pub fn fire_trigger(
     owner: &Owner,
     id: TriggerId,
 ) -> Result<Fired, FireError> {
+    fire(store, queue, owner, id, None)
+}
+
+/// The namespace of a scheduled fire's run id (UUID v5 over the trigger and
+/// its tick).
+const TICK_RUN_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x2c1e_7a90_5b3d_4f61_8e2a_6d0c_9b47_13f5);
+
+/// `fire_trigger` for trigger `id`'s tick at `tick_ms` (Phase 4.2): the
+/// run's id comes from the trigger and the tick, so the tick fired twice
+/// (two schedulers, or one that died between the fire and moving the
+/// trigger to its next tick) is one run, stored once and pushed once.
+pub fn fire_trigger_at(
+    store: &dyn RunStore,
+    queue: &RedisRunQueue,
+    owner: &Owner,
+    id: TriggerId,
+    tick_ms: i64,
+) -> Result<Fired, FireError> {
+    let mut name = id.as_uuid().as_bytes().to_vec();
+    name.extend_from_slice(&tick_ms.to_le_bytes());
+    let run = RunId::from_uuid(uuid::Uuid::new_v5(&TICK_RUN_NAMESPACE, &name));
+    fire(store, queue, owner, id, Some(run))
+}
+
+fn fire(
+    store: &dyn RunStore,
+    queue: &RedisRunQueue,
+    owner: &Owner,
+    id: TriggerId,
+    run_id: Option<RunId>,
+) -> Result<Fired, FireError> {
     let unread = |error: StoreError| FireError::NotStored(error.to_string());
     let triggers = store
         .triggers()
@@ -80,11 +112,15 @@ pub fn fire_trigger(
     else {
         return Ok(Fired::AgentNotFound);
     };
-    let spec = run_of(
+    let mut spec = run_of(
         &trigger,
         agent.manifest.version,
         agent.manifest.required_capabilities,
     );
+    if let Some(run_id) = run_id {
+        // A top-level run: its lineage names no root, so the id is its own.
+        spec.run_id = run_id;
+    }
     let run = spec.run_id;
     // Why the run was held, if it was: `Err` for a read that failed.
     let held: Cell<Option<Result<Fired, String>>> = Cell::new(None);
