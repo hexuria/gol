@@ -929,8 +929,16 @@ async fn get_board(
 /// Records `owner`'s stop of `scope` (Phase 3.4) and cancels the covered
 /// runs no worker holds (decision 55A): those still queued, and those parked
 /// on an ask, which it also wakes so their worker acknowledges them. A run a
-/// worker holds is cancelled by that worker at its next step boundary. The
-/// store keeps one terminal event whichever lands first.
+/// worker holds is cancelled by that worker at its next step boundary.
+///
+/// The cancel appends only onto the log it read, so a worker that moved the
+/// run on in between is left to cancel it itself (`formal/runlog`'s
+/// conditional append). Without a queue a run is carried out inside its
+/// request and is never queued or parked: the stop is recorded and nothing
+/// is cancelled here. Subscription turns do not run through the worker and
+/// are not stopped. A run that could not be cancelled here, or a failed read
+/// of the parked runs, answers 503 after the rest are done: the stop is
+/// recorded, and asking again is safe.
 async fn stop(
     state: &AppState,
     owner: Owner,
@@ -941,14 +949,16 @@ async fn stop(
         let Some(stops) = store.stops() else {
             return Ok(Err(ApiError::NoStops));
         };
-        stops.put_stop(&owner, &scope, Timestamp::now())?;
-        let parked: Vec<(RunId, protocol::MessageId)> = match &queue {
-            Some(queue) => queue.parked().unwrap_or_else(|error| {
-                eprintln!("gol: stop: parked runs: {error}");
-                Vec::new()
-            }),
-            None => Vec::new(),
+        stops.put_stop(&owner, &scope)?;
+        let Some(queue) = queue else {
+            return Ok(Ok(Vec::new()));
         };
+        let mut failed = false;
+        let parked = queue.parked().unwrap_or_else(|error| {
+            eprintln!("gol: stop: parked runs: {error}");
+            failed = true;
+            Vec::new()
+        });
         let mut cancelled = Vec::new();
         for run in stops.open_runs_under(&owner, &scope)? {
             let run_id = run.spec.run_id;
@@ -963,18 +973,42 @@ async fn stop(
             if !queued && ask.is_none() {
                 continue;
             }
-            let appended = store.append_events(
-                run_id,
-                vec![crate::inference::run_cancelled_event(&run.spec)],
-            )?;
-            if appended == Append::Appended {
-                cancelled.push(run_id);
-            }
-            if let (Some(queue), Some(ask)) = (&queue, ask) {
-                if let Err(error) = queue.wake(run_id, ask) {
-                    eprintln!("gol: stop: wake run {run_id}: {error}");
+            // A thread or owner stop does not cover a run stored after it.
+            match stops.stopped(run_id) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    eprintln!("gol: stop: run {run_id}: {error}");
+                    failed = true;
+                    continue;
                 }
             }
+            let appended = store.append_events_after(
+                run_id,
+                run.events.len(),
+                vec![crate::inference::run_cancelled_event(&run.spec)],
+            );
+            match appended {
+                Ok(Append::Appended) => {
+                    cancelled.push(run_id);
+                    if let Some(ask) = ask {
+                        if let Err(error) = queue.wake(run_id, ask) {
+                            eprintln!("gol: stop: wake run {run_id}: {error}");
+                            failed = true;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("gol: stop: cancel run {run_id}: {error}");
+                    failed = true;
+                }
+            }
+        }
+        if failed {
+            return Ok(Err(ApiError::Store(
+                "a stop could not cancel every run".to_string(),
+            )));
         }
         Ok::<_, StoreError>(Ok(cancelled))
     })

@@ -142,6 +142,10 @@ create table if not exists agents (
     owner_subject text not null,
     owner_tenant text not null
 );
+-- The store's order (Phase 3.4): each run insert and each stop takes the
+-- next number, so whether a stop came after a run does not rest on any
+-- server's clock.
+create sequence if not exists gol_order;
 create table if not exists runs (
     id uuid primary key,
     spec jsonb not null,
@@ -150,7 +154,8 @@ create table if not exists runs (
     owner_subject text,
     thread_id text,
     parent_run uuid,
-    created_ms bigint
+    created_ms bigint,
+    stored_seq bigint default nextval('gol_order')
 );
 create table if not exists run_events (
     run_id uuid not null references runs (id),
@@ -183,12 +188,15 @@ create table if not exists outbox (
 
 -- Stop requests (Phase 3.4): a principal's stop of a run, a thread, or all
 -- of its runs, and when it was made.
+-- The latest stop of each scope: a later stop of the same scope covers
+-- everything an earlier one did.
 create table if not exists stops (
     owner_issuer text not null,
     owner_subject text not null,
     kind text not null,
     key text not null,
-    requested_ms bigint not null
+    requested_seq bigint not null default nextval('gol_order'),
+    primary key (owner_issuer, owner_subject, kind, key)
 );
 
 create table if not exists messages (
@@ -288,6 +296,22 @@ fn ensure_schema(client: &mut postgres::Client) -> Result<(), StoreError> {
         )
         .map_err(sql)?;
     }
+    // A runs table from before Phase 3.4 has no place in the store's order:
+    // each run gets one (in no particular order, all before any stop).
+    let ordered = tx
+        .query_opt(
+            "select 1 from pg_attribute
+             where attrelid = 'runs'::regclass and attname = 'stored_seq' and not attisdropped",
+            &[],
+        )
+        .map_err(sql)?;
+    if ordered.is_none() {
+        tx.batch_execute(
+            "set local lock_timeout = '10s';
+             alter table runs add column stored_seq bigint default nextval('gol_order');",
+        )
+        .map_err(sql)?;
+    }
     // Every run without its columns: all of them just after the alter, and
     // any an older server stored since (a rolling deploy). A run with no
     // first event is dated now.
@@ -325,6 +349,8 @@ fn ensure_schema(client: &mut postgres::Client) -> Result<(), StoreError> {
     tx.batch_execute("select owner_issuer, owner_subject, owner_tenant from agents limit 0")
         .map_err(sql)?;
     tx.batch_execute("select pruned from outbox_counters limit 0")
+        .map_err(sql)?;
+    tx.batch_execute("select requested_seq from stops limit 0")
         .map_err(sql)?;
     // Resolved like the queries resolve `runs`, whatever the role may see.
     let events_column = tx
@@ -631,52 +657,53 @@ impl ThreadStore for PostgresStore {
 }
 
 impl StopStore for PostgresStore {
-    fn put_stop(&self, owner: &Owner, scope: &StopScope, at: Timestamp) -> Result<(), StoreError> {
+    /// One statement: the stop, numbered in the store's order, replacing an
+    /// earlier stop of the same scope.
+    fn put_stop(&self, owner: &Owner, scope: &StopScope) -> Result<(), StoreError> {
         let (kind, key) = scope.kind_and_key();
         self.with_client(|client| {
             client
                 .execute(
-                    "insert into stops (owner_issuer, owner_subject, kind, key, requested_ms)
-                     values ($1, $2, $3, $4, $5)",
-                    &[
-                        &owner.issuer,
-                        &owner.subject,
-                        &kind,
-                        &key,
-                        &at.as_unix_millis(),
-                    ],
+                    "insert into stops (owner_issuer, owner_subject, kind, key)
+                     values ($1, $2, $3, $4)
+                     on conflict (owner_issuer, owner_subject, kind, key)
+                     do update set requested_seq = nextval('gol_order')",
+                    &[&owner.issuer, &owner.subject, &kind, &key],
                 )
                 .map(|_| ())
                 .map_err(sql)
         })
     }
 
-    /// One statement: the run and each run above it, up `parent_run`, each
-    /// against its principal's stops.
+    /// One statement: the run and each run above it, up `parent_run` (or the
+    /// spec's parent, for a row an older server stored), each against its
+    /// principal's stops.
     fn stopped(&self, run: RunId) -> Result<bool, StoreError> {
         let run = run.as_uuid();
         self.with_client(|client| {
             client
                 .query_one(
                     "with recursive chain as (
-                         select id, parent_run, thread_id, created_ms,
+                         select id, thread_id, stored_seq,
+                                coalesce(parent_run, (spec->'lineage'->>'parent')::uuid) as parent,
                                 coalesce(owner_issuer, spec->'owner'->>'issuer') as issuer,
                                 coalesce(owner_subject, spec->'owner'->>'subject') as subject
                          from runs where id = $1
                          union all
-                         select runs.id, runs.parent_run, runs.thread_id, runs.created_ms,
+                         select runs.id, runs.thread_id, runs.stored_seq,
+                                coalesce(runs.parent_run, (runs.spec->'lineage'->>'parent')::uuid),
                                 coalesce(runs.owner_issuer, runs.spec->'owner'->>'issuer'),
                                 coalesce(runs.owner_subject, runs.spec->'owner'->>'subject')
-                         from runs join chain on runs.id = chain.parent_run
+                         from runs join chain on runs.id = chain.parent
                      )
                      select exists (
                          select 1 from chain join stops
                            on stops.owner_issuer = chain.issuer
                           and stops.owner_subject = chain.subject
-                         where stops.requested_ms >= coalesce(chain.created_ms, 0)
-                           and ((stops.kind = 'run' and stops.key = chain.id::text)
-                                or (stops.kind = 'thread' and stops.key = chain.thread_id)
-                                or stops.kind = 'owner'))",
+                         where (stops.kind = 'run' and stops.key = chain.id::text)
+                            or (stops.requested_seq > coalesce(chain.stored_seq, 0)
+                                and ((stops.kind = 'thread' and stops.key = chain.thread_id)
+                                     or stops.kind = 'owner')))",
                     &[&run],
                 )
                 .and_then(|row| row.try_get(0))
@@ -684,13 +711,13 @@ impl StopStore for PostgresStore {
         })
     }
 
-    /// One snapshot: the covered runs that have not ended, then their events.
+    /// One snapshot: the covered runs that have not ended, one query per
+    /// scope, then their events.
     fn open_runs_under(
         &self,
         owner: &Owner,
         scope: &StopScope,
     ) -> Result<Vec<StoredRun>, StoreError> {
-        let (kind, key) = scope.kind_and_key();
         let (specs, events) = self.with_client(|client| {
             let mut tx = client
                 .build_transaction()
@@ -698,26 +725,40 @@ impl StopStore for PostgresStore {
                 .isolation_level(IsolationLevel::RepeatableRead)
                 .start()
                 .map_err(sql)?;
-            let specs = tx
-                .query(
-                    "with recursive tree as (
-                         select id from runs
-                         where $3 = 'run' and id::text = $4
-                           and owner_issuer = $1 and owner_subject = $2
-                         union all
-                         select runs.id from runs join tree on runs.parent_run = tree.id
-                     )
-                     select runs.id, runs.spec from runs
-                     where owner_issuer = $1 and owner_subject = $2
-                       and (($3 = 'run' and runs.id in (select id from tree))
-                            or ($3 = 'thread' and thread_id = $4)
-                            or $3 = 'owner')
-                       and not exists (
-                           select 1 from run_events
-                           where run_events.run_id = runs.id and run_events.terminal)",
-                    &[&owner.issuer, &owner.subject, &kind, &key],
-                )
-                .map_err(sql)?;
+            let open = "not exists (
+                            select 1 from run_events
+                            where run_events.run_id = runs.id and run_events.terminal)";
+            let specs = match scope {
+                StopScope::Run(run) => tx.query(
+                    &format!(
+                        "with recursive tree as (
+                             select id from runs
+                             where id = $3 and owner_issuer = $1 and owner_subject = $2
+                             union all
+                             select runs.id from runs join tree on runs.parent_run = tree.id
+                         )
+                         select runs.id, runs.spec from runs join tree on runs.id = tree.id
+                         where owner_issuer = $1 and owner_subject = $2 and {open}"
+                    ),
+                    &[&owner.issuer, &owner.subject, &run.as_uuid()],
+                ),
+                StopScope::Thread(thread) => tx.query(
+                    &format!(
+                        "select id, spec from runs
+                         where owner_issuer = $1 and owner_subject = $2 and thread_id = $3
+                           and {open}"
+                    ),
+                    &[&owner.issuer, &owner.subject, thread],
+                ),
+                StopScope::Owner => tx.query(
+                    &format!(
+                        "select id, spec from runs
+                         where owner_issuer = $1 and owner_subject = $2 and {open}"
+                    ),
+                    &[&owner.issuer, &owner.subject],
+                ),
+            }
+            .map_err(sql)?;
             let ids: Vec<uuid::Uuid> = specs
                 .iter()
                 .map(|row| row.try_get(0))

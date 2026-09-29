@@ -9,16 +9,23 @@
 //! as `pg_redis.rs` does.
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::queued::{
     blocking, fresh_user, jev, serve, stores, stores_with_messages, Server, Store,
 };
 use harness::{AgentSpawner, ChildRequest, MessageDeliverer, MessageRequest};
-use protocol::{Actor, Event, EventPayload, EventSource, Limits, RunId, RunSpec, Timestamp};
+use protocol::{
+    Actor, AgentId, ArtifactId, Event, EventPayload, EventSource, Limits, Owner, RunId, RunSpec,
+    Timestamp,
+};
 use serde_json::{json, Value};
-use server::{is_terminal, OwnedDeliverer, OwnedSpawner, RedisRunQueue};
+use server::{
+    is_terminal, Append, InMemoryStore, OwnedDeliverer, OwnedSpawner, PutAgent, PutRun,
+    RedisRunQueue, RunStore, StopScope, StopStore, StoreError, StoredAgent, StoredArtifact,
+    StoredRun,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -148,32 +155,38 @@ async fn slow_second_step(delay: Duration) -> MockServer {
     server
 }
 
-// A stop reaches a run a worker holds at its next step boundary: stopped
-// while the run waits on its second decision, it is cancelled once that
-// step is stored, and never asks for a third.
+// A stop reaches a run a worker holds at its next step boundary, whichever
+// button covers it: stopped while the run waits on its second decision, it
+// is cancelled once that step is stored, and never asks for a third.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_running_task_stops_at_its_next_step() {
     for store in stores() {
-        let jev = slow_second_step(Duration::from_millis(800)).await;
-        let server = serve(store.clone(), &jev, 2).await;
-        let user = fresh_user();
-        let agent = server.agent(&user, "echoer", &["tool.echo"]).await;
-        let (_, run) = server.start(&user, agent, "hello").await;
-        let worker = server.worker.clone();
-        let working = tokio::task::spawn_blocking(move || worker.work_one().expect("work"));
-        // Wait until the second decision is asked for, then stop.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while jev.received_requests().await.expect("requests").len() < 2 {
-            assert!(std::time::Instant::now() < deadline, "the second step");
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        for scope in ["run", "thread", "owner"] {
+            let jev = slow_second_step(Duration::from_secs(3)).await;
+            let server = serve(store.clone(), &jev, 2).await;
+            let user = fresh_user();
+            let agent = server.agent(&user, "echoer", &["tool.echo"]).await;
+            let (thread, run) = server.start(&user, agent, "hello").await;
+            let worker = server.worker.clone();
+            let working = tokio::task::spawn_blocking(move || worker.work_one().expect("work"));
+            // Wait until the second decision is asked for, then stop.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while jev.received_requests().await.expect("requests").len() < 2 {
+                assert!(std::time::Instant::now() < deadline, "the second step");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let button = match scope {
+                "run" => format!("/v1/runs/{run}/stop"),
+                "thread" => format!("/v1/threads/{thread}/stop"),
+                _ => "/v1/stop".to_string(),
+            };
+            let (status, body) = server.post(&button, &user, json!({})).await;
+            assert_eq!(status, 200, "{scope}: {body}");
+            assert_eq!(body["cancelled"], json!([]), "{scope}: a worker holds it");
+            assert!(working.await.expect("worker").is_some());
+            assert!(cancelled(&terminals(&store, &run).await), "{scope}");
+            assert_eq!(jev.received_requests().await.expect("requests").len(), 2);
         }
-        let (status, _) = server
-            .post(&format!("/v1/runs/{run}/stop"), &user, json!({}))
-            .await;
-        assert_eq!(status, 200);
-        assert!(working.await.expect("worker").is_some());
-        assert!(cancelled(&terminals(&store, &run).await));
-        assert_eq!(jev.received_requests().await.expect("requests").len(), 2);
     }
 }
 
@@ -182,9 +195,10 @@ async fn a_running_task_stops_at_its_next_step() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_cascades_to_the_whole_chain() {
     for store in stores() {
-        // The coordinator delegates to the researcher; the researcher, then
-        // stopped mid-run is not needed: it delegates to the writer and ends
-        // before the stop, and the writer's task starts after it.
+        // The coordinator delegates to the researcher and ends; the
+        // researcher delegates to the writer and ends. Both end before the
+        // stop; the writer's task, two levels under the run stopped, is still
+        // queued, and the stop cancels it.
         let jev = jev(&[
             "delegate:researcher",
             "complete",
@@ -384,11 +398,33 @@ async fn a_thread_stop_and_an_owner_stop_cover_their_runs_only() {
             terminals(&store, &after).await.as_slice(),
             [EventPayload::RunCompleted { .. }]
         ));
+        // A second stop of the thread covers the work started since.
+        let (status, body) = server
+            .post(
+                &format!("/v1/threads/{a}/messages"),
+                &alice,
+                json!({"input": "once more"}),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let again = body["run"]["run_id"].as_str().expect("run").to_string();
+        let (status, _) = server
+            .post(&format!("/v1/threads/{a}/stop"), &alice, json!({}))
+            .await;
+        assert_eq!(status, 200);
+        assert!(cancelled(&terminals(&store, &again).await));
 
         let (_, c_run) = server.start(&alice, hers, "c").await;
         let (status, _) = server.post("/v1/stop", &alice, json!({})).await;
         assert_eq!(status, 200);
         assert!(cancelled(&terminals(&store, &c_run).await));
+        // Work started after the owner's stop runs as usual.
+        let (_, d_run) = server.start(&alice, hers, "d").await;
+        while server.work().await.is_some() {}
+        assert!(matches!(
+            terminals(&store, &d_run).await.as_slice(),
+            [EventPayload::RunCompleted { .. }]
+        ));
         // Bob's run is his own: it runs to its end.
         assert!(matches!(
             terminals(&store, &bob_run).await.as_slice(),
@@ -456,6 +492,12 @@ async fn another_principals_run_cannot_be_stopped() {
         let (status, _) = server.post("/v1/stop", &bob, json!({})).await;
         assert_eq!(status, 200);
         assert_eq!(terminals(&store, &run).await, Vec::new());
+        // The worker's check does not take Bob's stop for hers either.
+        while server.work().await.is_some() {}
+        assert!(matches!(
+            terminals(&store, &run).await.as_slice(),
+            [EventPayload::RunCompleted { .. }]
+        ));
         let _: Value = body;
     }
 }
@@ -516,4 +558,295 @@ async fn a_late_child_is_cancelled_when_claimed() {
             "the late child never asks Jev"
         );
     }
+}
+
+// The runs a stop covers, as each store reads them: a thread's open runs
+// only, and an owner's own open runs, not another principal's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_reads_the_open_runs_of_its_scope_only() {
+    for store in stores() {
+        let jev = jev(&["complete"]).await;
+        let server = serve(store.clone(), &jev, 11).await;
+        let (alice, bob) = (fresh_user(), fresh_user());
+        let hers = server.agent(&alice, "solo", &[]).await;
+        let his = server.agent(&bob, "solo", &[]).await;
+        let (a, a_run) = server.start(&alice, hers, "a").await;
+        let (_, b_run) = server.start(&alice, hers, "b").await;
+        server.start(&bob, his, "c").await;
+        let owner = spec_of(&store, &a_run).await.owner;
+        let runs = store.clone();
+        let (thread, everything) = blocking(move || {
+            let stops = runs.stops().expect("stops");
+            let ids = |scope: StopScope| {
+                let mut ids: Vec<String> = stops
+                    .open_runs_under(&owner, &scope)
+                    .expect("read")
+                    .iter()
+                    .map(|run| run.spec.run_id.to_string())
+                    .collect();
+                ids.sort();
+                ids
+            };
+            (ids(StopScope::Thread(a)), ids(StopScope::Owner))
+        })
+        .await;
+        assert_eq!(thread, vec![a_run.clone()]);
+        let mut hers = vec![a_run, b_run];
+        hers.sort();
+        assert_eq!(everything, hers);
+    }
+}
+
+/// What an `Interleaved` store does once, between the stop's steps.
+enum Hook {
+    /// Appends `RunScheduled` onto each run just after a stop reads the
+    /// runs it covers: a worker claiming the run between the stop's read and
+    /// its cancel.
+    ClaimAfterRead,
+    /// Stores this run just after a stop is recorded: work started between
+    /// the stop and its read.
+    PutAfterStop(Box<StoredRun>),
+    /// Fails the stop's cancel of a run.
+    FailCancel,
+}
+
+/// An in-memory store that runs its `Hook` once.
+struct Interleaved {
+    inner: InMemoryStore,
+    hook: Mutex<Option<Hook>>,
+}
+
+impl Interleaved {
+    fn store(hook: Hook) -> Store {
+        Arc::new(Self {
+            inner: InMemoryStore::default(),
+            hook: Mutex::new(Some(hook)),
+        })
+    }
+
+    /// Takes the hook if it is the one `wanted` names.
+    fn take(&self, wanted: impl Fn(&Hook) -> bool) -> Option<Hook> {
+        let mut hook = self.hook.lock().expect("hook");
+        if hook.as_ref().is_some_and(wanted) {
+            hook.take()
+        } else {
+            None
+        }
+    }
+}
+
+impl RunStore for Interleaved {
+    fn put_agent(&self, agent: StoredAgent) -> Result<PutAgent, StoreError> {
+        self.inner.put_agent(agent)
+    }
+    fn agent(&self, id: AgentId) -> Result<Option<StoredAgent>, StoreError> {
+        self.inner.agent(id)
+    }
+    fn agents_of(&self, owner: &Owner) -> Result<Vec<StoredAgent>, StoreError> {
+        self.inner.agents_of(owner)
+    }
+    fn put_run(&self, run: StoredRun) -> Result<PutRun, StoreError> {
+        self.inner.put_run(run)
+    }
+    fn append_events(&self, id: RunId, events: Vec<Event>) -> Result<Append, StoreError> {
+        self.inner.append_events(id, events)
+    }
+    fn append_events_after(
+        &self,
+        id: RunId,
+        seen: usize,
+        events: Vec<Event>,
+    ) -> Result<Append, StoreError> {
+        if self.take(|hook| matches!(hook, Hook::FailCancel)).is_some() {
+            return Err(StoreError::new("the store is unreachable"));
+        }
+        self.inner.append_events_after(id, seen, events)
+    }
+    fn run(&self, id: RunId) -> Result<Option<StoredRun>, StoreError> {
+        self.inner.run(id)
+    }
+    fn put_artifact(&self, artifact: StoredArtifact) -> Result<(), StoreError> {
+        self.inner.put_artifact(artifact)
+    }
+    fn artifact(&self, id: ArtifactId) -> Result<Option<StoredArtifact>, StoreError> {
+        self.inner.artifact(id)
+    }
+    fn stops(&self) -> Option<&dyn StopStore> {
+        Some(self)
+    }
+}
+
+impl StopStore for Interleaved {
+    fn put_stop(&self, owner: &Owner, scope: &StopScope) -> Result<(), StoreError> {
+        self.inner.put_stop(owner, scope)?;
+        if let Some(Hook::PutAfterStop(run)) =
+            self.take(|hook| matches!(hook, Hook::PutAfterStop(_)))
+        {
+            assert_eq!(self.inner.put_run(*run), Ok(PutRun::Stored));
+        }
+        Ok(())
+    }
+    fn stopped(&self, run: RunId) -> Result<bool, StoreError> {
+        self.inner.stopped(run)
+    }
+    fn open_runs_under(
+        &self,
+        owner: &Owner,
+        scope: &StopScope,
+    ) -> Result<Vec<StoredRun>, StoreError> {
+        let snapshot = self.inner.open_runs_under(owner, scope)?;
+        if self
+            .take(|hook| matches!(hook, Hook::ClaimAfterRead))
+            .is_some()
+        {
+            for run in &snapshot {
+                assert_eq!(
+                    self.inner.append_events(
+                        run.spec.run_id,
+                        vec![record(&run.spec, EventPayload::RunScheduled)]
+                    ),
+                    Ok(Append::Appended)
+                );
+            }
+        }
+        Ok(snapshot)
+    }
+}
+
+// The stop cancels only onto the log it read (RunLogWorkers' conditional
+// append): a worker that claimed the run in between moved the log, so the
+// stop leaves the run to that worker, which cancels it at its check.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_between_the_stops_read_and_its_cancel_is_left_to_the_worker() {
+    let store = Interleaved::store(Hook::ClaimAfterRead);
+    let jev = jev(&["complete"]).await;
+    let server = serve(store.clone(), &jev, 10).await;
+    let user = fresh_user();
+    let agent = server.agent(&user, "solo", &[]).await;
+    let (_, run) = server.start(&user, agent, "one").await;
+    let (status, body) = server
+        .post(&format!("/v1/runs/{run}/stop"), &user, json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["cancelled"], json!([]), "the log moved under the stop");
+    assert_eq!(terminals(&store, &run).await, Vec::new());
+    while server.work().await.is_some() {}
+    assert!(cancelled(&terminals(&store, &run).await));
+    assert_eq!(jev.received_requests().await.expect("requests").len(), 0);
+}
+
+// A run stored between an owner's stop and the stop's read of their runs
+// came after the stop: the stop leaves it, and it runs to its end.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_stored_just_after_a_stop_is_not_cancelled() {
+    let user = fresh_user();
+    let owner = Owner::new(common::ISSUER, &user, "tenant-1");
+    let agent = AgentId::new();
+    let spec = RunSpec::builder()
+        .owner(owner)
+        .agent(agent, "1")
+        .input("after")
+        .placement(protocol::ExecutionPlacement::Local)
+        .work_model(protocol::WorkModel {
+            provider: protocol::ModelProvider::OpenAI,
+            model_name: "gpt-test".to_string(),
+            credential: protocol::CredentialSource::PlatformGateway,
+        })
+        .build();
+    let late = spec.run_id;
+    let store = Interleaved::store(Hook::PutAfterStop(Box::new(StoredRun {
+        events: server::queued_events(&spec),
+        spec,
+    })));
+    let jev = jev(&["complete"]).await;
+    let server = serve(store.clone(), &jev, 12).await;
+    let stored = server.put_version(&user, agent, "solo", "1").await;
+    assert!(stored);
+    let (_, before) = server.start(&user, agent, "before").await;
+    let (status, body) = server.post("/v1/stop", &user, json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["cancelled"], json!([before]));
+    // Queued as its request would have queued it.
+    let url = server.redis.clone();
+    blocking(move || RedisRunQueue::open(url).push(late).expect("push")).await;
+    while server.work().await.is_some() {}
+    assert!(matches!(
+        terminals(&store, &late.to_string()).await.as_slice(),
+        [EventPayload::RunCompleted { .. }]
+    ));
+}
+
+// A cancel the store fails answers 503; the stop is recorded, so the
+// worker still cancels the run when it claims it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_cancel_answers_503_and_the_worker_still_cancels() {
+    let store = Interleaved::store(Hook::FailCancel);
+    let jev = jev(&["complete"]).await;
+    let server = serve(store.clone(), &jev, 13).await;
+    let user = fresh_user();
+    let agent = server.agent(&user, "solo", &[]).await;
+    let (_, run) = server.start(&user, agent, "one").await;
+    let (status, body) = server
+        .post(&format!("/v1/runs/{run}/stop"), &user, json!({}))
+        .await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(terminals(&store, &run).await, Vec::new());
+    while server.work().await.is_some() {}
+    assert!(cancelled(&terminals(&store, &run).await));
+}
+
+// A child an older server stored has no `parent_run` column, only its
+// spec's lineage: a stop of its parent still covers it. Postgres only.
+#[test]
+fn a_stop_covers_a_child_an_older_server_stored() {
+    let store = common::queued::POSTGRES
+        .get_or_init(|| {
+            Arc::new(server::PostgresStore::connect(common::queued::POSTGRES_URL).expect("connect"))
+                as Store
+        })
+        .clone();
+    let owner = Owner::new(common::ISSUER, fresh_user(), "tenant-1");
+    let spec = |parent: Option<&RunSpec>| {
+        let builder = RunSpec::builder()
+            .owner(owner.clone())
+            .agent(AgentId::new(), "1")
+            .input("x")
+            .placement(protocol::ExecutionPlacement::Local)
+            .work_model(protocol::WorkModel {
+                provider: protocol::ModelProvider::OpenAI,
+                model_name: "gpt-test".to_string(),
+                credential: protocol::CredentialSource::PlatformGateway,
+            });
+        match parent {
+            Some(parent) => builder.child_of(parent, 1).build(),
+            None => builder.build(),
+        }
+    };
+    let parent = spec(None);
+    let child = spec(Some(&parent));
+    let parent_id = parent.run_id;
+    assert_eq!(
+        store.put_run(StoredRun {
+            events: server::queued_events(&parent),
+            spec: parent.clone(),
+        }),
+        Ok(PutRun::Stored)
+    );
+    let mut admin =
+        postgres::Client::connect(common::queued::POSTGRES_URL, postgres::NoTls).expect("admin");
+    admin
+        .execute(
+            "insert into runs (id, spec) values ($1, $2)",
+            &[
+                &child.run_id.as_uuid(),
+                &serde_json::to_value(&child).expect("spec"),
+            ],
+        )
+        .expect("an older server's insert");
+    let stops = store.stops().expect("stops");
+    assert_eq!(stops.stopped(child.run_id), Ok(false));
+    stops
+        .put_stop(&owner, &StopScope::Run(parent_id))
+        .expect("stop");
+    assert_eq!(stops.stopped(child.run_id), Ok(true));
 }
