@@ -6,7 +6,7 @@ use harness::{InMemory, Memory};
 use memory::PostgresMemory;
 
 use crate::postgres::{PoolOptions, PostgresStore};
-use crate::store::{InMemoryStore, MessageStore, RunStore};
+use crate::store::{InMemoryStore, MessageStore, OutboxStore, RunStore};
 
 /// The server's run store, the memory its runs share, and the messages
 /// between its agents (Phase 2.1).
@@ -14,6 +14,8 @@ pub struct Stores {
     pub runs: Arc<dyn RunStore>,
     pub memory: Arc<dyn Memory>,
     pub messages: Arc<dyn MessageStore>,
+    /// The outbox every stored event is numbered in (Phase 3.1).
+    pub outbox: Arc<dyn OutboxStore>,
 }
 
 /// Postgres when `GOL_DATABASE_URL` is set and not empty, with
@@ -27,7 +29,8 @@ pub fn stores_from_env(env: &BTreeMap<String, String>) -> Result<Stores, String>
         return Ok(Stores {
             runs: runs.clone(),
             memory: Arc::new(InMemory::default()),
-            messages: runs,
+            messages: runs.clone(),
+            outbox: runs,
         });
     };
     let max_size = match env
@@ -56,6 +59,7 @@ pub fn stores_from_env(env: &BTreeMap<String, String>) -> Result<Stores, String>
     Ok(Stores {
         runs: runs.clone(),
         memory: Arc::new(memory),
-        messages: runs,
+        messages: runs.clone(),
+        outbox: runs,
     })
 }

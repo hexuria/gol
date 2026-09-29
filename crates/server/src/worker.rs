@@ -33,7 +33,9 @@ use crate::inference::{dispatch_events, run_failed_event};
 use crate::models::ModelsConfig;
 use crate::queue::{QueueTiming, RedisRunQueue};
 use crate::spawner::OwnedSpawner;
-use crate::store::{is_terminal, Append, MessageStore, RunStore, StoredMessage, StoredRun};
+use crate::store::{
+    is_terminal, Append, MessageStore, OutboxStore, RunStore, StoredMessage, StoredRun,
+};
 
 /// Takes runs off the queue and runs them to their end.
 pub struct Worker {
@@ -736,13 +738,18 @@ impl Claim<'_> {
     }
 }
 
-/// Hands back runs whose lease ran out, and sweeps runs left pending and
-/// the asks of parked runs, every `reap_every`, for as long as the process
-/// runs.
+/// How long an outbox entry is kept (decision 38A): a stream resuming from
+/// an older number is told to reload (Phase 3.2).
+pub const OUTBOX_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Hands back runs whose lease ran out, sweeps runs left pending and the
+/// asks of parked runs, and prunes outbox entries older than
+/// `OUTBOX_RETENTION`, every `reap_every`, for as long as the process runs.
 pub fn reap_forever(
     queue: &RedisRunQueue,
     store: &dyn RunStore,
     messages: Option<&dyn MessageStore>,
+    outbox: Option<&dyn OutboxStore>,
     timing: QueueTiming,
 ) {
     loop {
@@ -765,6 +772,18 @@ pub fn reap_forever(
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => eprintln!("gol: ask sweep: {error}"),
                 Err(_) => eprintln!("gol: ask sweep: sweeping panicked"),
+            }
+        }
+        if let Some(outbox) = outbox {
+            let before = Timestamp::unix_millis(
+                Timestamp::now()
+                    .as_unix_millis()
+                    .saturating_sub(OUTBOX_RETENTION.as_millis() as i64),
+            );
+            match catch_unwind(AssertUnwindSafe(|| outbox.prune_outbox(before))) {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => eprintln!("gol: outbox prune: {error}"),
+                Err(_) => eprintln!("gol: outbox prune: pruning panicked"),
             }
         }
         std::thread::sleep(timing.reap_every);
@@ -985,6 +1004,7 @@ pub fn start_queue(
     store: Arc<dyn RunStore>,
     memory: Arc<dyn Memory>,
     messages: Arc<dyn MessageStore>,
+    outbox: Arc<dyn OutboxStore>,
     jev_base_url: &str,
     models: Arc<ModelsConfig>,
 ) -> Result<(), String> {
@@ -1007,7 +1027,15 @@ pub fn start_queue(
     let reaper = RedisRunQueue::open(&settings.redis_url);
     std::thread::Builder::new()
         .name("gol-reaper".to_string())
-        .spawn(move || reap_forever(&reaper, store.as_ref(), Some(messages.as_ref()), timing))
+        .spawn(move || {
+            reap_forever(
+                &reaper,
+                store.as_ref(),
+                Some(messages.as_ref()),
+                Some(outbox.as_ref()),
+                timing,
+            )
+        })
         .map_err(|error| error.to_string())?;
     Ok(())
 }

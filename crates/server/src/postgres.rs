@@ -8,8 +8,8 @@ use serde_json::Value;
 use harness::StoreError;
 
 use crate::store::{
-    check_one_terminal, is_terminal, Append, MessageStore, PutAgent, PutMessage, PutRun, RunStore,
-    StoredAgent, StoredArtifact, StoredMessage, StoredRun,
+    check_one_terminal, is_terminal, Append, MessageStore, OutboxEntry, OutboxStore, PutAgent,
+    PutMessage, PutRun, RunStore, StoredAgent, StoredArtifact, StoredMessage, StoredRun,
 };
 
 /// The run store in Postgres over a pool of connections (C2, owner decision
@@ -88,6 +88,26 @@ create table if not exists run_events (
     terminal boolean not null,
     primary key (run_id, seq)
 );
+
+-- The per-owner outbox (Phase 3.1): each principal's count, and a row per
+-- stored event, numbered in the transaction that stores it, after the run
+-- row's lock (decision 16A, formal/outbox). A row points at its event.
+create table if not exists outbox_counters (
+    owner_issuer text not null,
+    owner_subject text not null,
+    last bigint not null,
+    primary key (owner_issuer, owner_subject)
+);
+create table if not exists outbox (
+    owner_issuer text not null,
+    owner_subject text not null,
+    seq bigint not null,
+    run_id uuid not null,
+    run_seq bigint not null,
+    stored_ms bigint not null,
+    primary key (owner_issuer, owner_subject, seq)
+);
+create index if not exists outbox_by_stored on outbox (stored_ms);
 
 create table if not exists messages (
     id uuid primary key,
@@ -269,11 +289,19 @@ impl PostgresStore {
             // after the row lock sees what the lock's last holder committed.
             let mut tx = read_committed(client)?;
             let locked = tx
-                .query_opt("select 1 from runs where id = $1 for update", &[&id])
+                .query_opt(
+                    "select spec->'owner'->>'issuer', spec->'owner'->>'subject'
+                     from runs where id = $1 for update",
+                    &[&id],
+                )
                 .map_err(sql)?;
-            if locked.is_none() {
+            let Some(locked) = locked else {
                 return Ok(Append::Missing);
-            }
+            };
+            let principal: (String, String) = (
+                locked.try_get(0).map_err(sql)?,
+                locked.try_get(1).map_err(sql)?,
+            );
             // Two index lookups: the partial index answers the first, the
             // primary key the second.
             let ended = tx
@@ -299,9 +327,64 @@ impl PostgresStore {
             if seen.is_some_and(|seen| i64::try_from(seen) != Ok(last)) {
                 return Ok(Append::Moved);
             }
-            rows.insert(&mut tx, id, last)?;
+            rows.insert(&mut tx, id, last, &principal)?;
             tx.commit().map_err(sql)?;
             Ok(Append::Appended)
+        })
+    }
+}
+
+impl OutboxStore for PostgresStore {
+    /// One statement: the outbox rows joined to their events. An owner's
+    /// numbers commit in order, so a read never sees a later number before
+    /// an earlier one.
+    fn outbox_after(
+        &self,
+        owner: &Owner,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<OutboxEntry>, StoreError> {
+        let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self.with_client(|client| {
+            client
+                .query(
+                    "select outbox.seq, outbox.run_id, outbox.run_seq, run_events.body
+                     from outbox join run_events
+                       on run_events.run_id = outbox.run_id and run_events.seq = outbox.run_seq
+                     where outbox.owner_issuer = $1 and outbox.owner_subject = $2
+                       and outbox.seq > $3
+                     order by outbox.seq
+                     limit $4",
+                    &[&owner.issuer, &owner.subject, &after, &limit],
+                )
+                .map_err(sql)
+        })?;
+        rows.iter()
+            .map(|row| {
+                let seq: i64 = row.try_get(0).map_err(sql)?;
+                let run_id: uuid::Uuid = row.try_get(1).map_err(sql)?;
+                let run_seq: i64 = row.try_get(2).map_err(sql)?;
+                let body: serde_json::Value = row.try_get(3).map_err(sql)?;
+                Ok(OutboxEntry {
+                    seq: u64::try_from(seq).map_err(|_| StoreError::new("negative outbox seq"))?,
+                    run_id: RunId::from_uuid(run_id),
+                    run_seq: u64::try_from(run_seq)
+                        .map_err(|_| StoreError::new("negative run seq"))?,
+                    event: serde_json::from_value(body).map_err(json)?,
+                })
+            })
+            .collect()
+    }
+
+    fn prune_outbox(&self, before: Timestamp) -> Result<u64, StoreError> {
+        self.with_client(|client| {
+            client
+                .execute(
+                    "delete from outbox where stored_ms < $1",
+                    &[&before.as_unix_millis()],
+                )
+                .map_err(sql)
         })
     }
 }
@@ -478,6 +561,10 @@ impl RunStore for PostgresStore {
         let spec = serde_json::to_value(&run.spec).map_err(json)?;
         let rows = EventRows::new(&run.events)?;
         let id = run.spec.run_id.as_uuid();
+        let principal = (
+            run.spec.owner.issuer.clone(),
+            run.spec.owner.subject.clone(),
+        );
         self.with_client(|client| {
             let mut tx = read_committed(client)?;
             let inserted = tx
@@ -487,7 +574,7 @@ impl RunStore for PostgresStore {
                 )
                 .map_err(sql)?;
             if inserted == 1 {
-                rows.insert(&mut tx, id, 0)?;
+                rows.insert(&mut tx, id, 0, &principal)?;
             }
             tx.commit().map_err(sql)?;
             Ok(if inserted == 1 {
@@ -634,18 +721,48 @@ impl EventRows {
         })
     }
 
-    /// Inserts the rows numbered after `last`, in order, in one statement.
+    /// Inserts the rows numbered after `last`, in order, in one statement,
+    /// then numbers them in `principal`'s outbox in another. The caller
+    /// holds the run row (locked or just inserted), so the counter row is
+    /// always taken after it; its lock is held to commit, so an owner's
+    /// numbers commit in order (`formal/outbox`).
     fn insert(
         &self,
         tx: &mut postgres::Transaction<'_>,
         run_id: uuid::Uuid,
         last: i64,
+        principal: &(String, String),
     ) -> Result<(), StoreError> {
         tx.execute(
             "insert into run_events (run_id, seq, body, terminal)
              select $1, $2 + row.ord, row.body, row.terminal
              from unnest($3::jsonb[], $4::bool[]) with ordinality as row (body, terminal, ord)",
             &[&run_id, &last, &self.bodies, &self.terminal],
+        )
+        .map_err(sql)?;
+        let count = i64::try_from(self.bodies.len()).unwrap_or(i64::MAX);
+        if count == 0 {
+            return Ok(());
+        }
+        tx.execute(
+            "with counter as (
+                 insert into outbox_counters (owner_issuer, owner_subject, last)
+                 values ($1, $2, $3)
+                 on conflict (owner_issuer, owner_subject)
+                 do update set last = outbox_counters.last + excluded.last
+                 returning last
+             )
+             insert into outbox (owner_issuer, owner_subject, seq, run_id, run_seq, stored_ms)
+             select $1, $2, counter.last - $3 + n, $4, $5 + n, $6
+             from counter, generate_series(1::bigint, $3) as n",
+            &[
+                &principal.0,
+                &principal.1,
+                &count,
+                &run_id,
+                &last,
+                &Timestamp::now().as_unix_millis(),
+            ],
         )
         .map_err(sql)?;
         Ok(())
