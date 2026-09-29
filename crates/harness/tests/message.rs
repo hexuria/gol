@@ -339,3 +339,38 @@ fn two_tells_in_one_step_are_two_requests() {
         .collect();
     assert_eq!(decisions, [1, 2]);
 }
+
+// A run cut after a message was authorized and before it was sent performs
+// it again on resume with the same decision count, so the deliverer can
+// recognize the resend.
+#[test]
+fn a_resumed_run_resends_a_message_with_the_same_decision() {
+    let spec = spec();
+    let first = Fake::accepting();
+    let mut driver = Driver::boot(spec.clone())
+        .unwrap()
+        .with_deliverer(first.clone());
+    run(&mut driver, vec![message(false, None), complete()]);
+    let log = driver.events().to_vec();
+    let authorized = log
+        .iter()
+        .position(|event| {
+            matches!(
+                event.payload,
+                EventPayload::EffectAuthorized {
+                    effect: Effect::SendMessage { .. }
+                }
+            )
+        })
+        .expect("authorized");
+    let again = Fake::accepting();
+    let mut resumed = Driver::resume(spec, log[..=authorized].to_vec())
+        .unwrap()
+        .with_deliverer(again.clone());
+    run(&mut resumed, vec![complete()]);
+    let first = first.asked.lock().unwrap();
+    let again = again.asked.lock().unwrap();
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].decision, first[0].decision);
+    assert_eq!(again[0].body, first[0].body);
+}

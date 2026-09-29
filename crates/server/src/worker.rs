@@ -399,10 +399,6 @@ enum Stopped {
     Store(Append),
     /// Its claim no longer holds the run's lease.
     LostLease,
-    /// The run waits for a reply to an ask (Phase 2.2). Until park and wake
-    /// (Phase 2.3) the run is handed back, never acknowledged open; with no
-    /// deliverer in the server yet, no run gets here.
-    Waiting,
 }
 
 impl Worker {
@@ -419,7 +415,7 @@ impl Worker {
             match self.run_from(&spec, events, token)? {
                 Stopped::Store(Append::Moved) if reloads < RELOADS => reloads += 1,
                 Stopped::Store(other) => return Ok(other),
-                Stopped::LostLease | Stopped::Waiting => return Ok(Append::Moved),
+                Stopped::LostLease => return Ok(Append::Moved),
             }
             events = match self.store.run(spec.run_id).map_err(|e| e.to_string())? {
                 Some(run) => run.events,
@@ -490,6 +486,9 @@ impl Worker {
             return Ok(Stopped::LostLease);
         }
         let (spawner, targets) = self.delegation(spec);
+        // No message deliverer yet: every message is refused, so no run here
+        // waits for a reply. A waiting run needs park and wake (Phase 2.3,
+        // decision 35A).
         driver = driver.with_spawner(spawner, targets);
         let mut decider = match jev_client(&self.jev_base_url) {
             Ok(client) => JevDecider::new(client),
@@ -532,14 +531,6 @@ impl Worker {
         );
         if let Some(refused) = refused {
             return refused;
-        }
-        if matches!(
-            driver.state().harness,
-            protocol::HarnessState::WaitingForMessage { .. }
-        ) {
-            // The boundary stored everything up to the ask; nothing ends
-            // the run, so it must not be acknowledged.
-            return Ok(Stopped::Waiting);
         }
         let mut tail = driver.events()[seen..].to_vec();
         if let Err(error) = outcome {

@@ -783,3 +783,82 @@ async fn a_worker_without_its_lease_does_not_redo_a_pending_effect() {
         assert_eq!(server.received_requests().await.expect("requests").len(), 0);
     }
 }
+
+// Phase 2.2 (decision 35A): the worker has no message deliverer, so a queued
+// run's ask is refused and the run goes on; no queued run waits for a reply
+// before park and wake. Here the stored log was cut after the ask was
+// authorized, so the resumed worker performs it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_runs_ask_is_refused_and_the_run_goes_on() {
+    for which in 0..2 {
+        let server = jev(&["complete"]).await;
+        let uri = server.uri();
+        blocking(move || {
+            let store = stores().swap_remove(which);
+            let mut spec = spec();
+            spec.capabilities
+                .push(protocol::Capability::new("agent.message"));
+            let mut events = queued_events(&spec);
+            for payload in [
+                EventPayload::RunScheduled,
+                EventPayload::RunProvisioning,
+                EventPayload::RunStarting,
+            ] {
+                events.push(event(&spec, payload));
+            }
+            let mut driver = Driver::resume(spec.clone(), events).expect("resume");
+            let mut decider = ScriptedDecider::new([Effect::SendMessage {
+                to: AgentId::new(),
+                body: "what is it?".to_string(),
+                expects_reply: true,
+                reply_to: None,
+                timeout_secs: None,
+            }]);
+            let _ = run_until(
+                &mut driver,
+                &mut decider,
+                &[],
+                &harness::UnavailableModel,
+                &InMemory::default(),
+                &mut |_| Boundary::Continue,
+            );
+            let authorized = driver
+                .events()
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event.payload,
+                        EventPayload::EffectAuthorized {
+                            effect: Effect::SendMessage { .. }
+                        }
+                    )
+                })
+                .expect("authorized");
+            store
+                .put_run(StoredRun {
+                    spec: spec.clone(),
+                    events: driver.events()[..=authorized].to_vec(),
+                })
+                .expect("put run");
+            let key = format!("gol:test:{}", RunId::new());
+            let queue = RedisRunQueue::with_key(REDIS_URL, &key);
+            queue.push(spec.run_id).expect("push");
+            let worker = worker(store.clone(), &key, &uri);
+            assert_eq!(worker.work_one().expect("work"), Some(spec.run_id));
+            let events = store.run(spec.run_id).expect("read").expect("run").events;
+            assert!(events.iter().any(|event| matches!(
+                &event.payload,
+                EventPayload::MessageRefused { reason, .. }
+                    if reason == "no message deliverer is configured"
+            )));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event.payload, EventPayload::MessageSent { .. })));
+            assert!(matches!(
+                events.last().map(|event| &event.payload),
+                Some(EventPayload::RunCompleted { .. })
+            ));
+            assert_eq!(queue.processing().expect("processing"), []);
+        });
+    }
+}
