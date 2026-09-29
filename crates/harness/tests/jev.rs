@@ -704,6 +704,16 @@ fn jev_offers_tell_and_ask_choices_only_when_allowed() {
     };
     assert_eq!(messages(&offered), 6);
 
+    // An input longer than a message may be: the authorizer would deny it.
+    let long = {
+        let mut long = messaging(limits(3, 2));
+        long.input = "x".repeat(protocol::MAX_MESSAGE_BYTES + 1);
+        long
+    };
+    let mut refused = offered;
+    refused.spec = &long;
+    assert_eq!(messages(&refused), 0);
+
     // No deliverer.
     let mut refused = offered;
     refused.messaging = false;

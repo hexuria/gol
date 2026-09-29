@@ -1,5 +1,6 @@
 use protocol::{
     AgentId, Capability, Effect, HarnessState, InvocationId, MAX_CHILDREN, MAX_DELEGATION_HOPS,
+    MAX_MESSAGE_BYTES,
 };
 use serde_json::{json, Value};
 use typesafe_sdk::blocking::Client;
@@ -165,10 +166,14 @@ fn delegate_choices(view: &DecisionView<'_>) -> Vec<(String, String, AgentId)> {
 /// The `tell:<name>` then the `ask:<name>` choices (decision 32A), as
 /// (label, description, agent, whether it asks), labelled and filtered as
 /// the delegate choices are: a tell or a new ask starts a task whose budget
-/// is carved as a delegation's (decision 33A). None without a deliverer or
-/// without `agent.message`.
+/// is carved as a delegation's (decision 33A). None without a deliverer,
+/// without `agent.message`, or with an input longer than a message may be
+/// (the body is the input, and the authorizer would deny it).
 fn message_choices(view: &DecisionView<'_>) -> Vec<(String, String, AgentId, bool)> {
-    if !view.messaging || !starts_task(view, "agent.message") {
+    if !view.messaging
+        || view.spec.input.len() > MAX_MESSAGE_BYTES
+        || !starts_task(view, "agent.message")
+    {
         return Vec::new();
     }
     let described = |verb: String, description: &str| {

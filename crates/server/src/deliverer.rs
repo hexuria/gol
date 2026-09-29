@@ -4,18 +4,27 @@
 //! `formal/runqueue` models the park and wake around it (decision 34A).
 use std::sync::Arc;
 
-use harness::{AgentSpawner, ChildRequest, MessageDeliverer, MessageRequest, SentMessage};
-use protocol::{Actor, Event, EventPayload, EventSource, MessageId, RunId, Timestamp};
+use harness::{ChildRequest, MessageDeliverer, MessageRequest, SentMessage};
+use protocol::{Actor, AgentId, Event, EventPayload, EventSource, MessageId, RunId, Timestamp};
 
 use crate::queue::RedisRunQueue;
 use crate::spawner::OwnedSpawner;
-use crate::store::{Append, MessageStore, PutMessage, RunStore, StoredMessage};
+use crate::store::{is_terminal, Append, MessageStore, PutMessage, RunStore, StoredMessage};
+
+/// The step a message's task is derived from: the sending decision with the
+/// high bit set, so a task never shares its id with a delegation's child at
+/// the same number (to the same agent with the same input). Decisions are
+/// bounded by `max_steps`, far below the bit.
+fn task_step(decision: u32) -> u32 {
+    decision | 1 << 31
+}
 
 /// Delivers a run's messages to other agents of its owner. A tell or a new
-/// ask starts the target's task through the owned spawner (same owner, the
-/// carved limits, decision 29A and 33A) and is stored with it; a reply
-/// answers an open ask whose task is the sending run, and reaches the asker
-/// at once (decision 31A allows an explicit reply beside the task's end).
+/// ask is stored first, with the task it names, then the task is started
+/// through the owned spawner (same owner, the carved limits, decision 29A
+/// and 33A). A reply answers an open ask whose task is the sending run, and
+/// reaches the asker at once (decision 31A allows an explicit reply beside
+/// the task's end).
 pub struct OwnedDeliverer {
     store: Arc<dyn RunStore>,
     messages: Arc<dyn MessageStore>,
@@ -39,11 +48,23 @@ impl OwnedDeliverer {
     }
 
     /// Stores `message` once for its run and decision, and returns the id
-    /// it was stored under (a resumed run's resend gets the first id).
+    /// it was stored under: a resumed run's resend gets the first id. A
+    /// different message at the same decision is refused (decision 30A).
     fn put(&self, message: StoredMessage) -> Result<MessageId, String> {
         match self.messages.put_message(message.clone()) {
             Ok(PutMessage::Stored) => Ok(message.id),
-            Ok(PutMessage::Existed(stored)) => Ok(stored.id),
+            Ok(PutMessage::Existed(stored)) => {
+                let same = stored.to_agent == message.to_agent
+                    && stored.body == message.body
+                    && stored.expects_reply == message.expects_reply
+                    && stored.reply_to == message.reply_to
+                    && stored.task_run == message.task_run;
+                if same {
+                    Ok(stored.id)
+                } else {
+                    Err("another message was sent at this decision".to_string())
+                }
+            }
             Err(error) => {
                 eprintln!("gol: message from run {}: {error}", message.from_run);
                 Err("store unavailable".to_string())
@@ -60,9 +81,9 @@ impl MessageDeliverer for OwnedDeliverer {
         let Some(limits) = request.limits else {
             return self.reply(request);
         };
-        let task = self.spawner.start(ChildRequest {
+        let task = self.spawner.child_spec(ChildRequest {
             parent: from,
-            step: request.decision,
+            step: task_step(request.decision),
             agent_id: request.to,
             input: request.body,
             limits,
@@ -74,6 +95,9 @@ impl MessageDeliverer for OwnedDeliverer {
                     .saturating_add(i64::from(seconds) * 1000),
             )
         });
+        // Stored before the task exists, so the task's end always finds it.
+        // A task that then fails to start leaves an ask its asker never
+        // logged; the sweep closes it at its deadline.
         let message_id = self.put(StoredMessage {
             id: MessageId::new(),
             owner: from.owner.clone(),
@@ -87,6 +111,7 @@ impl MessageDeliverer for OwnedDeliverer {
             task_run: Some(task.run_id),
             deadline,
         })?;
+        let task = self.spawner.enqueue_child(from, task)?;
         Ok(SentMessage {
             message_id,
             task: Some(task),
@@ -95,14 +120,16 @@ impl MessageDeliverer for OwnedDeliverer {
 }
 
 impl OwnedDeliverer {
-    /// A reply: to an open ask whose task is the sending run, and to no
-    /// other (the authorizer's hop exemption rests on this).
+    /// A reply: to the agent that asked, answering the open ask whose task
+    /// is the sending run, and to no other (the authorizer's hop exemption
+    /// rests on this).
     fn reply(&self, request: MessageRequest<'_>) -> Result<SentMessage, String> {
         let from = request.from;
         let not_asked = || "not a reply to an ask this run was sent".to_string();
-        let ask_id = request.reply_to.ok_or_else(not_asked)?;
-        let ask = match self.messages.message(ask_id) {
-            Ok(Some(ask)) if ask.expects_reply && ask.task_run == Some(from.run_id) => ask,
+        let ask = match self.messages.ask_of_task(from.run_id) {
+            Ok(Some(ask)) if Some(ask.id) == request.reply_to && ask.from_agent == request.to => {
+                ask
+            }
             Ok(_) => return Err(not_asked()),
             Err(error) => {
                 eprintln!("gol: reply from run {}: {error}", from.run_id);
@@ -122,11 +149,14 @@ impl OwnedDeliverer {
             task_run: None,
             deadline: None,
         })?;
-        deliver(
+        // Stored, so sent: it reaches the asker now, or, while the ask is
+        // not in the asker's log yet, never (the task's end answers then).
+        if let Err(error) = deliver(
             self.store.as_ref(),
             self.messages.as_ref(),
             &self.queue,
-            &ask,
+            ask.from_run,
+            ask.id,
             EventPayload::MessageReceived {
                 message_id,
                 from_agent: from.agent_id,
@@ -134,7 +164,10 @@ impl OwnedDeliverer {
                 body: request.body.to_string(),
                 reply_to: Some(ask.id),
             },
-        )?;
+            IfUnsent::Leave,
+        ) {
+            eprintln!("gol: reply {message_id} from run {}: {error}", from.run_id);
+        }
         Ok(SentMessage {
             message_id,
             task: None,
@@ -142,70 +175,103 @@ impl OwnedDeliverer {
     }
 }
 
-/// Delivers `answer` (the reply to `ask`, or its `AskTimedOut`) to the run
-/// that asked: appended to its log first, then the ask marked answered,
-/// then the asker woken if it is parked (`formal/runqueue` `ReplyAppend`
-/// then `ReplyWake`). Done twice it appends a second answer, which the
-/// asker's harness no longer waits on and ignores, and wakes nothing.
+/// Where an ask stands in its asker's log, read in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AskState {
+    /// No `MessageSent` names it: the asker's worker died before its log
+    /// said so, or the asker sent something else.
+    Unsent,
+    /// Sent, and no answer after it: the asker's harness waits on it.
+    Open,
+    /// Answered (a reply or `AskTimedOut`) after it was sent.
+    Answered,
+}
+
+/// Where `ask` stands in `events`. An answer before the ask's `MessageSent`
+/// does not count: the harness only takes an answer while it waits.
+pub(crate) fn ask_state(events: &[Event], ask: MessageId) -> AskState {
+    events
+        .iter()
+        .fold(AskState::Unsent, |state, event| match &event.payload {
+            EventPayload::MessageSent { message_id, .. } if *message_id == ask => AskState::Open,
+            EventPayload::MessageReceived {
+                reply_to: Some(reply_to),
+                ..
+            } if *reply_to == ask && state == AskState::Open => AskState::Answered,
+            EventPayload::AskTimedOut { message_id }
+                if *message_id == ask && state == AskState::Open =>
+            {
+                AskState::Answered
+            }
+            _ => state,
+        })
+}
+
+/// What `deliver` does with an ask its asker has not logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IfUnsent {
+    /// Leaves it open: the asker may still log it (a resumed run resends).
+    Leave,
+    /// Closes it: its deadline has passed. An asker that logs it later is
+    /// parked on a closed ask, and the sweep answers it then.
+    Close,
+}
+
+/// Delivers `answer` (a reply to `ask`, or its `AskTimedOut`) to `asker`,
+/// the run that asked: appended to its log while the ask is open there,
+/// then the ask marked answered, then the asker woken if it is parked on it
+/// (`formal/runqueue` `ReplyAppend` then `ReplyWake`). An ask already
+/// answered in the log is only marked and woken; an asker that ended, or is
+/// not stored, needs no answer. `true` when the ask is settled, `false`
+/// when it was left for later. Once the append is made, a failure to mark
+/// or wake goes to stderr: the sweep finishes it.
 pub(crate) fn deliver(
     store: &dyn RunStore,
     messages: &dyn MessageStore,
     queue: &RedisRunQueue,
-    ask: &StoredMessage,
+    asker: RunId,
+    ask: MessageId,
     answer: EventPayload,
-) -> Result<(), String> {
-    let failed = |error: String| {
-        eprintln!(
-            "gol: answer to ask {} of run {}: {error}",
-            ask.id, ask.from_run
-        );
-        "store unavailable".to_string()
-    };
-    // An asker that is not stored, or already ended, needs no answer: the
-    // ask is closed, so the sweep does not retry it.
-    let asker = store
-        .run(ask.from_run)
+    if_unsent: IfUnsent,
+) -> Result<bool, String> {
+    let failed = |error: String| format!("answer to ask {ask} of run {asker}: {error}");
+    let run = store
+        .run(asker)
         .map_err(|error| failed(error.to_string()))?;
-    if let Some(asker) = asker {
-        let event = Event::record(
-            EventSource::for_spec(&asker.spec, Actor::System, Timestamp::now()),
-            answer,
-        );
-        match store.append_events(ask.from_run, vec![event]) {
-            Ok(Append::Appended | Append::Terminal | Append::Missing) => {}
-            Ok(other) => return Err(failed(format!("{other:?}"))),
-            Err(error) => return Err(failed(error.to_string())),
+    if let Some(run) = &run {
+        let ended = run.events.iter().any(|event| is_terminal(&event.payload));
+        match ask_state(&run.events, ask) {
+            _ if ended => {}
+            AskState::Unsent if if_unsent == IfUnsent::Leave => return Ok(false),
+            AskState::Unsent | AskState::Answered => {}
+            AskState::Open => {
+                let event = Event::record(
+                    EventSource::for_spec(&run.spec, Actor::System, Timestamp::now()),
+                    answer,
+                );
+                match store.append_events(asker, vec![event]) {
+                    Ok(Append::Appended | Append::Terminal | Append::Missing) => {}
+                    Ok(other) => return Err(failed(format!("{other:?}"))),
+                    Err(error) => return Err(failed(error.to_string())),
+                }
+            }
         }
     }
-    messages
-        .answer(ask.id)
-        .map_err(|error| failed(error.to_string()))?;
-    queue.wake(ask.from_run).map_err(failed)?;
-    Ok(())
+    if let Err(error) = messages.answer(ask) {
+        eprintln!("gol: {}", failed(error.to_string()));
+    }
+    if let Err(error) = queue.wake(asker, ask) {
+        eprintln!("gol: {}", failed(error));
+    }
+    Ok(true)
 }
 
-/// Whether `events` hold the answer (reply or timeout) to `ask`.
-pub(crate) fn answered(events: &[Event], ask: MessageId) -> bool {
-    events.iter().any(|event| {
-        matches!(
-            &event.payload,
-            EventPayload::MessageReceived {
-                reply_to: Some(reply_to),
-                ..
-            } if *reply_to == ask
-        ) || matches!(
-            &event.payload,
-            EventPayload::AskTimedOut { message_id } if *message_id == ask
-        )
-    })
-}
-
-/// The reply a task gives its ask when it ends (decision 31A): its outcome,
+/// The reply a task gives `ask` when it ends (decision 31A): its outcome,
 /// or that it failed, was cancelled or expired. `None` while it runs.
 pub(crate) fn task_answer(
     task: RunId,
-    task_agent: protocol::AgentId,
-    ask: &StoredMessage,
+    task_agent: AgentId,
+    ask: MessageId,
     events: &[Event],
 ) -> Option<EventPayload> {
     let body = events.iter().rev().find_map(|event| match &event.payload {
@@ -220,6 +286,6 @@ pub(crate) fn task_answer(
         from_agent: task_agent,
         from_run: task,
         body,
-        reply_to: Some(ask.id),
+        reply_to: Some(ask),
     })
 }

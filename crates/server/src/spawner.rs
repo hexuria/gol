@@ -138,10 +138,19 @@ impl AgentSpawner for OwnedSpawner {
     /// read: they are fixed words, and a store or queue error's detail goes
     /// to stderr only.
     fn start(&self, request: ChildRequest<'_>) -> Result<StartedChild, String> {
-        let queue = self
-            .queue
-            .as_ref()
-            .ok_or_else(|| "delegation needs the run queue".to_string())?;
+        let spec = self.child_spec(request)?;
+        self.enqueue_child(request.parent, spec)
+    }
+}
+
+impl OwnedSpawner {
+    /// The child `request` asks for: a run of an agent the parent's owner
+    /// holds, with the capabilities both allow. Its id is derived from the
+    /// request, so asking again names the same child.
+    pub(crate) fn child_spec(&self, request: ChildRequest<'_>) -> Result<RunSpec, String> {
+        if self.queue.is_none() {
+            return Err("delegation needs the run queue".to_string());
+        }
         let parent = request.parent;
         let agent = match self.store.agent(request.agent_id) {
             Ok(Some(agent)) => agent,
@@ -178,6 +187,19 @@ impl AgentSpawner for OwnedSpawner {
             .metadata(metadata)
             .child_of(parent, request.step)
             .build();
+        Ok(spec)
+    }
+
+    /// Stores and queues `spec`, a child of `parent`, once.
+    pub(crate) fn enqueue_child(
+        &self,
+        parent: &RunSpec,
+        spec: RunSpec,
+    ) -> Result<StartedChild, String> {
+        let queue = self
+            .queue
+            .as_ref()
+            .ok_or_else(|| "delegation needs the run queue".to_string())?;
         match enqueue(
             self.store.as_ref(),
             queue,

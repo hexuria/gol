@@ -6,7 +6,7 @@
 //! `queue_worker.rs` does.
 use std::sync::Arc;
 
-use harness::{InMemory, MessageDeliverer, MessageRequest};
+use harness::{AgentSpawner, ChildRequest, InMemory, MessageDeliverer, MessageRequest};
 use protocol::{
     Actor, AgentId, Capability, CredentialSource, Event, EventPayload, EventSource,
     ExecutionPlacement, Limits, MessageId, ModelProvider, Owner, RunId, RunSpec, Timestamp,
@@ -15,8 +15,8 @@ use protocol::{
 use serde_json::json;
 use server::{
     is_terminal, queued_events, sweep_asks, AgentManifest, InMemoryStore, MessageStore,
-    OwnedDeliverer, PostgresStore, Prepared, RedisRunQueue, RunStore, StoredAgent, StoredMessage,
-    StoredRun, Worker,
+    OwnedDeliverer, OwnedSpawner, PostgresStore, Prepared, QueueTiming, RedisRunQueue, RunStore,
+    StoredAgent, StoredMessage, StoredRun, Worker,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -164,6 +164,22 @@ impl Setup {
         }
     }
 
+    /// A delivering worker whose lease runs out in 400 ms.
+    fn fast_worker(&self, uri: &str) -> Worker {
+        Worker::builder()
+            .queue(RedisRunQueue::with_key(REDIS_URL, &self.key))
+            .store(self.runs.clone())
+            .memory(Arc::new(InMemory::default()))
+            .jev(uri)
+            .timing(QueueTiming {
+                lease: std::time::Duration::from_millis(400),
+                heartbeat: std::time::Duration::from_millis(100),
+                ..QueueTiming::default()
+            })
+            .messages(self.messages.clone())
+            .build()
+    }
+
     fn events(&self, run_id: RunId) -> Vec<Event> {
         self.runs.run(run_id).expect("read").expect("run").events
     }
@@ -203,6 +219,22 @@ impl Setup {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Logs that the researcher sent `ask`, as its driver records it: the
+    /// ask is then open in its log.
+    fn log_sent(&self, ask: MessageId) {
+        let sent = Event::record(
+            EventSource::for_spec(&self.researcher, Actor::System, Timestamp::now()),
+            EventPayload::MessageSent {
+                message_id: ask,
+                to: self.writer,
+                expects_reply: true,
+            },
+        );
+        self.runs
+            .append_events(self.researcher.run_id, vec![sent])
+            .expect("append");
     }
 
     fn deliverer(&self) -> OwnedDeliverer {
@@ -315,8 +347,8 @@ async fn a_reply_before_the_park_still_wakes_the_asker() {
 
 // Decision 28A: an open ask past its deadline is answered by the sweep with
 // `AskTimedOut`; before its deadline it is left alone, and the task's later
-// end is no second answer. The ask waits 60 s, so the sweep at 61 s reaches
-// no other test's ask (Jev's wait an hour).
+// end is no second answer. The ask waits 60 s; every other test's ask here
+// waits an hour, so the sweep at 61 s reaches none of them.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_ask_past_its_deadline_times_out() {
     for which in 0..2 {
@@ -342,6 +374,7 @@ async fn an_ask_past_its_deadline_times_out() {
                 })
                 .expect("sent");
             let ask = sent.message_id;
+            setup.log_sent(ask);
             let sweep = |at: i64| {
                 sweep_asks(
                     &setup.queue,
@@ -364,6 +397,7 @@ async fn an_ask_past_its_deadline_times_out() {
             assert_eq!(setup.answers(), [(ask, None)]);
 
             a_due_ask_whose_task_ended_gets_the_tasks_answer(which, &uri);
+            an_ask_never_logged_is_closed_at_its_deadline(which);
         });
     }
 }
@@ -461,7 +495,7 @@ fn a_resent_message_is_stored_and_started_once() {
                     body: "what is the plan?",
                     expects_reply: true,
                     reply_to: None,
-                    timeout_secs: Some(60),
+                    timeout_secs: Some(3600),
                     limits: Some(Limits {
                         max_steps: 3,
                         max_model_calls: 2,
@@ -556,8 +590,39 @@ async fn an_explicit_reply_from_the_task_answers_the_ask() {
                 reply(&setup.researcher).map(|sent| sent.message_id),
                 Err("not a reply to an ask this run was sent".to_string())
             );
+            // A reply goes to the agent that asked.
+            let astray = setup.deliverer().send(MessageRequest {
+                from: &task_spec,
+                decision: 1,
+                to: setup.writer,
+                body: "the plan",
+                expects_reply: false,
+                reply_to: Some(ask),
+                timeout_secs: None,
+                limits: None,
+            });
+            assert_eq!(
+                astray.map(|sent| sent.message_id),
+                Err("not a reply to an ask this run was sent".to_string())
+            );
             let sent = reply(&task_spec).expect("replied");
             assert_eq!(sent.task, None);
+            // The ask is answered: a second reply, at another decision, is
+            // refused and appends nothing.
+            let again = setup.deliverer().send(MessageRequest {
+                from: &task_spec,
+                decision: 2,
+                to: setup.researcher.agent_id,
+                body: "more",
+                expects_reply: false,
+                reply_to: Some(ask),
+                timeout_secs: None,
+                limits: None,
+            });
+            assert_eq!(
+                again.map(|sent| sent.message_id),
+                Err("not a reply to an ask this run was sent".to_string())
+            );
             assert_eq!(setup.answers(), [(ask, Some("the plan".to_string()))]);
             assert_eq!(setup.messages.ask_of_task(task), Ok(None));
             assert_eq!(setup.queue.parked().expect("parked"), []);
@@ -595,7 +660,6 @@ fn an_ask_without_its_asker_is_closed() {
                 .iter()
                 .any(|message| message.id == orphan.id)
         };
-        assert!(open(&setup));
         sweep_asks(
             &setup.queue,
             setup.runs.as_ref(),
@@ -630,6 +694,7 @@ fn a_due_ask_whose_task_ended_gets_the_tasks_answer(which: usize, uri: &str) {
             }),
         })
         .expect("sent");
+    setup.log_sent(sent.message_id);
     let task = sent.task.expect("a task").run_id;
     // A worker that cannot deliver runs the task; the researcher's
     // claim is held so that it stays open.
@@ -652,4 +717,186 @@ fn a_due_ask_whose_task_ended_gets_the_tasks_answer(which: usize, uri: &str) {
         setup.answers(),
         [(sent.message_id, Some("done".to_string()))]
     );
+}
+
+// Decision 30A: a resumed run that sends something else at the same decision
+// is refused, before any task starts: the stored message stays the one its
+// log will name.
+#[test]
+fn a_different_message_at_the_same_decision_is_refused() {
+    for which in 0..2 {
+        let setup = setup(which);
+        let send = |expects_reply: bool| {
+            setup.deliverer().send(MessageRequest {
+                from: &setup.researcher,
+                decision: 3,
+                to: setup.writer,
+                body: "what is the plan?",
+                expects_reply,
+                reply_to: None,
+                timeout_secs: expects_reply.then_some(3600),
+                limits: Some(Limits {
+                    max_steps: 3,
+                    max_model_calls: 2,
+                }),
+            })
+        };
+        let told = send(false).expect("told");
+        let queued = setup.queue.queued().expect("queued");
+        assert_eq!(
+            send(true).map(|sent| sent.message_id),
+            Err("another message was sent at this decision".to_string())
+        );
+        assert_eq!(setup.queue.queued().expect("queued"), queued);
+        let task = told.task.expect("a task").run_id;
+        assert_eq!(setup.messages.ask_of_task(task), Ok(None));
+    }
+}
+
+// A message's task and a delegation's child at the same number, to the same
+// agent with the same input, are different runs.
+#[test]
+fn a_message_task_is_not_a_delegation_child() {
+    for which in 0..2 {
+        let setup = setup(which);
+        let told = setup
+            .deliverer()
+            .send(MessageRequest {
+                from: &setup.researcher,
+                decision: 2,
+                to: setup.writer,
+                body: "what is the plan?",
+                expects_reply: false,
+                reply_to: None,
+                timeout_secs: None,
+                limits: Some(Limits {
+                    max_steps: 3,
+                    max_model_calls: 2,
+                }),
+            })
+            .expect("told");
+        let spawner = OwnedSpawner::new(
+            setup.runs.clone(),
+            Some(Arc::new(RedisRunQueue::with_key(REDIS_URL, &setup.key))),
+        );
+        let child = spawner
+            .start(ChildRequest {
+                parent: &setup.researcher,
+                step: 2,
+                agent_id: setup.writer,
+                input: "what is the plan?",
+                limits: Limits {
+                    max_steps: 3,
+                    max_model_calls: 2,
+                },
+            })
+            .expect("delegated");
+        assert_ne!(told.task.expect("a task").run_id, child.run_id);
+    }
+}
+
+// The asker's worker died after its ask was stored and its task started,
+// before its log said so; the task ended meanwhile. Its answer waits for the
+// ask to be in the asker's log instead of landing before it (where the
+// asker's harness, waiting after it, would never see it). The resumed asker
+// resends the same ask, is parked, and the sweep delivers the task's end.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_waits_for_its_ask_to_be_logged() {
+    for which in 0..2 {
+        let server = jev(&["complete", "ask:writer", "complete"]).await;
+        let uri = server.uri();
+        blocking(move || {
+            let setup = setup(which);
+            let researcher = setup.researcher.run_id;
+            // What the dead worker did: the ask the researcher's first
+            // decision sends, stored with its task.
+            let sent = setup
+                .deliverer()
+                .send(MessageRequest {
+                    from: &setup.researcher,
+                    decision: 1,
+                    to: setup.writer,
+                    body: "what is the plan?",
+                    expects_reply: true,
+                    reply_to: None,
+                    timeout_secs: Some(harness::JEV_ASK_TIMEOUT_SECS),
+                    limits: Some(Limits {
+                        max_steps: 4,
+                        max_model_calls: 2,
+                    }),
+                })
+                .expect("sent");
+            let task = sent.task.expect("a task").run_id;
+            // The task runs first (Jev: complete) and ends.
+            let worker = setup.fast_worker(&uri);
+            let held = worker.claim().expect("claim").expect("a run");
+            assert_eq!(held.run_id(), researcher);
+            assert_eq!(worker.work_one().expect("work"), Some(task));
+            assert!(completed(&setup.events(task)));
+            assert_eq!(setup.answers(), []);
+
+            // The researcher's claim runs out, and it is run again (Jev:
+            // ask:writer): the same ask, and it is parked.
+            drop(held);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            setup.queue.reap().expect("reap");
+            assert_eq!(worker.work_one().expect("work"), Some(researcher));
+            assert_eq!(setup.asked(), (sent.message_id, task));
+            assert_eq!(
+                setup.queue.parked().expect("parked"),
+                [(researcher, sent.message_id)]
+            );
+
+            let swept = sweep_asks(
+                &setup.queue,
+                setup.runs.as_ref(),
+                setup.messages.as_ref(),
+                Timestamp::now(),
+            )
+            .expect("sweep");
+            assert!(swept.contains(&researcher));
+            assert_eq!(
+                setup.answers(),
+                [(sent.message_id, Some("done".to_string()))]
+            );
+            assert_eq!(worker.work_one().expect("work"), Some(researcher));
+            assert!(completed(&setup.events(researcher)));
+        });
+    }
+}
+
+// An ask whose asker never logged it (its worker died first, and the
+// resumed run did something else) is closed at its deadline, and nothing is
+// appended to the asker's log: no harness waits on it. Run from
+// `an_ask_past_its_deadline_times_out`, as the test above.
+fn an_ask_never_logged_is_closed_at_its_deadline(which: usize) {
+    let setup = setup(which);
+    let sent = setup
+        .deliverer()
+        .send(MessageRequest {
+            from: &setup.researcher,
+            decision: 1,
+            to: setup.writer,
+            body: "what is the plan?",
+            expects_reply: true,
+            reply_to: None,
+            timeout_secs: Some(60),
+            limits: Some(Limits {
+                max_steps: 3,
+                max_model_calls: 2,
+            }),
+        })
+        .expect("sent");
+    let task = sent.task.expect("a task").run_id;
+    let later = Timestamp::unix_millis(Timestamp::now().as_unix_millis() + 61_000);
+    let swept = sweep_asks(
+        &setup.queue,
+        setup.runs.as_ref(),
+        setup.messages.as_ref(),
+        later,
+    )
+    .expect("sweep");
+    assert!(swept.contains(&setup.researcher.run_id));
+    assert_eq!(setup.answers(), []);
+    assert_eq!(setup.messages.ask_of_task(task), Ok(None));
 }

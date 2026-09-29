@@ -151,10 +151,12 @@ redis.call('HDEL', KEYS[4], ARGV[1])
 return 1
 ";
 
-/// Wakes ARGV[1] if it is parked (KEYS[1]): back onto the runs list
-/// (KEYS[2]). 1 if it was parked, 0 otherwise; a second wake changes nothing.
+/// Wakes ARGV[1] if it is parked (KEYS[1]) on the ask ARGV[2]: back onto
+/// the runs list (KEYS[2]). 1 if it was, 0 otherwise; a second wake, or one
+/// for another ask, changes nothing.
 const WAKE: &str = r"
-if redis.call('HDEL', KEYS[1], ARGV[1]) == 0 then return 0 end
+if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+redis.call('HDEL', KEYS[1], ARGV[1])
 redis.call('LPUSH', KEYS[2], ARGV[1])
 return 1
 ";
@@ -414,14 +416,16 @@ impl RedisRunQueue {
         Ok(parked == 1)
     }
 
-    /// Puts a parked `id` back on the runs list; `false` when it was not
-    /// parked. Waking twice is harmless (`formal/runqueue` `Wake`).
-    pub fn wake(&self, id: RunId) -> Result<bool, String> {
+    /// Puts `id` back on the runs list if it is parked on `ask`; `false`
+    /// otherwise. Waking twice is harmless (`formal/runqueue` `Wake`), and a
+    /// late answer to an earlier ask does not wake a run parked on a newer one.
+    pub fn wake(&self, id: RunId, ask: MessageId) -> Result<bool, String> {
         let woken: i64 = self.with_connection(|connection| {
             Script::new(WAKE)
                 .key(&self.parked)
                 .key(&self.runs)
                 .arg(id.to_string())
+                .arg(ask.to_string())
                 .invoke(connection)
         })?;
         Ok(woken == 1)

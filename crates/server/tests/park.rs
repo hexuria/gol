@@ -56,13 +56,17 @@ fn a_wake_queues_a_parked_run_once() {
     let run = RunId::new();
     queue.push(run).expect("push");
     queue.claim("t1", LEASE).expect("claim");
-    queue.park(run, "t1", MessageId::new()).expect("park");
-    assert_eq!(queue.wake(run), Ok(true));
-    assert_eq!(queue.wake(run), Ok(false));
+    let ask = MessageId::new();
+    queue.park(run, "t1", ask).expect("park");
+    // A wake for another ask (a late answer to an earlier one) leaves it.
+    assert_eq!(queue.wake(run, MessageId::new()), Ok(false));
+    assert_eq!(queue.parked().expect("parked"), [(run, ask)]);
+    assert_eq!(queue.wake(run, ask), Ok(true));
+    assert_eq!(queue.wake(run, ask), Ok(false));
     assert_eq!(queue.queued().expect("queued"), [run]);
     assert_eq!(queue.parked().expect("parked"), []);
     // A run that is not parked is not woken onto the list.
     let other = RunId::new();
-    assert_eq!(queue.wake(other), Ok(false));
+    assert_eq!(queue.wake(other, ask), Ok(false));
     assert_eq!(queue.queued().expect("queued"), [run]);
 }

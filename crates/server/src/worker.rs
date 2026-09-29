@@ -27,7 +27,7 @@ use protocol::{
     RunId, RunSpec, Timestamp,
 };
 
-use crate::deliverer::{answered, deliver, task_answer, OwnedDeliverer};
+use crate::deliverer::{ask_state, deliver, task_answer, AskState, IfUnsent, OwnedDeliverer};
 use crate::http::{jev_client, Delegation};
 use crate::inference::{dispatch_events, run_failed_event};
 use crate::models::ModelsConfig;
@@ -481,14 +481,19 @@ impl Worker {
             else {
                 return Ok(());
             };
-            match task_answer(spec.run_id, spec.agent_id, &ask, &task.events) {
+            // An ask its asker has not logged yet is left open: the sweep
+            // delivers this end once the asker has logged it and is parked.
+            match task_answer(spec.run_id, spec.agent_id, ask.id, &task.events) {
                 Some(answer) => deliver(
                     self.store.as_ref(),
                     messages.as_ref(),
                     &self.queue,
-                    &ask,
+                    ask.from_run,
+                    ask.id,
                     answer,
-                ),
+                    IfUnsent::Leave,
+                )
+                .map(|_| ()),
                 None => Ok(()),
             }
         };
@@ -687,8 +692,8 @@ impl Done<'_> {
                     .map_err(|error| error.to_string())?
                     .map(|run| run.events)
                     .unwrap_or_default();
-                if answered(&events, ask) {
-                    queue.wake(run_id)?;
+                if ask_state(&events, ask) != AskState::Open {
+                    queue.wake(run_id, ask)?;
                 }
             }
             return Ok(run_id);
@@ -797,13 +802,16 @@ pub fn sweep(
     Ok(pushed)
 }
 
-/// Finishes what a crash can leave undone around an ask (decision 34A):
-/// wakes a parked run whose log already holds its answer, or that has
-/// ended; delivers the end of an asked task nobody delivered; and answers
-/// an open ask past its deadline, with its task's end if the task has
-/// ended, else `AskTimedOut` (decision 28A). Returns the runs it woke or
-/// answered. A run it cannot load or deliver to now is left for the next
-/// sweep; the others are still swept.
+/// Finishes what a crash can leave undone around an ask (decision 34A).
+/// For each parked run: wakes it if its log no longer waits on its ask (the
+/// answer landed, or the run ended) or the store lost it; otherwise
+/// delivers the end of the asked task if the task has ended, or, when the
+/// ask is closed or gone while the log still waits on it, `AskTimedOut`.
+/// Then answers each open ask past its deadline with its task's end if the
+/// task has ended, else `AskTimedOut` (decision 28A), closing one its asker
+/// never logged. Returns the runs it woke or answered. A run or ask it
+/// cannot load or deliver to now is left for the next sweep; the others are
+/// still swept.
 pub fn sweep_asks(
     queue: &RedisRunQueue,
     store: &dyn RunStore,
@@ -812,32 +820,50 @@ pub fn sweep_asks(
 ) -> Result<Vec<RunId>, String> {
     let mut swept = Vec::new();
     for (run_id, ask) in queue.parked()? {
-        // A parked run the store lost is woken too: a worker acknowledges it.
-        let settled = match store.run(run_id) {
+        let waits = match store.run(run_id) {
             Ok(Some(run)) => {
-                answered(&run.events, ask)
-                    || run.events.iter().any(|event| is_terminal(&event.payload))
+                ask_state(&run.events, ask) == AskState::Open
+                    && !run.events.iter().any(|event| is_terminal(&event.payload))
             }
-            Ok(None) => true,
+            // A parked run the store lost is woken: a worker acknowledges it.
+            Ok(None) => false,
             Err(error) => {
                 eprintln!("gol: ask sweep: load run {run_id}: {error}");
                 continue;
             }
         };
-        let result = if settled {
-            queue.wake(run_id).map(|_| ())
+        let result = if !waits {
+            queue.wake(run_id, ask).map(|_| true)
         } else {
-            match messages.message(ask) {
-                Ok(Some(ask)) => match task_end(store, &ask) {
-                    Some(answer) => deliver(store, messages, queue, &ask, answer),
-                    None => continue,
+            let timed_out = EventPayload::AskTimedOut { message_id: ask };
+            let answer = match messages.message(ask) {
+                Ok(Some(row)) => match task_end(store, &row) {
+                    Ok(Some(answer)) => Some(answer),
+                    // Closed while the log still waits: at its deadline,
+                    // before the asker logged it.
+                    Ok(None) if !open(messages, &row) => Some(timed_out),
+                    Ok(None) => None,
+                    Err(error) => {
+                        eprintln!("gol: ask sweep: task of ask {ask}: {error}");
+                        None
+                    }
                 },
-                Ok(None) => continue,
-                Err(error) => Err(error.to_string()),
+                Ok(None) => Some(timed_out),
+                Err(error) => {
+                    eprintln!("gol: ask sweep: load ask {ask}: {error}");
+                    None
+                }
+            };
+            match answer {
+                Some(answer) => {
+                    deliver(store, messages, queue, run_id, ask, answer, IfUnsent::Close)
+                }
+                None => continue,
             }
         };
         match result {
-            Ok(()) => swept.push(run_id),
+            Ok(true) => swept.push(run_id),
+            Ok(false) => {}
             Err(error) => eprintln!("gol: ask sweep: run {run_id}: {error}"),
         }
     }
@@ -845,20 +871,50 @@ pub fn sweep_asks(
         .open_asks_due(now)
         .map_err(|error| error.to_string())?
     {
-        let answer =
-            task_end(store, &ask).unwrap_or(EventPayload::AskTimedOut { message_id: ask.id });
-        match deliver(store, messages, queue, &ask, answer) {
-            Ok(()) => swept.push(ask.from_run),
+        let answer = match task_end(store, &ask) {
+            Ok(Some(answer)) => answer,
+            Ok(None) => EventPayload::AskTimedOut { message_id: ask.id },
+            // Not read now: a timeout would be final, so the next sweep
+            // looks again.
+            Err(error) => {
+                eprintln!("gol: ask sweep: task of ask {}: {error}", ask.id);
+                continue;
+            }
+        };
+        match deliver(
+            store,
+            messages,
+            queue,
+            ask.from_run,
+            ask.id,
+            answer,
+            IfUnsent::Close,
+        ) {
+            Ok(true) => swept.push(ask.from_run),
+            Ok(false) => {}
             Err(error) => eprintln!("gol: ask sweep: ask {}: {error}", ask.id),
         }
     }
     Ok(swept)
 }
 
-/// The answer `ask`'s task gives now that it has ended, if it has.
-fn task_end(store: &dyn RunStore, ask: &StoredMessage) -> Option<EventPayload> {
-    let task = store.run(ask.task_run?).ok()??;
-    task_answer(task.spec.run_id, task.spec.agent_id, ask, &task.events)
+/// Whether `ask` is still open in the messages store.
+fn open(messages: &dyn MessageStore, ask: &StoredMessage) -> bool {
+    ask.task_run
+        .and_then(|task| messages.ask_of_task(task).ok().flatten())
+        .is_some_and(|open| open.id == ask.id)
+}
+
+/// The answer `ask`'s task gives now that it has ended, if it has; an error
+/// when the task cannot be read now.
+fn task_end(store: &dyn RunStore, ask: &StoredMessage) -> Result<Option<EventPayload>, String> {
+    let Some(task) = ask.task_run else {
+        return Ok(None);
+    };
+    Ok(store
+        .run(task)
+        .map_err(|error| error.to_string())?
+        .and_then(|task| task_answer(task.spec.run_id, task.spec.agent_id, ask.id, &task.events)))
 }
 
 /// Whether `run`'s log is still as its producer stored it: created, queued

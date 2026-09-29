@@ -101,6 +101,13 @@ create table if not exists messages (
     unique (from_run, decision)
 );
 
+-- The open asks, by the task that answers them and by their deadline: a
+-- worker reads the first for every run it ends, the ask sweep the second.
+create index if not exists messages_open_by_task on messages (task_run)
+    where expects_reply and not answered;
+create index if not exists messages_open_by_deadline on messages (deadline_ms)
+    where expects_reply and not answered;
+
 create table if not exists artifacts (
     id uuid primary key,
     run_id uuid not null,
