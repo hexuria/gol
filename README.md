@@ -24,9 +24,20 @@ Runs and memory are kept in the process unless `GOL_DATABASE_URL` names a Postgr
 - A worker claims a run and its 30 s lease in one step, renews the lease every 10 s, records the run's events, and only then acknowledges it.
 - A reaper puts a run whose lease ran out back at the front of the queue, every 15 s, so a crashed worker's run is redelivered.
 - A redelivered run that already ended is acknowledged without running again, and one started more than five times without ending is failed. A run the worker cannot load (the database is down) is queued again at once, behind the other runs, and does not count as a start.
-- Delivery is at least once: a redelivered run starts over and repeats its Jev calls.
+- Delivery is at least once. A worker stores a run step by step, so a redelivered run resumes from its stored log; a step its worker had not stored is decided again.
 - The queue needs `GOL_DATABASE_URL`, since queued run ids outlive the process. One Redis serves one deployment: a standalone Redis (no cluster), with `noeviction` and AOF persistence. A Redis that does not answer a connection within 5 s counts as down.
 - The server refuses to start if Redis does not answer, and starts the workers only once its port is bound.
+
+## Model providers
+
+A run's model calls go to its work model's provider with the platform's key for that provider:
+
+- `GOL_OPENAI_API_KEY`, `GOL_ANTHROPIC_API_KEY`, `GOL_GEMINI_API_KEY`, `GOL_SYSTEMONE_API_KEY`: a provider without one fails the call, and the run, with `RunFailed { Dependency }`.
+- `GOL_<PROVIDER>_BASE_URL` overrides the provider's host: `https://`, or `http://` to a local host. System One has no public host, so it needs one. Values are trimmed.
+- `GOL_MODEL_TIMEOUT_SECS` bounds each call's connect and whole call (default 60, 1 to 600). A call is not retried.
+- A bring-your-own credential is refused on the server; it is used from the desktop through the local proxy.
+- Each `ModelResponded` records the tokens the call used, when the provider reports them.
+- A failed call leaves a fixed reason in the run log (`model call to Anthropic failed`); the provider's error, which may repeat the request's key, goes to the server's stderr.
 
 ## Authentication
 

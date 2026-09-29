@@ -9,7 +9,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use harness::{
     run_to_completion, AgentSpawner, BootError, DelegateTarget, Driver, EchoTool, InMemory,
-    JevDecider, Memory, RunMemory, StoreError, UnavailableModel,
+    JevDecider, Memory, RunMemory, StoreError,
 };
 use protocol::{
     fold, AgentId, Capability, Event, EventPayload, ExecutionPlacement, FailureClass, Limits,
@@ -23,6 +23,7 @@ use crate::inference::{
     ComputerPlan, GatewayPoster, HttpGatewayPoster, SandboxHost, SharedPoster, TurnError,
     TurnOutcome,
 };
+use crate::models::ModelsConfig;
 use crate::queue::RedisRunQueue;
 use crate::store::{AgentManifest, PutAgent, RunStore, StoredAgent, StoredRun};
 use crate::surface::{ag_ui_events, json_render_spec};
@@ -32,6 +33,8 @@ struct AppState {
     store: Arc<dyn RunStore>,
     memory: Arc<dyn Memory>,
     jev_base_url: String,
+    /// The work model each run calls (D2).
+    models: Arc<ModelsConfig>,
     /// The run queue, one connection shared by every request.
     queue: Option<Arc<RedisRunQueue>>,
     poster: SharedPoster,
@@ -136,6 +139,7 @@ pub fn router_with_queue(
         store,
         Arc::new(InMemory::default()),
         jev_base_url,
+        Arc::new(ModelsConfig::default()),
         redis_url,
         Arc::new(HttpGatewayPoster::from_env()),
         sandbox_from_env(),
@@ -163,6 +167,7 @@ pub fn router_with_sandbox(
         store,
         Arc::new(InMemory::default()),
         jev_base_url,
+        Arc::new(ModelsConfig::default()),
         None,
         poster,
         sandbox,
@@ -180,12 +185,14 @@ pub fn router_with_memory(
     jev_base_url: impl Into<String>,
     redis_url: Option<String>,
     poster: Arc<dyn GatewayPoster>,
+    models: Arc<ModelsConfig>,
     auth: Arc<dyn Authenticator>,
 ) -> Router {
     router_with_parts(
         store,
         memory,
         jev_base_url,
+        models,
         redis_url,
         poster,
         sandbox_from_env(),
@@ -193,10 +200,12 @@ pub fn router_with_memory(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn router_with_parts(
     store: Arc<dyn RunStore>,
     memory: Arc<dyn Memory>,
     jev_base_url: impl Into<String>,
+    models: Arc<ModelsConfig>,
     redis_url: Option<String>,
     poster: SharedPoster,
     sandbox: Arc<dyn SandboxHost>,
@@ -219,6 +228,7 @@ fn router_with_parts(
             store,
             memory,
             jev_base_url: jev_base_url.into(),
+            models,
             queue: redis_url.map(|url| Arc::new(RedisRunQueue::open(url))),
             poster,
             sandbox,
@@ -364,6 +374,7 @@ async fn create_run(
     }
 
     let jev_base_url = state.jev_base_url.clone();
+    let models = state.models.clone();
     let spec_for_run = spec.clone();
     let store_for_run = state.store.clone();
     let memory = state.memory.clone();
@@ -378,7 +389,8 @@ async fn create_run(
             })
             .map_err(RunStartError::Store)?;
         // Inline: a child needs the run queue, so this run offers no delegation.
-        let (events, outcome) = harness_events(&jev_base_url, &spec_for_run, memory.as_ref(), None);
+        let (events, outcome) =
+            harness_events(&jev_base_url, &spec_for_run, memory.as_ref(), &models, None);
         // Append, never overwrite: anything stored while Jev ran stays. When the
         // run is already terminal the store keeps its log and refuses these.
         store_for_run
@@ -615,9 +627,11 @@ pub(crate) fn harness_events(
     jev_base_url: &str,
     spec: &RunSpec,
     memory: &dyn Memory,
+    models: &ModelsConfig,
     delegation: Option<Delegation>,
 ) -> (Vec<Event>, Result<(), RunStartError>) {
-    let (mut events, outcome) = run_with_jev(jev_base_url, spec.clone(), memory, delegation);
+    let (mut events, outcome) =
+        run_with_jev(jev_base_url, spec.clone(), memory, models, delegation);
     if let Err(error) = &outcome {
         let (class, message) = match error {
             RunStartError::Unsupported(placement) => (
@@ -644,8 +658,10 @@ fn run_with_jev(
     jev_base_url: &str,
     spec: RunSpec,
     memory: &dyn Memory,
+    models: &ModelsConfig,
     delegation: Option<Delegation>,
 ) -> (Vec<Event>, Result<(), RunStartError>) {
+    let model = models.model_for(&spec);
     let mut driver = match Driver::boot(spec) {
         Ok(driver) => driver,
         Err(BootError::UnsupportedPlacement(placement)) => {
@@ -665,7 +681,7 @@ fn run_with_jev(
         &mut driver,
         &mut decider,
         &[&echo],
-        &UnavailableModel,
+        &model,
         &RunMemory::new(memory),
     )
     .map_err(|error| RunStartError::Decider(error.message));
