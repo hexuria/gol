@@ -94,6 +94,7 @@ async fn main() {
             stores.runs,
             stores.memory,
             stores.messages,
+            stores.outbox,
             &jev_base_url,
             models.clone(),
         ) {

@@ -201,6 +201,68 @@ pub trait MessageStore: Send + Sync {
     fn open_asks_due(&self, now: Timestamp) -> Result<Vec<StoredMessage>, StoreError>;
 }
 
+/// One event in its owner's outbox (Phase 3.1): `seq` numbers it among all
+/// the events of runs its owner's principal holds, from 1 with no gap
+/// (decisions 16A, 36A), and `run_seq` is its place in its run's log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboxEntry {
+    pub seq: u64,
+    pub run_id: RunId,
+    pub run_seq: u64,
+    pub event: Event,
+}
+
+/// A page of an owner's outbox, read at one moment: its entries, and the
+/// number up to which entries were pruned. A reader whose cursor is below
+/// `pruned_through` has lost entries and must reload (Phase 3.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboxPage {
+    pub entries: Vec<OutboxEntry>,
+    pub pruned_through: u64,
+}
+
+/// The per-owner outbox that every event a run store keeps is numbered in,
+/// in the same step as the event (`formal/outbox`). A reader resumes after
+/// the last number it saw.
+pub trait OutboxStore: Send + Sync {
+    /// The entries of `owner`'s principal numbered after `after`, in order,
+    /// at most `limit`.
+    fn outbox_after(
+        &self,
+        owner: &Owner,
+        after: u64,
+        limit: usize,
+    ) -> Result<OutboxPage, StoreError>;
+    /// For each principal, removes its entries up to the last one stored
+    /// before `before`, and returns how many went. What stays is a suffix of
+    /// its numbers even when writers' clocks differ, and its count stays, so
+    /// numbers never restart (decision 38A).
+    fn prune_outbox(&self, before: Timestamp) -> Result<u64, StoreError>;
+}
+
+/// An outbox row: what `OutboxEntry` reads through to the run's log.
+struct OutboxRow {
+    principal: (String, String),
+    seq: u64,
+    run_id: RunId,
+    run_seq: u64,
+    stored_ms: i64,
+}
+
+/// The in-memory outbox: each principal's count and pruned-through number,
+/// and the rows in the order they were numbered.
+#[derive(Default)]
+struct Outbox {
+    counts: HashMap<(String, String), u64>,
+    pruned: HashMap<(String, String), u64>,
+    rows: Vec<OutboxRow>,
+}
+
+/// The key an owner's outbox is kept under: the principal (decision 36A).
+fn principal(owner: &Owner) -> (String, String) {
+    (owner.issuer.clone(), owner.subject.clone())
+}
+
 /// The in-memory store. A poisoned lock (a writer panicked holding it) still
 /// serves reads, since every write completes before its guard drops; a write
 /// under a poisoned lock is refused as a StoreError (owner decision 3A).
@@ -211,9 +273,38 @@ pub struct InMemoryStore {
     artifacts: Mutex<HashMap<ArtifactId, StoredArtifact>>,
     /// Each message, and whether it (an ask) is answered.
     messages: Mutex<HashMap<MessageId, (StoredMessage, bool)>>,
+    /// A writer takes it only while holding `runs`, after it: the run, then
+    /// the count. Reads and prunes take it alone.
+    outbox: Mutex<Outbox>,
 }
 
 impl InMemoryStore {
+    /// Numbers `count` events stored in `run`'s log after `stored` events,
+    /// in its owner's outbox. The caller holds the runs lock.
+    fn number(
+        &self,
+        owner: &Owner,
+        run: RunId,
+        stored: usize,
+        count: usize,
+    ) -> Result<(), StoreError> {
+        let mut outbox = write(&self.outbox, "outbox")?;
+        let principal = principal(owner);
+        let first = outbox.counts.get(&principal).copied().unwrap_or(0) + 1;
+        let stored_ms = Timestamp::now().as_unix_millis();
+        for n in 0..count as u64 {
+            outbox.rows.push(OutboxRow {
+                principal: principal.clone(),
+                seq: first + n,
+                run_id: run,
+                run_seq: stored as u64 + n + 1,
+                stored_ms,
+            });
+        }
+        outbox.counts.insert(principal, first + count as u64 - 1);
+        Ok(())
+    }
+
     /// `append_events`, and with `seen` also refused as `Moved` unless the
     /// log is `seen` events long: all under the lock.
     fn append_checked(
@@ -237,6 +328,7 @@ impl InMemoryStore {
         if seen.is_some_and(|seen| seen != stored.events.len()) {
             return Ok(Append::Moved);
         }
+        self.number(&stored.spec.owner, id, stored.events.len(), events.len())?;
         stored.events.extend(events);
         Ok(Append::Appended)
     }
@@ -339,6 +431,7 @@ impl RunStore for InMemoryStore {
         match write(&self.runs, "run")?.entry(run.spec.run_id) {
             std::collections::hash_map::Entry::Occupied(_) => Ok(PutRun::Existed),
             std::collections::hash_map::Entry::Vacant(slot) => {
+                self.number(&run.spec.owner, run.spec.run_id, 0, run.events.len())?;
                 slot.insert(run);
                 Ok(PutRun::Stored)
             }
@@ -369,6 +462,74 @@ impl RunStore for InMemoryStore {
 
     fn artifact(&self, id: ArtifactId) -> Result<Option<StoredArtifact>, StoreError> {
         Ok(read(&self.artifacts).get(&id).cloned())
+    }
+}
+
+impl OutboxStore for InMemoryStore {
+    fn outbox_after(
+        &self,
+        owner: &Owner,
+        after: u64,
+        limit: usize,
+    ) -> Result<OutboxPage, StoreError> {
+        let principal = principal(owner);
+        let (rows, pruned_through) = {
+            let outbox = read(&self.outbox);
+            let rows: Vec<(u64, RunId, u64)> = outbox
+                .rows
+                .iter()
+                .filter(|row| row.principal == principal && row.seq > after)
+                .take(limit)
+                .map(|row| (row.seq, row.run_id, row.run_seq))
+                .collect();
+            (rows, outbox.pruned.get(&principal).copied().unwrap_or(0))
+        };
+        // Numbered under the runs lock with their events, so every row's
+        // event is stored.
+        let runs = read(&self.runs);
+        let entries = rows
+            .into_iter()
+            .map(|(seq, run_id, run_seq)| {
+                let event = runs
+                    .get(&run_id)
+                    .and_then(|run| run.events.get(run_seq as usize - 1))
+                    .ok_or_else(|| StoreError::new(format!("outbox entry {seq} has no event")))?
+                    .clone();
+                Ok(OutboxEntry {
+                    seq,
+                    run_id,
+                    run_seq,
+                    event,
+                })
+            })
+            .collect::<Result<_, StoreError>>()?;
+        Ok(OutboxPage {
+            entries,
+            pruned_through,
+        })
+    }
+
+    fn prune_outbox(&self, before: Timestamp) -> Result<u64, StoreError> {
+        let mut outbox = write(&self.outbox, "outbox")?;
+        let mut through: HashMap<(String, String), u64> = HashMap::new();
+        for row in &outbox.rows {
+            if row.stored_ms < before.as_unix_millis() {
+                let last = through.entry(row.principal.clone()).or_insert(0);
+                *last = (*last).max(row.seq);
+            }
+        }
+        let kept = outbox.rows.len();
+        outbox.rows.retain(|row| {
+            through
+                .get(&row.principal)
+                .is_none_or(|through| row.seq > *through)
+        });
+        let pruned = (kept - outbox.rows.len()) as u64;
+        for (principal, through) in through {
+            let last = outbox.pruned.entry(principal).or_insert(0);
+            *last = (*last).max(through);
+        }
+        Ok(pruned)
     }
 }
 
@@ -412,6 +573,41 @@ mod tests {
         other.spec.input = "changed".to_string();
         assert_eq!(store.put_run(other), Ok(PutRun::Existed));
         assert_eq!(store.run(spec.run_id).unwrap().unwrap().spec, spec);
+    }
+
+    // Decision 38A across clock skew, in the in-memory store: an entry
+    // stored with an earlier time than the one numbered before it takes that
+    // one with it, so what stays is a suffix of the principal's numbers.
+    #[test]
+    fn pruning_takes_a_prefix_across_clock_skew() {
+        let store = InMemoryStore::default();
+        let spec = spec();
+        let message = |text: &str| {
+            Event::record(
+                protocol::EventSource::for_spec(&spec, protocol::Actor::System, Timestamp::now()),
+                EventPayload::UserMessage {
+                    text: text.to_string(),
+                },
+            )
+        };
+        let run = StoredRun {
+            spec: spec.clone(),
+            events: vec![message("a"), message("b"), message("c")],
+        };
+        assert_eq!(store.put_run(run), Ok(PutRun::Stored));
+        for row in &mut store.outbox.lock().unwrap().rows {
+            row.stored_ms = if row.seq == 2 { 1_000 } else { 9_000 };
+        }
+        assert_eq!(store.prune_outbox(Timestamp::unix_millis(5_000)), Ok(2));
+        let page = store.outbox_after(&spec.owner, 0, usize::MAX).unwrap();
+        assert_eq!(page.pruned_through, 2);
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<Vec<_>>(),
+            [3]
+        );
     }
 
     // Owner decision 3A: a writer that panicked holding the lock leaves reads

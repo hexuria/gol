@@ -56,7 +56,7 @@ Runs and agents belong to the caller that created them, by token issuer and subj
 - `POST /v1/runs` needs a stored manifest the caller owns (otherwise 404), with the same `agent_version` (otherwise 409). The run takes its capabilities from the manifest, and a body with any unknown field, `capabilities` included, is 400.
 - A desktop turn (`POST /v1/coworker/turns`) needs no stored manifest and names its own capabilities.
 - Reading a run, its events, `ag-ui` or `ui`, and completing or failing a turn, answer 404 unless the caller owns the run.
-- Postgres keeps the owner with each agent, and each event in its own `run_events` row. A database from before either change is refused at connect and needs its `agents`, `runs` and `run_events` tables dropped.
+- Postgres keeps the owner with each agent, and each event in its own `run_events` row. Every stored event is also numbered in its owner's outbox (`outbox`, `outbox_counters`): one sequence per principal, from 1 with no gaps, written in the same transaction. When the run queue runs (`GOL_REDIS_URL`), its reaper prunes entries older than 7 days; without the queue, nothing prunes the outbox yet. A database from before either change is refused at connect and needs its `agents`, `runs` and `run_events` tables dropped.
 - A store that cannot answer gives 503 `{"error":"store unavailable"}`, with the detail on stderr only. A write that fails is not retried, since it may have committed. The Postgres store keeps a pool of connections (8 by default) and replaces one whose backend died before lending it out.
 
 `cargo test` does not call a live model and does not need an API key. The local server echoes the run input through one tool, then completes. A run records the user message before that loop.

@@ -34,8 +34,8 @@ pub use postgres::{PoolOptions, PostgresStore};
 pub use queue::{QueueTiming, RedisRunQueue};
 pub use spawner::OwnedSpawner;
 pub use store::{
-    is_terminal, AgentManifest, Append, InMemoryStore, MessageStore, PutAgent, PutMessage, PutRun,
-    RunStore, StoredAgent, StoredArtifact, StoredMessage, StoredRun,
+    is_terminal, AgentManifest, Append, InMemoryStore, MessageStore, OutboxEntry, OutboxStore,
+    PutAgent, PutMessage, PutRun, RunStore, StoredAgent, StoredArtifact, StoredMessage, StoredRun,
 };
 pub use stores::{stores_from_env, Stores};
 pub use surface::{ag_ui_events, json_render_spec};

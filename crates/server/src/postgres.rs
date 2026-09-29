@@ -8,8 +8,8 @@ use serde_json::Value;
 use harness::StoreError;
 
 use crate::store::{
-    check_one_terminal, is_terminal, Append, MessageStore, PutAgent, PutMessage, PutRun, RunStore,
-    StoredAgent, StoredArtifact, StoredMessage, StoredRun,
+    check_one_terminal, is_terminal, Append, MessageStore, OutboxEntry, OutboxPage, OutboxStore,
+    PutAgent, PutMessage, PutRun, RunStore, StoredAgent, StoredArtifact, StoredMessage, StoredRun,
 };
 
 /// The run store in Postgres over a pool of connections (C2, owner decision
@@ -89,6 +89,27 @@ create table if not exists run_events (
     primary key (run_id, seq)
 );
 
+-- The per-owner outbox (Phase 3.1): each principal's count, and a row per
+-- stored event, numbered in the transaction that stores it, after the run
+-- row's lock (decision 16A, formal/outbox). A row points at its event.
+create table if not exists outbox_counters (
+    owner_issuer text not null,
+    owner_subject text not null,
+    last bigint not null,
+    -- The principal's numbers up to this one were pruned (decision 38A).
+    pruned bigint not null default 0,
+    primary key (owner_issuer, owner_subject)
+);
+create table if not exists outbox (
+    owner_issuer text not null,
+    owner_subject text not null,
+    seq bigint not null,
+    run_id uuid not null,
+    run_seq bigint not null,
+    stored_ms bigint not null,
+    primary key (owner_issuer, owner_subject, seq)
+);
+
 create table if not exists messages (
     id uuid primary key,
     from_run uuid not null,
@@ -101,13 +122,6 @@ create table if not exists messages (
     unique (from_run, decision)
 );
 
--- The open asks, by the task that answers them and by their deadline: a
--- worker reads the first for every run it ends, the ask sweep the second.
-create index if not exists messages_open_by_task on messages (task_run)
-    where expects_reply and not answered;
-create index if not exists messages_open_by_deadline on messages (deadline_ms)
-    where expects_reply and not answered;
-
 create table if not exists artifacts (
     id uuid primary key,
     run_id uuid not null,
@@ -116,6 +130,36 @@ create table if not exists artifacts (
 );
 ";
 
+/// Indexes created once, each as (table, name, statement): an existing one
+/// is found in the catalog, not by `create index if not exists`.
+const INDEXES: [(&str, &str, &str); 4] = [
+    (
+        "run_events",
+        "run_events_one_terminal",
+        "create unique index run_events_one_terminal on run_events (run_id) where terminal",
+    ),
+    // The pruner reads each principal's oldest entries.
+    (
+        "outbox",
+        "outbox_by_stored",
+        "create index outbox_by_stored on outbox (stored_ms)",
+    ),
+    // The open asks, by the task that answers them and by their deadline: a
+    // worker reads the first for every run it ends, the ask sweep the second.
+    (
+        "messages",
+        "messages_open_by_task",
+        "create index messages_open_by_task on messages (task_run)
+             where expects_reply and not answered",
+    ),
+    (
+        "messages",
+        "messages_open_by_deadline",
+        "create index messages_open_by_deadline on messages (deadline_ms)
+             where expects_reply and not answered",
+    ),
+];
+
 fn ensure_schema(client: &mut postgres::Client) -> Result<(), StoreError> {
     let mut tx = client.transaction().map_err(sql)?;
     tx.query_one("select pg_advisory_xact_lock(872346)", &[])
@@ -123,25 +167,25 @@ fn ensure_schema(client: &mut postgres::Client) -> Result<(), StoreError> {
     tx.batch_execute(SCHEMA).map_err(sql)?;
     // `create index if not exists` locks the table even when the index is
     // there, and would wait behind any writer stalled mid-append.
-    // Looked up on the table itself, not by name on the search path.
-    let index = tx
-        .query_opt(
-            "select 1 from pg_index join pg_class on pg_class.oid = pg_index.indexrelid
-             where pg_index.indrelid = 'run_events'::regclass
-               and pg_class.relname = 'run_events_one_terminal'",
-            &[],
-        )
-        .map_err(sql)?;
-    if index.is_none() {
-        tx.batch_execute(
-            "create unique index run_events_one_terminal on run_events (run_id) where terminal",
-        )
-        .map_err(sql)?;
+    for (table, name, create) in INDEXES {
+        // Looked up on the table itself, not by name on the search path.
+        let index = tx
+            .query_opt(
+                "select 1 from pg_index join pg_class on pg_class.oid = pg_index.indexrelid
+                 where pg_index.indrelid = $1::text::regclass and pg_class.relname = $2",
+                &[&table, &name],
+            )
+            .map_err(sql)?;
+        if index.is_none() {
+            tx.batch_execute(create).map_err(sql)?;
+        }
     }
     // `create table if not exists` leaves a table from an older schema as it
     // was. Fail here, at connect, rather than on the first write; dropping
     // the transaction rolls back anything created above.
     tx.batch_execute("select owner_issuer, owner_subject, owner_tenant from agents limit 0")
+        .map_err(sql)?;
+    tx.batch_execute("select pruned from outbox_counters limit 0")
         .map_err(sql)?;
     // Resolved like the queries resolve `runs`, whatever the role may see.
     let events_column = tx
@@ -269,11 +313,19 @@ impl PostgresStore {
             // after the row lock sees what the lock's last holder committed.
             let mut tx = read_committed(client)?;
             let locked = tx
-                .query_opt("select 1 from runs where id = $1 for update", &[&id])
+                .query_opt(
+                    "select spec->'owner'->>'issuer', spec->'owner'->>'subject'
+                     from runs where id = $1 for update",
+                    &[&id],
+                )
                 .map_err(sql)?;
-            if locked.is_none() {
+            let Some(locked) = locked else {
                 return Ok(Append::Missing);
-            }
+            };
+            let principal: (String, String) = (
+                locked.try_get(0).map_err(sql)?,
+                locked.try_get(1).map_err(sql)?,
+            );
             // Two index lookups: the partial index answers the first, the
             // primary key the second.
             let ended = tx
@@ -299,10 +351,116 @@ impl PostgresStore {
             if seen.is_some_and(|seen| i64::try_from(seen) != Ok(last)) {
                 return Ok(Append::Moved);
             }
-            rows.insert(&mut tx, id, last)?;
+            rows.insert(&mut tx, id, last, &principal)?;
             tx.commit().map_err(sql)?;
             Ok(Append::Appended)
         })
+    }
+}
+
+impl OutboxStore for PostgresStore {
+    /// One snapshot: the outbox rows joined to their events, and how far the
+    /// principal's entries were pruned. An owner's numbers commit in order,
+    /// so a read never sees a later number before an earlier one.
+    fn outbox_after(
+        &self,
+        owner: &Owner,
+        after: u64,
+        limit: usize,
+    ) -> Result<OutboxPage, StoreError> {
+        let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let (pruned, rows) = self.with_client(|client| {
+            let mut tx = client
+                .build_transaction()
+                .read_only(true)
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()
+                .map_err(sql)?;
+            let pruned: i64 = tx
+                .query_opt(
+                    "select pruned from outbox_counters
+                     where owner_issuer = $1 and owner_subject = $2",
+                    &[&owner.issuer, &owner.subject],
+                )
+                .map_err(sql)?
+                .map(|row| row.try_get(0))
+                .transpose()
+                .map_err(sql)?
+                .unwrap_or(0);
+            let rows = tx
+                .query(
+                    "select outbox.seq, outbox.run_id, outbox.run_seq, run_events.body
+                     from outbox left join run_events
+                       on run_events.run_id = outbox.run_id and run_events.seq = outbox.run_seq
+                     where outbox.owner_issuer = $1 and outbox.owner_subject = $2
+                       and outbox.seq > $3
+                     order by outbox.seq
+                     limit $4",
+                    &[&owner.issuer, &owner.subject, &after, &limit],
+                )
+                .map_err(sql)?;
+            tx.commit().map_err(sql)?;
+            Ok((pruned, rows))
+        })?;
+        let entries = rows
+            .iter()
+            .map(|row| {
+                let seq: i64 = row.try_get(0).map_err(sql)?;
+                let run_id: uuid::Uuid = row.try_get(1).map_err(sql)?;
+                let run_seq: i64 = row.try_get(2).map_err(sql)?;
+                // Written with its event, so a missing one is corruption,
+                // not a gap to pass over.
+                let body: Option<serde_json::Value> = row.try_get(3).map_err(sql)?;
+                let body = body
+                    .ok_or_else(|| StoreError::new(format!("outbox entry {seq} has no event")))?;
+                Ok(OutboxEntry {
+                    seq: u64::try_from(seq).map_err(|_| StoreError::new("negative outbox seq"))?,
+                    run_id: RunId::from_uuid(run_id),
+                    run_seq: u64::try_from(run_seq)
+                        .map_err(|_| StoreError::new("negative run seq"))?,
+                    event: serde_json::from_value(body).map_err(json)?,
+                })
+            })
+            .collect::<Result<_, StoreError>>()?;
+        Ok(OutboxPage {
+            entries,
+            pruned_through: u64::try_from(pruned).unwrap_or(0),
+        })
+    }
+
+    /// One statement: for each principal, the last number stored before
+    /// `before`; its entries up to it deleted, and its counter row marked
+    /// pruned through it (taking only that row's lock, never a run row's).
+    fn prune_outbox(&self, before: Timestamp) -> Result<u64, StoreError> {
+        let deleted: i64 = self.with_client(|client| {
+            client
+                .query_one(
+                    "with cut as (
+                         select owner_issuer, owner_subject, max(seq) as through
+                         from outbox where stored_ms < $1
+                         group by owner_issuer, owner_subject
+                     ), gone as (
+                         delete from outbox using cut
+                         where outbox.owner_issuer = cut.owner_issuer
+                           and outbox.owner_subject = cut.owner_subject
+                           and outbox.seq <= cut.through
+                         returning 1
+                     ), marked as (
+                         update outbox_counters set pruned = greatest(pruned, cut.through)
+                         from cut
+                         where outbox_counters.owner_issuer = cut.owner_issuer
+                           and outbox_counters.owner_subject = cut.owner_subject
+                         returning 1
+                     )
+                     select count(*) from gone",
+                    &[&before.as_unix_millis()],
+                )
+                .map_err(sql)?
+                .try_get(0)
+                .map_err(sql)
+        })?;
+        Ok(u64::try_from(deleted).unwrap_or(0))
     }
 }
 
@@ -478,6 +636,10 @@ impl RunStore for PostgresStore {
         let spec = serde_json::to_value(&run.spec).map_err(json)?;
         let rows = EventRows::new(&run.events)?;
         let id = run.spec.run_id.as_uuid();
+        let principal = (
+            run.spec.owner.issuer.clone(),
+            run.spec.owner.subject.clone(),
+        );
         self.with_client(|client| {
             let mut tx = read_committed(client)?;
             let inserted = tx
@@ -487,7 +649,7 @@ impl RunStore for PostgresStore {
                 )
                 .map_err(sql)?;
             if inserted == 1 {
-                rows.insert(&mut tx, id, 0)?;
+                rows.insert(&mut tx, id, 0, &principal)?;
             }
             tx.commit().map_err(sql)?;
             Ok(if inserted == 1 {
@@ -634,18 +796,48 @@ impl EventRows {
         })
     }
 
-    /// Inserts the rows numbered after `last`, in order, in one statement.
+    /// Inserts the rows numbered after `last`, in order, in one statement,
+    /// then numbers them in `principal`'s outbox in another. The caller
+    /// holds the run row (locked or just inserted), so the counter row is
+    /// always taken after it; its lock is held to commit, so an owner's
+    /// numbers commit in order (`formal/outbox`).
     fn insert(
         &self,
         tx: &mut postgres::Transaction<'_>,
         run_id: uuid::Uuid,
         last: i64,
+        principal: &(String, String),
     ) -> Result<(), StoreError> {
         tx.execute(
             "insert into run_events (run_id, seq, body, terminal)
              select $1, $2 + row.ord, row.body, row.terminal
              from unnest($3::jsonb[], $4::bool[]) with ordinality as row (body, terminal, ord)",
             &[&run_id, &last, &self.bodies, &self.terminal],
+        )
+        .map_err(sql)?;
+        let count = i64::try_from(self.bodies.len()).unwrap_or(i64::MAX);
+        if count == 0 {
+            return Ok(());
+        }
+        tx.execute(
+            "with counter as (
+                 insert into outbox_counters (owner_issuer, owner_subject, last)
+                 values ($1, $2, $3)
+                 on conflict (owner_issuer, owner_subject)
+                 do update set last = outbox_counters.last + excluded.last
+                 returning last
+             )
+             insert into outbox (owner_issuer, owner_subject, seq, run_id, run_seq, stored_ms)
+             select $1, $2, counter.last - $3 + n, $4, $5 + n, $6
+             from counter, generate_series(1::bigint, $3) as n",
+            &[
+                &principal.0,
+                &principal.1,
+                &count,
+                &run_id,
+                &last,
+                &Timestamp::now().as_unix_millis(),
+            ],
         )
         .map_err(sql)?;
         Ok(())
