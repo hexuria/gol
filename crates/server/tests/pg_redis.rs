@@ -9,9 +9,9 @@ use protocol::{
 };
 use server::{
     accept_subscription_completion, box_container_name, fail_turn, open_turn, router_with_queue,
-    sweep, AgentManifest, Append, GatewayCall, GatewayPoster, MemorySandbox, PostgresStore,
-    QueueTiming, RedisRunQueue, RunStore, SandboxError, SandboxHost, StoredArtifact, StoredRun,
-    TurnError, Worker,
+    sweep, AgentManifest, Append, GatewayCall, GatewayPoster, MemorySandbox, OutboxStore,
+    PostgresStore, QueueTiming, RedisRunQueue, RunStore, SandboxError, SandboxHost, StoredArtifact,
+    StoredRun, TurnError, Worker,
 };
 
 const POSTGRES_URL: &str = "postgres://gol:gol@127.0.0.1/gol";
@@ -1495,8 +1495,79 @@ fn a_waiting_append_sees_what_the_lock_holder_committed() {
     }
 }
 
+/// While an outside session holds a principal's outbox counter, having
+/// numbered one uncommitted entry, the store appends to a run of that
+/// principal; the session then commits. Returns the principal's numbers.
+fn forced_number_after_a_counter_holder(extra: &str) -> Vec<u64> {
+    let application = format!("gol_p31_{}", uuid::Uuid::new_v4().simple());
+    let url = format!("{POSTGRES_URL}?application_name={application}{extra}");
+    let store = Arc::new(PostgresStore::connect(&url).expect("connect"));
+    let owner = protocol::Owner::new(
+        "https://issuer.test",
+        format!("user-{}", RunId::new()),
+        "tenant-1",
+    );
+    let mut spec = spec();
+    spec.owner = owner.clone();
+    store
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: vec![user_message(&spec, 1)],
+        })
+        .expect("put run");
+    // Another writer of the same principal, mid-append: its count is taken
+    // (and locked to commit), its entry points at the put's event.
+    let mut holder = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("holder");
+    let mut tx = holder.transaction().expect("begin");
+    let taken: i64 = tx
+        .query_one(
+            "update outbox_counters set last = last + 1
+             where owner_issuer = $1 and owner_subject = $2 returning last",
+            &[&owner.issuer, &owner.subject],
+        )
+        .expect("count")
+        .get(0);
+    assert_eq!(taken, 2);
+    tx.execute(
+        "insert into outbox (owner_issuer, owner_subject, seq, run_id, run_seq, stored_ms)
+         values ($1, $2, 2, $3, 1, 0)",
+        &[&owner.issuer, &owner.subject, &spec.run_id.as_uuid()],
+    )
+    .expect("held entry");
+    let waiter = {
+        let (store, spec) = (store.clone(), spec.clone());
+        std::thread::spawn(move || store.append_events(spec.run_id, vec![user_message(&spec, 2)]))
+    };
+    wait_for_lock_wait(&application);
+    tx.commit().expect("commit");
+    assert_eq!(waiter.join().unwrap(), Ok(Append::Appended));
+    store
+        .outbox_after(&owner, 0, usize::MAX)
+        .expect("outbox")
+        .entries
+        .iter()
+        .map(|entry| entry.seq)
+        .collect()
+}
+
+// formal/outbox's assumption on the real system (T3): an append waiting on a
+// principal's counter numbers after what the holder committed, whatever the
+// session's default isolation, so the numbers stay 1..n.
+#[test]
+fn a_waiting_append_numbers_after_the_counter_holder() {
+    let serializable = "&options=-cdefault_transaction_isolation%3Dserializable";
+    for extra in ["", serializable] {
+        assert_eq!(
+            forced_number_after_a_counter_holder(extra),
+            [1, 2, 3],
+            "{extra}"
+        );
+    }
+}
+
 // Connecting does not wait on a writer stalled mid-append: an existing schema
-// takes no lock that an uncommitted insert into run_events holds up.
+// takes no lock that an uncommitted insert into run_events, outbox or
+// messages holds up (the outbox is written in every append, Phase 3.1).
 #[test]
 fn a_connect_does_not_wait_on_a_stalled_append() {
     let store = PostgresStore::connect(POSTGRES_URL).expect("connect");
@@ -1517,6 +1588,18 @@ fn a_connect_does_not_wait_on_a_stalled_append() {
         ],
     )
     .expect("stalled insert");
+    tx.execute(
+        "insert into outbox (owner_issuer, owner_subject, seq, run_id, run_seq, stored_ms)
+         values ('https://issuer.test', $1, 1, $2, 2, 0)",
+        &[&format!("stalled-{}", RunId::new()), &spec.run_id.as_uuid()],
+    )
+    .expect("stalled outbox insert");
+    tx.execute(
+        "insert into messages (id, from_run, decision, expects_reply, body)
+         values ($1, $2, 1, false, '{}')",
+        &[&uuid::Uuid::new_v4(), &spec.run_id.as_uuid()],
+    )
+    .expect("stalled message insert");
     let started = std::time::Instant::now();
     let connected = std::thread::spawn(|| PostgresStore::connect(POSTGRES_URL).map(|_| ()));
     while !connected.is_finished() && started.elapsed() < std::time::Duration::from_secs(3) {

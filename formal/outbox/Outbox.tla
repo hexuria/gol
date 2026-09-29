@@ -18,10 +18,17 @@
 \*   runs take the same numbers (UniqueSeqs).
 \* - "sequence" takes numbers from a global sequence that is not rolled back
 \*   and commits in any order (16B): a reader passes a number that commits
-\*   later (NoSkip), and an aborted-looking hole stays (Contiguous).
+\*   later (NoSkip), and a hole stays open behind it (Suffix).
 \* - "inverted" has one write path (writer 1) take the counter before the
 \*   run row while the others keep run then counter: two appends to one run
 \*   deadlock.
+\* - "clock" prunes by each row's stored time alone, which writers on hosts
+\*   whose clocks differ can leave out of order: one row goes and an earlier
+\*   one stays (Suffix).
+\*
+\* The pruner (OutboxStore::prune_outbox, from the reaper) is a writer too:
+\* in "new" it deletes a principal's rows up to the last number stored
+\* before its cutoff, and marks the counter row pruned through it.
 EXTENDS Integers, FiniteSets
 
 CONSTANTS Design, NWriters, EventsPer
@@ -46,9 +53,10 @@ VARIABLES
   log,      \* each run's committed length
   outbox,   \* committed rows: [seq, run, runSeq]
   cursor,   \* the reader's last sequence number seen
-  seen      \* the rows the reader has delivered
+  seen,     \* the rows the reader has delivered
+  pruned    \* the counter row's pruned-through number
 
-vars == <<pc, runLock, ctrLock, counter, seqNext, taken, log, outbox, cursor, seen>>
+vars == <<pc, runLock, ctrLock, counter, seqNext, taken, log, outbox, cursor, seen, pruned>>
 
 Row == [seq : Nat, run : Runs, runSeq : Nat]
 
@@ -61,6 +69,7 @@ TypeOK ==
   /\ log \in [Runs -> Nat]
   /\ outbox \subseteq Row
   /\ cursor \in Nat /\ seen \subseteq Row
+  /\ pruned \in Nat
 
 Init ==
   /\ pc = [w \in Writers |-> "start"]
@@ -70,6 +79,7 @@ Init ==
   /\ taken = [w \in Writers |-> 0]
   /\ log = [r \in Runs |-> 0]
   /\ outbox = {} /\ cursor = 0 /\ seen = {}
+  /\ pruned = 0
 
 \* select 1 from runs where id = $1 for update: waits while another holds it.
 LockRun(w) ==
@@ -77,7 +87,7 @@ LockRun(w) ==
   /\ \/ ~First(w) /\ pc[w] = "start" /\ pc' = [pc EXCEPT ![w] = "run"]
      \/ First(w) /\ pc[w] = "taken" /\ UNCHANGED pc
   /\ runLock' = [runLock EXCEPT ![RunOf(w)] = w]
-  /\ UNCHANGED <<ctrLock, counter, seqNext, taken, log, outbox, cursor, seen>>
+  /\ UNCHANGED <<ctrLock, counter, seqNext, taken, log, outbox, cursor, seen, pruned>>
 
 \* The next sequence number: the counter row under its lock ("new",
 \* "inverted"), the counter read without a lock ("noLock"), or nextval
@@ -86,7 +96,7 @@ Take(w) ==
   /\ \/ ~First(w) /\ pc[w] = "run"
      \/ First(w) /\ pc[w] = "start"
   /\ pc' = [pc EXCEPT ![w] = "taken"]
-  /\ CASE Design \in {"new", "inverted"} ->
+  /\ CASE Design \in {"new", "inverted", "clock"} ->
             /\ ctrLock = Free
             /\ ctrLock' = w
             /\ taken' = [taken EXCEPT ![w] = counter + 1]
@@ -98,7 +108,7 @@ Take(w) ==
             /\ taken' = [taken EXCEPT ![w] = seqNext]
             /\ seqNext' = seqNext + EventsPer
             /\ UNCHANGED ctrLock
-  /\ UNCHANGED <<runLock, counter, log, outbox, cursor, seen>>
+  /\ UNCHANGED <<runLock, counter, log, outbox, cursor, seen, pruned>>
 
 \* Insert the events and their outbox rows, update the counter, commit:
 \* visible at once, and every lock released.
@@ -115,7 +125,7 @@ Commit(w) ==
                 ELSE taken[w] + EventsPer - 1
   /\ ctrLock' = IF ctrLock = w THEN Free ELSE ctrLock
   /\ pc' = [pc EXCEPT ![w] = "done"]
-  /\ UNCHANGED <<seqNext, taken, cursor, seen>>
+  /\ UNCHANGED <<seqNext, taken, cursor, seen, pruned>>
 
 \* The reader takes every committed row after its cursor, in order, and moves
 \* its cursor to the last one (one select ... where seq > $cursor).
@@ -125,7 +135,20 @@ Read ==
      /\ seen' = seen \cup next
      /\ cursor' = CHOOSE s \in {e.seq : e \in next} :
                     \A t \in {e.seq : e \in next} : t <= s
-     /\ UNCHANGED <<pc, runLock, ctrLock, counter, seqNext, taken, log, outbox>>
+     /\ UNCHANGED <<pc, runLock, ctrLock, counter, seqNext, taken, log, outbox, pruned>>
+
+\* One prune, of committed rows (bounded to one to keep the state space
+\* small). "new": the rows up to some committed number k, the last one
+\* stored before the cutoff, whichever that is; the count row is marked
+\* pruned through k. "clock": any one row whose time is old, alone.
+Prune ==
+  /\ pruned = 0
+  /\ \E k \in {e.seq : e \in outbox} :
+       /\ IF Design = "clock"
+            THEN outbox' = {e \in outbox : e.seq # k}
+            ELSE outbox' = {e \in outbox : e.seq > k}
+       /\ pruned' = k
+  /\ UNCHANGED <<pc, runLock, ctrLock, counter, seqNext, taken, log, cursor, seen>>
 
 \* Every writer committed and the reader has read everything. The only
 \* stuttering step.
@@ -134,7 +157,7 @@ Done ==
   /\ \A e \in outbox : e.seq <= cursor
   /\ UNCHANGED vars
 
-Next == (\E w \in Writers : LockRun(w) \/ Take(w) \/ Commit(w)) \/ Read \/ Done
+Next == (\E w \in Writers : LockRun(w) \/ Take(w) \/ Commit(w)) \/ Read \/ Prune \/ Done
 
 \* A writer's statements return (the store's calls are bounded), and the
 \* reader keeps polling while its stream is open.
@@ -145,15 +168,18 @@ Spec == Init /\ [][Next]_vars
 \* No two rows share a sequence number.
 UniqueSeqs == \A e, f \in outbox : e.seq = f.seq => e = f
 
-\* The committed numbers are 1..n with no hole.
-Contiguous == {e.seq : e \in outbox} = 1..Cardinality(outbox)
+\* The kept numbers are the ones after the pruned-through number, with no
+\* hole: a reader below `pruned` can tell it lost entries, and one above it
+\* misses nothing.
+Suffix == {e.seq : e \in outbox} = (pruned + 1)..(pruned + Cardinality(outbox))
 
 \* A run's events keep their order in the outbox.
 RunOrder ==
   \A e, f \in outbox : e.run = f.run /\ e.runSeq < f.runSeq => e.seq < f.seq
 
-\* A reader never passes a row it has not delivered: resuming from its
-\* cursor loses nothing (16A: "no skipped events on resume").
+\* A reader never passes a kept row it has not delivered: resuming from its
+\* cursor loses nothing but what was pruned, which `pruned` names (16A: "no
+\* skipped events on resume").
 NoSkip == \A e \in outbox : e.seq <= cursor => e \in seen
 
 EveryWriterCommits == <>(\A w \in Writers : pc[w] = "done")

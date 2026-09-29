@@ -212,6 +212,15 @@ pub struct OutboxEntry {
     pub event: Event,
 }
 
+/// A page of an owner's outbox, read at one moment: its entries, and the
+/// number up to which entries were pruned. A reader whose cursor is below
+/// `pruned_through` has lost entries and must reload (Phase 3.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboxPage {
+    pub entries: Vec<OutboxEntry>,
+    pub pruned_through: u64,
+}
+
 /// The per-owner outbox that every event a run store keeps is numbered in,
 /// in the same step as the event (`formal/outbox`). A reader resumes after
 /// the last number it saw.
@@ -223,9 +232,11 @@ pub trait OutboxStore: Send + Sync {
         owner: &Owner,
         after: u64,
         limit: usize,
-    ) -> Result<Vec<OutboxEntry>, StoreError>;
-    /// Removes every entry stored before `before`, and returns how many.
-    /// Each owner's count stays, so numbers never restart (decision 38A).
+    ) -> Result<OutboxPage, StoreError>;
+    /// For each principal, removes its entries up to the last one stored
+    /// before `before`, and returns how many went. What stays is a suffix of
+    /// its numbers even when writers' clocks differ, and its count stays, so
+    /// numbers never restart (decision 38A).
     fn prune_outbox(&self, before: Timestamp) -> Result<u64, StoreError>;
 }
 
@@ -238,11 +249,12 @@ struct OutboxRow {
     stored_ms: i64,
 }
 
-/// The in-memory outbox: each principal's count, and the rows in the order
-/// they were numbered.
+/// The in-memory outbox: each principal's count and pruned-through number,
+/// and the rows in the order they were numbered.
 #[derive(Default)]
 struct Outbox {
     counts: HashMap<(String, String), u64>,
+    pruned: HashMap<(String, String), u64>,
     rows: Vec<OutboxRow>,
 }
 
@@ -261,7 +273,8 @@ pub struct InMemoryStore {
     artifacts: Mutex<HashMap<ArtifactId, StoredArtifact>>,
     /// Each message, and whether it (an ask) is answered.
     messages: Mutex<HashMap<MessageId, (StoredMessage, bool)>>,
-    /// Taken only while `runs` is held, after it: the run, then the count.
+    /// A writer takes it only while holding `runs`, after it: the run, then
+    /// the count. Reads and prunes take it alone.
     outbox: Mutex<Outbox>,
 }
 
@@ -458,39 +471,65 @@ impl OutboxStore for InMemoryStore {
         owner: &Owner,
         after: u64,
         limit: usize,
-    ) -> Result<Vec<OutboxEntry>, StoreError> {
+    ) -> Result<OutboxPage, StoreError> {
         let principal = principal(owner);
-        let rows: Vec<(u64, RunId, u64)> = read(&self.outbox)
-            .rows
-            .iter()
-            .filter(|row| row.principal == principal && row.seq > after)
-            .take(limit)
-            .map(|row| (row.seq, row.run_id, row.run_seq))
-            .collect();
+        let (rows, pruned_through) = {
+            let outbox = read(&self.outbox);
+            let rows: Vec<(u64, RunId, u64)> = outbox
+                .rows
+                .iter()
+                .filter(|row| row.principal == principal && row.seq > after)
+                .take(limit)
+                .map(|row| (row.seq, row.run_id, row.run_seq))
+                .collect();
+            (rows, outbox.pruned.get(&principal).copied().unwrap_or(0))
+        };
         // Numbered under the runs lock with their events, so every row's
         // event is stored.
         let runs = read(&self.runs);
-        Ok(rows
+        let entries = rows
             .into_iter()
-            .filter_map(|(seq, run_id, run_seq)| {
-                let event = runs.get(&run_id)?.events.get(run_seq as usize - 1)?.clone();
-                Some(OutboxEntry {
+            .map(|(seq, run_id, run_seq)| {
+                let event = runs
+                    .get(&run_id)
+                    .and_then(|run| run.events.get(run_seq as usize - 1))
+                    .ok_or_else(|| StoreError::new(format!("outbox entry {seq} has no event")))?
+                    .clone();
+                Ok(OutboxEntry {
                     seq,
                     run_id,
                     run_seq,
                     event,
                 })
             })
-            .collect())
+            .collect::<Result<_, StoreError>>()?;
+        Ok(OutboxPage {
+            entries,
+            pruned_through,
+        })
     }
 
     fn prune_outbox(&self, before: Timestamp) -> Result<u64, StoreError> {
         let mut outbox = write(&self.outbox, "outbox")?;
+        let mut through: HashMap<(String, String), u64> = HashMap::new();
+        for row in &outbox.rows {
+            if row.stored_ms < before.as_unix_millis() {
+                let last = through.entry(row.principal.clone()).or_insert(0);
+                *last = (*last).max(row.seq);
+            }
+        }
         let kept = outbox.rows.len();
-        outbox
-            .rows
-            .retain(|row| row.stored_ms >= before.as_unix_millis());
-        Ok((kept - outbox.rows.len()) as u64)
+        outbox.rows.retain(|row| {
+            through
+                .get(&row.principal)
+                .is_none_or(|through| row.seq > *through)
+        });
+        let pruned = (kept - outbox.rows.len()) as u64;
+        for (principal, through) in through {
+            let last = outbox.pruned.entry(principal).or_insert(0);
+            *last = (*last).max(through);
+        }
+        Ok(pruned)
     }
 }
 

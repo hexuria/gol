@@ -81,7 +81,9 @@ fn put(store: &dyn RunStore, spec: &RunSpec) -> Vec<Event> {
 }
 
 fn all(outbox: &dyn OutboxStore, owner: &Owner) -> Vec<OutboxEntry> {
-    outbox.outbox_after(owner, 0, usize::MAX).expect("outbox")
+    let page = outbox.outbox_after(owner, 0, usize::MAX).expect("outbox");
+    assert_eq!(page.pruned_through, 0);
+    page.entries
 }
 
 fn numbers(entries: &[OutboxEntry]) -> Vec<(u64, RunId, u64)> {
@@ -278,6 +280,7 @@ fn the_outbox_lists_in_order_after_a_number() {
             outbox
                 .outbox_after(&owner, after, limit)
                 .expect("outbox")
+                .entries
                 .iter()
                 .map(|entry| entry.seq)
                 .collect::<Vec<_>>()
