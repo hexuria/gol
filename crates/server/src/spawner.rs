@@ -20,8 +20,8 @@ pub(crate) enum EnqueueError {
     Store(StoreError),
     /// The run is stored but the push failed; the run was ended.
     Push(String),
-    /// The run is stored and was held, but could not be cancelled: it is
-    /// open, never pushed, and off the pending set unless that failed too.
+    /// A fire's run is stored and was not pushed: its hold's cancel failed,
+    /// or its gate could not tell. It stays pending for the queue sweep.
     Held(String),
 }
 
@@ -47,34 +47,6 @@ pub(crate) fn enqueue(
     spec: &RunSpec,
     on_push_failure: OnPushFailure,
 ) -> Result<PutRun, EnqueueError> {
-    match enqueue_unless(store, queue, spec, on_push_failure, &|| false)? {
-        Gated::Queued(put) => Ok(put),
-        Gated::Held => unreachable!("an open gate holds nothing"),
-    }
-}
-
-/// What `enqueue_unless` did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Gated {
-    /// Queued, as `enqueue` does.
-    Queued(PutRun),
-    /// Stored, then held: cancelled before any worker could see it, and
-    /// never pushed.
-    Held,
-}
-
-/// `enqueue`, with `hold` asked once the run is stored and before it is
-/// pushed: a run it holds is cancelled and not pushed, so no worker ever
-/// claims it (a fire whose trigger a stop paused meanwhile, Phase 4.1). A
-/// held run whose cancel fails is taken off the pending set, so the sweep
-/// does not push it either, and the error names it.
-pub(crate) fn enqueue_unless(
-    store: &dyn RunStore,
-    queue: &RedisRunQueue,
-    spec: &RunSpec,
-    on_push_failure: OnPushFailure,
-    hold: &dyn Fn() -> bool,
-) -> Result<Gated, EnqueueError> {
     let run_id = spec.run_id;
     queue.pend(run_id).map_err(EnqueueError::Queue)?;
     let put = match store.put_run(StoredRun {
@@ -90,20 +62,6 @@ pub(crate) fn enqueue_unless(
             return Err(EnqueueError::Store(error));
         }
     };
-    if put == PutRun::Stored && hold() {
-        return match store.append_events(run_id, vec![run_cancelled_event(spec)]) {
-            Ok(Append::Appended | Append::Terminal) => Ok(Gated::Held),
-            Ok(Append::Missing | Append::Moved) => Err(EnqueueError::Held(
-                "a held run was not stored to cancel".to_string(),
-            )),
-            Err(error) => {
-                if let Err(unpend) = queue.unpend(run_id) {
-                    eprintln!("gol: held run {run_id} stays pending: {unpend}");
-                }
-                Err(EnqueueError::Held(error.to_string()))
-            }
-        };
-    }
     if put == PutRun::Stored {
         if let Err(error) = queue.push(run_id) {
             match on_push_failure {
@@ -119,7 +77,107 @@ pub(crate) fn enqueue_unless(
             }
         }
     }
-    Ok(Gated::Queued(put))
+    Ok(put)
+}
+
+/// What a fire's gate says of its stored, waiting run, just before the
+/// push.
+pub(crate) enum Gate {
+    /// Push it.
+    Open,
+    /// Hold it: cancel it, never pushed.
+    Shut,
+    /// It could not tell: the run stays stored, unpushed and pending, for
+    /// the queue sweep to settle.
+    Unknown(String),
+}
+
+/// What `settle_fire` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fire {
+    /// Queued now.
+    Pushed,
+    /// Held: cancelled before any worker could see it, and never pushed.
+    Held,
+    /// Queued, claimed or past waiting already: nothing more to do.
+    Found,
+}
+
+/// Stores a trigger's fire of `spec` (Phase 4.1-4.2), whose id is its
+/// trigger's and tick's, pending first, then settles it (`settle_fire`). A
+/// failed store ends nothing: the run, if it was stored, stays pending, and
+/// the queue sweep settles it.
+pub(crate) fn enqueue_fire(
+    store: &dyn RunStore,
+    queue: &RedisRunQueue,
+    spec: &RunSpec,
+    gate: &dyn Fn() -> Gate,
+) -> Result<Fire, EnqueueError> {
+    queue.pend(spec.run_id).map_err(EnqueueError::Queue)?;
+    store
+        .put_run(StoredRun {
+            spec: spec.clone(),
+            events: queued_events(spec),
+        })
+        .map_err(EnqueueError::Store)?;
+    settle_fire(store, queue, spec, gate)
+}
+
+/// Settles a trigger's stored run, for its fire or the queue sweep. A run
+/// that is no longer waiting (a worker took it, or it ended) is left, off
+/// the pending set. A waiting one is gated just before its push, so no run
+/// a stop or a pause covers ever reaches a worker: pushed once (a run two
+/// writers push is queued once), or held. A gate that cannot tell, or a
+/// hold whose cancel fails, keeps the run pending, and the sweep tries
+/// again.
+pub(crate) fn settle_fire(
+    store: &dyn RunStore,
+    queue: &RedisRunQueue,
+    spec: &RunSpec,
+    gate: &dyn Fn() -> Gate,
+) -> Result<Fire, EnqueueError> {
+    let run_id = spec.run_id;
+    let events = store
+        .run(run_id)
+        .map_err(EnqueueError::Store)?
+        .map(|run| run.events)
+        .unwrap_or_default();
+    if !still_waiting(&events) {
+        queue.unpend(run_id).map_err(EnqueueError::Queue)?;
+        return Ok(Fire::Found);
+    }
+    match gate() {
+        Gate::Open => match queue.push_once(run_id).map_err(EnqueueError::Push)? {
+            true => Ok(Fire::Pushed),
+            false => Ok(Fire::Found),
+        },
+        Gate::Shut => match store.append_events(run_id, vec![run_cancelled_event(spec)]) {
+            Ok(Append::Appended | Append::Terminal) => {
+                if let Err(error) = queue.unpend(run_id) {
+                    eprintln!("gol: held run {run_id} stays pending: {error}");
+                }
+                Ok(Fire::Held)
+            }
+            Ok(Append::Missing | Append::Moved) => Err(EnqueueError::Held(
+                "a held run was not stored to cancel".to_string(),
+            )),
+            Err(error) => Err(EnqueueError::Held(error.to_string())),
+        },
+        Gate::Unknown(reason) => Err(EnqueueError::Held(reason)),
+    }
+}
+
+/// Whether a run's log is still only its queued events: no worker ever
+/// scheduled it, and nothing ended it.
+fn still_waiting(events: &[protocol::Event]) -> bool {
+    events.iter().all(|event| {
+        matches!(
+            event.payload,
+            protocol::EventPayload::RunCreated
+                | protocol::EventPayload::RunQueued
+                | protocol::EventPayload::UserMessage { .. }
+        )
+    })
 }
 
 /// After an `enqueue` found `spec`'s run already stored, and put it on the
@@ -132,15 +190,7 @@ fn settle_existing(
     run_id: RunId,
     events: &[protocol::Event],
 ) -> Result<(), String> {
-    let waiting = events.iter().all(|event| {
-        matches!(
-            event.payload,
-            protocol::EventPayload::RunCreated
-                | protocol::EventPayload::RunQueued
-                | protocol::EventPayload::UserMessage { .. }
-        )
-    });
-    if !waiting || queue.queued_or_claimed(run_id)? {
+    if !still_waiting(events) || queue.queued_or_claimed(run_id)? {
         queue.unpend(run_id)?;
     }
     Ok(())

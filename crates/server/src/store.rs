@@ -565,6 +565,10 @@ pub struct StoredTrigger {
     /// When the scheduler fires it next (Phase 4.2); none until then.
     pub next_fire_ms: Option<i64>,
     pub created_ms: i64,
+    /// Bumped by each resume: a fire that read the trigger before a pause
+    /// and a resume finds another generation at its gate, and holds its run.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// The triggers a store keeps (Phase 4.1), each its owner's alone: every
@@ -596,6 +600,33 @@ pub trait TriggerStore: Send + Sync {
     /// Pauses every trigger of the principal's, and says how many were
     /// running.
     fn pause_triggers(&self, owner: &Owner) -> Result<usize, StoreError>;
+    /// Resumes one paused trigger, with its next tick (none for a webhook),
+    /// and bumps its generation, in one step: a scheduler never sees it
+    /// running with the tick it had when paused. A trigger that is running
+    /// is left as it is. The trigger as it is now; none when it is not the
+    /// principal's.
+    fn resume_trigger(
+        &self,
+        owner: &Owner,
+        id: TriggerId,
+        next_fire_ms: Option<i64>,
+    ) -> Result<Option<StoredTrigger>, StoreError>;
+    /// Every principal's running triggers whose next tick is at or before
+    /// `now_ms`, soonest first, at most `limit` (Phase 4.2).
+    fn due_triggers(&self, now_ms: i64, limit: usize) -> Result<Vec<StoredTrigger>, StoreError>;
+    /// Moves trigger `id` from tick `due_ms` to `next_ms`, only if its next
+    /// tick is still `due_ms` (decision 69A): of the schedulers that fired a
+    /// tick, one moves it. Whether this one did. No `due_ms` gives a
+    /// schedule its first tick; no `next_ms` leaves it none.
+    fn advance_trigger(
+        &self,
+        id: TriggerId,
+        due_ms: Option<i64>,
+        next_ms: Option<i64>,
+    ) -> Result<bool, StoreError>;
+    /// Running schedule triggers with no tick yet (made before Phase 4.2),
+    /// at most `limit`.
+    fn unscheduled_triggers(&self, limit: usize) -> Result<Vec<StoredTrigger>, StoreError>;
 }
 
 /// The in-memory store. A poisoned lock (a writer panicked holding it) still
@@ -904,6 +935,66 @@ impl TriggerStore for InMemoryStore {
         let before = triggers.len();
         triggers.retain(|trigger| !(trigger.id == id && trigger.owner.is(owner)));
         Ok(triggers.len() < before)
+    }
+
+    fn resume_trigger(
+        &self,
+        owner: &Owner,
+        id: TriggerId,
+        next_fire_ms: Option<i64>,
+    ) -> Result<Option<StoredTrigger>, StoreError> {
+        let mut triggers = write(&self.triggers, "triggers")?;
+        Ok(triggers
+            .iter_mut()
+            .find(|trigger| trigger.id == id && trigger.owner.is(owner))
+            .map(|trigger| {
+                if !trigger.enabled {
+                    trigger.enabled = true;
+                    trigger.next_fire_ms = next_fire_ms;
+                    trigger.generation += 1;
+                }
+                trigger.clone()
+            }))
+    }
+
+    fn due_triggers(&self, now_ms: i64, limit: usize) -> Result<Vec<StoredTrigger>, StoreError> {
+        let mut due: Vec<StoredTrigger> = read(&self.triggers)
+            .iter()
+            .filter(|trigger| {
+                trigger.enabled && trigger.next_fire_ms.is_some_and(|next| next <= now_ms)
+            })
+            .cloned()
+            .collect();
+        due.sort_by_key(|trigger| (trigger.next_fire_ms, trigger.id.as_uuid()));
+        due.truncate(limit);
+        Ok(due)
+    }
+
+    fn advance_trigger(
+        &self,
+        id: TriggerId,
+        due_ms: Option<i64>,
+        next_ms: Option<i64>,
+    ) -> Result<bool, StoreError> {
+        let mut triggers = write(&self.triggers, "triggers")?;
+        Ok(triggers
+            .iter_mut()
+            .find(|trigger| trigger.id == id && trigger.next_fire_ms == due_ms)
+            .map(|trigger| trigger.next_fire_ms = next_ms)
+            .is_some())
+    }
+
+    fn unscheduled_triggers(&self, limit: usize) -> Result<Vec<StoredTrigger>, StoreError> {
+        Ok(read(&self.triggers)
+            .iter()
+            .filter(|trigger| {
+                trigger.enabled
+                    && trigger.next_fire_ms.is_none()
+                    && matches!(trigger.kind, TriggerKind::Schedule { .. })
+            })
+            .take(limit)
+            .cloned()
+            .collect())
     }
 
     fn pause_triggers(&self, owner: &Owner) -> Result<usize, StoreError> {

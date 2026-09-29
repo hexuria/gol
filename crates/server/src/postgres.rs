@@ -234,7 +234,7 @@ create table if not exists artifacts (
 
 /// Indexes created once, each as (table, name, statement): an existing one
 /// is found in the catalog, not by `create index if not exists`.
-const INDEXES: [(&str, &str, &str); 8] = [
+const INDEXES: [(&str, &str, &str); 9] = [
     // A stop check reads a principal's stops, and walks runs by parent.
     (
         "stops",
@@ -245,6 +245,12 @@ const INDEXES: [(&str, &str, &str); 8] = [
         "runs",
         "runs_by_parent",
         "create index runs_by_parent on runs (parent_run)",
+    ),
+    // The running triggers by their next tick, for the scheduler.
+    (
+        "triggers",
+        "triggers_due",
+        "create index triggers_due on triggers (next_fire_ms) where enabled",
     ),
     // A principal's triggers, oldest first.
     (
@@ -1315,6 +1321,18 @@ impl RunStore for PostgresStore {
     }
 }
 
+/// The triggers of `rows` a server can read. A row it cannot (a kind a newer
+/// server stored) is left out, with an error, so it does not stop the rest.
+fn readable_triggers(rows: &[postgres::Row]) -> Vec<StoredTrigger> {
+    rows.iter()
+        .filter_map(|row| {
+            trigger_row(row)
+                .map_err(|error| eprintln!("gol: a trigger row cannot be read: {error}"))
+                .ok()
+        })
+        .collect()
+}
+
 /// A trigger from its row: the stored JSON, with the row's `enabled` and
 /// `next_fire_ms`, which the JSON's copies never override.
 fn trigger_row(row: &postgres::Row) -> Result<StoredTrigger, StoreError> {
@@ -1448,6 +1466,83 @@ impl TriggerStore for PostgresStore {
                     &[&id.as_uuid(), &owner.issuer, &owner.subject],
                 )
                 .map(|deleted| deleted > 0)
+                .map_err(sql)
+        })
+    }
+
+    fn resume_trigger(
+        &self,
+        owner: &Owner,
+        id: TriggerId,
+        next_fire_ms: Option<i64>,
+    ) -> Result<Option<StoredTrigger>, StoreError> {
+        // One statement resumes it only while it is paused, with a bumped
+        // generation; a running trigger is read as it is.
+        let row = self.with_client(|client| {
+            client
+                .query_opt(
+                    "update triggers set enabled = true, next_fire_ms = $4,
+                         body = jsonb_set(body, '{generation}',
+                             to_jsonb(coalesce((body->>'generation')::bigint, 0) + 1))
+                     where id = $1 and owner_issuer = $2 and owner_subject = $3
+                       and not enabled
+                     returning body, enabled, next_fire_ms",
+                    &[&id.as_uuid(), &owner.issuer, &owner.subject, &next_fire_ms],
+                )
+                .map_err(sql)
+        })?;
+        match row {
+            Some(row) => trigger_row(&row).map(Some),
+            None => self.trigger(owner, id),
+        }
+    }
+
+    fn due_triggers(&self, now_ms: i64, limit: usize) -> Result<Vec<StoredTrigger>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self.with_client(|client| {
+            client
+                .query(
+                    "select body, enabled, next_fire_ms from triggers
+                     where enabled and next_fire_ms <= $1
+                     order by next_fire_ms, id
+                     limit $2",
+                    &[&now_ms, &limit],
+                )
+                .map_err(sql)
+        })?;
+        Ok(readable_triggers(&rows))
+    }
+
+    fn unscheduled_triggers(&self, limit: usize) -> Result<Vec<StoredTrigger>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self.with_client(|client| {
+            client
+                .query(
+                    "select body, enabled, next_fire_ms from triggers
+                     where enabled and next_fire_ms is null and body->'kind' ? 'schedule'
+                     limit $1",
+                    &[&limit],
+                )
+                .map_err(sql)
+        })?;
+        Ok(readable_triggers(&rows))
+    }
+
+    /// One statement: the tick moves only from the one this scheduler fired.
+    fn advance_trigger(
+        &self,
+        id: TriggerId,
+        due_ms: Option<i64>,
+        next_ms: Option<i64>,
+    ) -> Result<bool, StoreError> {
+        self.with_client(|client| {
+            client
+                .execute(
+                    "update triggers set next_fire_ms = $3
+                     where id = $1 and next_fire_ms is not distinct from $2",
+                    &[&id.as_uuid(), &due_ms, &next_ms],
+                )
+                .map(|moved| moved == 1)
                 .map_err(sql)
         })
     }

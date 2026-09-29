@@ -9,12 +9,18 @@ use std::cell::Cell;
 use harness::StoreError;
 
 use crate::queue::RedisRunQueue;
-use crate::spawner::{enqueue_unless, EnqueueError, Gated, OnPushFailure};
-use crate::store::{RunStore, StoredTrigger, TriggerId, TriggerKind};
+use crate::spawner::{enqueue_fire, settle_fire, EnqueueError, Fire, Gate};
+use crate::store::{RunStore, StoredTrigger, TriggerId, TriggerKind, TriggerStore};
 
 /// The metadata key the server sets on a run a trigger started (decision
 /// 68A): its trigger's id. A caller that sends it is refused.
 pub const TRIGGER_KEY: &str = "gol.trigger";
+
+/// The trigger's generation a fire read (Phase 4.2), on its run.
+const GENERATION_KEY: &str = "gol.generation";
+
+/// The tick a scheduled fire fired (Phase 4.2), on its run.
+const TICK_KEY: &str = "gol.tick";
 
 /// The thread every run of trigger `id` belongs to, so its fires are the
 /// cards of one board.
@@ -33,6 +39,10 @@ pub enum Fired {
     NotFound,
     /// Nothing: its agent is no longer the principal's.
     AgentNotFound,
+    /// Nothing: the tick it was asked to fire is no longer the trigger's
+    /// next (another scheduler fired it and moved it on, or it was resumed
+    /// to a later one).
+    Moved,
 }
 
 /// Why a fire failed, for its caller to retry or not.
@@ -47,21 +57,57 @@ pub enum FireError {
 
 /// Fires `owner`'s trigger `id` (decision 68A): an ordinary queued run of
 /// its agent, at the version the owner keeps now, with its input and run
-/// template, in the trigger's thread and marked `TRIGGER_KEY`. Queued the
-/// way a child run is: pending before it is stored, and left to the queue
-/// sweep if the push fails. A paused trigger does not fire.
+/// template, in the trigger's thread and marked `TRIGGER_KEY`, through
+/// `spawner::enqueue_fire`. A paused trigger does not fire.
 ///
 /// The trigger is read again once the run is stored and before it is
 /// pushed. A trigger paused (the owner's stop pauses before it records
 /// itself) or deleted in between holds the run: it is cancelled before any
 /// worker can see it, and never pushed. A pause after that read comes
 /// before the stop's record, and the stop covers a run stored before it. A
-/// read that fails holds the run too.
+/// read that fails leaves the run stored and unpushed, and a failed push
+/// leaves it pending: a scheduled fire's next try of the tick (the same run
+/// id) gates and pushes it.
 pub fn fire_trigger(
     store: &dyn RunStore,
     queue: &RedisRunQueue,
     owner: &Owner,
     id: TriggerId,
+) -> Result<Fired, FireError> {
+    fire(store, queue, owner, id, None)
+}
+
+/// A scheduled fire: its run id, and its tick.
+type Tick = (RunId, i64);
+
+/// The namespace of a scheduled fire's run id (UUID v5 over the trigger and
+/// its tick).
+const TICK_RUN_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x2c1e_7a90_5b3d_4f61_8e2a_6d0c_9b47_13f5);
+
+/// `fire_trigger` for trigger `id`'s tick at `tick_ms` (Phase 4.2): the
+/// run's id comes from the trigger and the tick, so the tick fired twice
+/// (two schedulers, or one that died between the fire and moving the
+/// trigger to its next tick) is one run, stored once and pushed once.
+pub fn fire_trigger_at(
+    store: &dyn RunStore,
+    queue: &RedisRunQueue,
+    owner: &Owner,
+    id: TriggerId,
+    tick_ms: i64,
+) -> Result<Fired, FireError> {
+    let mut name = id.as_uuid().as_bytes().to_vec();
+    name.extend_from_slice(&tick_ms.to_le_bytes());
+    let run = RunId::from_uuid(uuid::Uuid::new_v5(&TICK_RUN_NAMESPACE, &name));
+    fire(store, queue, owner, id, Some((run, tick_ms)))
+}
+
+fn fire(
+    store: &dyn RunStore,
+    queue: &RedisRunQueue,
+    owner: &Owner,
+    id: TriggerId,
+    tick: Option<Tick>,
 ) -> Result<Fired, FireError> {
     let unread = |error: StoreError| FireError::NotStored(error.to_string());
     let triggers = store
@@ -73,6 +119,9 @@ pub fn fire_trigger(
     if !trigger.enabled {
         return Ok(Fired::Paused);
     }
+    if tick.is_some_and(|(_, at)| trigger.next_fire_ms != Some(at)) {
+        return Ok(Fired::Moved);
+    }
     let Some(agent) = store
         .agent(trigger.agent_id)
         .map_err(unread)?
@@ -80,44 +129,96 @@ pub fn fire_trigger(
     else {
         return Ok(Fired::AgentNotFound);
     };
-    let spec = run_of(
+    let mut spec = run_of(
         &trigger,
         agent.manifest.version,
         agent.manifest.required_capabilities,
     );
-    let run = spec.run_id;
-    // Why the run was held, if it was: `Err` for a read that failed.
-    let held: Cell<Option<Result<Fired, String>>> = Cell::new(None);
-    let hold = || {
-        let why = match triggers.trigger(owner, id) {
-            Ok(Some(trigger)) if trigger.enabled => return false,
-            Ok(Some(_)) => Ok(Fired::Paused),
-            Ok(None) => Ok(Fired::NotFound),
-            Err(error) => Err(error.to_string()),
-        };
-        held.set(Some(why));
-        true
-    };
-    let gated = enqueue_unless(store, queue, &spec, OnPushFailure::LeaveToSweep, &hold).map_err(
-        |error| match error {
-            EnqueueError::Queue(message) => FireError::NotStored(message),
-            EnqueueError::Push(message) | EnqueueError::Held(message) => {
-                FireError::MaybeStored { run, message }
-            }
-            EnqueueError::Store(error) => FireError::MaybeStored {
-                run,
-                message: error.to_string(),
-            },
-        },
-    )?;
-    match (gated, held.take()) {
-        (Gated::Held, Some(Err(message))) => Err(FireError::MaybeStored {
-            run,
-            message: format!("the trigger could not be read again, so the run was held: {message}"),
-        }),
-        (Gated::Held, Some(Ok(fired))) => Ok(fired),
-        _ => Ok(Fired::Run(run)),
+    if let Some((run_id, at)) = tick {
+        // A top-level run: its lineage names no root, so the id is its own.
+        spec.run_id = run_id;
+        spec.metadata.insert(TICK_KEY.to_string(), at.to_string());
     }
+    let run = spec.run_id;
+    // Why the run was held, if it was.
+    let held: Cell<Option<Fired>> = Cell::new(None);
+    let gate = || gate_of(triggers, owner, id, trigger.generation, &held);
+    let fired = enqueue_fire(store, queue, &spec, &gate).map_err(|error| match error {
+        EnqueueError::Queue(message) => FireError::NotStored(message),
+        EnqueueError::Push(message) | EnqueueError::Held(message) => {
+            FireError::MaybeStored { run, message }
+        }
+        EnqueueError::Store(error) => FireError::MaybeStored {
+            run,
+            message: error.to_string(),
+        },
+    })?;
+    Ok(match (fired, held.take()) {
+        (Fire::Held, Some(why)) => why,
+        _ => Fired::Run(run),
+    })
+}
+
+/// The gate of a fire of trigger `id` that read it at `generation` (Phase
+/// 4.2): open while the trigger runs at that generation; shut (the run is
+/// held) once it is paused, resumed since (a resumed trigger owes nothing
+/// for the ticks it was paused) or gone. `held` says which.
+fn gate_of(
+    triggers: &dyn TriggerStore,
+    owner: &Owner,
+    id: TriggerId,
+    generation: u64,
+    held: &Cell<Option<Fired>>,
+) -> Gate {
+    match triggers.trigger(owner, id) {
+        Ok(Some(trigger)) if trigger.enabled && trigger.generation == generation => Gate::Open,
+        Ok(Some(trigger)) => {
+            held.set(Some(if trigger.enabled {
+                Fired::Moved
+            } else {
+                Fired::Paused
+            }));
+            Gate::Shut
+        }
+        Ok(None) => {
+            held.set(Some(Fired::NotFound));
+            Gate::Shut
+        }
+        Err(error) => Gate::Unknown(format!(
+            "the trigger could not be read again, so the run was not pushed: {error}"
+        )),
+    }
+}
+
+/// Settles a trigger's stored run the queue sweep found pending (Phase
+/// 4.2): gated as its fire gates it, by the generation it recorded, then
+/// pushed once or held. A run a server cannot place (its trigger or
+/// generation unreadable) is held.
+pub(crate) fn settle_fired_run(
+    queue: &RedisRunQueue,
+    store: &dyn RunStore,
+    spec: &RunSpec,
+) -> Result<Fire, String> {
+    let triggers = store
+        .triggers()
+        .ok_or_else(|| "the store keeps no triggers".to_string())?;
+    let id = spec
+        .metadata
+        .get(TRIGGER_KEY)
+        .and_then(|id| id.parse::<TriggerId>().ok());
+    let generation = spec
+        .metadata
+        .get(GENERATION_KEY)
+        .and_then(|generation| generation.parse::<u64>().ok());
+    let (Some(id), Some(generation)) = (id, generation) else {
+        return settle_fire(store, queue, spec, &|| Gate::Shut)
+            .map_err(|error| format!("{error:?}"));
+    };
+    let held = Cell::new(None);
+    settle_fire(store, queue, spec, &|| {
+        gate_of(triggers, &spec.owner, id, generation, &held)
+    })
+    .map_err(|error| format!("{error:?}"))
 }
 
 /// The run a fire of `trigger` starts.
@@ -129,6 +230,7 @@ fn run_of(
     let metadata: BTreeMap<String, String> = [
         (SESSION_ID.to_string(), trigger_thread(trigger.id)),
         (TRIGGER_KEY.to_string(), trigger.id.to_string()),
+        (GENERATION_KEY.to_string(), trigger.generation.to_string()),
     ]
     .into_iter()
     .collect();

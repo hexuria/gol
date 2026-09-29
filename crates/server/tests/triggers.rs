@@ -309,6 +309,20 @@ async fn a_bad_trigger_is_refused() {
         .await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(body["error"], "gol.trigger is set by the server");
+    let (status, body) = server
+        .post(
+            "/v1/runs",
+            &user,
+            json!({
+                "agent_id": agent, "agent_version": "1", "input": "x", "placement": "Local",
+                "work_model": {"provider": "OpenAI", "model_name": "gpt-test",
+                    "credential": "PlatformGateway"},
+                "metadata": {"gol.generation": "7"},
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"], "gol. metadata is set by the server");
 }
 
 const WEBHOOK_KEY: &[u8] = b"a server key for tests, 32 bytes or more";
@@ -430,6 +444,7 @@ async fn a_fire_of_another_principals_agent_starts_nothing() {
             enabled: true,
             next_fire_ms: None,
             created_ms: 1,
+            generation: 0,
         };
         let runs = store.clone();
         blocking(move || {
@@ -457,11 +472,20 @@ enum Forced {
     PauseAfterPut,
     /// Right after a run is stored, the owner's triggers are deleted.
     DeleteAfterPut,
+    /// Right after a run is stored, the owner's triggers are paused and
+    /// resumed: a new generation.
+    PauseResumeAfterPut,
+    /// Right after a run is stored, the owner's triggers are paused, and
+    /// the first cancel after that fails.
+    PauseAfterPutFailCancel,
 }
 
 /// An in-memory store with one forced behavior.
 struct ForcedStore {
     inner: server::InMemoryStore,
+    /// The next cancel fails. One test thread and the store's one caller use
+    /// it in turn; its swap needs no order with other memory.
+    fail_cancel: std::sync::atomic::AtomicBool,
     forced: Forced,
 }
 
@@ -494,6 +518,17 @@ impl server::RunStore for ForcedStore {
                     self.inner.delete_trigger(&owner, trigger.id)?;
                 }
             }
+            Forced::PauseResumeAfterPut => {
+                self.inner.pause_triggers(&owner)?;
+                for trigger in self.inner.triggers_of(&owner)? {
+                    self.inner.resume_trigger(&owner, trigger.id, None)?;
+                }
+            }
+            Forced::PauseAfterPutFailCancel => {
+                self.inner.pause_triggers(&owner)?;
+                self.fail_cancel
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             Forced::FailPause => {}
         }
         Ok(put)
@@ -503,6 +538,16 @@ impl server::RunStore for ForcedStore {
         id: RunId,
         events: Vec<protocol::Event>,
     ) -> Result<server::Append, server::StoreError> {
+        let cancels = events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::RunCancelled));
+        if cancels
+            && self
+                .fail_cancel
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(server::StoreError::new("the store is unreachable"));
+        }
         self.inner.append_events(id, events)
     }
     fn append_events_after(
@@ -572,10 +617,39 @@ impl server::TriggerStore for ForcedStore {
     fn delete_trigger(&self, owner: &Owner, id: TriggerId) -> Result<bool, server::StoreError> {
         self.inner.delete_trigger(owner, id)
     }
+    fn resume_trigger(
+        &self,
+        owner: &Owner,
+        id: TriggerId,
+        next_fire_ms: Option<i64>,
+    ) -> Result<Option<server::StoredTrigger>, server::StoreError> {
+        self.inner.resume_trigger(owner, id, next_fire_ms)
+    }
+    fn due_triggers(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<server::StoredTrigger>, server::StoreError> {
+        self.inner.due_triggers(now_ms, limit)
+    }
+    fn advance_trigger(
+        &self,
+        id: TriggerId,
+        due_ms: Option<i64>,
+        next_ms: Option<i64>,
+    ) -> Result<bool, server::StoreError> {
+        self.inner.advance_trigger(id, due_ms, next_ms)
+    }
+    fn unscheduled_triggers(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<server::StoredTrigger>, server::StoreError> {
+        self.inner.unscheduled_triggers(limit)
+    }
     fn pause_triggers(&self, owner: &Owner) -> Result<usize, server::StoreError> {
         match self.forced {
             Forced::FailPause => Err(server::StoreError::new("the store is unreachable")),
-            Forced::PauseAfterPut | Forced::DeleteAfterPut => self.inner.pause_triggers(owner),
+            _ => self.inner.pause_triggers(owner),
         }
     }
 }
@@ -583,6 +657,7 @@ impl server::TriggerStore for ForcedStore {
 fn forced(forced: Forced) -> Store {
     std::sync::Arc::new(ForcedStore {
         inner: server::InMemoryStore::default(),
+        fail_cancel: std::sync::atomic::AtomicBool::new(false),
         forced,
     })
 }
@@ -673,6 +748,7 @@ fn racing_creates_keep_the_cap() {
             enabled: true,
             next_fire_ms: None,
             created_ms: n,
+            generation: 0,
         };
         let most = server::MAX_TRIGGERS;
         for n in 0..most - 5 {
@@ -709,6 +785,14 @@ fn racing_creates_keep_the_cap() {
             .triggers_of(&owner)
             .expect("list");
         assert_eq!(kept.len(), most);
+        // No later pass of a scheduler test on the shared Postgres ticks them.
+        for trigger in kept {
+            store
+                .triggers()
+                .expect("triggers")
+                .delete_trigger(&owner, trigger.id)
+                .expect("delete");
+        }
     }
 }
 
@@ -754,4 +838,68 @@ async fn triggers_are_refused_where_they_cannot_work() {
     assert!(created.windows(2).all(|pair| pair[0] <= pair[1]));
     let (status, body) = create(&server, &user, schedule(agent)).await;
     assert_eq!(status, 409, "{body}");
+}
+
+// A fire whose trigger is paused and resumed between its read and its
+// run's store finds a new generation at its gate: the resumed trigger owes
+// nothing for the tick it was paused, so the run is held, never pushed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fire_across_a_pause_and_resume_holds_its_run() {
+    let jev = jev(&["complete"]).await;
+    let server = serve(forced(Forced::PauseResumeAfterPut), &jev, 15).await;
+    let user = fresh_user();
+    let agent = server.agent(&user, "digest", &[]).await;
+    let (_, created) = create(&server, &user, schedule(agent)).await;
+    let id = created["id"].as_str().expect("id").to_string();
+    assert_eq!(fire(&server, &user, &id).await, Fired::Moved);
+    assert_eq!(server.work().await, None, "never pushed");
+    let (_, board) = server
+        .get(&format!("/v1/threads/trigger-{id}/board"), &user)
+        .await;
+    assert_eq!(board["cards"][0]["state"], "cancelled", "{board}");
+}
+
+// A hold whose cancel fails leaves the run stored, unpushed and pending; the
+// queue sweep settles it through the same gate, and holds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_hold_is_settled_by_the_sweep() {
+    let jev = jev(&["complete"]).await;
+    let server = serve(forced(Forced::PauseAfterPutFailCancel), &jev, 0).await;
+    let user = fresh_user();
+    let agent = server.agent(&user, "digest", &[]).await;
+    let (_, created) = create(&server, &user, schedule(agent)).await;
+    let id = created["id"].as_str().expect("id").to_string();
+    let (store, url, owner) = (
+        server.store.clone(),
+        server.redis.clone(),
+        Owner::new(common::ISSUER, user.clone(), "tenant-1"),
+    );
+    let trigger: TriggerId = id.parse().expect("id");
+    let (failed, pending) = blocking(move || {
+        let queue = RedisRunQueue::open(url);
+        let failed = fire_trigger(store.as_ref(), &queue, &owner, trigger);
+        (failed, queue.pending().expect("pending"))
+    })
+    .await;
+    let Err(server::FireError::MaybeStored { run, .. }) = failed else {
+        panic!("{failed:?}")
+    };
+    assert!(pending.contains(&run), "kept for the sweep");
+    let (store, url) = (server.store.clone(), server.redis.clone());
+    blocking(move || {
+        let queue = RedisRunQueue::open(url);
+        server::sweep(
+            &queue,
+            store.as_ref(),
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(3600),
+        )
+        .expect("sweep");
+        assert!(!queue.pending().expect("pending").contains(&run));
+    })
+    .await;
+    assert_eq!(server.work().await, None, "never pushed");
+    assert!(stored_payloads(&server.store, run)
+        .await
+        .contains(&EventPayload::RunCancelled));
 }

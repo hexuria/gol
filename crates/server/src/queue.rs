@@ -100,6 +100,18 @@ redis.call('ZREM', KEYS[2], ARGV[1])
 return 1
 ";
 
+/// Queues ARGV[1] unless it is already on the runs list (KEYS[1]) or in
+/// processing (KEYS[3]), and takes it off pending (KEYS[2]), in one step. 1
+/// if it queued it.
+const PUSH_ONCE: &str = r"
+redis.call('ZREM', KEYS[2], ARGV[1])
+if redis.call('LPOS', KEYS[1], ARGV[1]) or redis.call('LPOS', KEYS[3], ARGV[1]) then
+  return 0
+end
+redis.call('LPUSH', KEYS[1], ARGV[1])
+return 1
+";
+
 /// The entries pending for at least ARGV[1] ms, by the Redis clock.
 const PENDING_FOR: &str = r"
 local now = redis.call('TIME')
@@ -257,6 +269,20 @@ impl RedisRunQueue {
         .map(|_| ())
     }
 
+    /// `push`, unless `id` is already queued or claimed: two writers pushing
+    /// one run queue it once. Whether this one queued it.
+    pub fn push_once(&self, id: RunId) -> Result<bool, String> {
+        let pushed: i64 = self.with_connection(|connection| {
+            Script::new(PUSH_ONCE)
+                .key(&self.runs)
+                .key(&self.pending)
+                .key(&self.processing)
+                .arg(id.to_string())
+                .invoke(connection)
+        })?;
+        Ok(pushed == 1)
+    }
+
     /// Queues `id` and takes it off pending, in one step.
     pub fn push(&self, id: RunId) -> Result<(), String> {
         self.with_connection(|connection| {
@@ -315,6 +341,14 @@ impl RedisRunQueue {
     }
 
     /// Takes `id` off pending without queueing it.
+    /// Redis's clock, in Unix milliseconds: the one time every server shares
+    /// (the scheduler's, Phase 4.2).
+    pub fn now_ms(&self) -> Result<i64, String> {
+        let (seconds, micros): (i64, i64) =
+            self.with_connection(|connection| redis::cmd("TIME").query(connection))?;
+        Ok(seconds * 1000 + micros / 1000)
+    }
+
     pub fn unpend(&self, id: RunId) -> Result<(), String> {
         self.unpend_entry(&id.to_string())
     }
