@@ -459,3 +459,61 @@ async fn another_principals_run_cannot_be_stopped() {
         let _: Value = body;
     }
 }
+
+// A child that slipped past the spawner's check (started as the stop was
+// made) is still under the stopped run: its worker cancels it at its claim,
+// before it runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_child_is_cancelled_when_claimed() {
+    for store in stores() {
+        let jev = jev(&["complete"]).await;
+        let server = serve(store.clone(), &jev, 9).await;
+        let user = fresh_user();
+        let agent = server.agent(&user, "solo", &[]).await;
+        let (_, parent) = server.start(&user, agent, "parent").await;
+        let (status, _) = server
+            .post(&format!("/v1/runs/{parent}/stop"), &user, json!({}))
+            .await;
+        assert_eq!(status, 200);
+        // The child, stored and queued after the stop, as a spawner that
+        // checked just before it would.
+        let parent_spec = spec_of(&store, &parent).await;
+        let child = RunSpec::builder()
+            .owner(parent_spec.owner.clone())
+            .agent(agent, "1")
+            .input("late")
+            .placement(parent_spec.placement)
+            .work_model(parent_spec.work_model.clone())
+            .child_of(&parent_spec, 1)
+            .build();
+        let child_id = child.run_id;
+        let (runs, url) = (store.clone(), server.redis.clone());
+        blocking(move || {
+            runs.put_run(server::StoredRun {
+                events: server::queued_events(&child),
+                spec: child,
+            })
+            .expect("put");
+            RedisRunQueue::open(url).push(child_id).expect("push");
+        })
+        .await;
+        let asked = jev.received_requests().await.expect("requests").len();
+        while server.work().await.is_some() {}
+        assert!(cancelled(&terminals(&store, &child_id.to_string()).await));
+        // Cancelled before it ran: never scheduled, never started.
+        let runs = store.clone();
+        let log = blocking(move || runs.run(child_id).expect("read").expect("stored").events).await;
+        assert!(
+            !log.iter().any(|event| matches!(
+                event.payload,
+                EventPayload::RunScheduled | EventPayload::RunStarted
+            )),
+            "{log:?}"
+        );
+        assert_eq!(
+            jev.received_requests().await.expect("requests").len(),
+            asked,
+            "the late child never asks Jev"
+        );
+    }
+}
