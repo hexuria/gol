@@ -93,6 +93,7 @@ async fn main() {
             queue,
             stores.runs,
             stores.memory,
+            stores.messages,
             &jev_base_url,
             models.clone(),
         ) {

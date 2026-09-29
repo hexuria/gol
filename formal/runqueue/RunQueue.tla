@@ -16,19 +16,32 @@
 \* Design "early" acknowledges before recording. Design "loose" releases
 \* without holding the lease. Design "noSweep" has no sweep. Design "c4" is
 \* the producer before C6: no pend and no sweep.
+\*
+\* With Mail (Phase 2.3), a run may ask another agent and park until the
+\* reply: the worker parks it (one script: off processing into the parked
+\* set, the lease gone, only while it holds the lease), then re-reads the log
+\* and wakes it if a reply is already there. The replier (the asked task
+\* ending, or the sweep's timeout) appends the reply, then wakes the run if
+\* it is parked (one script: parked back onto the runs list); waking twice
+\* is harmless. The sweep also wakes a parked run that has a reply, for a
+\* worker that died between its park and its re-read. Design "lostWake" has
+\* neither the re-read nor that sweep: the negative control for a reply that
+\* lands before the park.
 EXTENDS Naturals, FiniteSets
 
-CONSTANTS Design, Workers, Runs, MaxCrashes, MaxSlow, MaxReleases, MaxProducerDeaths
+CONSTANTS Design, Workers, Runs, MaxCrashes, MaxSlow, MaxReleases, MaxProducerDeaths, Mail
 
 None == "none"
 
 VARIABLES produced, waiting, processing, lease, job, pc, ended, terminals,
-          ackedOpen, crashes, slow, releases, pending, stored, producer, deaths
+          ackedOpen, crashes, slow, releases, pending, stored, producer, deaths,
+          asked, replied, reply, parked
 
 queueVars == <<produced, waiting, processing, lease, job, pc, ended, terminals,
                ackedOpen, crashes, slow, releases>>
 producerVars == <<pending, stored, producer, deaths>>
-vars == <<queueVars, producerVars>>
+mailVars == <<asked, replied, reply, parked>>
+vars == <<queueVars, producerVars, mailVars>>
 
 TypeOK ==
   /\ produced \subseteq Runs
@@ -36,7 +49,7 @@ TypeOK ==
   /\ processing \subseteq Runs
   /\ lease \in [Runs -> Workers \cup {None}]
   /\ job \in [Workers -> Runs \cup {None}]
-  /\ pc \in [Workers -> {"idle", "claimed", "ran", "recorded"}]
+  /\ pc \in [Workers -> {"idle", "claimed", "ran", "recorded", "asked", "parked"}]
   /\ ended \subseteq Runs
   /\ terminals \in [Runs -> 0..Cardinality(Workers) + MaxCrashes + MaxSlow]
   /\ ackedOpen \in BOOLEAN
@@ -47,6 +60,10 @@ TypeOK ==
   /\ stored \subseteq Runs
   /\ producer \in [Runs -> {"new", "pended", "stored", "done", "dead"}]
   /\ deaths \in 0..MaxProducerDeaths
+  /\ asked \subseteq Runs
+  /\ replied \subseteq asked
+  /\ reply \in [Runs -> {"none", "appended", "done"}]
+  /\ parked \subseteq Runs
 
 Init ==
   /\ produced = {}
@@ -65,6 +82,10 @@ Init ==
   /\ stored = {}
   /\ producer = [r \in Runs |-> "new"]
   /\ deaths = 0
+  /\ asked = {}
+  /\ replied = {}
+  /\ reply = [r \in Runs |-> "none"]
+  /\ parked = {}
 
 \* create_run marks the run pending (one ZADD script), stores it as created
 \* and queued, then pushes it: one script queues it and takes it off pending.
@@ -74,12 +95,14 @@ Pend(r) ==
   /\ pending' = pending \cup {r}
   /\ producer' = [producer EXCEPT ![r] = "pended"]
   /\ UNCHANGED <<stored, deaths>> /\ UNCHANGED queueVars
+  /\ UNCHANGED mailVars
 
 Store(r) ==
   /\ producer[r] = IF Design = "c4" THEN "new" ELSE "pended"
   /\ stored' = stored \cup {r}
   /\ producer' = [producer EXCEPT ![r] = "stored"]
   /\ UNCHANGED <<pending, deaths>> /\ UNCHANGED queueVars
+  /\ UNCHANGED mailVars
 
 Push(r) ==
   /\ producer[r] = "stored"
@@ -89,6 +112,7 @@ Push(r) ==
   /\ producer' = [producer EXCEPT ![r] = "done"]
   /\ UNCHANGED <<stored, deaths>>
   /\ UNCHANGED <<processing, lease, job, pc, ended, terminals, ackedOpen, crashes, slow, releases>>
+  /\ UNCHANGED mailVars
 
 \* The server process dies in create_run after the pend, before the push.
 ProducerDies(r) ==
@@ -97,6 +121,7 @@ ProducerDies(r) ==
   /\ deaths' = deaths + 1
   /\ producer' = [producer EXCEPT ![r] = "dead"]
   /\ UNCHANGED <<pending, stored>> /\ UNCHANGED queueVars
+  /\ UNCHANGED mailVars
 
 \* The sweep takes a run pending longer than sweep_after. By then its
 \* producer has pushed it or died: the grace assumption. A stored run is
@@ -114,6 +139,7 @@ Sweep(r) ==
        ELSE UNCHANGED <<waiting, produced>>
   /\ UNCHANGED <<stored, producer, deaths>>
   /\ UNCHANGED <<processing, lease, job, pc, ended, terminals, ackedOpen, crashes, slow, releases>>
+  /\ UNCHANGED mailVars
 
 \* One claim script: off the runs list, onto processing, leased to w.
 Claim(w, r) ==
@@ -134,14 +160,17 @@ Claim(w, r) ==
             /\ pc' = [pc EXCEPT ![w] = IF Design = "early" THEN "recorded" ELSE "claimed"]
   /\ UNCHANGED <<produced, ended, terminals, ackedOpen, crashes, slow, releases>>
   /\ UNCHANGED producerVars
+  /\ UNCHANGED mailVars
 
 \* The harness runs with Jev (Claim::prepare and execute): no shared write.
 Run(w) ==
   /\ pc[w] = "claimed"
+  /\ job[w] \in asked => job[w] \in replied
   /\ pc' = [pc EXCEPT ![w] = "ran"]
   /\ UNCHANGED <<produced, waiting, processing, lease, job, ended, terminals,
                  ackedOpen, crashes, slow, releases>>
   /\ UNCHANGED producerVars
+  /\ UNCHANGED mailVars
 
 \* One append of the harness's events, which end the run; the store refuses
 \* it once the log is terminal.
@@ -154,6 +183,7 @@ Record(w) ==
   /\ job' = IF Design = "early" THEN [job EXCEPT ![w] = None] ELSE job
   /\ UNCHANGED <<produced, waiting, processing, lease, ackedOpen, crashes, slow, releases>>
   /\ UNCHANGED producerVars
+  /\ UNCHANGED mailVars
 
 \* One ack script: off processing, and the lease released if w holds it.
 Ack(w) ==
@@ -166,6 +196,7 @@ Ack(w) ==
   /\ job' = IF Design = "early" THEN job ELSE [job EXCEPT ![w] = None]
   /\ UNCHANGED <<produced, waiting, ended, terminals, crashes, slow, releases>>
   /\ UNCHANGED producerVars
+  /\ UNCHANGED mailVars
 
 \* A worker dies holding a run, and restarts with nothing. Its lease stays
 \* until it expires.
@@ -177,6 +208,7 @@ Crash(w) ==
   /\ job' = [job EXCEPT ![w] = None]
   /\ UNCHANGED <<produced, waiting, processing, lease, ended, terminals, ackedOpen, slow, releases>>
   /\ UNCHANGED producerVars
+  /\ UNCHANGED mailVars
 
 \* A lease runs out: its holder died, or (at most MaxSlow times) its holder
 \* is alive but missed its heartbeats.
@@ -187,6 +219,7 @@ Expire(r) ==
   /\ lease' = [lease EXCEPT ![r] = None]
   /\ UNCHANGED <<produced, waiting, processing, job, pc, ended, terminals, ackedOpen, crashes, releases>>
   /\ UNCHANGED producerVars
+  /\ UNCHANGED mailVars
 
 \* One release script, for a claim that could not load or start its run, or
 \* (Phase 1.5b) one that ran but found the run log kept moving under it and
@@ -208,6 +241,7 @@ Release(w) ==
   /\ job' = [job EXCEPT ![w] = None]
   /\ UNCHANGED <<produced, ended, terminals, ackedOpen, crashes, slow>>
   /\ UNCHANGED producerVars
+  /\ UNCHANGED mailVars
 
 \* One reap script: a run in processing without a lease goes back on the list.
 Reap(r) ==
@@ -217,6 +251,86 @@ Reap(r) ==
   /\ waiting' = waiting \cup {r}
   /\ UNCHANGED <<produced, lease, job, pc, ended, terminals, ackedOpen, crashes, slow, releases>>
   /\ UNCHANGED producerVars
+  /\ UNCHANGED mailVars
+
+\* Mail: the run asks (or, resumed, still waits on its ask): its step stored
+\* MessageSent, and the harness waits. At most one ask per run.
+Ask(w) ==
+  /\ Mail
+  /\ pc[w] = "claimed"
+  /\ job[w] \notin replied
+  /\ asked' = asked \cup {job[w]}
+  /\ pc' = [pc EXCEPT ![w] = "asked"]
+  /\ UNCHANGED <<replied, reply, parked>>
+  /\ UNCHANGED <<produced, waiting, processing, lease, job, ended, terminals,
+                 ackedOpen, crashes, slow, releases>>
+  /\ UNCHANGED producerVars
+
+Wake(r) ==
+  /\ parked' = parked \ {r}
+  /\ waiting' = waiting \cup {r}
+
+\* One park script, only while w holds the lease: off processing into the
+\* parked set, the lease gone. Without the lease it does nothing, and the
+\* holder has the run.
+Park(w) ==
+  /\ pc[w] = "asked"
+  /\ LET r == job[w] IN
+       IF lease[r] = w
+         THEN /\ processing' = processing \ {r}
+              /\ parked' = parked \cup {r}
+              /\ lease' = [lease EXCEPT ![r] = None]
+              /\ pc' = [pc EXCEPT ![w] = "parked"]
+              /\ UNCHANGED job
+         ELSE /\ UNCHANGED <<processing, parked, lease>>
+              /\ pc' = [pc EXCEPT ![w] = "idle"]
+              /\ job' = [job EXCEPT ![w] = None]
+  /\ UNCHANGED <<asked, replied, reply>>
+  /\ UNCHANGED <<produced, waiting, ended, terminals, ackedOpen, crashes, slow, releases>>
+  /\ UNCHANGED producerVars
+
+\* After the park, the worker re-reads the log: a reply already there wakes
+\* the run (it may have landed before the park, when its waker found the run
+\* not parked yet). Design "lostWake" skips it.
+Recheck(w) ==
+  /\ pc[w] = "parked"
+  /\ LET r == job[w] IN
+       IF Design # "lostWake" /\ r \in replied /\ r \in parked
+         THEN Wake(r)
+         ELSE UNCHANGED <<parked, waiting>>
+  /\ pc' = [pc EXCEPT ![w] = "idle"]
+  /\ job' = [job EXCEPT ![w] = None]
+  /\ UNCHANGED <<asked, replied, reply>>
+  /\ UNCHANGED <<produced, processing, lease, ended, terminals, ackedOpen, crashes, slow, releases>>
+  /\ UNCHANGED producerVars
+
+\* The replier appends the reply (or the timeout) to the asker's log, then
+\* wakes the asker if it is parked.
+ReplyAppend(r) ==
+  /\ r \in asked
+  /\ r \notin replied
+  /\ replied' = replied \cup {r}
+  /\ reply' = [reply EXCEPT ![r] = "appended"]
+  /\ UNCHANGED <<asked, parked>> /\ UNCHANGED queueVars /\ UNCHANGED producerVars
+
+ReplyWake(r) ==
+  /\ reply[r] = "appended"
+  /\ IF r \in parked THEN Wake(r) ELSE UNCHANGED <<parked, waiting>>
+  /\ reply' = [reply EXCEPT ![r] = "done"]
+  /\ UNCHANGED <<asked, replied>>
+  /\ UNCHANGED <<produced, processing, lease, job, pc, ended, terminals, ackedOpen, crashes, slow, releases>>
+  /\ UNCHANGED producerVars
+
+\* The sweep wakes a parked run that has its reply: its worker died between
+\* the park and the re-read. Design "lostWake" has no such sweep.
+SweepParked(r) ==
+  /\ Design # "lostWake"
+  /\ r \in parked
+  /\ r \in replied
+  /\ Wake(r)
+  /\ UNCHANGED <<asked, replied, reply>>
+  /\ UNCHANGED <<produced, processing, lease, job, pc, ended, terminals, ackedOpen, crashes, slow, releases>>
+  /\ UNCHANGED producerVars
 
 \* Every producer has pushed or died, nothing is pending, every stored run
 \* has ended, and every worker is idle. The only stuttering step.
@@ -225,13 +339,16 @@ Done ==
   /\ pending = {}
   /\ stored \subseteq ended
   /\ \A w \in Workers : pc[w] = "idle"
+  /\ \A r \in Runs : reply[r] # "appended"
   /\ UNCHANGED vars
 
 Next ==
   \/ \E r \in Runs : Pend(r) \/ Store(r) \/ Push(r) \/ ProducerDies(r) \/ Sweep(r)
                      \/ Expire(r) \/ Reap(r)
   \/ \E w \in Workers : Run(w) \/ Record(w) \/ Ack(w) \/ Crash(w) \/ Release(w)
+                        \/ Ask(w) \/ Park(w) \/ Recheck(w)
                         \/ \E r \in Runs : Claim(w, r)
+  \/ \E r \in Runs : ReplyAppend(r) \/ ReplyWake(r) \/ SweepParked(r)
   \/ Done
 
 \* Fairness for the producer, each worker's own steps, the reaper and the
@@ -243,12 +360,22 @@ Spec ==
   /\ \A r \in Runs : WF_vars(Reap(r)) /\ WF_vars(Sweep(r))
   /\ \A r \in Runs : WF_vars(lease[r] # None /\ job[lease[r]] # r /\ Expire(r))
   /\ \A w \in Workers : WF_vars(Run(w) \/ Record(w) \/ Ack(w) \/ \E r \in Runs : Claim(w, r))
+  \* Mail: the worker's own park and re-read, the replier (the asked task
+  \* ends, or the ask's timeout comes), and the sweep all keep running.
+  /\ \A w \in Workers : WF_vars(Ask(w) \/ Park(w) \/ Recheck(w))
+  /\ \A r \in Runs : WF_vars(ReplyAppend(r)) /\ WF_vars(ReplyWake(r)) /\ WF_vars(SweepParked(r))
 
 \* A pushed run that has not ended is on the list, in processing, or in a
 \* live worker's hands: no crash loses it.
 NoOrphan ==
   \A r \in produced :
-    r \in ended \/ r \in waiting \/ r \in processing \/ \E w \in Workers : job[w] = r
+    \/ r \in ended \/ r \in waiting \/ r \in processing \/ \E w \in Workers : job[w] = r
+    \* Mail: parked, waiting for its reply, or with a waker still to come.
+    \/ r \in parked
+
+\* A parked run holds no lease and is on no list: parking frees its worker.
+ParkedIsIdle ==
+  \A r \in parked : lease[r] = None /\ r \notin processing /\ r \notin waiting
 
 \* No run leaves processing before its log is terminal.
 AckAfterTerminal == ~ackedOpen
@@ -263,6 +390,7 @@ NoStrandedRun ==
   \A r \in stored :
     \/ r \in ended \/ r \in pending \/ r \in waiting \/ r \in processing
     \/ \E w \in Workers : job[w] = r
+    \/ r \in parked
 
 \* Every run that was stored ends, and every producer finishes or dies.
 EveryRunEnds ==

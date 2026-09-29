@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use harness::StoreError;
-use protocol::{AgentId, ArtifactId, Capability, Event, EventPayload, Owner, RunId, RunSpec};
+use protocol::{
+    AgentId, ArtifactId, Capability, Event, EventPayload, MessageId, Owner, RunId, RunSpec,
+    Timestamp,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentManifest {
@@ -148,6 +151,56 @@ pub trait RunStore: Send + Sync {
     fn artifact(&self, id: ArtifactId) -> Result<Option<StoredArtifact>, StoreError>;
 }
 
+/// A message between agents (Phase 2), as its deliverer stored it: from
+/// `from_run`'s `decision`, which names it (decision 30A), to `to_agent`. A
+/// tell or an ask started `task_run` for the target; an ask may have a
+/// `deadline` for its timeout (28A), counted from its first send, and
+/// `timeout_secs` is the timeout it asked for. `hop` is the sender's
+/// delegation depth.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredMessage {
+    pub id: MessageId,
+    pub owner: Owner,
+    pub from_run: RunId,
+    pub from_agent: AgentId,
+    pub decision: u32,
+    pub to_agent: AgentId,
+    pub body: String,
+    pub expects_reply: bool,
+    pub reply_to: Option<MessageId>,
+    pub task_run: Option<RunId>,
+    pub deadline: Option<Timestamp>,
+    /// Stored within the message's JSON body, as `hop` is; rows stored
+    /// without them read `None` and 0.
+    #[serde(default)]
+    pub timeout_secs: Option<u32>,
+    #[serde(default)]
+    pub hop: u32,
+}
+
+/// What `MessageStore::put_message` did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PutMessage {
+    Stored,
+    /// That run's decision already sent this message; nothing was written.
+    Existed(Box<StoredMessage>),
+}
+
+/// Where messages between agents are kept (Phase 2.1).
+pub trait MessageStore: Send + Sync {
+    /// Stores `message` unless its run and decision already sent one, in
+    /// one atomic step.
+    fn put_message(&self, message: StoredMessage) -> Result<PutMessage, StoreError>;
+    fn message(&self, id: MessageId) -> Result<Option<StoredMessage>, StoreError>;
+    /// The open (unanswered) ask whose task is `task_run`: the one that
+    /// task's end answers.
+    fn ask_of_task(&self, task_run: RunId) -> Result<Option<StoredMessage>, StoreError>;
+    /// Marks the ask answered, once: true for the call that did.
+    fn answer(&self, ask: MessageId) -> Result<bool, StoreError>;
+    /// Asks not yet answered whose deadline is at or before `now`.
+    fn open_asks_due(&self, now: Timestamp) -> Result<Vec<StoredMessage>, StoreError>;
+}
+
 /// The in-memory store. A poisoned lock (a writer panicked holding it) still
 /// serves reads, since every write completes before its guard drops; a write
 /// under a poisoned lock is refused as a StoreError (owner decision 3A).
@@ -156,6 +209,8 @@ pub struct InMemoryStore {
     agents: Mutex<HashMap<AgentId, StoredAgent>>,
     runs: Mutex<HashMap<RunId, StoredRun>>,
     artifacts: Mutex<HashMap<ArtifactId, StoredArtifact>>,
+    /// Each message, and whether it (an ask) is answered.
+    messages: Mutex<HashMap<MessageId, (StoredMessage, bool)>>,
 }
 
 impl InMemoryStore {
@@ -184,6 +239,61 @@ impl InMemoryStore {
         }
         stored.events.extend(events);
         Ok(Append::Appended)
+    }
+}
+
+impl MessageStore for InMemoryStore {
+    fn put_message(&self, message: StoredMessage) -> Result<PutMessage, StoreError> {
+        let mut messages = write(&self.messages, "message")?;
+        if let Some((existing, _)) = messages.values().find(|(stored, _)| {
+            stored.from_run == message.from_run && stored.decision == message.decision
+        }) {
+            return Ok(PutMessage::Existed(Box::new(existing.clone())));
+        }
+        messages.insert(message.id, (message, false));
+        Ok(PutMessage::Stored)
+    }
+
+    fn message(&self, id: MessageId) -> Result<Option<StoredMessage>, StoreError> {
+        Ok(read(&self.messages)
+            .get(&id)
+            .map(|(message, _)| message.clone()))
+    }
+
+    fn ask_of_task(&self, task_run: RunId) -> Result<Option<StoredMessage>, StoreError> {
+        Ok(read(&self.messages)
+            .values()
+            .find(|(message, answered)| {
+                !answered && message.expects_reply && message.task_run == Some(task_run)
+            })
+            .map(|(message, _)| message.clone()))
+    }
+
+    fn answer(&self, ask: MessageId) -> Result<bool, StoreError> {
+        let mut messages = write(&self.messages, "message")?;
+        Ok(match messages.get_mut(&ask) {
+            Some((_, answered)) if !*answered => {
+                *answered = true;
+                true
+            }
+            _ => false,
+        })
+    }
+
+    fn open_asks_due(&self, now: Timestamp) -> Result<Vec<StoredMessage>, StoreError> {
+        let mut due: Vec<StoredMessage> = read(&self.messages)
+            .values()
+            .filter(|(message, answered)| {
+                !answered
+                    && message.expects_reply
+                    && message
+                        .deadline
+                        .is_some_and(|deadline| deadline.as_unix_millis() <= now.as_unix_millis())
+            })
+            .map(|(message, _)| message.clone())
+            .collect();
+        due.sort_by_key(|message| message.id.as_uuid());
+        Ok(due)
     }
 }
 

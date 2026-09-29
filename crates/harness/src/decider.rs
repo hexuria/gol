@@ -10,6 +10,7 @@ pub struct Skill {
     pub body: String,
 }
 
+#[derive(Clone, Copy)]
 pub struct DecisionView<'a> {
     pub spec: &'a RunSpec,
     pub state: &'a RunState,
@@ -18,6 +19,8 @@ pub struct DecisionView<'a> {
     pub skills: &'a [Skill],
     /// The agents this run may hand work to. Empty without a spawner.
     pub agents: &'a [DelegateTarget],
+    /// A message deliverer is present: without one every message is refused.
+    pub messaging: bool,
     /// The run has spent its step budget. Only a `Complete` that finishes the
     /// run is still allowed; any other decision fails the run with `Budget`.
     /// While a tool call is outstanding even a `Complete` cannot finish the

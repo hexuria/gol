@@ -23,15 +23,17 @@ use harness::{
     run_until, Boundary, DelegateTarget, Driver, EchoTool, JevDecider, Memory, RunMemory,
 };
 use protocol::{
-    fold, Capability, DispatchPhase, Event, EventPayload, FailureClass, RunId, RunSpec,
+    fold, Capability, DispatchPhase, Event, EventPayload, FailureClass, HarnessState, MessageId,
+    RunId, RunSpec, Timestamp,
 };
 
+use crate::deliverer::{ask_state, deliver, task_answer, AskState, IfUnsent, OwnedDeliverer};
 use crate::http::{jev_client, Delegation};
 use crate::inference::{dispatch_events, run_failed_event};
 use crate::models::ModelsConfig;
 use crate::queue::{QueueTiming, RedisRunQueue};
 use crate::spawner::OwnedSpawner;
-use crate::store::{is_terminal, Append, RunStore, StoredRun};
+use crate::store::{is_terminal, Append, MessageStore, RunStore, StoredMessage, StoredRun};
 
 /// Takes runs off the queue and runs them to their end.
 pub struct Worker {
@@ -43,6 +45,10 @@ pub struct Worker {
     timing: QueueTiming,
     /// The work model each run calls (D2).
     models: Arc<ModelsConfig>,
+    /// Where messages between agents are kept. With it the worker delivers
+    /// a run's messages and parks a run that waits on an ask (Phase 2.3);
+    /// without it every message is refused.
+    messages: Option<Arc<dyn MessageStore>>,
 }
 
 /// Builder state: a required input not given yet.
@@ -59,6 +65,7 @@ pub struct WorkerBuilder<Q, S, M, J> {
     jev_base_url: Option<String>,
     timing: QueueTiming,
     models: Arc<ModelsConfig>,
+    messages: Option<Arc<dyn MessageStore>>,
     states: PhantomData<(Q, S, M, J)>,
 }
 
@@ -71,6 +78,7 @@ impl Worker {
             jev_base_url: None,
             timing: QueueTiming::default(),
             models: Arc::new(ModelsConfig::default()),
+            messages: None,
             states: PhantomData,
         }
     }
@@ -85,6 +93,7 @@ impl<Q, S, M, J> WorkerBuilder<Q, S, M, J> {
             jev_base_url: self.jev_base_url,
             timing: self.timing,
             models: self.models,
+            messages: self.messages,
             states: PhantomData,
         }
     }
@@ -98,6 +107,12 @@ impl<Q, S, M, J> WorkerBuilder<Q, S, M, J> {
     /// model call fails.
     pub fn models(mut self, models: Arc<ModelsConfig>) -> Self {
         self.models = models;
+        self
+    }
+
+    /// Where messages between agents are kept (Phase 2.3).
+    pub fn messages(mut self, messages: Arc<dyn MessageStore>) -> Self {
+        self.messages = Some(messages);
         self
     }
 }
@@ -144,6 +159,7 @@ impl WorkerBuilder<Given, Given, Given, Given> {
             jev_base_url,
             timing: self.timing,
             models: self.models,
+            messages: self.messages,
         }
     }
 }
@@ -180,7 +196,15 @@ pub struct Executed<'a> {
     /// Events still to append in one go (a run started too often).
     events: Vec<Event>,
     /// What storing the run step by step came to, when it was.
-    stored: Option<Result<Append, String>>,
+    stored: Option<Result<Outcome, String>>,
+}
+
+/// What a run executed step by step came to.
+enum Outcome {
+    /// What the store answered to its last append.
+    Stored(Append),
+    /// Its harness waits on the ask; it is to be parked (Phase 2.3).
+    Waiting(MessageId),
 }
 
 /// A claimed run whose log is terminal, or that is not stored: the only
@@ -189,6 +213,8 @@ pub struct Executed<'a> {
 pub struct Done<'a> {
     claim: Claim<'a>,
     recorded: Option<Append>,
+    /// The ask the run waits on: it is parked, not acknowledged.
+    waiting: Option<MessageId>,
 }
 
 impl Worker {
@@ -200,10 +226,10 @@ impl Worker {
             self.store.clone(),
             Some(self.queue.clone()),
         ));
-        if !spec
-            .capabilities
-            .contains(&Capability::new("agent.delegate"))
-        {
+        // The owner's agents are the targets of a delegation and of a
+        // message (decision 32A).
+        let reaches = |capability| spec.capabilities.contains(&Capability::new(capability));
+        if !reaches("agent.delegate") && !reaches("agent.message") {
             return (spawner, Vec::new());
         }
         let targets = match self.store.agents_of(&spec.owner) {
@@ -316,6 +342,7 @@ impl<'a> Claim<'a> {
             return Ok(Prepared::Done(Done {
                 claim: self,
                 recorded: None,
+                waiting: None,
             }));
         };
         if stored
@@ -326,6 +353,7 @@ impl<'a> Claim<'a> {
             return Ok(Prepared::Done(Done {
                 claim: self,
                 recorded: None,
+                waiting: None,
             }));
         }
         let starts = match worker.queue.start(run_id) {
@@ -371,6 +399,7 @@ impl<'a> Open<'a> {
         let worker = self.claim.worker;
         let claim = &self.claim;
         let stored = *self.stored;
+        let spec = stored.spec.clone();
         let outcome = std::thread::scope(|scope| {
             let (stop, stopped) = mpsc::channel::<()>();
             std::thread::Builder::new()
@@ -381,6 +410,11 @@ impl<'a> Open<'a> {
             drop(stop);
             outcome
         });
+        // This worker ended a task that was asked: its end is the reply
+        // (decision 31A). A failed delivery is left to the sweep.
+        if let Ok(Outcome::Stored(Append::Appended)) = &outcome {
+            worker.answer_ask(&spec);
+        }
         Executed {
             claim: self.claim,
             events: Vec::new(),
@@ -399,6 +433,8 @@ enum Stopped {
     Store(Append),
     /// Its claim no longer holds the run's lease.
     LostLease,
+    /// Its harness waits on the reply to this ask.
+    Waiting(MessageId),
 }
 
 impl Worker {
@@ -407,20 +443,62 @@ impl Worker {
     /// worker ended the run, `Terminal` when another writer did, `Moved` when
     /// it gave up or lost its lease (`Done::ack` then releases the run, which
     /// does nothing once another worker holds the lease).
-    fn store_as_it_goes(&self, stored: StoredRun, token: &str) -> Result<Append, String> {
+    fn store_as_it_goes(&self, stored: StoredRun, token: &str) -> Result<Outcome, String> {
         let spec = stored.spec;
         let mut events = stored.events;
         let mut reloads = 0;
         loop {
             match self.run_from(&spec, events, token)? {
                 Stopped::Store(Append::Moved) if reloads < RELOADS => reloads += 1,
-                Stopped::Store(other) => return Ok(other),
-                Stopped::LostLease => return Ok(Append::Moved),
+                Stopped::Store(other) => return Ok(Outcome::Stored(other)),
+                Stopped::LostLease => return Ok(Outcome::Stored(Append::Moved)),
+                Stopped::Waiting(ask) => return Ok(Outcome::Waiting(ask)),
             }
             events = match self.store.run(spec.run_id).map_err(|e| e.to_string())? {
                 Some(run) => run.events,
-                None => return Ok(Append::Missing),
+                None => return Ok(Outcome::Stored(Append::Missing)),
             };
+        }
+    }
+
+    /// Delivers the end of `spec`'s run, a task that was asked and has
+    /// ended, to the run that asked it (decision 31A).
+    fn answer_ask(&self, spec: &RunSpec) {
+        let Some(messages) = &self.messages else {
+            return;
+        };
+        let answered = || -> Result<(), String> {
+            let Some(ask) = messages
+                .ask_of_task(spec.run_id)
+                .map_err(|error| error.to_string())?
+            else {
+                return Ok(());
+            };
+            let Some(task) = self
+                .store
+                .run(spec.run_id)
+                .map_err(|error| error.to_string())?
+            else {
+                return Ok(());
+            };
+            // An ask its asker has not logged yet is left open: the sweep
+            // delivers this end once the asker has logged it and is parked.
+            match task_answer(spec.run_id, spec.agent_id, ask.id, &task.events) {
+                Some(answer) => deliver(
+                    self.store.as_ref(),
+                    messages.as_ref(),
+                    &self.queue,
+                    ask.from_run,
+                    ask.id,
+                    answer,
+                    IfUnsent::Leave,
+                )
+                .map(|_| ()),
+                None => Ok(()),
+            }
+        };
+        if let Err(error) = answered() {
+            eprintln!("gol: queue worker: answer of task {}: {error}", spec.run_id);
         }
     }
 
@@ -486,10 +564,16 @@ impl Worker {
             return Ok(Stopped::LostLease);
         }
         let (spawner, targets) = self.delegation(spec);
-        // No message deliverer yet: every message is refused, so no run here
-        // waits for a reply. A waiting run needs park and wake (Phase 2.3,
-        // decision 35A).
         driver = driver.with_spawner(spawner, targets);
+        if let Some(messages) = &self.messages {
+            driver = driver.with_deliverer(Arc::new(
+                OwnedDeliverer::builder()
+                    .store(self.store.clone())
+                    .messages(messages.clone())
+                    .queue(self.queue.clone())
+                    .build(),
+            ));
+        }
         let mut decider = match jev_client(&self.jev_base_url) {
             Ok(client) => JevDecider::new(client),
             Err(message) => {
@@ -540,10 +624,20 @@ impl Worker {
                 format!("decider: {}", error.message),
             ));
         }
-        if tail.is_empty() {
-            return Ok(Stopped::Store(Append::Appended));
+        let stopped = if tail.is_empty() {
+            Stopped::Store(Append::Appended)
+        } else {
+            append(seen, tail)?
+        };
+        // Stored up to the ask it waits on: the run is parked (decision 34A).
+        if let (
+            Stopped::Store(Append::Appended),
+            HarnessState::WaitingForMessage { message_id, .. },
+        ) = (&stopped, &driver.state().harness)
+        {
+            return Ok(Stopped::Waiting(*message_id));
         }
-        append(seen, tail)
+        Ok(stopped)
     }
 }
 
@@ -552,18 +646,26 @@ impl<'a> Executed<'a> {
     /// so two workers on one run leave one terminal event. An error keeps the
     /// claim from acknowledging.
     pub fn record(self) -> Result<Done<'a>, String> {
-        let recorded = match self.stored {
-            Some(stored) => stored?,
-            None => self
-                .claim
-                .worker
-                .store
-                .append_events(self.claim.run_id(), self.events)
-                .map_err(|error| error.to_string())?,
+        let (recorded, waiting) = match self.stored {
+            Some(stored) => match stored? {
+                Outcome::Stored(append) => (Some(append), None),
+                Outcome::Waiting(ask) => (None, Some(ask)),
+            },
+            None => (
+                Some(
+                    self.claim
+                        .worker
+                        .store
+                        .append_events(self.claim.run_id(), self.events)
+                        .map_err(|error| error.to_string())?,
+                ),
+                None,
+            ),
         };
         Ok(Done {
             claim: self.claim,
-            recorded: Some(recorded),
+            recorded,
+            waiting,
         })
     }
 }
@@ -578,6 +680,26 @@ impl Done<'_> {
     /// if this claim still holds it.
     pub fn ack(self) -> Result<RunId, String> {
         let claim = self.claim;
+        let run_id = claim.run_id();
+        // Waiting on an ask: parked while this claim holds the lease, then
+        // woken at once if the answer came before the park (decision 34A,
+        // `formal/runqueue` `Park` then `Recheck`).
+        if let Some(ask) = self.waiting {
+            let queue = &claim.worker.queue;
+            if queue.park(run_id, &claim.token, ask)? {
+                let events = claim
+                    .worker
+                    .store
+                    .run(run_id)
+                    .map_err(|error| error.to_string())?
+                    .map(|run| run.events)
+                    .unwrap_or_default();
+                if ask_state(&events, ask) != AskState::Open {
+                    queue.wake(run_id, ask)?;
+                }
+            }
+            return Ok(run_id);
+        }
         // Still open: other writers kept moving the log. The run goes back
         // on the queue, and its next delivery resumes from the stored log.
         if self.recorded == Some(Append::Moved) {
@@ -614,9 +736,15 @@ impl Claim<'_> {
     }
 }
 
-/// Hands back runs whose lease ran out, and sweeps runs left pending, every
-/// `reap_every`, for as long as the process runs.
-pub fn reap_forever(queue: &RedisRunQueue, store: &dyn RunStore, timing: QueueTiming) {
+/// Hands back runs whose lease ran out, and sweeps runs left pending and
+/// the asks of parked runs, every `reap_every`, for as long as the process
+/// runs.
+pub fn reap_forever(
+    queue: &RedisRunQueue,
+    store: &dyn RunStore,
+    messages: Option<&dyn MessageStore>,
+    timing: QueueTiming,
+) {
     loop {
         match catch_unwind(AssertUnwindSafe(|| queue.reap())) {
             Ok(Ok(_)) => {}
@@ -629,6 +757,15 @@ pub fn reap_forever(queue: &RedisRunQueue, store: &dyn RunStore, timing: QueueTi
             Ok(Ok(_)) => {}
             Ok(Err(error)) => eprintln!("gol: queue sweep: {error}"),
             Err(_) => eprintln!("gol: queue sweep: sweeping panicked"),
+        }
+        if let Some(messages) = messages {
+            match catch_unwind(AssertUnwindSafe(|| {
+                sweep_asks(queue, store, messages, Timestamp::now())
+            })) {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => eprintln!("gol: ask sweep: {error}"),
+                Err(_) => eprintln!("gol: ask sweep: sweeping panicked"),
+            }
         }
         std::thread::sleep(timing.reap_every);
     }
@@ -665,6 +802,133 @@ pub fn sweep(
         }
     }
     Ok(pushed)
+}
+
+/// Finishes what a crash can leave undone around an ask (decision 34A).
+/// For each parked run: wakes it if its log no longer waits on its ask (the
+/// answer landed, or the run ended) or the store lost it; otherwise
+/// delivers the end of the asked task if the task has ended, or, when the
+/// ask is closed or gone while the log still waits on it, `AskTimedOut`.
+/// Then answers each open ask past its deadline with its task's end if the
+/// task has ended, else `AskTimedOut` (decision 28A), closing one its asker
+/// never logged. Returns the runs it woke or answered. A run or ask it
+/// cannot load or deliver to now is left for the next sweep; the others are
+/// still swept.
+pub fn sweep_asks(
+    queue: &RedisRunQueue,
+    store: &dyn RunStore,
+    messages: &dyn MessageStore,
+    now: Timestamp,
+) -> Result<Vec<RunId>, String> {
+    let mut swept = Vec::new();
+    for (run_id, ask) in queue.parked()? {
+        let waits = match store.run(run_id) {
+            Ok(Some(run)) => {
+                ask_state(&run.events, ask) == AskState::Open
+                    && !run.events.iter().any(|event| is_terminal(&event.payload))
+            }
+            // A parked run the store lost is woken: a worker acknowledges it.
+            Ok(None) => false,
+            Err(error) => {
+                eprintln!("gol: ask sweep: load run {run_id}: {error}");
+                continue;
+            }
+        };
+        let result = if !waits {
+            queue.wake(run_id, ask).map(|_| true)
+        } else {
+            let timed_out = EventPayload::AskTimedOut { message_id: ask };
+            let answer = match messages.message(ask) {
+                Ok(Some(row)) => match task_end(store, &row) {
+                    Ok(Some(answer)) => Some(answer),
+                    // Closed while the log still waits: at its deadline,
+                    // before the asker logged it. A timeout is final, so
+                    // one the store cannot confirm waits for the next sweep.
+                    Ok(None) => match open(messages, &row) {
+                        Ok(false) => Some(timed_out),
+                        Ok(true) => None,
+                        Err(error) => {
+                            eprintln!("gol: ask sweep: open ask {ask}: {error}");
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("gol: ask sweep: task of ask {ask}: {error}");
+                        None
+                    }
+                },
+                Ok(None) => Some(timed_out),
+                Err(error) => {
+                    eprintln!("gol: ask sweep: load ask {ask}: {error}");
+                    None
+                }
+            };
+            match answer {
+                Some(answer) => {
+                    deliver(store, messages, queue, run_id, ask, answer, IfUnsent::Close)
+                }
+                None => continue,
+            }
+        };
+        match result {
+            Ok(true) => swept.push(run_id),
+            Ok(false) => {}
+            Err(error) => eprintln!("gol: ask sweep: run {run_id}: {error}"),
+        }
+    }
+    for ask in messages
+        .open_asks_due(now)
+        .map_err(|error| error.to_string())?
+    {
+        let answer = match task_end(store, &ask) {
+            Ok(Some(answer)) => answer,
+            Ok(None) => EventPayload::AskTimedOut { message_id: ask.id },
+            // Not read now: a timeout would be final, so the next sweep
+            // looks again.
+            Err(error) => {
+                eprintln!("gol: ask sweep: task of ask {}: {error}", ask.id);
+                continue;
+            }
+        };
+        match deliver(
+            store,
+            messages,
+            queue,
+            ask.from_run,
+            ask.id,
+            answer,
+            IfUnsent::Close,
+        ) {
+            Ok(true) => swept.push(ask.from_run),
+            Ok(false) => {}
+            Err(error) => eprintln!("gol: ask sweep: ask {}: {error}", ask.id),
+        }
+    }
+    Ok(swept)
+}
+
+/// Whether `ask` is still open in the messages store; an error when the
+/// store cannot say now.
+fn open(messages: &dyn MessageStore, ask: &StoredMessage) -> Result<bool, String> {
+    let Some(task) = ask.task_run else {
+        return Ok(false);
+    };
+    Ok(messages
+        .ask_of_task(task)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|open| open.id == ask.id))
+}
+
+/// The answer `ask`'s task gives now that it has ended, if it has; an error
+/// when the task cannot be read now.
+fn task_end(store: &dyn RunStore, ask: &StoredMessage) -> Result<Option<EventPayload>, String> {
+    let Some(task) = ask.task_run else {
+        return Ok(None);
+    };
+    Ok(store
+        .run(task)
+        .map_err(|error| error.to_string())?
+        .and_then(|task| task_answer(task.spec.run_id, task.spec.agent_id, ask.id, &task.events)))
 }
 
 /// Whether `run`'s log is still as its producer stored it: created, queued
@@ -714,11 +978,13 @@ pub fn queue_from_env(env: &BTreeMap<String, String>) -> Result<Option<QueueSett
 }
 
 /// Starts `settings.workers` worker threads and one reaper, which also
-/// sweeps, all running for as long as the process does.
+/// sweeps, all running for as long as the process does. Queued runs may
+/// message each other through `messages` (Phase 2.3).
 pub fn start_queue(
     settings: &QueueSettings,
     store: Arc<dyn RunStore>,
     memory: Arc<dyn Memory>,
+    messages: Arc<dyn MessageStore>,
     jev_base_url: &str,
     models: Arc<ModelsConfig>,
 ) -> Result<(), String> {
@@ -731,6 +997,7 @@ pub fn start_queue(
             .jev(jev_base_url)
             .timing(timing)
             .models(models.clone())
+            .messages(messages.clone())
             .build();
         std::thread::Builder::new()
             .name(format!("gol-worker-{index}"))
@@ -740,7 +1007,7 @@ pub fn start_queue(
     let reaper = RedisRunQueue::open(&settings.redis_url);
     std::thread::Builder::new()
         .name("gol-reaper".to_string())
-        .spawn(move || reap_forever(&reaper, store.as_ref(), timing))
+        .spawn(move || reap_forever(&reaper, store.as_ref(), Some(messages.as_ref()), timing))
         .map_err(|error| error.to_string())?;
     Ok(())
 }

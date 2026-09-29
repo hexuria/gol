@@ -6,12 +6,14 @@ use harness::{InMemory, Memory};
 use memory::PostgresMemory;
 
 use crate::postgres::{PoolOptions, PostgresStore};
-use crate::store::{InMemoryStore, RunStore};
+use crate::store::{InMemoryStore, MessageStore, RunStore};
 
-/// The server's run store and the memory its runs share.
+/// The server's run store, the memory its runs share, and the messages
+/// between its agents (Phase 2.1).
 pub struct Stores {
     pub runs: Arc<dyn RunStore>,
     pub memory: Arc<dyn Memory>,
+    pub messages: Arc<dyn MessageStore>,
 }
 
 /// Postgres when `GOL_DATABASE_URL` is set and not empty, with
@@ -21,9 +23,11 @@ pub struct Stores {
 /// thread.
 pub fn stores_from_env(env: &BTreeMap<String, String>) -> Result<Stores, String> {
     let Some(url) = env.get("GOL_DATABASE_URL").filter(|url| !url.is_empty()) else {
+        let runs = Arc::new(InMemoryStore::default());
         return Ok(Stores {
-            runs: Arc::new(InMemoryStore::default()),
+            runs: runs.clone(),
             memory: Arc::new(InMemory::default()),
+            messages: runs,
         });
     };
     let max_size = match env
@@ -48,8 +52,10 @@ pub fn stores_from_env(env: &BTreeMap<String, String>) -> Result<Stores, String>
     )
     .map_err(|error| format!("run store: {error}"))?;
     let memory = PostgresMemory::connect(url).map_err(|error| format!("memory: {error}"))?;
+    let runs = Arc::new(runs);
     Ok(Stores {
-        runs: Arc::new(runs),
+        runs: runs.clone(),
         memory: Arc::new(memory),
+        messages: runs,
     })
 }

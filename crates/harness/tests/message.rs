@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use harness::{
     run_until, Boundary, Driver, InMemory, MessageDeliverer, MessageRequest, ScriptedDecider,
-    UnavailableModel,
+    SentMessage, StartedChild, UnavailableModel,
 };
 use protocol::{
     Actor, AgentId, Capability, CredentialSource, Effect, Event, EventPayload, EventSource,
@@ -70,6 +70,12 @@ struct Asked {
     expects_reply: bool,
     reply_to: Option<MessageId>,
     timeout_secs: Option<u32>,
+    limits: Option<Limits>,
+}
+
+/// The task a tell or a new ask starts.
+fn task_run() -> RunId {
+    RunId::from_uuid(Uuid::from_u128(2))
 }
 
 /// Accepts every message as `sent_id()`, or refuses them all.
@@ -95,7 +101,7 @@ impl Fake {
 }
 
 impl MessageDeliverer for Fake {
-    fn send(&self, request: MessageRequest<'_>) -> Result<MessageId, String> {
+    fn send(&self, request: MessageRequest<'_>) -> Result<SentMessage, String> {
         self.asked.lock().unwrap().push(Asked {
             from: request.from.run_id,
             decision: request.decision,
@@ -104,10 +110,17 @@ impl MessageDeliverer for Fake {
             expects_reply: request.expects_reply,
             reply_to: request.reply_to,
             timeout_secs: request.timeout_secs,
+            limits: request.limits,
         });
         match &self.refusal {
             Some(reason) => Err(reason.clone()),
-            None => Ok(sent_id()),
+            None => Ok(SentMessage {
+                message_id: sent_id(),
+                task: request.limits.map(|limits| StartedChild {
+                    run_id: task_run(),
+                    limits,
+                }),
+            }),
         }
     }
 }
@@ -168,8 +181,23 @@ fn a_tell_is_sent_and_the_run_goes_on() {
             expects_reply: false,
             reply_to: None,
             timeout_secs: None,
+            // Decision 33A: half of what the run had left after this step.
+            limits: Some(Limits {
+                max_steps: 2,
+                max_model_calls: 1,
+            }),
         }]
     );
+    // The task counts as a child whose budget was given.
+    assert!(payloads(&driver).contains(&EventPayload::ChildStarted {
+        run_id: task_run(),
+        agent_id: writer(),
+        limits: Limits {
+            max_steps: 2,
+            max_model_calls: 1,
+        },
+    }));
+    assert_eq!(driver.state().given_steps, 2);
 }
 
 // An ask parks the run: run_until returns with the harness waiting, and the
@@ -321,7 +349,12 @@ fn a_message_without_the_capability_is_denied() {
 // the same decision, so a deliverer can tell them apart and dedupe a resend.
 #[test]
 fn two_tells_in_one_step_are_two_requests() {
-    let spec = spec();
+    let mut spec = spec();
+    // Room to carve a task for each tell (decision 33A).
+    spec.limits = Limits {
+        max_steps: 12,
+        max_model_calls: 8,
+    };
     let deliverer = Fake::accepting();
     let mut driver = Driver::boot(spec)
         .unwrap()
@@ -373,4 +406,47 @@ fn a_resumed_run_resends_a_message_with_the_same_decision() {
     assert_eq!(again.len(), 1);
     assert_eq!(again[0].decision, first[0].decision);
     assert_eq!(again[0].body, first[0].body);
+}
+
+// A reply starts no task, so it carves nothing.
+#[test]
+fn a_reply_starts_no_task() {
+    let deliverer = Fake::accepting();
+    let mut driver = Driver::boot(spec())
+        .unwrap()
+        .with_deliverer(deliverer.clone());
+    let reply = Effect::SendMessage {
+        to: writer(),
+        body: "the plan".to_string(),
+        expects_reply: false,
+        reply_to: Some(MessageId::new()),
+        timeout_secs: None,
+    };
+    run(&mut driver, vec![reply, complete()]);
+    assert_eq!(deliverer.asked.lock().unwrap()[0].limits, None);
+    assert!(!payloads(&driver)
+        .iter()
+        .any(|payload| matches!(payload, EventPayload::ChildStarted { .. })));
+    assert_eq!(driver.state().given_steps, 0);
+}
+
+// Decision 33A: a message that would start a task needs budget to give it,
+// as a delegation does; without it the deliverer is not asked.
+#[test]
+fn a_message_that_would_start_a_task_needs_budget_to_give() {
+    let mut spec = spec();
+    spec.limits = Limits {
+        max_steps: 6,
+        max_model_calls: 1,
+    };
+    let deliverer = Fake::accepting();
+    let mut driver = Driver::boot(spec)
+        .unwrap()
+        .with_deliverer(deliverer.clone());
+    run(&mut driver, vec![message(false, None), complete()]);
+    assert!(payloads(&driver).contains(&EventPayload::MessageRefused {
+        to: writer(),
+        reason: "not enough budget left to give a child".to_string(),
+    }));
+    assert!(deliverer.asked.lock().unwrap().is_empty());
 }

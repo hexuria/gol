@@ -18,7 +18,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use protocol::RunId;
+use protocol::{MessageId, RunId};
 use redis::{Commands, Script};
 
 /// How long a claim is held and how often it is renewed and reaped (owner
@@ -138,6 +138,29 @@ end
 return 1
 ";
 
+/// Parks ARGV[1] while ARGV[2] holds its lease KEYS[2] (Phase 2.3): off
+/// processing (KEYS[1]) into the parked hash (KEYS[3]) with the ask it waits
+/// on (ARGV[3]), its lease and its start count (KEYS[4]) gone. 1 if parked;
+/// 0 when another worker holds the lease, which changes nothing.
+const PARK: &str = r"
+if redis.call('GET', KEYS[2]) ~= ARGV[2] then return 0 end
+redis.call('LREM', KEYS[1], 1, ARGV[1])
+redis.call('HSET', KEYS[3], ARGV[1], ARGV[3])
+redis.call('DEL', KEYS[2])
+redis.call('HDEL', KEYS[4], ARGV[1])
+return 1
+";
+
+/// Wakes ARGV[1] if it is parked (KEYS[1]) on the ask ARGV[2]: back onto
+/// the runs list (KEYS[2]). 1 if it was, 0 otherwise; a second wake, or one
+/// for another ask, changes nothing.
+const WAKE: &str = r"
+if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+redis.call('HDEL', KEYS[1], ARGV[1])
+redis.call('LPUSH', KEYS[2], ARGV[1])
+return 1
+";
+
 /// Extends the lease KEYS[1] by ARGV[2] ms while ARGV[1] holds it.
 const RENEW: &str = r"
 if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -177,6 +200,7 @@ pub struct RedisRunQueue {
     processing: String,
     deliveries: String,
     pending: String,
+    parked: String,
     lease_prefix: String,
     /// Idle connections for the next callers, and how connecting has gone.
     slot: Mutex<Slot>,
@@ -201,7 +225,7 @@ impl RedisRunQueue {
     }
 
     /// A queue under `{key}`, with `{key}:processing`, `{key}:deliveries`,
-    /// `{key}:pending` and `{key}:lease:<run>`.
+    /// `{key}:pending`, `{key}:parked` and `{key}:lease:<run>`.
     pub fn with_key(url: impl Into<String>, key: impl Into<String>) -> Self {
         let tag = format!("{{{}}}", key.into());
         Self {
@@ -209,6 +233,7 @@ impl RedisRunQueue {
             processing: format!("{tag}:processing"),
             deliveries: format!("{tag}:deliveries"),
             pending: format!("{tag}:pending"),
+            parked: format!("{tag}:parked"),
             lease_prefix: format!("{tag}:lease:"),
             runs: tag,
             slot: Mutex::new(Slot::default()),
@@ -370,6 +395,53 @@ impl RedisRunQueue {
                 .invoke::<i64>(connection)
         })
         .map(|_| ())
+    }
+
+    /// Parks `id`, waiting on `ask`, while `token` holds its lease: it
+    /// holds no worker and no lease, and its start count is cleared, since
+    /// waiting is not a failed start. `false` when another worker holds the
+    /// lease, which changes nothing (Phase 2.3, `formal/runqueue` `Park`).
+    pub fn park(&self, id: RunId, token: &str, ask: MessageId) -> Result<bool, String> {
+        let parked: i64 = self.with_connection(|connection| {
+            Script::new(PARK)
+                .key(&self.processing)
+                .key(self.lease_key(&id.to_string()))
+                .key(&self.parked)
+                .key(&self.deliveries)
+                .arg(id.to_string())
+                .arg(token)
+                .arg(ask.to_string())
+                .invoke(connection)
+        })?;
+        Ok(parked == 1)
+    }
+
+    /// Puts `id` back on the runs list if it is parked on `ask`; `false`
+    /// otherwise. Waking twice is harmless (`formal/runqueue` `Wake`), and a
+    /// late answer to an earlier ask does not wake a run parked on a newer one.
+    pub fn wake(&self, id: RunId, ask: MessageId) -> Result<bool, String> {
+        let woken: i64 = self.with_connection(|connection| {
+            Script::new(WAKE)
+                .key(&self.parked)
+                .key(&self.runs)
+                .arg(id.to_string())
+                .arg(ask.to_string())
+                .invoke(connection)
+        })?;
+        Ok(woken == 1)
+    }
+
+    /// The parked runs and the ask each waits on. Entries that do not parse
+    /// are left out.
+    pub fn parked(&self) -> Result<Vec<(RunId, MessageId)>, String> {
+        let entries: Vec<(String, String)> =
+            self.with_connection(|connection| connection.hgetall(&self.parked))?;
+        let mut parked: Vec<(RunId, MessageId)> = entries
+            .iter()
+            .filter_map(|(run, ask)| Some((parse(run).ok()?, ask.parse().ok()?)))
+            .collect();
+        parked.sort_by_key(|(run, _)| run.as_uuid());
+        Ok(parked)
     }
 
     /// How many starts `id` has had since its last acknowledgement.

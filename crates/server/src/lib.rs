@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 /// Bearer-token authentication; its builder state markers live here.
 pub mod auth;
+mod deliverer;
 mod http;
 mod inference;
 mod local;
@@ -17,6 +18,7 @@ pub use auth::{
     auth_from_env, AuthError, Authenticator, LocalDevAuthenticator, OidcConfig, OidcConfigBuilder,
     OidcVerifier, Principal, LOCAL_DEV_TOKEN,
 };
+pub use deliverer::{OwnedDeliverer, OwnedDelivererBuilder};
 pub use http::{
     router, router_with_gateway, router_with_memory, router_with_queue, router_with_sandbox,
 };
@@ -32,14 +34,14 @@ pub use postgres::{PoolOptions, PostgresStore};
 pub use queue::{QueueTiming, RedisRunQueue};
 pub use spawner::OwnedSpawner;
 pub use store::{
-    is_terminal, AgentManifest, Append, InMemoryStore, PutAgent, PutRun, RunStore, StoredAgent,
-    StoredArtifact, StoredRun,
+    is_terminal, AgentManifest, Append, InMemoryStore, MessageStore, PutAgent, PutMessage, PutRun,
+    RunStore, StoredAgent, StoredArtifact, StoredMessage, StoredRun,
 };
 pub use stores::{stores_from_env, Stores};
 pub use surface::{ag_ui_events, json_render_spec};
 pub use worker::{
-    queue_from_env, reap_forever, start_queue, sweep, Claim, Done, Executed, Open, Prepared,
-    QueueSettings, Worker, WorkerBuilder,
+    queue_from_env, reap_forever, start_queue, sweep, sweep_asks, Claim, Done, Executed, Open,
+    Prepared, QueueSettings, Worker, WorkerBuilder,
 };
 
 /// Returned by every `RunStore` method.

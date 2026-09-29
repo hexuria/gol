@@ -6,9 +6,9 @@
 use std::sync::Arc;
 
 use harness::{
-    jev_choices, jev_state, run_to_completion, AgentSpawner, ChildRequest, DeciderError,
+    jev_choices, jev_state, run_to_completion, AgentSpawner, ChildRequest, Decider, DeciderError,
     DecisionView, DelegateTarget, Driver, EchoTool, InMemory, JevDecider, ModelCompletion, Skill,
-    StartedChild, Tool, MAX_EVENT_TEXT,
+    StartedChild, Tool, JEV_ASK_TIMEOUT_SECS, MAX_EVENT_TEXT,
 };
 use protocol::{
     AgentId, Capability, CredentialSource, Effect, Event, EventPayload, ExecutionPlacement,
@@ -338,6 +338,7 @@ fn view<'a>(
         tools,
         skills,
         agents: &[],
+        messaging: false,
         steps_exhausted: false,
         model_calls_exhausted: false,
     }
@@ -639,4 +640,178 @@ fn an_ambiguous_delegate_label_is_not_offered() {
             "complete"
         ]
     );
+}
+
+fn messaging(limits: Limits) -> RunSpec {
+    let mut spec = spec(limits);
+    spec.capabilities.push(Capability::new("agent.message"));
+    spec
+}
+
+// Decision 32A: each of the owner's other agents is offered as `tell:<name>`
+// and `ask:<name>`, under the delegate choices' labels and filters, while a
+// message could start a task: a deliverer is present, the run holds
+// `agent.message`, is running below the hop limit with fewer than 10
+// children, and after this decision's step still has 2 steps and 2 model
+// calls to give (decision 33A carves them as a delegation does).
+#[test]
+fn jev_offers_tell_and_ask_choices_only_when_allowed() {
+    let editor_a: AgentId = "aaaaaaaa-0000-4000-8000-000000000001".parse().unwrap();
+    let editor_b: AgentId = "bbbbbbbb-0000-4000-8000-000000000002".parse().unwrap();
+    let writer = AgentId::new();
+    let spec = messaging(limits(3, 2));
+    let targets = [
+        target(writer, "writer", "Writes things up."),
+        target(spec.agent_id, "me", ""),
+        target(editor_a, "editor", ""),
+        target(editor_b, "editor", ""),
+    ];
+    let driver = Driver::boot(spec.clone()).unwrap();
+    let state = driver.state();
+    let tools = [EchoTool.descriptor()];
+    let mut offered = view(&spec, &state, driver.events(), &tools, &[]);
+    offered.agents = &targets;
+    offered.messaging = true;
+    assert_eq!(
+        labels(&offered),
+        [
+            "echo",
+            "tell:writer",
+            "tell:editor-aaaaaaaa",
+            "tell:editor-bbbbbbbb",
+            "ask:writer",
+            "ask:editor-aaaaaaaa",
+            "ask:editor-bbbbbbbb",
+            "model",
+            "complete",
+        ]
+    );
+    let choices = jev_choices(&offered);
+    assert_eq!(
+        choices[1].1.as_deref(),
+        Some("Tell agent writer the input, without waiting: Writes things up.")
+    );
+    assert_eq!(
+        choices[5].1.as_deref(),
+        Some("Ask agent editor about the input, and wait for its answer.")
+    );
+
+    let messages = |view: &DecisionView<'_>| {
+        labels(view)
+            .into_iter()
+            .filter(|label| label.starts_with("tell:") || label.starts_with("ask:"))
+            .count()
+    };
+    assert_eq!(messages(&offered), 6);
+
+    // An input longer than a message may be: the authorizer would deny it.
+    let long = {
+        let mut long = messaging(limits(3, 2));
+        long.input = "x".repeat(protocol::MAX_MESSAGE_BYTES + 1);
+        long
+    };
+    let mut refused = offered;
+    refused.spec = &long;
+    assert_eq!(messages(&refused), 0);
+
+    // No deliverer.
+    let mut refused = offered;
+    refused.messaging = false;
+    assert_eq!(messages(&refused), 0);
+
+    // No capability: `agent.delegate` alone is not enough.
+    let plain = delegating(limits(3, 2));
+    let mut refused = offered;
+    refused.spec = &plain;
+    assert_eq!(messages(&refused), 0);
+
+    // Two steps left: this decision takes one, leaving one to give.
+    let short = messaging(limits(2, 2));
+    let mut refused = offered;
+    refused.spec = &short;
+    assert_eq!(messages(&refused), 0);
+
+    // One model call left.
+    let short = messaging(limits(3, 1));
+    let mut refused = offered;
+    refused.spec = &short;
+    assert_eq!(messages(&refused), 0);
+
+    // Ten children already.
+    let mut full = state.clone();
+    full.children = 10;
+    let mut refused = offered;
+    refused.state = &full;
+    assert_eq!(messages(&refused), 0);
+
+    // Already 8 hops deep.
+    let mut deep = spec.clone();
+    deep.lineage.hop = 8;
+    let mut refused = offered;
+    refused.spec = &deep;
+    assert_eq!(messages(&refused), 0);
+
+    // Not running.
+    let mut waiting = state.clone();
+    waiting.harness = HarnessState::Cancelled;
+    let mut refused = offered;
+    refused.state = &waiting;
+    assert_eq!(messages(&refused), 0);
+
+    // A tool named like a message choice is left out.
+    let mut clash = EchoTool.descriptor();
+    clash.name = "ask:writer".into();
+    let tools = [clash];
+    let mut clashing = offered;
+    clashing.tools = &tools;
+    assert_eq!(
+        labels(&clashing)
+            .iter()
+            .filter(|label| *label == "ask:writer")
+            .count(),
+        1
+    );
+}
+
+// Jev picks `tell:writer` or `ask:writer`: the decision is a message to the
+// writer agent with the run's input; an ask waits `JEV_ASK_TIMEOUT_SECS`.
+#[tokio::test(flavor = "multi_thread")]
+async fn tell_and_ask_choices_map_to_messages() {
+    let writer = AgentId::new();
+    for (label, expects_reply, timeout_secs) in [
+        ("tell:writer", false, None),
+        ("ask:writer", true, Some(JEV_ASK_TIMEOUT_SECS)),
+    ] {
+        let server = jev(&[label]).await;
+        let base_url = server.uri();
+        let effect = tokio::task::spawn_blocking(move || {
+            let client = typesafe_sdk::blocking::Client::builder()
+                .api_key("gol")
+                .base_url(base_url)
+                .retry(typesafe_sdk::RetryPolicy::disabled())
+                .build()
+                .unwrap();
+            let spec = messaging(limits(8, 4));
+            let driver = Driver::boot(spec.clone()).unwrap();
+            let state = driver.state();
+            let targets = [target(writer, "writer", "")];
+            let mut offered = view(&spec, &state, driver.events(), &[], &[]);
+            offered.agents = &targets;
+            offered.messaging = true;
+            JevDecider::new(client).decide(&offered)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            effect,
+            Ok(Effect::SendMessage {
+                to: writer,
+                body: "hi".to_string(),
+                expects_reply,
+                reply_to: None,
+                timeout_secs,
+            }),
+            "{label}"
+        );
+    }
 }
