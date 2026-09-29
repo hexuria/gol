@@ -646,6 +646,7 @@ async fn four_modes_only_let_the_server_post_in_gateway_mode() {
             Arc::new(HttpGatewayPoster {
                 url: proxy_url.clone(),
                 token: "gol-gateway-local".to_string(),
+                timeout: std::time::Duration::from_secs(60),
             }),
             common::authenticator(),
         );
@@ -1842,4 +1843,44 @@ fn a_docker_error_is_recorded_as_its_last_line() {
             vec![format!("failed Environment: provision: {kept}")]
         );
     }
+}
+
+// A gateway that never answers does not hold the caller: the call gives up
+// at the poster's timeout (a queue worker would otherwise be pinned, its
+// lease renewed, for good).
+#[tokio::test]
+async fn a_gateway_that_never_answers_times_out() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Accepts, reads nothing, answers nothing, and keeps the socket open.
+    let held = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            sockets.push(socket);
+        }
+    });
+    let poster = HttpGatewayPoster {
+        url: format!("http://{addr}"),
+        token: "gol-gateway-local".to_string(),
+        timeout: std::time::Duration::from_millis(300),
+    };
+    let started = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        poster.complete(&GatewayCall {
+            run_id: RunId::new(),
+            input: "hello".to_string(),
+            model_name: "gpt-test".to_string(),
+            placement: ExecutionPlacement::Local,
+        })
+    })
+    .await
+    .unwrap();
+    held.abort();
+    assert!(result.is_err(), "{result:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "gave up at the timeout, not later: {:?}",
+        started.elapsed()
+    );
 }

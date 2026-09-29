@@ -25,7 +25,15 @@ pub trait GatewayPoster: Send + Sync {
 pub struct HttpGatewayPoster {
     pub url: String,
     pub token: String,
+    /// How long one completion may take, from connect to the last byte of
+    /// the answer. A gateway that never answers would otherwise hold its
+    /// caller for good: a request, or a queue worker whose heartbeat keeps
+    /// renewing its lease (Phase 3.6).
+    pub timeout: std::time::Duration,
 }
+
+/// `HttpGatewayPoster::from_env`'s timeout: 10 minutes.
+pub const GATEWAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl HttpGatewayPoster {
     pub fn from_env() -> Self {
@@ -34,6 +42,7 @@ impl HttpGatewayPoster {
                 .unwrap_or_else(|_| "http://127.0.0.1:43124".to_string()),
             token: std::env::var("GOL_GATEWAY_TOKEN")
                 .unwrap_or_else(|_| "gol-gateway-local".to_string()),
+            timeout: GATEWAY_TIMEOUT,
         }
     }
 }
@@ -43,6 +52,7 @@ impl GatewayPoster for HttpGatewayPoster {
         ensure_fixture_proxy(&self.url)?;
         let endpoint = format!("{}/v1/gateway/complete", self.url.trim_end_matches('/'));
         let response = ureq::post(&endpoint)
+            .timeout(self.timeout)
             .set("authorization", &format!("Bearer {}", self.token))
             .set("content-type", "application/json")
             .set("x-gol-caller", "server")
@@ -404,7 +414,30 @@ pub fn open_turn(
             events: events.clone(),
         })
         .map_err(store_error)?;
+    finish_turn(store, spec, events, poster, sandbox)
+}
 
+/// The metadata key the server sets on a background coworker turn (Phase
+/// 3.6, decision 62A): a queue worker runs it as a turn, not through the
+/// harness. A caller that sends it is refused.
+pub const TURN_KEY: &str = "gol.turn";
+
+/// Whether `spec` is a background coworker turn.
+pub fn is_turn(spec: &RunSpec) -> bool {
+    spec.metadata.contains_key(TURN_KEY)
+}
+
+/// The rest of a turn once its user message is stored (`events`, the log so
+/// far): a Box sandbox, the gateway's completion, the sandbox removed, then
+/// the completion stored; or the turn failed. `open_turn` runs it in the
+/// request; a queue worker runs it for a background turn (Phase 3.6).
+pub(crate) fn finish_turn(
+    store: &dyn RunStore,
+    spec: RunSpec,
+    mut events: Vec<Event>,
+    poster: &dyn GatewayPoster,
+    sandbox: &dyn SandboxHost,
+) -> Result<TurnOutcome, TurnError> {
     let box_turn = spec.placement == ExecutionPlacement::Box;
     let name = box_container_name(spec.run_id);
     if box_turn {
@@ -650,7 +683,7 @@ pub fn user_message_event(spec: &RunSpec) -> Event {
 }
 
 /// A `payload` event from the system, for `spec`'s run.
-fn system_event(spec: &RunSpec, payload: EventPayload) -> Event {
+pub(crate) fn system_event(spec: &RunSpec, payload: EventPayload) -> Event {
     Event::record(
         EventSource::for_spec(spec, Actor::System, Timestamp::now()),
         payload,
