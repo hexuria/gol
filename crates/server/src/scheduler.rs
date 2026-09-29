@@ -2,7 +2,7 @@
 //! triggers at their ticks.
 use std::time::Duration;
 
-use protocol::{RunId, Timestamp};
+use protocol::RunId;
 
 use crate::queue::RedisRunQueue;
 use crate::store::{Missed, RunStore, StoredTrigger, TriggerKind};
@@ -15,38 +15,126 @@ pub const MISSED_AFTER_MS: i64 = 60_000;
 /// The most triggers one pass fires.
 const PASS_LIMIT: usize = 100;
 
+/// The most candidates `next_tick` looks through for one tick: croner's,
+/// each checked against the clock changes.
+const MAX_CANDIDATES: usize = 1000;
+
+/// The parser of a schedule: five fields, minute to day of week. No seconds
+/// (a schedule fires at most once a minute) and no year (a schedule never
+/// runs out of ticks).
+fn parser() -> croner::parser::CronParser {
+    croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Disallowed)
+        .year(croner::parser::Year::Disallowed)
+        .build()
+}
+
 /// The first tick of `cron` in `time_zone` strictly after `after_ms`, in
-/// Unix milliseconds. Daylight saving follows croner: a wall-clock time the
-/// clocks skip runs at its next occurrence, and one they repeat runs once.
+/// Unix milliseconds. Through daylight-saving changes:
+/// - a wall-clock time the clocks skip runs when they resume, once, and a
+///   time outside the gap is not moved;
+/// - a wall-clock time the clocks repeat runs at its first occurrence only.
 pub fn next_tick(cron: &str, time_zone: &str, after_ms: i64) -> Result<i64, String> {
     use chrono::TimeZone;
-    let cron: croner::Cron = cron
-        .parse()
+    let cron = parser()
+        .parse(cron)
         .map_err(|error| format!("not a cron expression: {error}"))?;
     let zone: chrono_tz::Tz = time_zone
         .parse()
         .map_err(|_| format!("not a known time zone: {time_zone}"))?;
-    let after = zone
+    let mut after = zone
         .timestamp_millis_opt(after_ms)
         .single()
         .ok_or_else(|| "a time out of range".to_string())?;
-    cron.find_next_occurrence(&after, false)
-        .map(|next| next.timestamp_millis())
-        .map_err(|error| format!("no next tick: {error}"))
+    for _ in 0..MAX_CANDIDATES {
+        let candidate = cron
+            .find_next_occurrence(&after, false)
+            .map_err(|error| format!("no next tick: {error}"))?;
+        if is_tick(&cron, zone, &candidate)? {
+            return Ok(candidate.timestamp_millis());
+        }
+        after = candidate;
+    }
+    Err("no next tick".to_string())
 }
 
-/// One scheduler pass at `now_ms`: every due trigger fired for its tick (or
-/// not, by its missed-tick rule) and moved to its next tick. The runs it
-/// fired. A trigger whose fire failed keeps its tick, and the next pass
-/// fires it again: the same run, since its id comes from the tick.
+/// Whether croner's `candidate` is a tick: its wall-clock time matches the
+/// pattern and is not the repeat of a time the clocks went back over; or it
+/// is where the clocks resume after a gap that skipped a time the pattern
+/// names (croner gives the gap's end for a time inside it, and at times for
+/// one that is not).
+fn is_tick(
+    cron: &croner::Cron,
+    zone: chrono_tz::Tz,
+    candidate: &chrono::DateTime<chrono_tz::Tz>,
+) -> Result<bool, String> {
+    use chrono::TimeZone;
+    let wall = candidate.naive_local();
+    if let chrono::LocalResult::Ambiguous(first, _) = zone.from_local_datetime(&wall) {
+        if *candidate != first {
+            return Ok(false);
+        }
+    }
+    let matches = |wall: chrono::NaiveDateTime| {
+        cron.is_time_matching(&chrono::Utc.from_utc_datetime(&wall))
+            .map_err(|error| error.to_string())
+    };
+    if matches(wall)? {
+        return Ok(true);
+    }
+    // The wall-clock minutes just before the candidate that never happened.
+    let minute = chrono::Duration::minutes(1);
+    let mut skipped = wall - minute;
+    for _ in 0..(3 * 60) {
+        if !matches!(
+            zone.from_local_datetime(&skipped),
+            chrono::LocalResult::None
+        ) {
+            break;
+        }
+        if matches(skipped)? {
+            return Ok(true);
+        }
+        skipped -= minute;
+    }
+    Ok(false)
+}
+
+/// One scheduler pass at `now_ms`: every schedule with no tick yet gets
+/// its first, and every due trigger is fired for its tick (or not, by its
+/// missed-tick rule) and moved to its next tick. The runs it fired. A
+/// trigger whose fire failed keeps its tick, and the next pass fires it
+/// again: the same run, since its id comes from the tick.
 pub fn schedule_due(
     store: &dyn RunStore,
     queue: &RedisRunQueue,
     now_ms: i64,
 ) -> Result<Vec<RunId>, String> {
+    pass(store, queue, now_ms).map(|(fired, _)| fired)
+}
+
+/// `schedule_due`, and whether the pass read as many due triggers as it may
+/// (more may be waiting).
+fn pass(
+    store: &dyn RunStore,
+    queue: &RedisRunQueue,
+    now_ms: i64,
+) -> Result<(Vec<RunId>, bool), String> {
     let triggers = store
         .triggers()
         .ok_or_else(|| "the store keeps no triggers".to_string())?;
+    // Schedules made before the scheduler (Phase 4.1) get their first tick.
+    for trigger in triggers
+        .unscheduled_triggers(PASS_LIMIT)
+        .map_err(|error| error.to_string())?
+    {
+        if let TriggerKind::Schedule { cron, time_zone } = &trigger.kind {
+            let first = next_tick(cron, time_zone, now_ms).ok();
+            triggers
+                .advance_trigger(trigger.id, None, first)
+                .map_err(|error| error.to_string())?;
+        }
+    }
     let due = triggers
         .due_triggers(now_ms, PASS_LIMIT)
         .map_err(|error| error.to_string())?;
@@ -58,13 +146,14 @@ pub fn schedule_due(
             Err(error) => eprintln!("gol: scheduler: trigger {}: {error}", trigger.id),
         }
     }
-    Ok(fired)
+    Ok((fired, due.len() == PASS_LIMIT))
 }
 
 /// Fires due `trigger` for its tick, as read, unless its tick was missed
 /// and it skips missed ticks, then moves it to the first tick after
-/// `now_ms` if its tick is still the one read (decision 69A). The run it
-/// fired, or found fired for that tick.
+/// `now_ms` if its tick is still the one read (decision 69A); a schedule
+/// with no tick after now is left with none. The run it fired, or found
+/// fired for that tick; none when another scheduler had already moved it.
 pub fn fire_due_trigger(
     store: &dyn RunStore,
     queue: &RedisRunQueue,
@@ -76,7 +165,6 @@ pub fn fire_due_trigger(
     else {
         return Ok(None);
     };
-    let next = next_tick(cron, time_zone, now_ms)?;
     let missed = now_ms - due > MISSED_AFTER_MS;
     let mut run = None;
     if !(missed && trigger.missed == Missed::Skip) {
@@ -84,30 +172,49 @@ pub fn fire_due_trigger(
             .map_err(|error| format!("{error:?}"))?
         {
             Fired::Run(fired) => run = Some(fired),
-            Fired::Paused | Fired::NotFound | Fired::AgentNotFound => {}
+            Fired::Paused | Fired::NotFound | Fired::AgentNotFound | Fired::Moved => {}
         }
     }
+    let next = next_tick(cron, time_zone, now_ms)
+        .map_err(|error| eprintln!("gol: scheduler: trigger {}: {error}", trigger.id))
+        .ok();
     let triggers = store
         .triggers()
         .ok_or_else(|| "the store keeps no triggers".to_string())?;
     triggers
-        .advance_trigger(trigger.id, due, next)
+        .advance_trigger(trigger.id, Some(due), next)
         .map_err(|error| error.to_string())?;
     Ok(run)
 }
 
+/// The most passes a scheduler runs back to back while each finds as many
+/// due triggers as it may.
+const DRAIN_PASSES: usize = 10;
+
 /// Runs a scheduler pass every `every`, for good (decision 72A: every
 /// server runs one; exactly one fire per tick across servers is claimed on
-/// Postgres, where their passes share the triggers table).
+/// Postgres, where their passes share the triggers table). The time is
+/// Redis's, which every server shares, so a server whose clock is off fires
+/// nothing early. A full pass is followed at once by another, up to
+/// `DRAIN_PASSES`. A pass that panics is reported, and the next one runs.
 pub fn schedule_forever(
     store: std::sync::Arc<dyn RunStore>,
     queue: std::sync::Arc<RedisRunQueue>,
     every: Duration,
 ) {
     loop {
-        if let Err(error) = schedule_due(store.as_ref(), &queue, Timestamp::now().as_unix_millis())
-        {
-            eprintln!("gol: scheduler: {error}");
+        for _ in 0..DRAIN_PASSES {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let now = queue.now_ms()?;
+                pass(store.as_ref(), &queue, now)
+            }));
+            match outcome {
+                Ok(Ok((_, true))) => continue,
+                Ok(Ok((_, false))) => {}
+                Ok(Err(error)) => eprintln!("gol: scheduler: {error}"),
+                Err(_) => eprintln!("gol: scheduler: a pass panicked"),
+            }
+            break;
         }
         std::thread::sleep(every);
     }

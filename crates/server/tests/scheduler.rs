@@ -12,8 +12,8 @@ use common::queued::{blocking, fresh_user, jev, serve, stores, Server, Store};
 use protocol::{Owner, RunId};
 use serde_json::{json, Value};
 use server::{
-    fire_due_trigger, next_tick, schedule_due, Missed, RedisRunQueue, StoredTrigger, TriggerId,
-    TriggerKind,
+    fire_due_trigger, fire_trigger_at, next_tick, schedule_due, Fired, Missed, RedisRunQueue,
+    StoredTrigger, TriggerId, TriggerKind,
 };
 
 const HOUR: i64 = 3_600_000;
@@ -143,10 +143,11 @@ async fn a_schedule_gets_its_next_tick_when_made() {
         .post("/v1/triggers", &user, body("* * * * *", "UTC"))
         .await;
     assert_eq!(status, 201, "{created}");
+    let after = protocol::Timestamp::now().as_unix_millis();
     let next = created["next_fire_at"].as_i64().expect("next");
     assert_eq!(next % 60_000, 0, "on a minute");
     assert!(
-        next > before && next <= before + 60_000,
+        next > before && next <= after + 60_000,
         "{next} after {before}"
     );
     for (cron, zone) in [("every morning", "UTC"), ("0 9 * * *", "Mars/Olympus")] {
@@ -184,6 +185,7 @@ async fn a_due_trigger_fires_once_per_tick() {
             queued.iter().filter(|queued| **queued == first[0]).count(),
             1
         );
+        forget(&store, &owner, &[due.id]).await;
     }
 }
 
@@ -210,7 +212,7 @@ async fn one_fire_per_tick_with_two_schedulers() {
             fire_due_trigger(runs.as_ref(), &RedisRunQueue::open(url), &stale, now).expect("fire")
         })
         .await;
-        assert_eq!(late, Some(other[0]), "the same tick is the same run");
+        assert_eq!(late, None, "a moved tick is not fired again");
         assert_eq!(
             fired(&server, &user, due.id).await.len(),
             2,
@@ -254,6 +256,7 @@ async fn missed_ticks_follow_their_rule() {
                 Some(14 * HOUR)
             );
         }
+        forget(&store, &owner, &[late.id, skips.id]).await;
     }
 }
 
@@ -293,23 +296,335 @@ async fn a_paused_schedule_is_not_owed_its_ticks() {
     }
 }
 
-// Daylight saving time, by the trigger's time zone. On the day New York's
-// clocks go back, 01:30 happens twice and a daily 01:30 fires once; on the
-// day they go forward, 02:30 does not happen and the job runs at its next
-// occurrence.
+// Daylight saving time, by the trigger's time zone, with exact times:
+// - a wall-clock time the clocks skip runs when they resume (New York's
+//   02:30 on 2026-03-08 runs at 03:00 EDT), and a daily time outside the gap
+//   runs once that day (London's midnight on 2026-03-29, New York's 01:30);
+// - a wall-clock time the clocks repeat runs at its first occurrence only
+//   (New York's 01:30 on 2026-11-01, even for `30 1,2 * * *`).
+// A schedule has minutes and no seconds or years.
 #[test]
 fn ticks_follow_the_time_zone_through_daylight_saving() {
-    // 2026-11-01 01:30 EDT is 05:30 UTC; the next 01:30 is 2026-11-02 EST.
-    let first = next_tick("30 1 * * *", "America/New_York", 1_793_511_000_000 - 1).expect("tick");
-    assert_eq!(first, 1_793_511_000_000, "2026-11-01T05:30Z");
-    let second = next_tick("30 1 * * *", "America/New_York", first).expect("tick");
+    let tick = |cron: &str, zone: &str, after: i64| next_tick(cron, zone, after).expect("tick");
+    // Spring forward.
     assert_eq!(
-        second, 1_793_601_000_000,
-        "2026-11-02T06:30Z, not the repeated 01:30"
+        tick("0 0 * * *", "Europe/London", 1_774_742_400_000),
+        1_774_825_200_000
     );
-    // 2026-03-08 02:30 does not exist in New York.
-    let gap = next_tick("30 2 * * *", "America/New_York", 1_772_946_000_000).expect("tick");
-    assert!(gap > 1_772_946_000_000);
+    assert_eq!(
+        tick("30 1 * * *", "America/New_York", 1_772_951_400_000),
+        1_773_034_200_000
+    );
+    assert_eq!(
+        tick("30 2 * * *", "America/New_York", 1_772_946_000_000),
+        1_772_953_200_000
+    );
+    // Fall back: 01:30 EDT (05:30Z) runs, 01:30 EST (06:30Z) does not.
+    assert_eq!(
+        tick("30 1 * * *", "America/New_York", 1_793_511_000_000 - 1),
+        1_793_511_000_000
+    );
+    assert_eq!(
+        tick("30 1 * * *", "America/New_York", 1_793_511_000_000),
+        1_793_601_000_000
+    );
+    assert_eq!(
+        tick("30 1,2 * * *", "America/New_York", 1_793_511_000_000),
+        1_793_518_200_000
+    );
+    for bad in [
+        "every morning",
+        "0 0 9 * * *",
+        "0 9 1 1 * 2027",
+        "0 0 9 1 1 * 2027",
+    ] {
+        assert!(next_tick(bad, "UTC", 0).is_err(), "{bad}");
+    }
     assert!(next_tick("0 9 * * *", "Mars/Olympus", 0).is_err());
-    assert!(next_tick("every morning", "UTC", 0).is_err());
+}
+
+/// Deletes `ids`, so no later pass on the shared Postgres fires them.
+async fn forget(store: &Store, owner: &Owner, ids: &[TriggerId]) {
+    let (store, owner, ids) = (store.clone(), owner.clone(), ids.to_vec());
+    blocking(move || {
+        for id in ids {
+            store
+                .triggers()
+                .expect("triggers")
+                .delete_trigger(&owner, id)
+                .expect("delete");
+        }
+    })
+    .await;
+}
+
+// A tick fired twice (a scheduler that died between its fire and moving the
+// trigger on, then the next pass) is one run, pushed once: the second fire
+// finds it queued and leaves it, and the queue sweep does not push it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tick_fired_twice_is_one_run_pushed_once() {
+    let _turn = SERIAL.lock().await;
+    for store in stores() {
+        let (server, _, owner, agent) = setup(&store, 6).await;
+        let due = trigger(&owner, agent, "0 * * * *", 20 * HOUR, Missed::RunOnceLate);
+        put(&store, &due).await;
+        let (runs, url, id, who) = (store.clone(), server.redis.clone(), due.id, owner.clone());
+        let (first, second, pending) = blocking(move || {
+            let queue = RedisRunQueue::open(url);
+            let first = fire_trigger_at(runs.as_ref(), &queue, &who, id, 20 * HOUR).expect("fire");
+            let second = fire_trigger_at(runs.as_ref(), &queue, &who, id, 20 * HOUR).expect("fire");
+            let pushed = server::sweep(
+                &queue,
+                runs.as_ref(),
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(3600),
+            )
+            .expect("sweep");
+            assert!(pushed.is_empty(), "{pushed:?}");
+            (first, second, queue.pending().expect("pending"))
+        })
+        .await;
+        let Fired::Run(run) = first else {
+            panic!("{first:?}")
+        };
+        assert_eq!(second, Fired::Run(run));
+        assert!(!pending.contains(&run), "off the pending set");
+        let url = server.redis.clone();
+        let queued = blocking(move || RedisRunQueue::open(url).queued().expect("queued")).await;
+        assert_eq!(queued.iter().filter(|queued| **queued == run).count(), 1);
+        forget(&store, &owner, &[due.id]).await;
+    }
+}
+
+/// An in-memory store whose one-trigger reads fail once, when armed: the
+/// `n`-th read after `arm(n)`.
+#[derive(Default)]
+struct FailingRead {
+    inner: server::InMemoryStore,
+    /// A countdown, not a lock: the test arms it, then one pass on one
+    /// thread reads it in turn. Its load and store need no order with any
+    /// other memory, and SeqCst is used only for plainness.
+    fail_in: std::sync::atomic::AtomicUsize,
+}
+
+impl FailingRead {
+    fn arm(&self, n: usize) {
+        self.fail_in.store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl server::RunStore for FailingRead {
+    fn put_agent(
+        &self,
+        agent: server::StoredAgent,
+    ) -> Result<server::PutAgent, server::StoreError> {
+        self.inner.put_agent(agent)
+    }
+    fn agent(
+        &self,
+        id: protocol::AgentId,
+    ) -> Result<Option<server::StoredAgent>, server::StoreError> {
+        self.inner.agent(id)
+    }
+    fn agents_of(&self, owner: &Owner) -> Result<Vec<server::StoredAgent>, server::StoreError> {
+        self.inner.agents_of(owner)
+    }
+    fn put_run(&self, run: server::StoredRun) -> Result<server::PutRun, server::StoreError> {
+        self.inner.put_run(run)
+    }
+    fn append_events(
+        &self,
+        id: RunId,
+        events: Vec<protocol::Event>,
+    ) -> Result<server::Append, server::StoreError> {
+        self.inner.append_events(id, events)
+    }
+    fn append_events_after(
+        &self,
+        id: RunId,
+        seen: usize,
+        events: Vec<protocol::Event>,
+    ) -> Result<server::Append, server::StoreError> {
+        self.inner.append_events_after(id, seen, events)
+    }
+    fn run(&self, id: RunId) -> Result<Option<server::StoredRun>, server::StoreError> {
+        self.inner.run(id)
+    }
+    fn put_artifact(&self, artifact: server::StoredArtifact) -> Result<(), server::StoreError> {
+        self.inner.put_artifact(artifact)
+    }
+    fn artifact(
+        &self,
+        id: protocol::ArtifactId,
+    ) -> Result<Option<server::StoredArtifact>, server::StoreError> {
+        self.inner.artifact(id)
+    }
+    fn threads(&self) -> Option<&dyn server::ThreadStore> {
+        self.inner.threads()
+    }
+    fn stops(&self) -> Option<&dyn server::StopStore> {
+        self.inner.stops()
+    }
+    fn triggers(&self) -> Option<&dyn server::TriggerStore> {
+        Some(self)
+    }
+}
+
+impl server::TriggerStore for FailingRead {
+    fn put_trigger(
+        &self,
+        trigger: &StoredTrigger,
+        most: usize,
+    ) -> Result<bool, server::StoreError> {
+        self.inner.put_trigger(trigger, most)
+    }
+    fn triggers_of(&self, owner: &Owner) -> Result<Vec<StoredTrigger>, server::StoreError> {
+        self.inner.triggers_of(owner)
+    }
+    fn trigger(
+        &self,
+        owner: &Owner,
+        id: TriggerId,
+    ) -> Result<Option<StoredTrigger>, server::StoreError> {
+        use std::sync::atomic::Ordering;
+        let left = self.fail_in.load(Ordering::SeqCst);
+        if left > 0 {
+            self.fail_in.store(left - 1, Ordering::SeqCst);
+            if left == 1 {
+                return Err(server::StoreError::new("the store is unreachable"));
+            }
+        }
+        self.inner.trigger(owner, id)
+    }
+    fn set_enabled(
+        &self,
+        owner: &Owner,
+        id: TriggerId,
+        enabled: bool,
+    ) -> Result<Option<StoredTrigger>, server::StoreError> {
+        self.inner.set_enabled(owner, id, enabled)
+    }
+    fn rotate_webhook(
+        &self,
+        owner: &Owner,
+        id: TriggerId,
+    ) -> Result<Option<StoredTrigger>, server::StoreError> {
+        self.inner.rotate_webhook(owner, id)
+    }
+    fn delete_trigger(&self, owner: &Owner, id: TriggerId) -> Result<bool, server::StoreError> {
+        self.inner.delete_trigger(owner, id)
+    }
+    fn pause_triggers(&self, owner: &Owner) -> Result<usize, server::StoreError> {
+        self.inner.pause_triggers(owner)
+    }
+    fn resume_trigger(
+        &self,
+        owner: &Owner,
+        id: TriggerId,
+        next_fire_ms: Option<i64>,
+    ) -> Result<Option<StoredTrigger>, server::StoreError> {
+        self.inner.resume_trigger(owner, id, next_fire_ms)
+    }
+    fn due_triggers(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<StoredTrigger>, server::StoreError> {
+        self.inner.due_triggers(now_ms, limit)
+    }
+    fn advance_trigger(
+        &self,
+        id: TriggerId,
+        due_ms: Option<i64>,
+        next_ms: Option<i64>,
+    ) -> Result<bool, server::StoreError> {
+        self.inner.advance_trigger(id, due_ms, next_ms)
+    }
+    fn unscheduled_triggers(&self, limit: usize) -> Result<Vec<StoredTrigger>, server::StoreError> {
+        self.inner.unscheduled_triggers(limit)
+    }
+}
+
+// A fire whose second read of its trigger fails leaves its run stored and
+// unpushed, and the tick unmoved; the next pass fires the tick again, finds
+// the run, and pushes it: the tick runs, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_second_read_is_finished_by_the_next_pass() {
+    let _turn = SERIAL.lock().await;
+    let failing = std::sync::Arc::new(FailingRead::default());
+    let store: Store = failing.clone();
+    let (server, user, owner, agent) = setup(&store, 7).await;
+    let due = trigger(&owner, agent, "0 * * * *", 10 * HOUR, Missed::RunOnceLate);
+    put(&store, &due).await;
+    // The pass reads the due triggers, then the fire reads it (1) and reads
+    // it again at its gate (2): that read fails.
+    failing.arm(2);
+    let now = 10 * HOUR + 10_000;
+    assert_eq!(pass(&server, now, &[due.id]).await, Vec::<RunId>::new());
+    assert_eq!(
+        stored(&store, &owner, due.id).await.next_fire_ms,
+        Some(10 * HOUR)
+    );
+    assert_eq!(server.work().await, None, "not pushed");
+    let again = pass(&server, now, &[due.id]).await;
+    assert_eq!(again.len(), 1);
+    assert_eq!(server.work().await, Some(again[0]), "pushed now");
+    let cards = fired(&server, &user, due.id).await;
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0]["state"], "completed");
+}
+
+// A schedule made before the scheduler (no tick yet) gets its first tick
+// from the next pass; one whose schedule has no tick after now (a date that
+// never comes again) fires its last tick and is then left with none.
+#[tokio::test(flavor = "multi_thread")]
+async fn schedules_without_a_tick_get_one_or_none() {
+    let _turn = SERIAL.lock().await;
+    for store in stores() {
+        let (server, _, owner, agent) = setup(&store, 8).await;
+        let mut old = trigger(&owner, agent, "0 * * * *", 0, Missed::RunOnceLate);
+        old.next_fire_ms = None;
+        put(&store, &old).await;
+        let now = 30 * HOUR + 10_000;
+        // A pass ticks at most 100 such schedules, and the shared Postgres
+        // may hold others'.
+        for _ in 0..50 {
+            pass(&server, now, &[old.id]).await;
+            if stored(&store, &owner, old.id).await.next_fire_ms.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            stored(&store, &owner, old.id).await.next_fire_ms,
+            Some(31 * HOUR)
+        );
+        // February 30th never comes: its one tick (stored by hand) fires,
+        // and then there is no next.
+        let never = trigger(&owner, agent, "0 0 30 2 *", 30 * HOUR, Missed::RunOnceLate);
+        put(&store, &never).await;
+        assert_eq!(pass(&server, now, &[never.id]).await.len(), 1);
+        assert_eq!(stored(&store, &owner, never.id).await.next_fire_ms, None);
+        assert_eq!(pass(&server, now, &[never.id]).await, Vec::<RunId>::new());
+        forget(&store, &owner, &[old.id, never.id]).await;
+    }
+}
+
+// Resuming a trigger that is running keeps its tick: a due tick is not
+// dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn resuming_a_running_trigger_keeps_its_tick() {
+    let _turn = SERIAL.lock().await;
+    let store = stores().remove(0);
+    let (server, user, owner, agent) = setup(&store, 9).await;
+    let due = trigger(&owner, agent, "* * * * *", 60_000, Missed::RunOnceLate);
+    put(&store, &due).await;
+    let (status, resumed) = server
+        .post(&format!("/v1/triggers/{}/resume", due.id), &user, json!({}))
+        .await;
+    assert_eq!(status, 200, "{resumed}");
+    assert_eq!(resumed["next_fire_at"], 60_000);
+    assert_eq!(
+        stored(&store, &owner, due.id).await.next_fire_ms,
+        Some(60_000)
+    );
 }

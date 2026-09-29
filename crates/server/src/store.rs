@@ -610,9 +610,17 @@ pub trait TriggerStore: Send + Sync {
     fn due_triggers(&self, now_ms: i64, limit: usize) -> Result<Vec<StoredTrigger>, StoreError>;
     /// Moves trigger `id` from tick `due_ms` to `next_ms`, only if its next
     /// tick is still `due_ms` (decision 69A): of the schedulers that fired a
-    /// tick, one moves it. Whether this one did.
-    fn advance_trigger(&self, id: TriggerId, due_ms: i64, next_ms: i64)
-        -> Result<bool, StoreError>;
+    /// tick, one moves it. Whether this one did. No `due_ms` gives a
+    /// schedule its first tick; no `next_ms` leaves it none.
+    fn advance_trigger(
+        &self,
+        id: TriggerId,
+        due_ms: Option<i64>,
+        next_ms: Option<i64>,
+    ) -> Result<bool, StoreError>;
+    /// Running schedule triggers with no tick yet (made before Phase 4.2),
+    /// at most `limit`.
+    fn unscheduled_triggers(&self, limit: usize) -> Result<Vec<StoredTrigger>, StoreError>;
 }
 
 /// The in-memory store. A poisoned lock (a writer panicked holding it) still
@@ -956,15 +964,28 @@ impl TriggerStore for InMemoryStore {
     fn advance_trigger(
         &self,
         id: TriggerId,
-        due_ms: i64,
-        next_ms: i64,
+        due_ms: Option<i64>,
+        next_ms: Option<i64>,
     ) -> Result<bool, StoreError> {
         let mut triggers = write(&self.triggers, "triggers")?;
         Ok(triggers
             .iter_mut()
-            .find(|trigger| trigger.id == id && trigger.next_fire_ms == Some(due_ms))
-            .map(|trigger| trigger.next_fire_ms = Some(next_ms))
+            .find(|trigger| trigger.id == id && trigger.next_fire_ms == due_ms)
+            .map(|trigger| trigger.next_fire_ms = next_ms)
             .is_some())
+    }
+
+    fn unscheduled_triggers(&self, limit: usize) -> Result<Vec<StoredTrigger>, StoreError> {
+        Ok(read(&self.triggers)
+            .iter()
+            .filter(|trigger| {
+                trigger.enabled
+                    && trigger.next_fire_ms.is_none()
+                    && matches!(trigger.kind, TriggerKind::Schedule { .. })
+            })
+            .take(limit)
+            .cloned()
+            .collect())
     }
 
     fn pause_triggers(&self, owner: &Owner) -> Result<usize, StoreError> {

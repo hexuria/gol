@@ -23,6 +23,17 @@
 \* - "blind": the scheduler moves the trigger to its tick + 1 without the
 \*   condition that its tick is still the one read (69A), so a stale
 \*   scheduler moves it back (TicksAdvance).
+\* - "nopush": the gate holds every run, trigger paused or not
+\*   (HeldOnlyWhenPaused).
+\* - "nofire": the scheduler stores no run and still moves the trigger on
+\*   (PassedTicksFired).
+\*
+\* Not modelled: the fire's first read and its "moved" answer (a stale
+\* scheduler that finds the trigger's tick moved fires nothing), resume and
+\* delete, the missed-tick rules, and the error paths (a failed store,
+\* push or second read leaves the tick unmoved, and its next try, under the
+\* same run id, gates and pushes the stored run). These only take
+\* behaviours away from the model's scheduler, or are tested in Rust.
 EXTENDS Integers, FiniteSets
 
 CONSTANTS Design, Schedulers, MaxTick
@@ -40,9 +51,10 @@ VARIABLES
   seen,      \* each scheduler's tick, as it read it
   fresh,     \* whether this scheduler's store stored the run (not found it)
   status,    \* each run id: "none", "stored", "pushed", "held"
-  afterStop  \* each run id: stored after the stop's record
+  afterStop, \* each run id: stored after the stop's record
+  heldWhile  \* each run id: the trigger was running when its gate held it
 
-vars == <<next, enabled, stop, pc, seen, fresh, status, afterStop>>
+vars == <<next, enabled, stop, pc, seen, fresh, status, afterStop, heldWhile>>
 
 TypeOK ==
   /\ next \in 1..(MaxTick + 1)
@@ -53,6 +65,7 @@ TypeOK ==
   /\ fresh \in [Schedulers -> BOOLEAN]
   /\ status \in [Ids -> {"none", "stored", "pushed", "held"}]
   /\ afterStop \in [Ids -> BOOLEAN]
+  /\ heldWhile \in [Ids -> BOOLEAN]
 
 Init ==
   /\ next = 1
@@ -63,6 +76,7 @@ Init ==
   /\ fresh = [s \in Schedulers |-> FALSE]
   /\ status = [id \in Ids |-> "none"]
   /\ afterStop = [id \in Ids |-> FALSE]
+  /\ heldWhile = [id \in Ids |-> FALSE]
 
 \* due_triggers: the trigger is running and its tick is due.
 Read(s) ==
@@ -71,13 +85,13 @@ Read(s) ==
   /\ next <= MaxTick
   /\ seen' = [seen EXCEPT ![s] = next]
   /\ pc' = [pc EXCEPT ![s] = "read"]
-  /\ UNCHANGED <<next, enabled, stop, fresh, status, afterStop>>
+  /\ UNCHANGED <<next, enabled, stop, fresh, status, afterStop, heldWhile>>
 
 \* enqueue_unless's put_run: store once. "latecheck" pushes it here.
 Store(s) ==
   LET id == Id(s, seen[s]) IN
   /\ pc[s] = "read"
-  /\ IF status[id] = "none"
+  /\ IF status[id] = "none" /\ Design # "nofire"
        THEN /\ status' = [status EXCEPT ![id] =
                             IF Design = "latecheck" THEN "pushed" ELSE "stored"]
             /\ afterStop' = [afterStop EXCEPT ![id] = (stop = "recorded")]
@@ -85,7 +99,7 @@ Store(s) ==
        ELSE /\ fresh' = [fresh EXCEPT ![s] = FALSE]
             /\ UNCHANGED <<status, afterStop>>
   /\ pc' = [pc EXCEPT ![s] = "stored"]
-  /\ UNCHANGED <<next, enabled, stop, seen>>
+  /\ UNCHANGED <<next, enabled, stop, seen, heldWhile>>
 
 \* The trigger read again: a run this scheduler stored is pushed if the
 \* trigger runs, held otherwise ("latecheck": cancelled after its push).
@@ -95,7 +109,11 @@ Gate(s) ==
   /\ status' = IF ~fresh[s] THEN status
                ELSE IF Design = "latecheck"
                  THEN (IF enabled THEN status ELSE [status EXCEPT ![id] = "held"])
+               ELSE IF Design = "nopush"
+                 THEN [status EXCEPT ![id] = "held"]
                  ELSE [status EXCEPT ![id] = IF enabled THEN "pushed" ELSE "held"]
+  /\ heldWhile' = IF fresh[s] /\ enabled /\ status'[id] = "held"
+                   THEN [heldWhile EXCEPT ![id] = TRUE] ELSE heldWhile
   /\ pc' = [pc EXCEPT ![s] = "gated"]
   /\ UNCHANGED <<next, enabled, stop, seen, fresh, afterStop>>
 
@@ -105,19 +123,19 @@ Advance(s) ==
   /\ next' = IF Design = "blind" THEN seen[s] + 1
              ELSE IF next = seen[s] THEN next + 1 ELSE next
   /\ pc' = [pc EXCEPT ![s] = "idle"]
-  /\ UNCHANGED <<enabled, stop, seen, fresh, status, afterStop>>
+  /\ UNCHANGED <<enabled, stop, seen, fresh, status, afterStop, heldWhile>>
 
 \* The owner's stop: its pause, then its record.
 Pause ==
   /\ stop = "none"
   /\ enabled' = FALSE
   /\ stop' = "paused"
-  /\ UNCHANGED <<next, pc, seen, fresh, status, afterStop>>
+  /\ UNCHANGED <<next, pc, seen, fresh, status, afterStop, heldWhile>>
 
 Record ==
   /\ stop = "paused"
   /\ stop' = "recorded"
-  /\ UNCHANGED <<next, enabled, pc, seen, fresh, status, afterStop>>
+  /\ UNCHANGED <<next, enabled, pc, seen, fresh, status, afterStop, heldWhile>>
 
 Step(s) == Read(s) \/ Store(s) \/ Gate(s) \/ Advance(s)
 
@@ -130,12 +148,12 @@ Done ==
 
 Next == (\E s \in Schedulers : Step(s)) \/ Pause \/ Record \/ Done
 
-\* Each scheduler's pass keeps running, and a stop begun finishes; the stop
-\* itself may never come.
+\* Each scheduler's pass keeps running (its thread loops, each pass reads
+\* the due triggers). The stop may never come, and need not finish:
+\* EveryTickFires holds either way once the trigger is paused.
 Spec ==
   /\ Init /\ [][Next]_vars
   /\ \A s \in Schedulers : WF_vars(Step(s))
-  /\ WF_vars(Record)
 
 \* One run for each tick, however many schedulers fired it.
 OneRunPerTick ==
@@ -145,6 +163,15 @@ OneRunPerTick ==
 \* A run stored after the stop's record (which covers only earlier runs) is
 \* never pushed: no worker ever sees it.
 NoRunEscapesStop == \A id \in Ids : afterStop[id] => status[id] # "pushed"
+
+\* A run is held only because its trigger was paused.
+HeldOnlyWhenPaused == \A id \in Ids : ~heldWhile[id]
+
+\* Every tick the trigger has moved past was fired: its run was pushed, or
+\* held because the trigger was paused.
+PassedTicksFired ==
+  \A t \in Ticks : t < next =>
+    \E id \in Ids : TickOf(id) = t /\ status[id] \in {"pushed", "held", "stored"}
 
 \* The trigger's next tick never moves back.
 TicksAdvance == [][next' >= next]_next

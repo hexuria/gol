@@ -315,6 +315,14 @@ impl RedisRunQueue {
     }
 
     /// Takes `id` off pending without queueing it.
+    /// Redis's clock, in Unix milliseconds: the one time every server shares
+    /// (the scheduler's, Phase 4.2).
+    pub fn now_ms(&self) -> Result<i64, String> {
+        let (seconds, micros): (i64, i64) =
+            self.with_connection(|connection| redis::cmd("TIME").query(connection))?;
+        Ok(seconds * 1000 + micros / 1000)
+    }
+
     pub fn unpend(&self, id: RunId) -> Result<(), String> {
         self.unpend_entry(&id.to_string())
     }

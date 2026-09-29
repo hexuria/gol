@@ -590,10 +590,16 @@ impl server::TriggerStore for ForcedStore {
     fn advance_trigger(
         &self,
         id: TriggerId,
-        due_ms: i64,
-        next_ms: i64,
+        due_ms: Option<i64>,
+        next_ms: Option<i64>,
     ) -> Result<bool, server::StoreError> {
         self.inner.advance_trigger(id, due_ms, next_ms)
+    }
+    fn unscheduled_triggers(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<server::StoredTrigger>, server::StoreError> {
+        self.inner.unscheduled_triggers(limit)
     }
     fn pause_triggers(&self, owner: &Owner) -> Result<usize, server::StoreError> {
         match self.forced {
@@ -732,6 +738,14 @@ fn racing_creates_keep_the_cap() {
             .triggers_of(&owner)
             .expect("list");
         assert_eq!(kept.len(), most);
+        // No later pass of a scheduler test on the shared Postgres ticks them.
+        for trigger in kept {
+            store
+                .triggers()
+                .expect("triggers")
+                .delete_trigger(&owner, trigger.id)
+                .expect("delete");
+        }
     }
 }
 

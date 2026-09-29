@@ -1602,9 +1602,9 @@ async fn pause_trigger(
     set_trigger_enabled(&state, &principal, id, false).await
 }
 
-/// `POST /v1/triggers/{id}/resume`.
 /// `POST /v1/triggers/{id}/resume`: it fires again from the first tick
-/// after now, and owes nothing for the ticks it was paused.
+/// after now, and owes nothing for the ticks it was paused. A trigger that
+/// is running keeps its tick.
 async fn resume_trigger(
     Authenticated(principal): Authenticated,
     State(state): State<AppState>,
@@ -1615,6 +1615,10 @@ async fn resume_trigger(
         let Some(trigger) = triggers.trigger(&owner, id)? else {
             return Ok(Err(ApiError::TriggerNotFound));
         };
+        // A running trigger keeps its tick: a resume does not drop one due.
+        if trigger.enabled {
+            return Ok(Ok(trigger));
+        }
         let next = match first_tick(&trigger.kind) {
             Ok(next) => next,
             Err(error) => return Ok(Err(error)),

@@ -957,6 +957,16 @@ pub fn sweep(
     let mut pushed = Vec::new();
     for run_id in queue.pending_for(after)? {
         match store.run(run_id) {
+            // A trigger's run is its fire's to push, after its gate (Phase
+            // 4.2): the tick's next try pushes it.
+            Ok(Some(run))
+                if waiting(&run)
+                    && run.spec.metadata.contains_key(crate::triggers::TRIGGER_KEY) =>
+            {
+                if let Err(error) = queue.unpend(run_id) {
+                    eprintln!("gol: queue sweep: unpend run {run_id}: {error}");
+                }
+            }
             Ok(Some(run)) if waiting(&run) => match queue.push(run_id) {
                 Ok(()) => pushed.push(run_id),
                 Err(error) => eprintln!("gol: queue sweep: push run {run_id}: {error}"),
@@ -1160,12 +1170,12 @@ pub fn queue_from_env(env: &BTreeMap<String, String>) -> Result<Option<QueueSett
     }))
 }
 
-/// Starts `settings.workers` worker threads and one reaper, which also
-/// sweeps, all running for as long as the process does. Queued runs may
-/// message each other through `messages` (Phase 2.3).
 /// How often each server's scheduler looks for due triggers.
 const SCHEDULE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Starts `settings.workers` worker threads, one scheduler and one reaper,
+/// which also sweeps, all running for as long as the process does. Queued
+/// runs may message each other through `messages` (Phase 2.3).
 pub fn start_queue(
     settings: &QueueSettings,
     store: Arc<dyn RunStore>,

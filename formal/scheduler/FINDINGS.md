@@ -21,13 +21,25 @@ Checked on 2026-09-30 for Phase 4.2. `Scheduler.tla` is one schedule trigger fir
 - `"random"` gives each fire a fresh run id.
 - `"latecheck"` pushes the run before the second read, as #84's first version did.
 - `"blind"` moves the trigger to its tick + 1 without the condition.
+- `"nopush"` holds every run at its gate, trigger paused or not.
+- `"nofire"` stores no run and still moves the trigger on.
+
+**Not modelled:**
+- the fire's first read and its `Moved` answer, where a stale scheduler that finds the trigger's tick moved fires nothing;
+- resume and delete;
+- the missed-tick rules;
+- the error paths. A failed store, push or second read leaves the tick unmoved, and its next try, under the same run id, gates and pushes the stored run (`spawner::enqueue_fire`).
+
+The first two only take behaviours away from the model's scheduler. The others are tested in Rust.
 
 ## Properties
 
 - `OneRunPerTick`: one run for each tick, however many schedulers fired it.
 - `NoRunEscapesStop`: a run stored after the stop's record is never pushed.
+- `HeldOnlyWhenPaused`: a run is held only because its trigger was paused.
+- `PassedTicksFired`: every tick the trigger has moved past has a run.
 - `TicksAdvance`: the next tick never moves back.
-- `EveryTickFires`: while the trigger runs, the schedule gets through its ticks. This holds under weak fairness on each scheduler's steps (its pass keeps running) and on the stop's record (a stop begun finishes). The stop itself need not come.
+- `EveryTickFires`: while the trigger runs, the schedule gets through its ticks. This holds under weak fairness on each scheduler's steps: its thread loops, and each pass reads the due triggers. The stop need not come or finish, since the property holds once the trigger is paused. It is a liveness claim about the model's scheduler only. A trigger whose fire keeps failing in Rust keeps its tick and is tried every pass.
 - Deadlock is checked. `Done` is the only stuttering step.
 
 ## TLA+ Findings
@@ -46,7 +58,9 @@ TLC2 Version 2.19 of 08 August 2024, from tla2tools v1.7.4, which `scripts/insta
 Negative controls, each on a copy of `Scheduler.cfg` with `-workers 1`:
 - `Design = "random"` violates `OneRunPerTick` in a 5-state trace: s1 reads tick 1 and stores its run, then s2 reads tick 1 and stores another.
 - `Design = "latecheck"` violates `NoRunEscapesStop` in a 5-state trace: s1 reads tick 1, the stop pauses the trigger and records itself, then s1 stores and pushes its run, which the stop does not cover.
-- `Design = "blind"` violates `TicksAdvance` in a 10-state trace: s1 fires tick 1; s2 reads tick 1; s1 moves the trigger to 2, fires tick 2 and moves it to 3; then s2, going on with tick 1, moves it back to 2.
+- `Design = "blind"` violates `TicksAdvance` in a 13-state trace: s1 fires tick 1; s2 reads tick 1; s1 moves the trigger to 2, fires tick 2 and moves it to 3; then s2, going on with tick 1, moves it back to 2.
+- `Design = "nopush"` violates `HeldOnlyWhenPaused` in a 4-state trace: s1 reads tick 1, stores its run, and holds it while the trigger runs.
+- `Design = "nofire"` violates `PassedTicksFired` in a 5-state trace: s1 reads tick 1, stores nothing, and moves the trigger to 2.
 
 ## Mapping
 
@@ -54,6 +68,7 @@ Negative controls, each on a copy of `Scheduler.cfg` with `-workers 1`:
 - `NoRunEscapesStop`: `a_fire_racing_a_pause_holds_its_run` and `a_fire_racing_a_delete_holds_its_run` (forced: the pause lands between the fire's store and its second read), in `crates/server/tests/triggers.rs`.
 - `TicksAdvance`: `one_fire_per_tick_with_two_schedulers`. The other scheduler fires two ticks and moves the trigger to the third, and the stale scheduler's update then leaves it there, where an unconditional one would move it back (its hand mutant fails that test on both stores). `advance_trigger` is one conditional update on Postgres and one lock scope in memory.
 - A paused trigger is not due: `a_paused_schedule_is_not_owed_its_ticks` (a pass leaves its tick alone, and a resume moves it to the first tick after now).
+- `HeldOnlyWhenPaused` and `PassedTicksFired`: `a_due_trigger_fires_once_per_tick` and `a_failed_second_read_is_finished_by_the_next_pass` (a read that fails leaves the run unpushed and the tick unmoved, not held, and the next pass pushes it), in `crates/server/tests/scheduler.rs`.
 - `EveryTickFires`: unlinked.
 - The model's assumption that `put_run` stores a run once: RunLog's `Reput`, and its Rust tests.
 
