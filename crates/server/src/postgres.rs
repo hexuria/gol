@@ -1326,26 +1326,47 @@ fn trigger_row(row: &postgres::Row) -> Result<StoredTrigger, StoreError> {
 }
 
 impl TriggerStore for PostgresStore {
-    fn put_trigger(&self, trigger: &StoredTrigger) -> Result<(), StoreError> {
+    /// One transaction under the principal's advisory lock: the count and
+    /// the insert, so concurrent creates keep the cap.
+    fn put_trigger(&self, trigger: &StoredTrigger, most: usize) -> Result<bool, StoreError> {
         let body = serde_json::to_value(trigger).map_err(json)?;
+        let most = i64::try_from(most).unwrap_or(i64::MAX);
         self.with_client(|client| {
-            client
-                .execute(
-                    "insert into triggers
-                         (id, owner_issuer, owner_subject, body, enabled, next_fire_ms, created_ms)
-                     values ($1, $2, $3, $4, $5, $6, $7)",
-                    &[
-                        &trigger.id.as_uuid(),
-                        &trigger.owner.issuer,
-                        &trigger.owner.subject,
-                        &body,
-                        &trigger.enabled,
-                        &trigger.next_fire_ms,
-                        &trigger.created_ms,
-                    ],
+            let mut tx = client.transaction().map_err(sql)?;
+            tx.execute(
+                "select pg_advisory_xact_lock(
+                     hashtextextended('gol.triggers:' || $1 || chr(31) || $2, 0))",
+                &[&trigger.owner.issuer, &trigger.owner.subject],
+            )
+            .map_err(sql)?;
+            let kept: i64 = tx
+                .query_one(
+                    "select count(*) from triggers
+                     where owner_issuer = $1 and owner_subject = $2",
+                    &[&trigger.owner.issuer, &trigger.owner.subject],
                 )
-                .map(|_| ())
-                .map_err(sql)
+                .and_then(|row| row.try_get(0))
+                .map_err(sql)?;
+            if kept >= most {
+                return Ok(false);
+            }
+            tx.execute(
+                "insert into triggers
+                     (id, owner_issuer, owner_subject, body, enabled, next_fire_ms, created_ms)
+                 values ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &trigger.id.as_uuid(),
+                    &trigger.owner.issuer,
+                    &trigger.owner.subject,
+                    &body,
+                    &trigger.enabled,
+                    &trigger.next_fire_ms,
+                    &trigger.created_ms,
+                ],
+            )
+            .map_err(sql)?;
+            tx.commit().map_err(sql)?;
+            Ok(true)
         })
     }
 

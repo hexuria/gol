@@ -445,7 +445,8 @@ async fn start_run(state: &AppState, owner: Owner, body: RunBody) -> Result<RunS
                     ApiError::Decider(format!("queue unavailable: {error}"))
                 }
                 crate::spawner::EnqueueError::Store(error) => ApiError::from(error),
-                crate::spawner::EnqueueError::Push(error) => ApiError::Decider(error),
+                crate::spawner::EnqueueError::Push(error)
+                | crate::spawner::EnqueueError::Held(error) => ApiError::Decider(error),
             })
         })
         .await
@@ -585,7 +586,9 @@ async fn background_turn(
             ApiError::Decider(format!("queue unavailable: {error}"))
         }
         crate::spawner::EnqueueError::Store(error) => ApiError::from(error),
-        crate::spawner::EnqueueError::Push(error) => ApiError::Decider(error),
+        crate::spawner::EnqueueError::Push(error) | crate::spawner::EnqueueError::Held(error) => {
+            ApiError::Decider(error)
+        }
     })?;
     Ok((
         StatusCode::ACCEPTED,
@@ -1542,12 +1545,11 @@ async fn create_trigger(
         if !owned {
             return Ok(Err(ApiError::AgentNotFound));
         }
-        if triggers.triggers_of(&stored.owner)?.len() >= MAX_TRIGGERS {
+        if !triggers.put_trigger(&stored, MAX_TRIGGERS)? {
             return Ok(Err(ApiError::Conflict(
                 "a principal keeps at most 100 triggers",
             )));
         }
-        triggers.put_trigger(&stored)?;
         Ok(Ok(()))
     })
     .await?;

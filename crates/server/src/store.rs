@@ -571,8 +571,9 @@ pub struct StoredTrigger {
 /// read and write names the owner, and another principal's trigger is not
 /// found.
 pub trait TriggerStore: Send + Sync {
-    /// Stores a new trigger.
-    fn put_trigger(&self, trigger: &StoredTrigger) -> Result<(), StoreError>;
+    /// Stores a new trigger unless its principal already keeps `most`, in
+    /// one step: whether it was stored.
+    fn put_trigger(&self, trigger: &StoredTrigger, most: usize) -> Result<bool, StoreError>;
     /// `owner`'s principal's triggers, oldest first.
     fn triggers_of(&self, owner: &Owner) -> Result<Vec<StoredTrigger>, StoreError>;
     fn trigger(&self, owner: &Owner, id: TriggerId) -> Result<Option<StoredTrigger>, StoreError>;
@@ -831,9 +832,17 @@ impl RunStore for InMemoryStore {
 }
 
 impl TriggerStore for InMemoryStore {
-    fn put_trigger(&self, trigger: &StoredTrigger) -> Result<(), StoreError> {
-        write(&self.triggers, "triggers")?.push(trigger.clone());
-        Ok(())
+    fn put_trigger(&self, trigger: &StoredTrigger, most: usize) -> Result<bool, StoreError> {
+        let mut triggers = write(&self.triggers, "triggers")?;
+        let kept = triggers
+            .iter()
+            .filter(|kept| kept.owner.is(&trigger.owner))
+            .count();
+        if kept >= most {
+            return Ok(false);
+        }
+        triggers.push(trigger.clone());
+        Ok(true)
     }
 
     fn triggers_of(&self, owner: &Owner) -> Result<Vec<StoredTrigger>, StoreError> {

@@ -435,7 +435,7 @@ async fn a_fire_of_another_principals_agent_starts_nothing() {
         blocking(move || {
             runs.triggers()
                 .expect("triggers")
-                .put_trigger(&trigger)
+                .put_trigger(&trigger, server::MAX_TRIGGERS)
                 .expect("put")
         })
         .await;
@@ -455,6 +455,8 @@ enum Forced {
     /// Right after a run is stored, the owner's triggers are paused: a stop
     /// landing between a fire's read of its trigger and its run.
     PauseAfterPut,
+    /// Right after a run is stored, the owner's triggers are deleted.
+    DeleteAfterPut,
 }
 
 /// An in-memory store with one forced behavior.
@@ -482,9 +484,17 @@ impl server::RunStore for ForcedStore {
     fn put_run(&self, run: server::StoredRun) -> Result<server::PutRun, server::StoreError> {
         let owner = run.spec.owner.clone();
         let put = self.inner.put_run(run)?;
-        if let Forced::PauseAfterPut = self.forced {
-            use server::TriggerStore;
-            self.inner.pause_triggers(&owner)?;
+        use server::TriggerStore;
+        match self.forced {
+            Forced::PauseAfterPut => {
+                self.inner.pause_triggers(&owner)?;
+            }
+            Forced::DeleteAfterPut => {
+                for trigger in self.inner.triggers_of(&owner)? {
+                    self.inner.delete_trigger(&owner, trigger.id)?;
+                }
+            }
+            Forced::FailPause => {}
         }
         Ok(put)
     }
@@ -527,8 +537,12 @@ impl server::RunStore for ForcedStore {
 }
 
 impl server::TriggerStore for ForcedStore {
-    fn put_trigger(&self, trigger: &server::StoredTrigger) -> Result<(), server::StoreError> {
-        self.inner.put_trigger(trigger)
+    fn put_trigger(
+        &self,
+        trigger: &server::StoredTrigger,
+        most: usize,
+    ) -> Result<bool, server::StoreError> {
+        self.inner.put_trigger(trigger, most)
     }
     fn triggers_of(&self, owner: &Owner) -> Result<Vec<server::StoredTrigger>, server::StoreError> {
         self.inner.triggers_of(owner)
@@ -561,7 +575,7 @@ impl server::TriggerStore for ForcedStore {
     fn pause_triggers(&self, owner: &Owner) -> Result<usize, server::StoreError> {
         match self.forced {
             Forced::FailPause => Err(server::StoreError::new("the store is unreachable")),
-            Forced::PauseAfterPut => self.inner.pause_triggers(owner),
+            Forced::PauseAfterPut | Forced::DeleteAfterPut => self.inner.pause_triggers(owner),
         }
     }
 }
@@ -592,10 +606,11 @@ async fn a_failed_pause_does_not_stop_the_stop() {
 }
 
 // A fire whose trigger is paused between its read and its run's store (as
-// the owner's stop pauses before it records itself) cancels that run, so no
-// run escapes the stop: a run stored after a stop is not covered by it.
+// the owner's stop pauses before it records itself) holds that run: it is
+// cancelled before any worker can see it and never pushed, so no run
+// escapes the stop (a run stored after a stop is not covered by it).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_fire_racing_a_pause_cancels_its_run() {
+async fn a_fire_racing_a_pause_holds_its_run() {
     let jev = jev(&["complete"]).await;
     let server = serve(forced(Forced::PauseAfterPut), &jev, 11).await;
     let user = fresh_user();
@@ -603,13 +618,98 @@ async fn a_fire_racing_a_pause_cancels_its_run() {
     let (_, created) = create(&server, &user, schedule(agent)).await;
     let id = created["id"].as_str().expect("id").to_string();
     assert_eq!(fire(&server, &user, &id).await, Fired::Paused);
-    let run = server.work().await.expect("the fired run is queued");
-    let payloads = stored_payloads(&server.store, run).await;
-    assert!(
-        payloads.contains(&EventPayload::RunCancelled),
-        "{payloads:?}"
-    );
-    assert!(!payloads.contains(&EventPayload::RunStarted), "never ran");
+    assert_eq!(server.work().await, None, "never pushed");
+    let (status, board) = server
+        .get(&format!("/v1/threads/trigger-{id}/board"), &user)
+        .await;
+    assert_eq!(status, 200, "{board}");
+    assert_eq!(board["cards"][0]["state"], "cancelled", "{board}");
+    assert_eq!(board["cards"][0]["started_at"], Value::Null);
+}
+
+// A fire whose trigger is deleted between its read and its run's store holds
+// its run the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fire_racing_a_delete_holds_its_run() {
+    let jev = jev(&["complete"]).await;
+    let server = serve(forced(Forced::DeleteAfterPut), &jev, 14).await;
+    let user = fresh_user();
+    let agent = server.agent(&user, "digest", &[]).await;
+    let (_, created) = create(&server, &user, schedule(agent)).await;
+    let id = created["id"].as_str().expect("id").to_string();
+    assert_eq!(fire(&server, &user, &id).await, Fired::NotFound);
+    assert_eq!(server.work().await, None, "never pushed");
+    let (_, board) = server
+        .get(&format!("/v1/threads/trigger-{id}/board"), &user)
+        .await;
+    assert_eq!(board["cards"][0]["state"], "cancelled", "{board}");
+}
+
+// The cap and the insert are one step on each store: sixteen writers racing
+// for the last five places store exactly five. (A race, not a forced order:
+// each store holds one lock across the count and the insert, so there is no
+// point between them to force.)
+#[test]
+fn racing_creates_keep_the_cap() {
+    for store in stores() {
+        let owner = Owner::new(common::ISSUER, fresh_user(), "tenant-1");
+        let trigger = |n: i64| server::StoredTrigger {
+            id: TriggerId::new(),
+            owner: owner.clone(),
+            agent_id: protocol::AgentId::new(),
+            kind: server::TriggerKind::Schedule {
+                cron: "0 9 * * *".to_string(),
+                time_zone: "UTC".to_string(),
+            },
+            input: "x".to_string(),
+            placement: protocol::ExecutionPlacement::Local,
+            work_model: protocol::WorkModel {
+                provider: protocol::ModelProvider::OpenAI,
+                model_name: "gpt-test".to_string(),
+                credential: protocol::CredentialSource::PlatformGateway,
+            },
+            limits: None,
+            missed: server::Missed::RunOnceLate,
+            enabled: true,
+            next_fire_ms: None,
+            created_ms: n,
+        };
+        let most = server::MAX_TRIGGERS;
+        for n in 0..most - 5 {
+            let stored = store
+                .triggers()
+                .expect("triggers")
+                .put_trigger(&trigger(n as i64), most)
+                .expect("put");
+            assert!(stored);
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let racers: Vec<_> = (0..16)
+            .map(|n| {
+                let (store, barrier, trigger) = (store.clone(), barrier.clone(), trigger(1000 + n));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .triggers()
+                        .expect("triggers")
+                        .put_trigger(&trigger, most)
+                        .expect("put")
+                })
+            })
+            .collect();
+        let stored = racers
+            .into_iter()
+            .map(|racer| racer.join().expect("racer"))
+            .filter(|stored| *stored)
+            .count();
+        assert_eq!(stored, 5);
+        let kept = store
+            .triggers()
+            .expect("triggers")
+            .triggers_of(&owner)
+            .expect("list");
+        assert_eq!(kept.len(), most);
+    }
 }
 
 // Where a trigger cannot be made: a server without the run queue (its fires

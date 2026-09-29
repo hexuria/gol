@@ -4,11 +4,12 @@ use std::collections::BTreeMap;
 
 use protocol::{Limits, Owner, RunId, RunSpec, SESSION_ID};
 
+use std::cell::Cell;
+
 use harness::StoreError;
 
-use crate::inference::run_cancelled_event;
 use crate::queue::RedisRunQueue;
-use crate::spawner::{enqueue, EnqueueError, OnPushFailure};
+use crate::spawner::{enqueue_unless, EnqueueError, Gated, OnPushFailure};
 use crate::store::{RunStore, StoredTrigger, TriggerId, TriggerKind};
 
 /// The metadata key the server sets on a run a trigger started (decision
@@ -39,9 +40,9 @@ pub enum Fired {
 pub enum FireError {
     /// Nothing was stored: firing again is safe.
     NotStored(String),
-    /// The store failed after the run may have been stored; a stored run is
-    /// pending, and the queue sweep pushes it.
-    MaybeStored(String),
+    /// Run `run` may be stored. It was never pushed unless it was queued
+    /// before the failure; a caller that finds the trigger paused ends it.
+    MaybeStored { run: RunId, message: String },
 }
 
 /// Fires `owner`'s trigger `id` (decision 68A): an ordinary queued run of
@@ -50,11 +51,12 @@ pub enum FireError {
 /// way a child run is: pending before it is stored, and left to the queue
 /// sweep if the push fails. A paused trigger does not fire.
 ///
-/// The trigger is read again once the run is stored. A trigger paused in
-/// between (the owner's stop pauses before it records itself) has its run
-/// cancelled: without that, a run stored after the stop would escape it.
-/// A pause after that read comes before the stop, which then covers the
-/// run.
+/// The trigger is read again once the run is stored and before it is
+/// pushed. A trigger paused (the owner's stop pauses before it records
+/// itself) or deleted in between holds the run: it is cancelled before any
+/// worker can see it, and never pushed. A pause after that read comes
+/// before the stop's record, and the stop covers a run stored before it. A
+/// read that fails holds the run too.
 pub fn fire_trigger(
     store: &dyn RunStore,
     queue: &RedisRunQueue,
@@ -83,22 +85,39 @@ pub fn fire_trigger(
         agent.manifest.version,
         agent.manifest.required_capabilities,
     );
-    enqueue(store, queue, &spec, OnPushFailure::LeaveToSweep).map_err(|error| match error {
-        EnqueueError::Queue(error) => FireError::NotStored(error),
-        EnqueueError::Push(error) => FireError::MaybeStored(error),
-        EnqueueError::Store(error) => FireError::MaybeStored(error.to_string()),
-    })?;
-    let paused = triggers
-        .trigger(owner, id)
-        .map_err(|error| FireError::MaybeStored(error.to_string()))?
-        .is_some_and(|trigger| !trigger.enabled);
-    if paused {
-        store
-            .append_events(spec.run_id, vec![run_cancelled_event(&spec)])
-            .map_err(|error| FireError::MaybeStored(error.to_string()))?;
-        return Ok(Fired::Paused);
+    let run = spec.run_id;
+    // Why the run was held, if it was: `Err` for a read that failed.
+    let held: Cell<Option<Result<Fired, String>>> = Cell::new(None);
+    let hold = || {
+        let why = match triggers.trigger(owner, id) {
+            Ok(Some(trigger)) if trigger.enabled => return false,
+            Ok(Some(_)) => Ok(Fired::Paused),
+            Ok(None) => Ok(Fired::NotFound),
+            Err(error) => Err(error.to_string()),
+        };
+        held.set(Some(why));
+        true
+    };
+    let gated = enqueue_unless(store, queue, &spec, OnPushFailure::LeaveToSweep, &hold).map_err(
+        |error| match error {
+            EnqueueError::Queue(message) => FireError::NotStored(message),
+            EnqueueError::Push(message) | EnqueueError::Held(message) => {
+                FireError::MaybeStored { run, message }
+            }
+            EnqueueError::Store(error) => FireError::MaybeStored {
+                run,
+                message: error.to_string(),
+            },
+        },
+    )?;
+    match (gated, held.take()) {
+        (Gated::Held, Some(Err(message))) => Err(FireError::MaybeStored {
+            run,
+            message: format!("the trigger could not be read again, so the run was held: {message}"),
+        }),
+        (Gated::Held, Some(Ok(fired))) => Ok(fired),
+        _ => Ok(Fired::Run(run)),
     }
-    Ok(Fired::Run(spec.run_id))
 }
 
 /// The run a fire of `trigger` starts.
