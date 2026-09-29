@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use protocol::{
     applicable, authorize, fold, Actor, AgentId, DispatchPhase, Effect, Event, EventPayload,
-    ExecutionPlacement, FailureClass, HarnessState, InvocationId, Limits, MemoryScope,
+    ExecutionPlacement, FailureClass, HarnessState, InvocationId, Limits, MemoryScope, MessageId,
     PolicyDecision, RunSpec, RunState, Timestamp, ToolDescriptor, MAX_CHILDREN,
 };
 
 use crate::{
     AgentSpawner, ChildRequest, Decider, DeciderError, DecisionView, DelegateTarget, LoadedCatalog,
-    Memory, MemoryKey, ModelCompletion, Skill, StoreError, Tool,
+    Memory, MemoryKey, MessageDeliverer, MessageRequest, ModelCompletion, Skill, StoreError, Tool,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +32,7 @@ pub struct Driver {
     skills: Vec<Skill>,
     loaded: Option<Vec<Box<dyn Tool>>>,
     spawner: Option<Arc<dyn AgentSpawner>>,
+    deliverer: Option<Arc<dyn MessageDeliverer>>,
     targets: Vec<DelegateTarget>,
     /// Effects the log authorized and holds no result for, performed first
     /// by `run_until`: the tail of a step a resumed run was cut in.
@@ -55,6 +56,7 @@ impl Driver {
             skills: Vec::new(),
             loaded: None,
             spawner: None,
+            deliverer: None,
             targets: Vec::new(),
             pending: Vec::new(),
             undecided: None,
@@ -94,6 +96,7 @@ impl Driver {
             skills: Vec::new(),
             loaded: None,
             spawner: None,
+            deliverer: None,
             targets: Vec::new(),
             pending: Vec::new(),
             undecided: None,
@@ -159,6 +162,13 @@ impl Driver {
     /// Delegations this run is allowed to make start their children through
     /// `spawner`. Without one, they are refused. `targets` are the agents the
     /// decider is offered.
+    /// Messages this run is allowed to send are accepted by `deliverer`.
+    /// Without one, they are refused.
+    pub fn with_deliverer(mut self, deliverer: Arc<dyn MessageDeliverer>) -> Self {
+        self.deliverer = Some(deliverer);
+        self
+    }
+
     pub fn with_spawner(
         mut self,
         spawner: Arc<dyn AgentSpawner>,
@@ -466,6 +476,13 @@ impl Driver {
                     }
                 }
                 Effect::Delegate { agent_id, input } => self.delegate(*agent_id, input),
+                Effect::SendMessage {
+                    to,
+                    body,
+                    expects_reply,
+                    reply_to,
+                    timeout_secs,
+                } => self.send_message(*to, body, *expects_reply, *reply_to, *timeout_secs),
                 Effect::Complete { .. }
                 | Effect::Execute { .. }
                 | Effect::AskUser { .. }
@@ -583,6 +600,48 @@ impl Driver {
         self.push(payload, Actor::System);
     }
 
+    /// Hands a message to the deliverer and records what happened. An
+    /// accepted ask moves the harness to `WaitingForMessage`.
+    fn send_message(
+        &mut self,
+        to: AgentId,
+        body: &str,
+        expects_reply: bool,
+        reply_to: Option<MessageId>,
+        timeout_secs: Option<u32>,
+    ) {
+        let state = self.state();
+        // The decision that sent it: fold's count of decisions, the same
+        // when a resumed run performs it again.
+        let decision = matches!(state.harness, HarnessState::Running { .. }).then_some(state.steps);
+        let sent = decision
+            .ok_or_else(|| "the run is not running".to_string())
+            .and_then(|decision| {
+                let deliverer = self
+                    .deliverer
+                    .clone()
+                    .ok_or_else(|| "no message deliverer is configured".to_string())?;
+                deliverer.send(MessageRequest {
+                    from: &self.spec,
+                    decision,
+                    to,
+                    body,
+                    expects_reply,
+                    reply_to,
+                    timeout_secs,
+                })
+            });
+        let payload = match sent {
+            Ok(message_id) => EventPayload::MessageSent {
+                message_id,
+                to,
+                expects_reply,
+            },
+            Err(reason) => EventPayload::MessageRefused { to, reason },
+        };
+        self.push(payload, Actor::System);
+    }
+
     fn push(&mut self, payload: EventPayload, actor: Actor) {
         self.events.push(Event::record(
             protocol::EventSource::for_spec(&self.spec, actor, Timestamp::now()),
@@ -650,6 +709,15 @@ pub fn run_until(
             }
             Boundary::Pause => return Ok(()),
         }
+        // An ask waits for its reply: nothing more to decide until the run
+        // is resumed with it (or its timeout). Its events are at the
+        // boundary above.
+        if matches!(
+            driver.state().harness,
+            HarnessState::WaitingForMessage { .. }
+        ) {
+            return Ok(());
+        }
         let effects = driver.decide(decider, &descriptors)?;
         if effects.is_empty() {
             if driver.state().harness.is_terminal() {
@@ -669,6 +737,7 @@ fn describe(state: &HarnessState) -> &'static str {
         HarnessState::Running { answered: true, .. } => "running, answered",
         HarnessState::Running { .. } => "running",
         HarnessState::WaitingForTool { .. } => "waiting for a tool",
+        HarnessState::WaitingForMessage { .. } => "waiting for a reply",
         HarnessState::Completed { .. } | HarnessState::Failed { .. } | HarnessState::Cancelled => {
             "finished"
         }

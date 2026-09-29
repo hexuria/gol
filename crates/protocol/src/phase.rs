@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ApprovalId, InvocationId};
+use crate::{ApprovalId, InvocationId, MessageId};
 
 pub const MAX_RETRIES: u32 = 2;
 
@@ -10,6 +10,12 @@ pub const MAX_DELEGATION_HOPS: u32 = 8;
 
 /// How many child runs one run may start.
 pub const MAX_CHILDREN: u32 = 10;
+
+/// The largest message body, in bytes (decision 30A).
+pub const MAX_MESSAGE_BYTES: usize = 32 * 1024;
+
+/// The longest an ask may wait for its reply, in seconds (decision 28A).
+pub const MAX_ASK_TIMEOUT_SECS: u32 = 24 * 60 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HarnessState {
@@ -24,6 +30,13 @@ pub enum HarnessState {
         attempt: u32,
         name: String,
         invocation: InvocationId,
+    },
+    /// An ask was sent from this step, which waits for its reply (or its
+    /// timeout) before the run goes on (Phase 2).
+    WaitingForMessage {
+        step: u32,
+        attempt: u32,
+        message_id: MessageId,
     },
     Completed {
         outcome: String,

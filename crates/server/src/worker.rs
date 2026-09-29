@@ -486,6 +486,9 @@ impl Worker {
             return Ok(Stopped::LostLease);
         }
         let (spawner, targets) = self.delegation(spec);
+        // No message deliverer yet: every message is refused, so no run here
+        // waits for a reply. A waiting run needs park and wake (Phase 2.3,
+        // decision 35A).
         driver = driver.with_spawner(spawner, targets);
         let mut decider = match jev_client(&self.jev_base_url) {
             Ok(client) => JevDecider::new(client),

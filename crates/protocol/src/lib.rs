@@ -15,10 +15,13 @@ pub use authorizer::authorize;
 pub use effect::{memory_owner_id, Effect, MemoryScope, SESSION_ID, WORKSPACE_ID};
 pub use event::{Actor, Event, EventEnvelope, EventPayload, EventSource, Timestamp};
 pub use fold::{fold, RunState};
-pub use id::{AgentId, ApprovalId, ArtifactId, EventId, InvocationId, RunId, StepId, ToolId};
+pub use id::{
+    AgentId, ApprovalId, ArtifactId, EventId, InvocationId, MessageId, RunId, StepId, ToolId,
+};
 pub use model::{MessageRole, ModelMessage, ModelRequest, Usage};
 pub use phase::{
-    DispatchPhase, FailureClass, HarnessState, MAX_CHILDREN, MAX_DELEGATION_HOPS, MAX_RETRIES,
+    DispatchPhase, FailureClass, HarnessState, MAX_ASK_TIMEOUT_SECS, MAX_CHILDREN,
+    MAX_DELEGATION_HOPS, MAX_MESSAGE_BYTES, MAX_RETRIES,
 };
 pub use policy::PolicyDecision;
 pub use reduce::{applicable, reduce, reduce_dispatch, Effects};

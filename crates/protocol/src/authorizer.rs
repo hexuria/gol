@@ -1,12 +1,14 @@
 use crate::policy::PolicyDecision;
 use crate::{
-    memory_owner_id, Capability, Effect, MemoryScope, RunSpec, ToolDescriptor, MAX_DELEGATION_HOPS,
+    memory_owner_id, Capability, Effect, MemoryScope, RunSpec, ToolDescriptor,
+    MAX_ASK_TIMEOUT_SECS, MAX_DELEGATION_HOPS, MAX_MESSAGE_BYTES,
 };
 
 const MODEL_CALL: &str = "model.call";
 const MEMORY_READ: &str = "memory.read";
 const MEMORY_WRITE: &str = "memory.write";
 const AGENT_DELEGATE: &str = "agent.delegate";
+const AGENT_MESSAGE: &str = "agent.message";
 
 pub fn authorize(spec: &RunSpec, effect: &Effect, tools: &[ToolDescriptor]) -> PolicyDecision {
     match effect {
@@ -34,6 +36,10 @@ pub fn authorize(spec: &RunSpec, effect: &Effect, tools: &[ToolDescriptor]) -> P
             }
             decision => decision,
         },
+        Effect::SendMessage { .. } => match allow_capability(spec, AGENT_MESSAGE) {
+            PolicyDecision::Allow => check_message(spec, effect),
+            decision => decision,
+        },
         Effect::Execute { .. }
         | Effect::AskUser { .. }
         | Effect::RequestApproval { .. }
@@ -41,6 +47,42 @@ pub fn authorize(spec: &RunSpec, effect: &Effect, tools: &[ToolDescriptor]) -> P
         | Effect::PublishArtifact { .. } => PolicyDecision::Deny {
             reason: "effect is not implemented in this slice".to_string(),
         },
+    }
+}
+
+/// A message's bounds, once its capability is held. A tell or a new ask
+/// starts a task one hop further (decision 29A), so it obeys the hop cap; a
+/// reply adds no hop, unless it asks back, which opens a new ask. The body is at most `MAX_MESSAGE_BYTES` (30A), and
+/// only an ask has a timeout, from 1 second to `MAX_ASK_TIMEOUT_SECS` (28A).
+fn check_message(spec: &RunSpec, effect: &Effect) -> PolicyDecision {
+    let Effect::SendMessage {
+        body,
+        expects_reply,
+        reply_to,
+        timeout_secs,
+        ..
+    } = effect
+    else {
+        return PolicyDecision::Allow;
+    };
+    let deny = |reason: String| PolicyDecision::Deny { reason };
+    let starts_task = reply_to.is_none() || *expects_reply;
+    if starts_task && spec.lineage.hop >= MAX_DELEGATION_HOPS {
+        return deny(format!(
+            "messaging is already {MAX_DELEGATION_HOPS} hops deep"
+        ));
+    }
+    if body.len() > MAX_MESSAGE_BYTES {
+        return deny(format!(
+            "a message body is at most {MAX_MESSAGE_BYTES} bytes"
+        ));
+    }
+    match timeout_secs {
+        Some(_) if !expects_reply => deny("only an ask has a timeout".to_string()),
+        Some(seconds) if !(1..=MAX_ASK_TIMEOUT_SECS).contains(seconds) => deny(format!(
+            "an ask waits at most {MAX_ASK_TIMEOUT_SECS} seconds"
+        )),
+        _ => PolicyDecision::Allow,
     }
 }
 
@@ -116,6 +158,139 @@ mod tests {
 
         spec.capabilities.push(Capability::new("tool.echo"));
         assert_eq!(authorize(&spec, &effect, &tools), PolicyDecision::Allow);
+    }
+
+    fn message(expects_reply: bool, reply_to: bool) -> Effect {
+        Effect::SendMessage {
+            to: crate::AgentId::new(),
+            body: "hi".to_string(),
+            expects_reply,
+            reply_to: reply_to.then(crate::MessageId::new),
+            timeout_secs: None,
+        }
+    }
+
+    // Phase 2.2: a message needs agent.message.
+    #[test]
+    fn a_message_needs_its_capability() {
+        let mut spec = sample_spec();
+        for effect in [
+            message(false, false),
+            message(true, false),
+            message(false, true),
+        ] {
+            assert_eq!(
+                authorize(&spec, &effect, &[]),
+                PolicyDecision::Deny {
+                    reason: "missing capability: agent.message".to_string()
+                }
+            );
+        }
+        spec.capabilities.push(Capability::new("agent.message"));
+        for effect in [
+            message(false, false),
+            message(true, false),
+            message(false, true),
+        ] {
+            assert_eq!(authorize(&spec, &effect, &[]), PolicyDecision::Allow);
+        }
+    }
+
+    // A tell or a new ask starts a task one hop further (29A), so 8 hops
+    // deep they are refused; a reply adds no hop and still goes.
+    #[test]
+    fn a_message_that_starts_a_task_obeys_the_hop_cap_and_a_reply_does_not() {
+        let mut spec = sample_spec();
+        spec.capabilities.push(Capability::new("agent.message"));
+        spec.lineage.hop = MAX_DELEGATION_HOPS;
+        for effect in [message(false, false), message(true, false)] {
+            assert_eq!(
+                authorize(&spec, &effect, &[]),
+                PolicyDecision::Deny {
+                    reason: format!("messaging is already {MAX_DELEGATION_HOPS} hops deep")
+                }
+            );
+        }
+        assert_eq!(
+            authorize(&spec, &message(false, true), &[]),
+            PolicyDecision::Allow
+        );
+        // A reply that asks back opens a new ask, so the cap applies to it.
+        assert_eq!(
+            authorize(&spec, &message(true, true), &[]),
+            PolicyDecision::Deny {
+                reason: format!("messaging is already {MAX_DELEGATION_HOPS} hops deep")
+            }
+        );
+        spec.lineage.hop = MAX_DELEGATION_HOPS - 1;
+        assert_eq!(
+            authorize(&spec, &message(true, false), &[]),
+            PolicyDecision::Allow
+        );
+    }
+
+    // 30A: a body is at most 32 KiB; 28A: a timeout is on an ask, at most
+    // 24 hours.
+    #[test]
+    fn a_message_body_and_an_ask_timeout_are_bounded() {
+        let mut spec = sample_spec();
+        spec.capabilities.push(Capability::new("agent.message"));
+        let with =
+            |body: String, expects_reply: bool, timeout_secs: Option<u32>| Effect::SendMessage {
+                to: crate::AgentId::new(),
+                body,
+                expects_reply,
+                reply_to: None,
+                timeout_secs,
+            };
+        assert_eq!(
+            authorize(
+                &spec,
+                &with("x".repeat(MAX_MESSAGE_BYTES), false, None),
+                &[]
+            ),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            authorize(
+                &spec,
+                &with("x".repeat(MAX_MESSAGE_BYTES + 1), false, None),
+                &[]
+            ),
+            PolicyDecision::Deny {
+                reason: format!("a message body is at most {MAX_MESSAGE_BYTES} bytes")
+            }
+        );
+        assert_eq!(
+            authorize(
+                &spec,
+                &with("q".to_string(), true, Some(MAX_ASK_TIMEOUT_SECS)),
+                &[]
+            ),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            authorize(
+                &spec,
+                &with("q".to_string(), true, Some(MAX_ASK_TIMEOUT_SECS + 1)),
+                &[]
+            ),
+            PolicyDecision::Deny {
+                reason: format!("an ask waits at most {MAX_ASK_TIMEOUT_SECS} seconds")
+            }
+        );
+        assert_eq!(
+            authorize(&spec, &with("q".to_string(), true, Some(0)), &[]),
+            PolicyDecision::Deny {
+                reason: format!("an ask waits at most {MAX_ASK_TIMEOUT_SECS} seconds")
+            }
+        );
+        assert_eq!(
+            authorize(&spec, &with("t".to_string(), false, Some(60)), &[]),
+            PolicyDecision::Deny {
+                reason: "only an ask has a timeout".to_string()
+            }
+        );
     }
 
     fn delegate() -> Effect {

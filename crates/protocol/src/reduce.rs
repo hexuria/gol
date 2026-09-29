@@ -99,6 +99,30 @@ pub fn reduce(state: HarnessState, event: &Event, spec: &RunSpec) -> (HarnessSta
             }
             _ => (state, Vec::new()),
         },
+        EventPayload::MessageSent {
+            message_id,
+            expects_reply: true,
+            ..
+        } => match state {
+            HarnessState::Running {
+                step,
+                attempt,
+                answered: false,
+            } => (
+                HarnessState::WaitingForMessage {
+                    step,
+                    attempt,
+                    message_id: *message_id,
+                },
+                Vec::new(),
+            ),
+            other => (other, Vec::new()),
+        },
+        EventPayload::MessageReceived {
+            reply_to: Some(reply_to),
+            ..
+        } => answer_ask(state, *reply_to),
+        EventPayload::AskTimedOut { message_id } => answer_ask(state, *message_id),
         EventPayload::StepRetried => match state {
             HarnessState::Running {
                 step,
@@ -139,7 +163,9 @@ pub fn reduce(state: HarnessState, event: &Event, spec: &RunSpec) -> (HarnessSta
             other => (other, Vec::new()),
         },
         EventPayload::RunFailed { class, message } => match state {
-            HarnessState::Running { .. } | HarnessState::WaitingForTool { .. } => (
+            HarnessState::Running { .. }
+            | HarnessState::WaitingForTool { .. }
+            | HarnessState::WaitingForMessage { .. } => (
                 HarnessState::Failed {
                     class: *class,
                     message: message.clone(),
@@ -149,13 +175,15 @@ pub fn reduce(state: HarnessState, event: &Event, spec: &RunSpec) -> (HarnessSta
             other => (other, Vec::new()),
         },
         EventPayload::RunCancelled => match state {
-            HarnessState::Running { .. } | HarnessState::WaitingForTool { .. } => {
-                (HarnessState::Cancelled, Vec::new())
-            }
+            HarnessState::Running { .. }
+            | HarnessState::WaitingForTool { .. }
+            | HarnessState::WaitingForMessage { .. } => (HarnessState::Cancelled, Vec::new()),
             other => (other, Vec::new()),
         },
         EventPayload::RunExpired => match state {
-            HarnessState::Running { .. } | HarnessState::WaitingForTool { .. } => (
+            HarnessState::Running { .. }
+            | HarnessState::WaitingForTool { .. }
+            | HarnessState::WaitingForMessage { .. } => (
                 HarnessState::Failed {
                     class: FailureClass::Timeout,
                     message: "run expired".to_string(),
@@ -181,7 +209,10 @@ pub fn reduce(state: HarnessState, event: &Event, spec: &RunSpec) -> (HarnessSta
         | EventPayload::MemoryRead { .. }
         | EventPayload::MemoryWritten { .. }
         | EventPayload::ChildStarted { .. }
-        | EventPayload::DelegateRefused { .. } => (state, Vec::new()),
+        | EventPayload::DelegateRefused { .. }
+        | EventPayload::MessageSent { .. }
+        | EventPayload::MessageRefused { .. }
+        | EventPayload::MessageReceived { .. } => (state, Vec::new()),
     }
 }
 
@@ -200,11 +231,34 @@ pub fn applicable(state: &HarnessState, effect: &Effect, spec: &RunSpec) -> bool
         | Effect::MemoryRead { .. }
         | Effect::MemoryWrite { .. }
         | Effect::Delegate { .. } => true,
+        // A tell passes through any running step; an ask needs a step the
+        // reply can answer.
+        Effect::SendMessage { expects_reply, .. } => !(*expects_reply && *answered),
         Effect::Execute { .. }
         | Effect::AskUser { .. }
         | Effect::RequestApproval { .. }
         | Effect::Wait { .. }
         | Effect::PublishArtifact { .. } => false,
+    }
+}
+
+/// The reply to, or the timeout of, the ask `message_id` answers the step
+/// that is waiting on it. Anything else leaves the state as it is.
+fn answer_ask(state: HarnessState, message_id: crate::MessageId) -> (HarnessState, Effects) {
+    match state {
+        HarnessState::WaitingForMessage {
+            step,
+            attempt,
+            message_id: waiting,
+        } if waiting == message_id => (
+            HarnessState::Running {
+                step,
+                attempt,
+                answered: true,
+            },
+            Vec::new(),
+        ),
+        other => (other, Vec::new()),
     }
 }
 
@@ -244,7 +298,7 @@ mod tests {
     use crate::spec::sample_spec;
     use crate::{
         Actor, AgentId, Capability, CredentialSource, Event, EventSource, ExecutionPlacement,
-        FailureClass, InvocationId, Limits, ModelProvider, RunSpec, Timestamp, WorkModel,
+        FailureClass, InvocationId, Limits, ModelProvider, RunId, RunSpec, Timestamp, WorkModel,
     };
     use proptest::prelude::*;
     use uuid::Uuid;
@@ -322,6 +376,180 @@ mod tests {
         assert_eq!(effects, vec![delegate.clone()]);
         let waiting = echo_wait(2, 0);
         assert!(!applicable(&waiting, &delegate, &spec));
+    }
+
+    fn message_id(n: u128) -> crate::MessageId {
+        crate::MessageId::from_uuid(Uuid::from_u128(n))
+    }
+
+    fn send(expects_reply: bool) -> Effect {
+        Effect::SendMessage {
+            to: AgentId::from_uuid(Uuid::from_u128(9)),
+            body: "hi".to_string(),
+            expects_reply,
+            reply_to: None,
+            timeout_secs: None,
+        }
+    }
+
+    fn running(answered: bool) -> HarnessState {
+        HarnessState::Running {
+            step: 2,
+            attempt: 1,
+            answered,
+        }
+    }
+
+    fn waiting_for(n: u128) -> HarnessState {
+        HarnessState::WaitingForMessage {
+            step: 2,
+            attempt: 1,
+            message_id: message_id(n),
+        }
+    }
+
+    // Phase 2.2: an authorized message passes through a running step, as a
+    // delegation does; an ask only from a step not yet answered, since the
+    // reply answers it.
+    #[test]
+    fn an_authorized_message_passes_through_and_an_ask_needs_an_open_step() {
+        let spec = sample_spec();
+        for (effect, answered, acts) in [
+            (send(false), false, true),
+            (send(false), true, true),
+            (send(true), false, true),
+            (send(true), true, false),
+        ] {
+            assert_eq!(applicable(&running(answered), &effect, &spec), acts);
+            let (next, effects) = reduce(
+                running(answered),
+                &ev(EventPayload::EffectAuthorized {
+                    effect: effect.clone(),
+                }),
+                &spec,
+            );
+            assert_eq!(next, running(answered));
+            assert_eq!(effects, if acts { vec![effect] } else { Vec::new() });
+        }
+        assert!(!applicable(&waiting_for(1), &send(false), &spec));
+    }
+
+    // A sent ask waits for its reply; a sent tell does not.
+    #[test]
+    fn a_sent_ask_waits_for_its_reply() {
+        let spec = sample_spec();
+        let sent = |expects_reply| {
+            ev(EventPayload::MessageSent {
+                message_id: message_id(1),
+                to: AgentId::from_uuid(Uuid::from_u128(9)),
+                expects_reply,
+            })
+        };
+        assert_eq!(reduce(running(false), &sent(true), &spec).0, waiting_for(1));
+        assert_eq!(
+            reduce(running(false), &sent(false), &spec).0,
+            running(false)
+        );
+        // An answered step cannot ask (see `applicable`), so a sent ask there
+        // changes nothing.
+        assert_eq!(reduce(running(true), &sent(true), &spec).0, running(true));
+    }
+
+    // Only the reply to the ask, or the ask's timeout, answers the step.
+    #[test]
+    fn the_reply_or_the_timeout_answers_the_asking_step() {
+        let spec = sample_spec();
+        let received = |reply_to| {
+            ev(EventPayload::MessageReceived {
+                message_id: message_id(7),
+                from_agent: AgentId::from_uuid(Uuid::from_u128(9)),
+                from_run: RunId::from_uuid(Uuid::from_u128(10)),
+                body: "answer".to_string(),
+                reply_to,
+            })
+        };
+        assert_eq!(
+            reduce(waiting_for(1), &received(Some(message_id(1))), &spec).0,
+            running(true)
+        );
+        assert_eq!(
+            reduce(waiting_for(1), &received(Some(message_id(2))), &spec).0,
+            waiting_for(1)
+        );
+        assert_eq!(
+            reduce(waiting_for(1), &received(None), &spec).0,
+            waiting_for(1)
+        );
+        assert_eq!(
+            reduce(running(false), &received(Some(message_id(1))), &spec).0,
+            running(false)
+        );
+        let timed_out = |n| {
+            ev(EventPayload::AskTimedOut {
+                message_id: message_id(n),
+            })
+        };
+        assert_eq!(
+            reduce(waiting_for(1), &timed_out(1), &spec).0,
+            running(true)
+        );
+        assert_eq!(
+            reduce(waiting_for(1), &timed_out(2), &spec).0,
+            waiting_for(1)
+        );
+    }
+
+    // A waiting ask ends like a waiting tool call.
+    #[test]
+    fn a_waiting_ask_can_fail_be_cancelled_or_expire_but_not_complete() {
+        let spec = sample_spec();
+        assert_eq!(
+            reduce(waiting_for(1), &ev(EventPayload::RunCancelled), &spec).0,
+            HarnessState::Cancelled
+        );
+        assert!(matches!(
+            reduce(
+                waiting_for(1),
+                &ev(EventPayload::RunFailed {
+                    class: FailureClass::Dependency,
+                    message: "m".to_string()
+                }),
+                &spec
+            )
+            .0,
+            HarnessState::Failed { .. }
+        ));
+        assert!(matches!(
+            reduce(waiting_for(1), &ev(EventPayload::RunExpired), &spec).0,
+            HarnessState::Failed {
+                class: FailureClass::Timeout,
+                ..
+            }
+        ));
+        assert_eq!(
+            reduce(
+                waiting_for(1),
+                &ev(EventPayload::RunCompleted {
+                    outcome: "done".to_string()
+                }),
+                &spec
+            )
+            .0,
+            waiting_for(1)
+        );
+        // A refused message changes nothing.
+        assert_eq!(
+            reduce(
+                running(false),
+                &ev(EventPayload::MessageRefused {
+                    to: AgentId::from_uuid(Uuid::from_u128(9)),
+                    reason: "no".to_string()
+                }),
+                &spec
+            )
+            .0,
+            running(false)
+        );
     }
 
     // What the driver records about a delegation changes neither state.

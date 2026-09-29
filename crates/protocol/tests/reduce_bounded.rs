@@ -16,8 +16,8 @@
 use protocol::{
     applicable, reduce, reduce_dispatch, Actor, AgentId, ApprovalId, ArtifactId, CredentialSource,
     DispatchPhase, Effect, Event, EventPayload, EventSource, ExecutionPlacement, FailureClass,
-    HarnessState, InvocationId, Limits, MemoryScope, MessageRole, ModelMessage, ModelProvider,
-    RunId, RunSpec, Timestamp, WorkModel, MAX_RETRIES,
+    HarnessState, InvocationId, Limits, MemoryScope, MessageId, MessageRole, ModelMessage,
+    ModelProvider, RunId, RunSpec, Timestamp, WorkModel, MAX_RETRIES,
 };
 use uuid::Uuid;
 
@@ -31,6 +31,25 @@ fn invocation() -> InvocationId {
 
 fn other_invocation() -> InvocationId {
     InvocationId::from_uuid(Uuid::from_u128(2))
+}
+
+/// The ask the harness waits on, and another.
+fn message() -> MessageId {
+    MessageId::from_uuid(Uuid::from_u128(11))
+}
+
+fn other_message() -> MessageId {
+    MessageId::from_uuid(Uuid::from_u128(12))
+}
+
+fn send(expects_reply: bool, reply_to: Option<MessageId>) -> Effect {
+    Effect::SendMessage {
+        to: AgentId::from_uuid(Uuid::from_u128(5)),
+        body: "b".to_string(),
+        expects_reply,
+        reply_to,
+        timeout_secs: None,
+    }
 }
 
 fn spec(max_steps: u32) -> RunSpec {
@@ -149,8 +168,11 @@ fn effects() -> Vec<Effect> {
         Effect::Complete {
             outcome: "by effect".to_string(),
         },
+        send(false, None),
+        send(true, None),
+        send(false, Some(other_message())),
     ];
-    assert_covers(all.iter().map(effect_index), 11);
+    assert_covers(all.iter().map(effect_index), 12);
     all
 }
 
@@ -167,6 +189,7 @@ fn effect_index(effect: &Effect) -> usize {
         Effect::Wait { .. } => 8,
         Effect::PublishArtifact { .. } => 9,
         Effect::Complete { .. } => 10,
+        Effect::SendMessage { .. } => 11,
     }
 }
 
@@ -238,7 +261,30 @@ fn payloads(max_steps: u32) -> Vec<EventPayload> {
             agent_id: AgentId::from_uuid(Uuid::from_u128(8)),
             reason: "no".to_string(),
         },
+        EventPayload::MessageRefused {
+            to: AgentId::from_uuid(Uuid::from_u128(5)),
+            reason: "no".to_string(),
+        },
     ];
+    for expects_reply in [false, true] {
+        all.push(EventPayload::MessageSent {
+            message_id: message(),
+            to: AgentId::from_uuid(Uuid::from_u128(5)),
+            expects_reply,
+        });
+    }
+    for reply_to in [Some(message()), Some(other_message()), None] {
+        all.push(EventPayload::MessageReceived {
+            message_id: MessageId::from_uuid(Uuid::from_u128(13)),
+            from_agent: AgentId::from_uuid(Uuid::from_u128(5)),
+            from_run: RunId::from_uuid(Uuid::from_u128(14)),
+            body: "r".to_string(),
+            reply_to,
+        });
+    }
+    for message_id in [message(), other_message()] {
+        all.push(EventPayload::AskTimedOut { message_id });
+    }
     for class in classes() {
         all.push(EventPayload::RunFailed {
             class,
@@ -266,7 +312,7 @@ fn payloads(max_steps: u32) -> Vec<EventPayload> {
             all.push(tool_result(TOOL, invocation(), step, attempt + 1));
         }
     }
-    assert_covers(all.iter().map(payload_index), 27);
+    assert_covers(all.iter().map(payload_index), 31);
     all
 }
 
@@ -299,6 +345,10 @@ fn payload_index(payload: &EventPayload) -> usize {
         EventPayload::MemoryWritten { .. } => 24,
         EventPayload::ChildStarted { .. } => 25,
         EventPayload::DelegateRefused { .. } => 26,
+        EventPayload::MessageSent { .. } => 27,
+        EventPayload::MessageRefused { .. } => 28,
+        EventPayload::MessageReceived { .. } => 29,
+        EventPayload::AskTimedOut { .. } => 30,
     }
 }
 
@@ -336,6 +386,15 @@ fn harness_states(max_steps: u32) -> Vec<HarnessState> {
             }
         }
     }
+    for step in 1..=max_steps.max(1) {
+        for attempt in 0..=MAX_RETRIES {
+            all.push(HarnessState::WaitingForMessage {
+                step,
+                attempt,
+                message_id: message(),
+            });
+        }
+    }
     for step in 1..=max_steps {
         for attempt in 0..=MAX_RETRIES {
             all.push(HarnessState::WaitingForTool {
@@ -352,7 +411,8 @@ fn harness_states(max_steps: u32) -> Vec<HarnessState> {
 /// The validity the Lean model called `Valid`, over the Rust state.
 fn valid(state: &HarnessState, max_steps: u32) -> bool {
     match state {
-        HarnessState::Running { step, attempt, .. } => {
+        HarnessState::Running { step, attempt, .. }
+        | HarnessState::WaitingForMessage { step, attempt, .. } => {
             (1..=max_steps.max(1)).contains(step) && *attempt <= MAX_RETRIES
         }
         HarnessState::WaitingForTool { step, attempt, .. } => {
@@ -366,8 +426,8 @@ fn valid(state: &HarnessState, max_steps: u32) -> bool {
 }
 
 /// Lexicographic: terminal < running or waiting < idle. Among active states,
-/// fewer steps left, then fewer retries left, then answered < waiting <
-/// unanswered.
+/// fewer steps left, then fewer retries left, then answered < waiting (for a
+/// tool or a reply) < unanswered.
 fn rank(state: &HarnessState, max_steps: u32) -> (u8, i64, i64, u8) {
     let left = |step: u32, attempt: u32| {
         (
@@ -388,7 +448,8 @@ fn rank(state: &HarnessState, max_steps: u32) -> (u8, i64, i64, u8) {
             let (steps, retries) = left(*step, *attempt);
             (1, steps, retries, if *answered { 1 } else { 3 })
         }
-        HarnessState::WaitingForTool { step, attempt, .. } => {
+        HarnessState::WaitingForTool { step, attempt, .. }
+        | HarnessState::WaitingForMessage { step, attempt, .. } => {
             let (steps, retries) = left(*step, *attempt);
             (1, steps, retries, 2)
         }
@@ -453,9 +514,31 @@ fn may_change(state: &HarnessState, payload: &EventPayload, max_steps: u32) -> b
             },
             P::StepAdvanced,
         ) => *step < max_steps,
+        (
+            H::Running {
+                answered: false, ..
+            },
+            P::MessageSent {
+                expects_reply: true,
+                ..
+            },
+        ) => true,
+        (
+            H::WaitingForMessage { message_id, .. },
+            P::MessageReceived {
+                reply_to: Some(reply_to),
+                ..
+            },
+        ) => message_id == reply_to,
+        (
+            H::WaitingForMessage { message_id, .. },
+            P::AskTimedOut {
+                message_id: timed_out,
+            },
+        ) => message_id == timed_out,
         (H::Running { .. }, P::RunCompleted { .. }) => true,
         (
-            H::Running { .. } | H::WaitingForTool { .. },
+            H::Running { .. } | H::WaitingForTool { .. } | H::WaitingForMessage { .. },
             P::RunFailed { .. } | P::RunCancelled | P::RunExpired,
         ) => true,
         _ => false,
@@ -486,11 +569,22 @@ fn expected_next(state: &HarnessState, payload: &EventPayload) -> HarnessState {
             },
             other => panic!("no change expected for {other:?}"),
         },
-        (H::WaitingForTool { step, attempt, .. }, P::ToolResult { .. }) => H::Running {
+        (H::WaitingForTool { step, attempt, .. }, P::ToolResult { .. })
+        | (
+            H::WaitingForMessage { step, attempt, .. },
+            P::MessageReceived { .. } | P::AskTimedOut { .. },
+        ) => H::Running {
             step: *step,
             attempt: *attempt,
             answered: true,
         },
+        (H::Running { step, attempt, .. }, P::MessageSent { message_id, .. }) => {
+            H::WaitingForMessage {
+                step: *step,
+                attempt: *attempt,
+                message_id: *message_id,
+            }
+        }
         (H::Running { step, attempt, .. }, P::StepRetried) => H::Running {
             step: *step,
             attempt: attempt + 1,
@@ -517,9 +611,10 @@ fn expected_next(state: &HarnessState, payload: &EventPayload) -> HarnessState {
     }
 }
 
-/// The exact effects of every pair. An authorized model call, memory access
-/// or delegation passes through from any running step; an authorized tool
-/// call only from an unanswered step inside the budget. Nothing else emits.
+/// The exact effects of every pair. An authorized model call, memory access,
+/// delegation or tell passes through from any running step; an authorized
+/// ask only from an unanswered step; an authorized tool call only from an
+/// unanswered step inside the budget. Nothing else emits.
 fn expected_effects(state: &HarnessState, payload: &EventPayload, max_steps: u32) -> Vec<Effect> {
     let (HarnessState::Running { step, answered, .. }, EventPayload::EffectAuthorized { effect }) =
         (state, payload)
@@ -532,6 +627,7 @@ fn expected_effects(state: &HarnessState, payload: &EventPayload, max_steps: u32
         | Effect::MemoryRead { .. }
         | Effect::MemoryWrite { .. }
         | Effect::Delegate { .. } => true,
+        Effect::SendMessage { expects_reply, .. } => !(*expects_reply && *answered),
         Effect::Execute { .. }
         | Effect::AskUser { .. }
         | Effect::RequestApproval { .. }
