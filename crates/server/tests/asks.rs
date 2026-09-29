@@ -9,8 +9,8 @@ use std::sync::Arc;
 use harness::{AgentSpawner, ChildRequest, InMemory, MessageDeliverer, MessageRequest};
 use protocol::{
     Actor, AgentId, Capability, CredentialSource, Event, EventPayload, EventSource,
-    ExecutionPlacement, Limits, MessageId, MessageRole, ModelMessage, ModelProvider, Owner, RunId,
-    RunSpec, Timestamp, WorkModel,
+    ExecutionPlacement, FailureClass, Limits, MessageId, MessageRole, ModelMessage, ModelProvider,
+    Owner, RunId, RunSpec, Timestamp, WorkModel,
 };
 use serde_json::json;
 use server::{
@@ -1103,22 +1103,71 @@ fn a_reply_before_its_ask_is_logged_is_refused_and_retried() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_task_answers_with_its_last_model_response() {
     let max = protocol::MAX_MESSAGE_BYTES;
+    let completed = || EventPayload::RunCompleted {
+        outcome: "done".to_string(),
+    };
+    let assistant = MessageRole::Assistant;
+    // (the last response's role and text, how the task ended, the answer)
     let cases = [
         (
+            assistant,
             "the plan is to ship on Friday".to_string(),
+            completed(),
             "the plan is to ship on Friday".to_string(),
         ),
-        // An empty response answers nothing: the one before it does.
-        (String::new(), "a first thought".to_string()),
-        ("a".repeat(max), "a".repeat(max)),
-        ("a".repeat(max + 1), "a".repeat(max)),
+        // An empty, blank or non-assistant response answers nothing: the
+        // one before it does.
+        (
+            assistant,
+            String::new(),
+            completed(),
+            "a first thought".to_string(),
+        ),
+        (
+            assistant,
+            " \n\t".to_string(),
+            completed(),
+            "a first thought".to_string(),
+        ),
+        (
+            MessageRole::User,
+            "not an answer".to_string(),
+            completed(),
+            "a first thought".to_string(),
+        ),
+        (assistant, "a".repeat(max), completed(), "a".repeat(max)),
+        (assistant, "a".repeat(max + 1), completed(), "a".repeat(max)),
         // 1 + 2 * 20,000 bytes: the cap falls inside a two-byte character.
         (
+            assistant,
             format!("a{}", "é".repeat(20_000)),
+            completed(),
             format!("a{}", "é".repeat((max - 1) / 2)),
         ),
+        // A task that did not complete says so, whatever it answered before.
+        (
+            assistant,
+            "almost".to_string(),
+            EventPayload::RunFailed {
+                class: FailureClass::Dependency,
+                message: "decider: down".to_string(),
+            },
+            "the task failed: decider: down".to_string(),
+        ),
+        (
+            assistant,
+            "almost".to_string(),
+            EventPayload::RunCancelled,
+            "the task was cancelled".to_string(),
+        ),
+        (
+            assistant,
+            "almost".to_string(),
+            EventPayload::RunExpired,
+            "the task expired".to_string(),
+        ),
     ];
-    for (which, (text, expected)) in cases
+    for (which, (role, text, end, expected)) in cases
         .into_iter()
         .flat_map(|case| [(0, case.clone()), (1, case)])
     {
@@ -1139,9 +1188,9 @@ async fn a_task_answers_with_its_last_model_response() {
                     payload,
                 )
             };
-            let reply = |text: &str| EventPayload::ModelResponded {
+            let reply = |role: MessageRole, text: &str| EventPayload::ModelResponded {
                 message: ModelMessage {
-                    role: MessageRole::Assistant,
+                    role,
                     text: text.to_string(),
                 },
                 usage: None,
@@ -1151,11 +1200,9 @@ async fn a_task_answers_with_its_last_model_response() {
                 .append_events(
                     task,
                     vec![
-                        record(reply("a first thought")),
-                        record(reply(&text)),
-                        record(EventPayload::RunCompleted {
-                            outcome: "done".to_string(),
-                        }),
+                        record(reply(MessageRole::Assistant, "a first thought")),
+                        record(reply(role, &text)),
+                        record(end),
                     ],
                 )
                 .expect("append");
