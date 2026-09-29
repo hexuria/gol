@@ -135,16 +135,16 @@ pub fn router_with_queue(
     redis_url: Option<String>,
     auth: Arc<dyn Authenticator>,
 ) -> Router {
-    router_with_parts(
+    router_with_state(AppState {
         store,
-        Arc::new(InMemory::default()),
-        jev_base_url,
-        Arc::new(ModelsConfig::default()),
-        redis_url,
-        Arc::new(HttpGatewayPoster::from_env()),
-        sandbox_from_env(),
+        memory: Arc::new(InMemory::default()),
+        jev_base_url: jev_base_url.into(),
+        models: Arc::new(ModelsConfig::default()),
+        queue: redis_url.map(open_queue),
+        poster: Arc::new(HttpGatewayPoster::from_env()),
+        sandbox: sandbox_from_env(),
         auth,
-    )
+    })
 }
 
 pub fn router_with_gateway(
@@ -163,16 +163,16 @@ pub fn router_with_sandbox(
     sandbox: Arc<dyn SandboxHost>,
     auth: Arc<dyn Authenticator>,
 ) -> Router {
-    router_with_parts(
+    router_with_state(AppState {
         store,
-        Arc::new(InMemory::default()),
-        jev_base_url,
-        Arc::new(ModelsConfig::default()),
-        None,
+        memory: Arc::new(InMemory::default()),
+        jev_base_url: jev_base_url.into(),
+        models: Arc::new(ModelsConfig::default()),
+        queue: None,
         poster,
         sandbox,
         auth,
-    )
+    })
 }
 
 /// The server's router: runs in `store`, and every run's memory in `memory`,
@@ -188,29 +188,24 @@ pub fn router_with_memory(
     models: Arc<ModelsConfig>,
     auth: Arc<dyn Authenticator>,
 ) -> Router {
-    router_with_parts(
+    router_with_state(AppState {
         store,
         memory,
-        jev_base_url,
+        jev_base_url: jev_base_url.into(),
         models,
-        redis_url,
+        queue: redis_url.map(open_queue),
         poster,
-        sandbox_from_env(),
+        sandbox: sandbox_from_env(),
         auth,
-    )
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn router_with_parts(
-    store: Arc<dyn RunStore>,
-    memory: Arc<dyn Memory>,
-    jev_base_url: impl Into<String>,
-    models: Arc<ModelsConfig>,
-    redis_url: Option<String>,
-    poster: SharedPoster,
-    sandbox: Arc<dyn SandboxHost>,
-    auth: Arc<dyn Authenticator>,
-) -> Router {
+/// The run queue at `redis_url`, one connection shared by every request.
+fn open_queue(redis_url: String) -> Arc<RedisRunQueue> {
+    Arc::new(RedisRunQueue::open(redis_url))
+}
+
+fn router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/v1/agents", post(create_agent))
         .route("/v1/runs", post(create_run))
@@ -224,16 +219,7 @@ fn router_with_parts(
             post(complete_coworker_turn),
         )
         .route("/v1/coworker/turns/{id}/fail", post(fail_coworker_turn))
-        .with_state(AppState {
-            store,
-            memory,
-            jev_base_url: jev_base_url.into(),
-            models,
-            queue: redis_url.map(|url| Arc::new(RedisRunQueue::open(url))),
-            poster,
-            sandbox,
-            auth,
-        })
+        .with_state(state)
 }
 
 /// The caller, from a bearer token the server's authenticator accepted.
