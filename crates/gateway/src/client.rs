@@ -129,12 +129,13 @@ impl<T: HttpTransport> GatewayClient<Set, Set, T> {
         }
         let key = match credential {
             CredentialSource::BringYourOwn { .. } => return Err(GatewayError::BringYourOwn),
-            // A key with a control character (a line break) would split
-            // the request's headers.
+            // Only visible ASCII: anything else (a line break, a space, a
+            // non-ASCII byte) ureq either refuses with the key in its error
+            // or would write into the headers.
             CredentialSource::PlatformGateway => self
                 .api_key
                 .as_deref()
-                .filter(|key| !key.is_empty() && !key.chars().any(char::is_control))
+                .filter(|key| !key.is_empty() && key.bytes().all(|b| (0x21..=0x7e).contains(&b)))
                 .ok_or(GatewayError::NotConfigured(provider))?,
         };
         let base = self.base_url.trim_end_matches('/');

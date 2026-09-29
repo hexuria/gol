@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use gateway::{GatewayClient, GatewayError, HttpTransport, ModelGateway, UreqTransport};
 use protocol::{CredentialSource, MessageRole, ModelProvider, ModelRequest, Usage};
 use serde_json::{json, Value};
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[test]
@@ -210,18 +210,124 @@ fn a_gemini_model_name_with_a_colon_is_refused() {
     );
 }
 
-// A key with a line break would split the request's headers.
+// A key ureq would not put in a header (a line break, a space, anything
+// outside visible ASCII) is refused before any HTTP, and the error does not
+// repeat it.
 #[test]
 fn a_key_with_a_line_break_is_refused_before_http() {
-    for key in ["key\r\nx-evil: 1", "key\n", "\rkey"] {
-        let error = GatewayClient::with_transport(NoHttp)
-            .provider(ModelProvider::Anthropic)
-            .credential(CredentialSource::PlatformGateway)
-            .api_key(key)
-            .complete(&request(ModelProvider::Anthropic))
-            .expect_err("refused");
-        assert!(matches!(error, GatewayError::NotConfigured(_)), "{key:?}");
+    for kind in PROVIDERS {
+        for key in [
+            "key\r\nx-evil: 1",
+            "key\n",
+            "\rkey",
+            "sk-live-\u{e9}-do-not-log",
+            "sk live",
+            "sk\tlive",
+        ] {
+            let error = GatewayClient::with_transport(NoHttp)
+                .provider(kind)
+                .credential(CredentialSource::PlatformGateway)
+                .api_key(key)
+                .base_url("http://127.0.0.1:9")
+                .complete(&request(kind))
+                .expect_err("refused");
+            assert!(
+                matches!(error, GatewayError::NotConfigured(_)),
+                "{kind:?} {key:?}"
+            );
+            assert!(!error.to_string().contains("live"), "{error}");
+        }
     }
+}
+
+// The allow-list keeps the ids real models have: Gemini's dotted names, and
+// OpenAI fine-tunes with colons.
+#[test]
+fn a_dotted_gemini_id_and_a_colon_openai_id_are_sent() {
+    let text = "ok";
+    let (_, (name, value), body) = case(ModelProvider::Gemini, text);
+    let gemini = provider(
+        "/v1beta/models/gemini-2.0-flash:generateContent",
+        Some((name, &value)),
+        ResponseTemplate::new(200).set_body_json(body),
+    );
+    let completion = GatewayClient::new()
+        .provider(ModelProvider::Gemini)
+        .credential(CredentialSource::PlatformGateway)
+        .api_key("key-test")
+        .base_url(&gemini.uri)
+        .complete(&ModelRequest {
+            provider: ModelProvider::Gemini,
+            model_name: "gemini-2.0-flash".to_string(),
+            prompt: "ping".to_string(),
+        })
+        .expect("a dotted Gemini id");
+    assert_eq!(completion.message.text, text);
+
+    let fine_tune = "ft:gpt-4o-mini:org:custom:abc123";
+    let (route, (name, value), body) = case(ModelProvider::OpenAI, text);
+    let openai = provider_with_body(
+        route,
+        (name, &value),
+        json!({"model": fine_tune}),
+        ResponseTemplate::new(200).set_body_json(body),
+    );
+    let completion = GatewayClient::new()
+        .provider(ModelProvider::OpenAI)
+        .credential(CredentialSource::PlatformGateway)
+        .api_key("key-test")
+        .base_url(&openai.uri)
+        .complete(&ModelRequest {
+            provider: ModelProvider::OpenAI,
+            model_name: fine_tune.to_string(),
+            prompt: "ping".to_string(),
+        })
+        .expect("a colon OpenAI id");
+    assert_eq!(completion.message.text, text);
+}
+
+// Review of #70: a redirect is not followed. ureq would keep x-api-key and
+// x-goog-api-key on the next request and parse its body as the completion;
+// a 3xx is a transport error, and the Location is never asked.
+#[test]
+fn a_redirect_is_not_followed() {
+    for kind in [ModelProvider::Anthropic, ModelProvider::Gemini] {
+        let (route, _, _) = case(kind, "");
+        let mock = redirecting(route);
+        let error = GatewayClient::new()
+            .provider(kind)
+            .credential(CredentialSource::PlatformGateway)
+            .api_key("key-test")
+            .base_url(&mock.uri)
+            .complete(&request(kind))
+            .expect_err("a redirect");
+        assert!(
+            matches!(error, GatewayError::Transport(_)),
+            "{kind:?}: {error}"
+        );
+        assert_eq!(mock.collected(), 0, "{kind:?} followed the redirect");
+    }
+}
+
+// A connect that does not complete is cut at the timeout too (192.0.2.1 is
+// TEST-NET-1, which nothing answers).
+#[test]
+fn a_connect_that_hangs_is_cut_at_the_timeout() {
+    let started = Instant::now();
+    let error =
+        GatewayClient::with_transport(UreqTransport::with_timeout(Duration::from_millis(300)))
+            .provider(ModelProvider::OpenAI)
+            .credential(CredentialSource::PlatformGateway)
+            .api_key("key-test")
+            .base_url("http://192.0.2.1:81")
+            .complete(&request(ModelProvider::OpenAI))
+            .expect_err("no answer");
+    assert!(matches!(error, GatewayError::Transport(_)), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 // A provider's error says why the call failed; its start is kept.
@@ -349,5 +455,112 @@ impl HttpTransport for NoHttp {
         _body: &Value,
     ) -> Result<Value, GatewayError> {
         panic!("http was called: {url}");
+    }
+}
+
+/// Like `provider`, and the request must also carry `body` (partially).
+fn provider_with_body(
+    route: &str,
+    (name, value): (&str, &str),
+    body: Value,
+    response: ResponseTemplate,
+) -> Provider {
+    let (uri_tx, uri_rx) = mpsc::channel();
+    let (stop, stop_rx) = mpsc::channel::<()>();
+    let (route, name, value) = (route.to_string(), name.to_string(), value.to_string());
+    let worker = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async move {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(route))
+                .and(header(name.as_str(), value.as_str()))
+                .and(body_partial_json(body))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+            uri_tx.send(server.uri()).expect("uri");
+            let _ = stop_rx.recv();
+        });
+    });
+    Provider {
+        uri: uri_rx.recv().expect("mock uri"),
+        stop,
+        worker: Some(worker),
+    }
+}
+
+/// A provider whose `route` answers 302 to `/collect`, which counts the
+/// requests it gets.
+struct Redirecting {
+    uri: String,
+    collected: mpsc::Receiver<usize>,
+    stop: mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Redirecting {
+    fn collected(&self) -> usize {
+        let _ = self.stop.send(());
+        self.collected.recv().expect("count")
+    }
+}
+
+impl Drop for Redirecting {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn redirecting(route: &str) -> Redirecting {
+    let (uri_tx, uri_rx) = mpsc::channel();
+    let (count_tx, collected) = mpsc::channel();
+    let (stop, stop_rx) = mpsc::channel::<()>();
+    let route = route.to_string();
+    let worker = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async move {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(302)
+                        .insert_header("location", format!("{}/collect", server.uri())),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(path("/collect"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "content": [{"type": "text", "text": "collected"}],
+                    "candidates": [{"content": {"parts": [{"text": "collected"}]}}]
+                })))
+                .mount(&server)
+                .await;
+            uri_tx.send(server.uri()).expect("uri");
+            let _ = stop_rx.recv();
+            let collected = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| request.url.path() == "/collect")
+                .count();
+            let _ = count_tx.send(collected);
+        });
+    });
+    Redirecting {
+        uri: uri_rx.recv().expect("mock uri"),
+        collected,
+        stop,
+        worker: Some(worker),
     }
 }
