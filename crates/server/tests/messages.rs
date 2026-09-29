@@ -62,6 +62,8 @@ fn an_ask_is_found_by_the_task_it_started_and_answered_once() {
         assert_eq!(store.ask_of_task(RunId::new()), Ok(None));
         assert_eq!(store.answer(asked.id), Ok(true));
         assert_eq!(store.answer(asked.id), Ok(false));
+        // Once answered, the task has no open ask to answer.
+        assert_eq!(store.ask_of_task(task), Ok(None));
         assert_eq!(store.answer(MessageId::new()), Ok(false));
     }
 }

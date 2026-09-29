@@ -350,7 +350,7 @@ impl MessageStore for PostgresStore {
         self.with_client(|client| {
             client
                 .query_opt(
-                    "select body from messages where task_run = $1 and expects_reply",
+                    "select body from messages where task_run = $1 and expects_reply and not answered",
                     &[&task_run.as_uuid()],
                 )
                 .map_err(sql)?

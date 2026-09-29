@@ -184,7 +184,8 @@ pub trait MessageStore: Send + Sync {
     /// one atomic step.
     fn put_message(&self, message: StoredMessage) -> Result<PutMessage, StoreError>;
     fn message(&self, id: MessageId) -> Result<Option<StoredMessage>, StoreError>;
-    /// The ask whose task is `task_run`: the one that task's end answers.
+    /// The open (unanswered) ask whose task is `task_run`: the one that
+    /// task's end answers.
     fn ask_of_task(&self, task_run: RunId) -> Result<Option<StoredMessage>, StoreError>;
     /// Marks the ask answered, once: true for the call that did.
     fn answer(&self, ask: MessageId) -> Result<bool, StoreError>;
@@ -254,9 +255,10 @@ impl MessageStore for InMemoryStore {
     fn ask_of_task(&self, task_run: RunId) -> Result<Option<StoredMessage>, StoreError> {
         Ok(read(&self.messages)
             .values()
-            .map(|(message, _)| message)
-            .find(|message| message.expects_reply && message.task_run == Some(task_run))
-            .cloned())
+            .find(|(message, answered)| {
+                !answered && message.expects_reply && message.task_run == Some(task_run)
+            })
+            .map(|(message, _)| message.clone()))
     }
 
     fn answer(&self, ask: MessageId) -> Result<bool, StoreError> {
