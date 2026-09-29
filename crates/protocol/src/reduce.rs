@@ -103,7 +103,8 @@ pub fn reduce(state: HarnessState, event: &Event, spec: &RunSpec) -> (HarnessSta
             message_id,
             expects_reply: true,
             ..
-        } => match state {
+        }
+        | EventPayload::UserAsked { message_id, .. } => match state {
             HarnessState::Running {
                 step,
                 attempt,
@@ -122,7 +123,8 @@ pub fn reduce(state: HarnessState, event: &Event, spec: &RunSpec) -> (HarnessSta
             reply_to: Some(reply_to),
             ..
         } => answer_ask(state, *reply_to),
-        EventPayload::AskTimedOut { message_id } => answer_ask(state, *message_id),
+        EventPayload::AskTimedOut { message_id }
+        | EventPayload::UserAnswered { message_id, .. } => answer_ask(state, *message_id),
         EventPayload::StepRetried => match state {
             HarnessState::Running {
                 step,
@@ -212,7 +214,8 @@ pub fn reduce(state: HarnessState, event: &Event, spec: &RunSpec) -> (HarnessSta
         | EventPayload::DelegateRefused { .. }
         | EventPayload::MessageSent { .. }
         | EventPayload::MessageRefused { .. }
-        | EventPayload::MessageReceived { .. } => (state, Vec::new()),
+        | EventPayload::MessageReceived { .. }
+        | EventPayload::UserAskRefused { .. } => (state, Vec::new()),
     }
 }
 
@@ -234,8 +237,9 @@ pub fn applicable(state: &HarnessState, effect: &Effect, spec: &RunSpec) -> bool
         // A tell passes through any running step; an ask needs a step the
         // reply can answer.
         Effect::SendMessage { expects_reply, .. } => !(*expects_reply && *answered),
+        // A question, like an ask, needs a step the answer can answer.
+        Effect::AskUser { .. } => !answered,
         Effect::Execute { .. }
-        | Effect::AskUser { .. }
         | Effect::RequestApproval { .. }
         | Effect::Wait { .. }
         | Effect::PublishArtifact { .. } => false,
@@ -496,6 +500,68 @@ mod tests {
         assert_eq!(
             reduce(waiting_for(1), &timed_out(2), &spec).0,
             waiting_for(1)
+        );
+    }
+
+    fn ask_user() -> Effect {
+        Effect::AskUser {
+            prompt: "Which airport?".to_string(),
+        }
+    }
+
+    // Phase 3.5: an authorized question to the user passes through a step
+    // not yet answered, as an ask does: the user's answer answers it.
+    #[test]
+    fn an_authorized_question_passes_through_an_open_step() {
+        let spec = sample_spec();
+        for (answered, acts) in [(false, true), (true, false)] {
+            assert_eq!(applicable(&running(answered), &ask_user(), &spec), acts);
+            let (next, effects) = reduce(
+                running(answered),
+                &ev(EventPayload::EffectAuthorized { effect: ask_user() }),
+                &spec,
+            );
+            assert_eq!(next, running(answered));
+            assert_eq!(effects, if acts { vec![ask_user()] } else { Vec::new() });
+        }
+        assert!(!applicable(&waiting_for(1), &ask_user(), &spec));
+    }
+
+    // A question asked waits for the user's answer; a refused one does not.
+    #[test]
+    fn a_question_waits_for_the_users_answer() {
+        let spec = sample_spec();
+        let asked = ev(EventPayload::UserAsked {
+            message_id: message_id(1),
+            prompt: "Which airport?".to_string(),
+        });
+        assert_eq!(reduce(running(false), &asked, &spec).0, waiting_for(1));
+        assert_eq!(reduce(running(true), &asked, &spec).0, running(true));
+        assert_eq!(reduce(waiting_for(2), &asked, &spec).0, waiting_for(2));
+        let refused = ev(EventPayload::UserAskRefused {
+            reason: "no".to_string(),
+        });
+        assert_eq!(reduce(running(false), &refused, &spec).0, running(false));
+    }
+
+    // Only the answer to the question answers the step.
+    #[test]
+    fn only_the_answer_to_the_question_answers_the_step() {
+        let spec = sample_spec();
+        let answered = |n| {
+            ev(EventPayload::UserAnswered {
+                message_id: message_id(n),
+                text: "SFO".to_string(),
+            })
+        };
+        assert_eq!(reduce(waiting_for(1), &answered(1), &spec).0, running(true));
+        assert_eq!(
+            reduce(waiting_for(1), &answered(2), &spec).0,
+            waiting_for(1)
+        );
+        assert_eq!(
+            reduce(running(false), &answered(1), &spec).0,
+            running(false)
         );
     }
 

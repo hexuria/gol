@@ -284,7 +284,18 @@ fn payloads(max_steps: u32) -> Vec<EventPayload> {
     }
     for message_id in [message(), other_message()] {
         all.push(EventPayload::AskTimedOut { message_id });
+        all.push(EventPayload::UserAsked {
+            message_id,
+            prompt: "q".to_string(),
+        });
+        all.push(EventPayload::UserAnswered {
+            message_id,
+            text: "a".to_string(),
+        });
     }
+    all.push(EventPayload::UserAskRefused {
+        reason: "no".to_string(),
+    });
     for class in classes() {
         all.push(EventPayload::RunFailed {
             class,
@@ -312,7 +323,7 @@ fn payloads(max_steps: u32) -> Vec<EventPayload> {
             all.push(tool_result(TOOL, invocation(), step, attempt + 1));
         }
     }
-    assert_covers(all.iter().map(payload_index), 31);
+    assert_covers(all.iter().map(payload_index), 34);
     all
 }
 
@@ -349,6 +360,9 @@ fn payload_index(payload: &EventPayload) -> usize {
         EventPayload::MessageRefused { .. } => 28,
         EventPayload::MessageReceived { .. } => 29,
         EventPayload::AskTimedOut { .. } => 30,
+        EventPayload::UserAsked { .. } => 31,
+        EventPayload::UserAskRefused { .. } => 32,
+        EventPayload::UserAnswered { .. } => 33,
     }
 }
 
@@ -521,7 +535,8 @@ fn may_change(state: &HarnessState, payload: &EventPayload, max_steps: u32) -> b
             P::MessageSent {
                 expects_reply: true,
                 ..
-            },
+            }
+            | P::UserAsked { .. },
         ) => true,
         (
             H::WaitingForMessage { message_id, .. },
@@ -533,9 +548,13 @@ fn may_change(state: &HarnessState, payload: &EventPayload, max_steps: u32) -> b
         (
             H::WaitingForMessage { message_id, .. },
             P::AskTimedOut {
-                message_id: timed_out,
+                message_id: answered,
+            }
+            | P::UserAnswered {
+                message_id: answered,
+                ..
             },
-        ) => message_id == timed_out,
+        ) => message_id == answered,
         (H::Running { .. }, P::RunCompleted { .. }) => true,
         (
             H::Running { .. } | H::WaitingForTool { .. } | H::WaitingForMessage { .. },
@@ -572,19 +591,20 @@ fn expected_next(state: &HarnessState, payload: &EventPayload) -> HarnessState {
         (H::WaitingForTool { step, attempt, .. }, P::ToolResult { .. })
         | (
             H::WaitingForMessage { step, attempt, .. },
-            P::MessageReceived { .. } | P::AskTimedOut { .. },
+            P::MessageReceived { .. } | P::AskTimedOut { .. } | P::UserAnswered { .. },
         ) => H::Running {
             step: *step,
             attempt: *attempt,
             answered: true,
         },
-        (H::Running { step, attempt, .. }, P::MessageSent { message_id, .. }) => {
-            H::WaitingForMessage {
-                step: *step,
-                attempt: *attempt,
-                message_id: *message_id,
-            }
-        }
+        (
+            H::Running { step, attempt, .. },
+            P::MessageSent { message_id, .. } | P::UserAsked { message_id, .. },
+        ) => H::WaitingForMessage {
+            step: *step,
+            attempt: *attempt,
+            message_id: *message_id,
+        },
         (H::Running { step, attempt, .. }, P::StepRetried) => H::Running {
             step: *step,
             attempt: attempt + 1,
@@ -628,8 +648,8 @@ fn expected_effects(state: &HarnessState, payload: &EventPayload, max_steps: u32
         | Effect::MemoryWrite { .. }
         | Effect::Delegate { .. } => true,
         Effect::SendMessage { expects_reply, .. } => !(*expects_reply && *answered),
+        Effect::AskUser { .. } => !answered,
         Effect::Execute { .. }
-        | Effect::AskUser { .. }
         | Effect::RequestApproval { .. }
         | Effect::Wait { .. }
         | Effect::PublishArtifact { .. }

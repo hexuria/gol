@@ -9,6 +9,7 @@ const MEMORY_READ: &str = "memory.read";
 const MEMORY_WRITE: &str = "memory.write";
 const AGENT_DELEGATE: &str = "agent.delegate";
 const AGENT_MESSAGE: &str = "agent.message";
+const USER_ASK: &str = "user.ask";
 
 pub fn authorize(spec: &RunSpec, effect: &Effect, tools: &[ToolDescriptor]) -> PolicyDecision {
     match effect {
@@ -40,8 +41,16 @@ pub fn authorize(spec: &RunSpec, effect: &Effect, tools: &[ToolDescriptor]) -> P
             PolicyDecision::Allow => check_message(spec, effect),
             decision => decision,
         },
+        Effect::AskUser { prompt } => match allow_capability(spec, USER_ASK) {
+            PolicyDecision::Allow if prompt.trim().is_empty() => PolicyDecision::Deny {
+                reason: "a question is empty".to_string(),
+            },
+            PolicyDecision::Allow if prompt.len() > MAX_MESSAGE_BYTES => PolicyDecision::Deny {
+                reason: format!("a question is over {MAX_MESSAGE_BYTES} bytes"),
+            },
+            decision => decision,
+        },
         Effect::Execute { .. }
-        | Effect::AskUser { .. }
         | Effect::RequestApproval { .. }
         | Effect::Wait { .. }
         | Effect::PublishArtifact { .. } => PolicyDecision::Deny {
@@ -194,6 +203,48 @@ mod tests {
         ] {
             assert_eq!(authorize(&spec, &effect, &[]), PolicyDecision::Allow);
         }
+    }
+
+    // Phase 3.5 (58A): a question to the user needs user.ask.
+    #[test]
+    fn a_question_needs_its_capability() {
+        let mut spec = sample_spec();
+        let effect = Effect::AskUser {
+            prompt: "Which airport?".to_string(),
+        };
+        assert_eq!(
+            authorize(&spec, &effect, &[]),
+            PolicyDecision::Deny {
+                reason: "missing capability: user.ask".to_string()
+            }
+        );
+        spec.capabilities.push(Capability::new("user.ask"));
+        assert_eq!(authorize(&spec, &effect, &[]), PolicyDecision::Allow);
+    }
+
+    // A question, like a message body, is not blank and at most
+    // MAX_MESSAGE_BYTES.
+    #[test]
+    fn a_question_is_bounded() {
+        let mut spec = sample_spec();
+        spec.capabilities.push(Capability::new("user.ask"));
+        let ask = |prompt: String| Effect::AskUser { prompt };
+        assert_eq!(
+            authorize(&spec, &ask("  ".to_string()), &[]),
+            PolicyDecision::Deny {
+                reason: "a question is empty".to_string()
+            }
+        );
+        assert_eq!(
+            authorize(&spec, &ask("x".repeat(crate::MAX_MESSAGE_BYTES)), &[]),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            authorize(&spec, &ask("x".repeat(crate::MAX_MESSAGE_BYTES + 1)), &[]),
+            PolicyDecision::Deny {
+                reason: format!("a question is over {} bytes", crate::MAX_MESSAGE_BYTES)
+            }
+        );
     }
 
     // A tell or a new ask starts a task one hop further (29A), so 8 hops

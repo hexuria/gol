@@ -416,7 +416,10 @@ pub trait ThreadStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<ThreadSummary>, StoreError>;
     /// The runs of `owner`'s principal's thread `thread`, oldest first, at
-    /// most `limit`. Empty for a thread that is not the principal's.
+    /// most `limit`: by creation time, then by the store's order (Phase
+    /// 3.4's numbering), so a run stored later in the same millisecond comes
+    /// after, and a task's place, its label (decision 60A), does not change
+    /// as the thread grows. Empty for a thread that is not the principal's.
     fn runs_of_thread(
         &self,
         owner: &Owner,
@@ -845,7 +848,14 @@ impl ThreadStore for InMemoryStore {
             .filter(|run| run.spec.owner.is(owner) && thread_of(&run.spec) == Some(thread))
             .cloned()
             .collect();
-        found.sort_by_key(|run| (created_ms(run), run.spec.run_id.as_uuid()));
+        let stored = read(&self.stored);
+        found.sort_by_key(|run| {
+            (
+                created_ms(run),
+                stored.get(&run.spec.run_id).copied(),
+                run.spec.run_id.as_uuid(),
+            )
+        });
         found.truncate(limit);
         Ok(found)
     }

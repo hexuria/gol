@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use harness::{ChildRequest, MessageDeliverer, MessageRequest, SentMessage};
 use protocol::{
-    Actor, AgentId, Event, EventPayload, EventSource, MessageId, MessageRole, RunId, Timestamp,
-    MAX_DELEGATION_HOPS, MAX_MESSAGE_BYTES,
+    fold, Actor, AgentId, Event, EventPayload, EventSource, HarnessState, MessageId, MessageRole,
+    RunId, RunSpec, Timestamp, MAX_DELEGATION_HOPS, MAX_MESSAGE_BYTES,
 };
 
 use crate::queue::RedisRunQueue;
@@ -257,12 +257,14 @@ impl OwnedDeliverer {
 /// Where an ask stands in its asker's log, read in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AskState {
-    /// No `MessageSent` names it: the asker's worker died before its log
-    /// said so, or the asker sent something else.
+    /// No `MessageSent` (or `UserAsked`, a question to the user) names it:
+    /// the asker's worker died before its log said so, or the asker sent
+    /// something else.
     Unsent,
     /// Sent, and no answer after it: the asker's harness waits on it.
     Open,
-    /// Answered (a reply or `AskTimedOut`) after it was sent.
+    /// Answered (a reply, `AskTimedOut` or the user's `UserAnswered`) after
+    /// it was sent.
     Answered,
 }
 
@@ -272,18 +274,51 @@ pub(crate) fn ask_state(events: &[Event], ask: MessageId) -> AskState {
     events
         .iter()
         .fold(AskState::Unsent, |state, event| match &event.payload {
-            EventPayload::MessageSent { message_id, .. } if *message_id == ask => AskState::Open,
+            EventPayload::MessageSent { message_id, .. }
+            | EventPayload::UserAsked { message_id, .. }
+                if *message_id == ask =>
+            {
+                AskState::Open
+            }
             EventPayload::MessageReceived {
                 reply_to: Some(reply_to),
                 ..
             } if *reply_to == ask && state == AskState::Open => AskState::Answered,
             EventPayload::AskTimedOut { message_id }
+            | EventPayload::UserAnswered { message_id, .. }
                 if *message_id == ask && state == AskState::Open =>
             {
                 AskState::Answered
             }
             _ => state,
         })
+}
+
+/// The question to the user `spec`'s run waits on, as (id, prompt): its
+/// harness waits on an ask a `UserAsked` in its log put (Phase 3.5), and the
+/// log has not ended.
+pub(crate) fn open_question(spec: &RunSpec, events: &[Event]) -> Option<(MessageId, String)> {
+    if events.iter().any(|event| is_terminal(&event.payload)) {
+        return None;
+    }
+    let HarnessState::WaitingForMessage { message_id, .. } = fold(spec, events).harness else {
+        return None;
+    };
+    events.iter().find_map(|event| match &event.payload {
+        EventPayload::UserAsked {
+            message_id: asked,
+            prompt,
+        } if *asked == message_id => Some((message_id, prompt.clone())),
+        _ => None,
+    })
+}
+
+/// Whether `ask` is a question to the user: a `UserAsked` in `events` put
+/// it. It has no timeout (decision 57A).
+pub(crate) fn is_user_question(events: &[Event], ask: MessageId) -> bool {
+    events.iter().any(|event| {
+        matches!(&event.payload, EventPayload::UserAsked { message_id, .. } if *message_id == ask)
+    })
 }
 
 /// What `deliver` does with an ask its asker has not logged.

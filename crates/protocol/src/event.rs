@@ -155,6 +155,24 @@ pub enum EventPayload {
     AskTimedOut {
         message_id: MessageId,
     },
+    /// An authorized question was put to the run's user as `message_id`
+    /// (Phase 3.5). The asking step waits for the user's answer; a question
+    /// has no timeout (57A).
+    UserAsked {
+        message_id: MessageId,
+        prompt: String,
+    },
+    /// An authorized question was not put, for `reason`: the run cannot wait
+    /// (it runs inside its request).
+    UserAskRefused {
+        reason: String,
+    },
+    /// The user's answer to the question `message_id`, which answers the
+    /// asking step.
+    UserAnswered {
+        message_id: MessageId,
+        text: String,
+    },
 }
 
 impl EventPayload {
@@ -191,6 +209,9 @@ impl EventPayload {
             Self::MessageRefused { .. } => "message.refused",
             Self::MessageReceived { .. } => "message.received",
             Self::AskTimedOut { .. } => "message.ask_timed_out",
+            Self::UserAsked { .. } => "user.asked",
+            Self::UserAskRefused { .. } => "user.ask_refused",
+            Self::UserAnswered { .. } => "user.answered",
         }
     }
 }

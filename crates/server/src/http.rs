@@ -13,13 +13,14 @@ use harness::{
     JevDecider, Memory, RunMemory, StoreError,
 };
 use protocol::{
-    fold, AgentId, Capability, DispatchPhase, Event, EventPayload, ExecutionPlacement,
-    FailureClass, HarnessState, Limits, Owner, RunId, RunSpec, RunState, Timestamp, WorkModel,
-    SESSION_ID,
+    fold, Actor, AgentId, Capability, DispatchPhase, Event, EventPayload, EventSource,
+    ExecutionPlacement, FailureClass, HarnessState, Limits, MessageId, Owner, RunId, RunSpec,
+    RunState, Timestamp, WorkModel, MAX_MESSAGE_BYTES, SESSION_ID,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{AuthError, Authenticator, Principal};
+use crate::deliverer::open_question;
 use crate::inference::{
     accept_subscription_completion, fail_turn, open_turn, run_failed_event, sandbox_from_env,
     ComputerPlan, GatewayPoster, HttpGatewayPoster, SandboxHost, SharedPoster, TurnError,
@@ -229,6 +230,7 @@ fn router_with_state(state: AppState) -> Router {
         .route("/v1/threads/{id}/messages", post(follow_up))
         .route("/v1/threads/{id}/board", get(get_board))
         .route("/v1/runs/{id}/stop", post(stop_run))
+        .route("/v1/runs/{id}/reply", post(reply_run))
         .route("/v1/threads/{id}/stop", post(stop_thread))
         .route("/v1/stop", post(stop_owner))
         .route("/v1/coworker/turns", post(create_coworker_turn))
@@ -724,12 +726,35 @@ async fn follow_up(
             return Ok(Err(ApiError::ThreadNotFound));
         };
         let agent = store.agent(root.agent_id)?;
-        Ok::<_, StoreError>(Ok((root, agent)))
+        let runs = threads.runs_of_thread(&thread_owner, &thread, BOARD_RUNS)?;
+        Ok::<_, StoreError>(Ok((root, agent, waiting_on_user(&runs))))
     })
     .await
     .map_err(|error| ApiError::Store(error.to_string()))?
     .map_err(ApiError::from)?;
-    let (root, agent) = found?;
+    let (root, agent, waiting) = found?;
+    // A task waits on the user: the message answers it (decision 61A).
+    if !waiting.is_empty() {
+        let (task, text) = match addressed(&body.input) {
+            Some((label, text)) => match waiting.iter().find(|task| task.label == label) {
+                Some(task) => (task, text),
+                None => return Err(ApiError::WhichTask(waiting)),
+            },
+            None if waiting.len() == 1 => (&waiting[0], body.input.as_str()),
+            None => return Err(ApiError::WhichTask(waiting)),
+        };
+        if body.limits.is_some() {
+            return Err(ApiError::BadRequest(
+                "an answer takes no limits: they are for a follow-up",
+            ));
+        }
+        let run_id = task.run_id;
+        answer_question(&state, run_id, text, Some(task.question_id)).await?;
+        return Ok(Json(serde_json::json!({
+            "thread_id": id,
+            "answered": { "label": format!("T{}", task.label), "run_id": run_id },
+        })));
+    }
     let agent = agent
         .filter(|agent| agent.owner.is(&owner))
         .ok_or(ApiError::AgentNotFound)?;
@@ -748,6 +773,138 @@ async fn follow_up(
     )
     .await?;
     Ok(Json(serde_json::json!({ "thread_id": id, "run": run })))
+}
+
+/// A task of a thread that waits on its user (Phase 3.5).
+#[derive(Debug)]
+struct WaitingTask {
+    /// Its number in the thread: "T<label>" (decision 60A).
+    label: usize,
+    run_id: RunId,
+    question_id: MessageId,
+    question: String,
+}
+
+/// The tasks among a thread's `runs` (in the thread's order) that wait on
+/// the user, labelled by their place in that order.
+fn waiting_on_user(runs: &[StoredRun]) -> Vec<WaitingTask> {
+    runs.iter()
+        .enumerate()
+        .filter_map(|(at, run)| {
+            open_question(&run.spec, &run.events).map(|(question_id, question)| WaitingTask {
+                label: at + 1,
+                run_id: run.spec.run_id,
+                question_id,
+                question,
+            })
+        })
+        .collect()
+}
+
+/// A message addressed to a task, "T<n>: text", as (n, text): `T` or `t`,
+/// 1 to 9 digits naming a task from 1, a colon, and the text after it,
+/// trimmed. Leading white space is allowed.
+fn addressed(input: &str) -> Option<(usize, &str)> {
+    let rest = input.trim_start();
+    let rest = rest.strip_prefix(['T', 't'])?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || digits > 9 {
+        return None;
+    }
+    let (number, rest) = rest.split_at(digits);
+    let text = rest.strip_prefix(':')?;
+    let number: usize = number.parse().ok()?;
+    (number >= 1).then(|| (number, text.trim()))
+}
+
+/// Appends the user's `text` as the answer to the question run `run_id`
+/// waits on, onto the log it read, and wakes the run. A log another writer
+/// moved in between is read again, up to three times; a run that no longer
+/// waits on its user is 409. A failed wake is left to the ask sweep, which
+/// wakes a parked run whose log no longer waits.
+async fn answer_question(
+    state: &AppState,
+    run_id: RunId,
+    text: &str,
+    asked: Option<MessageId>,
+) -> Result<(), ApiError> {
+    if text.trim().is_empty() {
+        return Err(ApiError::BadRequest("the answer is empty"));
+    }
+    if text.len() > MAX_MESSAGE_BYTES {
+        return Err(ApiError::TooLarge("the answer is too long"));
+    }
+    let (store, queue, text) = (state.store.clone(), state.queue.clone(), text.to_string());
+    tokio::task::spawn_blocking(move || {
+        // The question answered: the one the caller saw, else the one first
+        // read. A task that went on to another question is not answered
+        // with text meant for this one.
+        let mut asked = asked;
+        for _ in 0..3 {
+            let Some(run) = store.run(run_id)? else {
+                return Ok(Err(ApiError::NotFound));
+            };
+            let Some((question, _)) = open_question(&run.spec, &run.events) else {
+                return Ok(Err(ApiError::Conflict("the task is not waiting for you")));
+            };
+            if *asked.get_or_insert(question) != question {
+                return Ok(Err(ApiError::Conflict(
+                    "the task is waiting on another question",
+                )));
+            }
+            let answer = Event::record(
+                EventSource::for_spec(&run.spec, Actor::System, Timestamp::now()),
+                EventPayload::UserAnswered {
+                    message_id: question,
+                    text: text.clone(),
+                },
+            );
+            match store.append_events_after(run_id, run.events.len(), vec![answer])? {
+                Append::Appended => {
+                    if let Some(queue) = &queue {
+                        if let Err(error) = queue.wake(run_id, question) {
+                            eprintln!("gol: reply: wake run {run_id}: {error}");
+                        }
+                    }
+                    return Ok(Ok(()));
+                }
+                Append::Moved => continue,
+                Append::Missing => return Ok(Err(ApiError::NotFound)),
+                Append::Terminal => {
+                    return Ok(Err(ApiError::Conflict("the task is not waiting for you")))
+                }
+            }
+        }
+        Ok::<_, StoreError>(Err(ApiError::Store(
+            "the task kept changing while it was answered".to_string(),
+        )))
+    })
+    .await
+    .map_err(|error| ApiError::Store(error.to_string()))?
+    .map_err(ApiError::from)?
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyBody {
+    text: String,
+    /// The question answered, as its card showed it; without it, the one
+    /// the run waits on when the reply is read.
+    question_id: Option<MessageId>,
+}
+
+/// `POST /v1/runs/{id}/reply`: the user's answer to the question the run
+/// waits on (Phase 3.5, decision 56A).
+async fn reply_run(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<RunId>,
+    body: Result<Json<ReplyBody>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Json(body) = body.map_err(body_rejection)?;
+    owned_run_page(&state, id, &principal, 0, 1).await?;
+    answer_question(&state, id, &body.text, body.question_id).await?;
+    Ok(Json(serde_json::json!({ "answered": id })))
 }
 
 /// A page of threads: `after` of them seen, at most `limit`.
@@ -834,8 +991,8 @@ impl CardState {
     }
 }
 
-/// One run's card on a board, with its state.
-fn card(run: &StoredRun) -> (CardState, serde_json::Value) {
+/// One run's card on a board, with its state: the thread's `label`-th run.
+fn card(label: usize, run: &StoredRun) -> (CardState, serde_json::Value) {
     let state = fold(&run.spec, &run.events);
     let card_state = CardState::of(&state);
     // Once each, in the order started: a resumed run may log one twice.
@@ -857,7 +1014,11 @@ fn card(run: &StoredRun) -> (CardState, serde_json::Value) {
             .find(|event| wanted(&event.payload))
             .map(|event| event.envelope.at)
     };
+    let question = open_question(&run.spec, &run.events);
     let card = serde_json::json!({
+        "label": format!("T{label}"),
+        "question_id": question.as_ref().map(|(id, _)| *id),
+        "question": question.map(|(_, question)| question),
         "run_id": run.spec.run_id,
         "agent_id": run.spec.agent_id,
         "parent": run.spec.lineage.parent,
@@ -903,13 +1064,15 @@ async fn get_board(
         let cards: Vec<serde_json::Value> = match wanted {
             None => runs
                 .iter()
+                .enumerate()
                 .skip(after)
                 .take(limit)
-                .map(|run| card(run).1)
+                .map(|(at, run)| card(at + 1, run).1)
                 .collect(),
             Some(wanted) => runs
                 .iter()
-                .map(card)
+                .enumerate()
+                .map(|(at, run)| card(at + 1, run))
                 .filter(|(state, _)| *state == wanted)
                 .skip(after)
                 .take(limit)
@@ -1239,6 +1402,11 @@ enum ApiError {
     Unauthorized,
     AuthUnavailable(String),
     TooManyStreams,
+    /// 413, with the reason.
+    TooLarge(&'static str),
+    /// A message to a thread where several tasks wait on the user, and it
+    /// names none of them: 409 with each task's label and question.
+    WhichTask(Vec<WaitingTask>),
     ThreadNotFound,
     /// The store keeps no threads.
     NoThreads,
@@ -1308,6 +1476,27 @@ impl axum::response::IntoResponse for ApiError {
                 Json(serde_json::json!({ "error": "thread not found" })),
             )
                 .into_response(),
+            Self::TooLarge(message) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response(),
+            Self::WhichTask(waiting) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "which task?",
+                    "waiting": waiting
+                        .iter()
+                        .map(|task| serde_json::json!({
+                            "label": format!("T{}", task.label),
+                            "run_id": task.run_id,
+                            "question_id": task.question_id,
+                            "question": task.question,
+                        }))
+                        .collect::<Vec<_>>(),
+                })),
+            )
+                .into_response(),
             Self::TooManyStreams => (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(serde_json::json!({ "error": "too many open streams" })),
@@ -1366,6 +1555,58 @@ impl axum::response::IntoResponse for ApiError {
                 )
                     .into_response()
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod addressed_tests {
+    use super::addressed;
+    use proptest::prelude::*;
+
+    #[test]
+    fn a_label_names_a_task_and_its_text() {
+        assert_eq!(addressed("T1: SFO"), Some((1, "SFO")));
+        assert_eq!(addressed("  t12:LAX  "), Some((12, "LAX")));
+        assert_eq!(addressed("T2:"), Some((2, "")));
+        for plain in [
+            "SFO",
+            "T: x",
+            "T0: x",
+            "T1 x",
+            "T1234567890: x",
+            "Tx: y",
+            "",
+            "T",
+        ] {
+            assert_eq!(addressed(plain), None, "{plain:?}");
+        }
+    }
+
+    proptest! {
+        // Any input: no panic, and a label is read only from its exact form.
+        #[test]
+        fn any_input_is_read_only_in_its_exact_form(input in any::<String>()) {
+            let oracle = {
+                let rest = input.trim_start();
+                let rest = rest.strip_prefix('T').or_else(|| rest.strip_prefix('t'));
+                rest.and_then(|rest| {
+                    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                    let after = &rest[digits.len()..];
+                    let number: usize = digits.parse().ok()?;
+                    (!digits.is_empty() && digits.len() <= 9 && number >= 1)
+                        .then_some(())
+                        .and(after.strip_prefix(':'))
+                        .map(|text| (number, text.trim()))
+                })
+            };
+            prop_assert_eq!(addressed(&input), oracle);
+        }
+
+        #[test]
+        fn a_formed_label_reads_back(number in 1usize..=999_999_999, text in "[^\\s].*|") {
+            let input = format!("T{number}: {text}");
+            prop_assert_eq!(addressed(&input), Some((number, text.trim())));
         }
     }
 }
