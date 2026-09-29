@@ -404,7 +404,30 @@ pub fn open_turn(
             events: events.clone(),
         })
         .map_err(store_error)?;
+    finish_turn(store, spec, events, poster, sandbox)
+}
 
+/// The metadata key the server sets on a background coworker turn (Phase
+/// 3.6, decision 62A): a queue worker runs it as a turn, not through the
+/// harness. A caller that sends it is refused.
+pub const TURN_KEY: &str = "gol.turn";
+
+/// Whether `spec` is a background coworker turn.
+pub fn is_turn(spec: &RunSpec) -> bool {
+    spec.metadata.contains_key(TURN_KEY)
+}
+
+/// The rest of a turn once its user message is stored (`events`, the log so
+/// far): a Box sandbox, the gateway's completion, the sandbox removed, then
+/// the completion stored; or the turn failed. `open_turn` runs it in the
+/// request; a queue worker runs it for a background turn (Phase 3.6).
+pub(crate) fn finish_turn(
+    store: &dyn RunStore,
+    spec: RunSpec,
+    mut events: Vec<Event>,
+    poster: &dyn GatewayPoster,
+    sandbox: &dyn SandboxHost,
+) -> Result<TurnOutcome, TurnError> {
     let box_turn = spec.placement == ExecutionPlacement::Box;
     let name = box_container_name(spec.run_id);
     if box_turn {
@@ -650,7 +673,7 @@ pub fn user_message_event(spec: &RunSpec) -> Event {
 }
 
 /// A `payload` event from the system, for `spec`'s run.
-fn system_event(spec: &RunSpec, payload: EventPayload) -> Event {
+pub(crate) fn system_event(spec: &RunSpec, payload: EventPayload) -> Event {
     Event::record(
         EventSource::for_spec(spec, Actor::System, Timestamp::now()),
         payload,

@@ -24,7 +24,7 @@ use crate::deliverer::open_question;
 use crate::inference::{
     accept_subscription_completion, fail_turn, open_turn, run_failed_event, sandbox_from_env,
     ComputerPlan, GatewayPoster, HttpGatewayPoster, SandboxHost, SharedPoster, TurnError,
-    TurnOutcome,
+    TurnOutcome, TURN_KEY,
 };
 use crate::models::ModelsConfig;
 use crate::queue::RedisRunQueue;
@@ -79,6 +79,9 @@ struct TurnRequest {
     limits: Option<Limits>,
     #[serde(default)]
     metadata: BTreeMap<String, String>,
+    /// Queue the turn for a worker and answer 202 at once (Phase 3.6).
+    #[serde(default)]
+    background: bool,
 }
 
 /// The owner a request's principal becomes.
@@ -436,7 +439,10 @@ async fn create_coworker_turn(
     Authenticated(principal): Authenticated,
     State(state): State<AppState>,
     Json(body): Json<TurnRequest>,
-) -> Result<Json<TurnBody>, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
+    if body.background {
+        return background_turn(&state, principal, body).await;
+    }
     let spec = build_spec(
         owner_of(&principal),
         SpecCore {
@@ -459,7 +465,71 @@ async fn create_coworker_turn(
     .await
     .map_err(|error| ApiError::Decider(error.to_string()))?
     .map_err(ApiError::from)?;
-    Ok(Json(TurnBody::from_outcome(outcome)))
+    Ok(Json(TurnBody::from_outcome(outcome)).into_response())
+}
+
+/// A coworker turn posted with `background: true` (Phase 3.6): stored queued
+/// and marked as a turn (decision 62A), pushed for a worker, and answered 202
+/// at once. A subscription turn's model call is the desktop's, so it has
+/// nothing to run in the background (63A); without a queue there is no
+/// worker to run it (64A).
+async fn background_turn(
+    state: &AppState,
+    principal: Principal,
+    body: TurnRequest,
+) -> Result<axum::response::Response, ApiError> {
+    if !matches!(
+        body.work_model.credential,
+        protocol::CredentialSource::PlatformGateway
+    ) {
+        return Err(ApiError::BadRequest(
+            "a subscription turn cannot run in the background",
+        ));
+    }
+    let Some(queue) = state.queue.clone() else {
+        return Err(ApiError::Unavailable("background turns are not available"));
+    };
+    let mut spec = build_spec(
+        owner_of(&principal),
+        SpecCore {
+            agent_id: body.agent_id,
+            agent_version: body.agent_version,
+            input: body.input,
+            placement: body.placement,
+            work_model: body.work_model,
+            limits: body.limits,
+            metadata: body.metadata,
+        },
+        body.capabilities,
+    )?;
+    spec.metadata.insert(TURN_KEY.to_string(), "1".to_string());
+    let (store, queued) = (state.store.clone(), spec.clone());
+    tokio::task::spawn_blocking(move || {
+        crate::spawner::enqueue(
+            store.as_ref(),
+            &queue,
+            &queued,
+            crate::spawner::OnPushFailure::End,
+        )
+    })
+    .await
+    .map_err(|error| ApiError::Store(error.to_string()))?
+    .map_err(|error| match error {
+        crate::spawner::EnqueueError::Queue(error) => {
+            ApiError::Decider(format!("queue unavailable: {error}"))
+        }
+        crate::spawner::EnqueueError::Store(error) => ApiError::from(error),
+        crate::spawner::EnqueueError::Push(error) => ApiError::Decider(error),
+    })?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "run_id": spec.run_id,
+            "placement": spec.placement,
+            "state": "queued",
+        })),
+    )
+        .into_response())
 }
 
 async fn complete_coworker_turn(
@@ -1390,6 +1460,10 @@ fn build_spec(
     if !bounded.contains(&limits.max_steps) || !bounded.contains(&limits.max_model_calls) {
         return Err(ApiError::BadRequest("limits must be between 1 and 64"));
     }
+    // The server marks a background turn (decision 62A); a caller cannot.
+    if core.metadata.contains_key(TURN_KEY) {
+        return Err(ApiError::BadRequest("gol.turn is set by the server"));
+    }
     Ok(RunSpec::builder()
         .owner(owner)
         .agent(core.agent_id, core.agent_version)
@@ -1418,6 +1492,8 @@ enum ApiError {
     Unauthorized,
     AuthUnavailable(String),
     TooManyStreams,
+    /// 503, with the reason: a feature this server was started without.
+    Unavailable(&'static str),
     /// 413, with the reason.
     TooLarge(&'static str),
     /// A message to a thread where several tasks wait on the user, and it
@@ -1490,6 +1566,11 @@ impl axum::response::IntoResponse for ApiError {
             Self::ThreadNotFound => (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "thread not found" })),
+            )
+                .into_response(),
+            Self::Unavailable(message) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": message })),
             )
                 .into_response(),
             Self::TooLarge(message) => (

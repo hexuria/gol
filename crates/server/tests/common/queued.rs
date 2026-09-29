@@ -7,8 +7,8 @@ use harness::InMemory;
 use protocol::{AgentId, Capability, RunId};
 use serde_json::{json, Value};
 use server::{
-    router_with_queue, AgentManifest, InMemoryStore, MessageStore, PostgresStore, RedisRunQueue,
-    RunStore, StoredAgent, Worker,
+    router_with_queue, AgentManifest, GatewayPoster, InMemoryStore, MessageStore, PostgresStore,
+    RedisRunQueue, RunStore, SandboxHost, StoredAgent, Worker,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -145,6 +145,26 @@ impl Server {
                 .memory(Arc::new(InMemory::default()))
                 .jev(self.jev.clone())
                 .messages(messages)
+                .build(),
+        );
+        self
+    }
+
+    /// The same server, with a worker whose background coworker turns
+    /// (Phase 3.6) call `poster` and run in `sandbox`.
+    pub fn with_turns(
+        mut self,
+        poster: Arc<dyn GatewayPoster>,
+        sandbox: Arc<dyn SandboxHost>,
+    ) -> Self {
+        self.worker = Arc::new(
+            Worker::builder()
+                .queue(RedisRunQueue::open(self.redis.clone()))
+                .store(self.store.clone())
+                .memory(Arc::new(InMemory::default()))
+                .jev(self.jev.clone())
+                .poster(poster)
+                .sandbox(sandbox)
                 .build(),
         );
         self

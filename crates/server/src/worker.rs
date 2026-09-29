@@ -31,7 +31,11 @@ use crate::deliverer::{
     ask_state, deliver, is_user_question, task_answer, AskState, IfUnsent, OwnedDeliverer,
 };
 use crate::http::{jev_client, Delegation};
-use crate::inference::{dispatch_events, run_cancelled_event, run_failed_event};
+use crate::inference::{
+    box_container_name, dispatch_events, finish_turn, is_turn, run_cancelled_event,
+    run_failed_event, sandbox_from_env, system_event, GatewayPoster, HttpGatewayPoster,
+    SandboxHost, TurnError,
+};
 use crate::models::ModelsConfig;
 use crate::queue::{QueueTiming, RedisRunQueue};
 use crate::spawner::OwnedSpawner;
@@ -53,6 +57,10 @@ pub struct Worker {
     /// a run's messages and parks a run that waits on an ask (Phase 2.3);
     /// without it every message is refused.
     messages: Option<Arc<dyn MessageStore>>,
+    /// The gateway and the sandbox host a background coworker turn uses
+    /// (Phase 3.6).
+    poster: Arc<dyn GatewayPoster>,
+    sandbox: Arc<dyn SandboxHost>,
 }
 
 /// Builder state: a required input not given yet.
@@ -61,7 +69,8 @@ pub struct Missing;
 pub struct Given;
 
 /// A `Worker` whose queue, store, memory and Jev address are each required
-/// before `build` exists; the timing and the models are optional.
+/// before `build` exists; the timing, the models, the messages, the gateway
+/// and the sandbox host are optional.
 pub struct WorkerBuilder<Q, S, M, J> {
     queue: Option<RedisRunQueue>,
     store: Option<Arc<dyn RunStore>>,
@@ -70,6 +79,8 @@ pub struct WorkerBuilder<Q, S, M, J> {
     timing: QueueTiming,
     models: Arc<ModelsConfig>,
     messages: Option<Arc<dyn MessageStore>>,
+    poster: Option<Arc<dyn GatewayPoster>>,
+    sandbox: Option<Arc<dyn SandboxHost>>,
     states: PhantomData<(Q, S, M, J)>,
 }
 
@@ -83,6 +94,8 @@ impl Worker {
             timing: QueueTiming::default(),
             models: Arc::new(ModelsConfig::default()),
             messages: None,
+            poster: None,
+            sandbox: None,
             states: PhantomData,
         }
     }
@@ -98,6 +111,8 @@ impl<Q, S, M, J> WorkerBuilder<Q, S, M, J> {
             timing: self.timing,
             models: self.models,
             messages: self.messages,
+            poster: self.poster,
+            sandbox: self.sandbox,
             states: PhantomData,
         }
     }
@@ -117,6 +132,20 @@ impl<Q, S, M, J> WorkerBuilder<Q, S, M, J> {
     /// Where messages between agents are kept (Phase 2.3).
     pub fn messages(mut self, messages: Arc<dyn MessageStore>) -> Self {
         self.messages = Some(messages);
+        self
+    }
+
+    /// The gateway a background coworker turn calls. Without it, the one the
+    /// environment names (`HttpGatewayPoster::from_env`).
+    pub fn poster(mut self, poster: Arc<dyn GatewayPoster>) -> Self {
+        self.poster = Some(poster);
+        self
+    }
+
+    /// Where a background Box turn's sandbox runs. Without it, the one the
+    /// environment names (`sandbox_from_env`).
+    pub fn sandbox(mut self, sandbox: Arc<dyn SandboxHost>) -> Self {
+        self.sandbox = Some(sandbox);
         self
     }
 }
@@ -164,6 +193,10 @@ impl WorkerBuilder<Given, Given, Given, Given> {
             timing: self.timing,
             models: self.models,
             messages: self.messages,
+            poster: self
+                .poster
+                .unwrap_or_else(|| Arc::new(HttpGatewayPoster::from_env())),
+            sandbox: self.sandbox.unwrap_or_else(sandbox_from_env),
         }
     }
 }
@@ -568,6 +601,11 @@ impl Worker {
             seen += ladder.len();
             events.extend(ladder);
         }
+        // A background coworker turn (Phase 3.6) runs as a quick turn does,
+        // not through the harness.
+        if is_turn(spec) {
+            return self.run_turn(spec, events, seen, &append, &holds);
+        }
         let mut driver = match Driver::resume(spec.clone(), events) {
             Ok(driver) => driver,
             Err(error) => {
@@ -665,6 +703,82 @@ impl Worker {
             return Ok(Stopped::Waiting(*message_id));
         }
         Ok(stopped)
+    }
+}
+
+impl Worker {
+    /// Runs background coworker turn `spec` from its log (`events`, the
+    /// first `seen` stored; its user message was stored with it queued):
+    /// starts it, then
+    /// `finish_turn`, which stores the completion or the failure after the
+    /// Box sandbox is gone. A turn a dead worker started is picked up where
+    /// its log stops, its leftover sandbox removed first (decision 65A): the
+    /// gateway is called again. A turn left open (its sandbox could not be
+    /// removed, or the store could not answer) is not acknowledged, so it is
+    /// tried again.
+    fn run_turn(
+        &self,
+        spec: &RunSpec,
+        mut events: Vec<Event>,
+        seen: usize,
+        append: &dyn Fn(usize, Vec<Event>) -> Result<Stopped, String>,
+        holds: &dyn Fn() -> bool,
+    ) -> Result<Stopped, String> {
+        let started = events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::RunStarted));
+        if !started {
+            let begun = vec![system_event(spec, EventPayload::RunStarted)];
+            match append(seen, begun.clone())? {
+                Stopped::Store(Append::Appended) => {}
+                refused => return Ok(refused),
+            }
+            events.extend(begun);
+        } else if spec.placement == protocol::ExecutionPlacement::Box {
+            let name = box_container_name(spec.run_id);
+            let leftover = !self
+                .sandbox
+                .absent(&name)
+                .map_err(|error| format!("turn sandbox: {error:?}"))?;
+            if leftover {
+                self.sandbox
+                    .destroy(&name)
+                    .map_err(|error| format!("turn sandbox: {error:?}"))?;
+            }
+        }
+        if !holds() {
+            return Ok(Stopped::LostLease);
+        }
+        // Read again just before the sandbox goes up: a worker whose lease
+        // lapsed may have ended the turn since this one loaded it, and a
+        // sandbox is not provisioned for an ended turn.
+        let ended = self
+            .store
+            .run(spec.run_id)
+            .map_err(|error| error.to_string())?
+            .is_none_or(|run| run.events.iter().any(|event| is_terminal(&event.payload)));
+        if ended {
+            return Ok(Stopped::Store(Append::Terminal));
+        }
+        match finish_turn(
+            self.store.as_ref(),
+            spec.clone(),
+            events,
+            self.poster.as_ref(),
+            self.sandbox.as_ref(),
+        ) {
+            Ok(_) => Ok(Stopped::Store(Append::Appended)),
+            Err(TurnError::Conflict(_)) => Ok(Stopped::Store(Append::Terminal)),
+            Err(TurnError::NotFound) => Ok(Stopped::Store(Append::Missing)),
+            // A gateway failure ends the turn failed when its sandbox is
+            // gone; anything else leaves it open.
+            Err(error) => match self.store.run(spec.run_id) {
+                Ok(Some(run)) if run.events.iter().any(|event| is_terminal(&event.payload)) => {
+                    Ok(Stopped::Store(Append::Appended))
+                }
+                _ => Err(format!("turn left open: {error:?}")),
+            },
+        }
     }
 }
 
