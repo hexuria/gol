@@ -850,3 +850,97 @@ fn a_stop_covers_a_child_an_older_server_stored() {
         .expect("stop");
     assert_eq!(stops.stopped(child.run_id), Ok(true));
 }
+
+// Runs an older server stored have no owner, thread or parent columns until
+// the next connect fills them (51A). Every stop scope still reads them,
+// through their spec, so the stop cancels them at once rather than leaving
+// them to a worker's claim. Postgres only.
+#[test]
+fn every_stop_reads_the_runs_an_older_server_stored() {
+    let store = common::queued::POSTGRES
+        .get_or_init(|| {
+            Arc::new(server::PostgresStore::connect(common::queued::POSTGRES_URL).expect("connect"))
+                as Store
+        })
+        .clone();
+    let owner = Owner::new(common::ISSUER, fresh_user(), "tenant-1");
+    let thread = format!("old-{}", RunId::new());
+    let spec = |parent: Option<&RunSpec>| {
+        let builder = RunSpec::builder()
+            .owner(owner.clone())
+            .agent(AgentId::new(), "1")
+            .input("x")
+            .placement(protocol::ExecutionPlacement::Local)
+            .work_model(protocol::WorkModel {
+                provider: protocol::ModelProvider::OpenAI,
+                model_name: "gpt-test".to_string(),
+                credential: protocol::CredentialSource::PlatformGateway,
+            })
+            .metadata(
+                [(protocol::SESSION_ID.to_string(), thread.clone())]
+                    .into_iter()
+                    .collect(),
+            );
+        match parent {
+            Some(parent) => builder.child_of(parent, 1).build(),
+            None => builder.build(),
+        }
+    };
+    // A parent this server stored, its child and a root an older one did.
+    let parent = spec(None);
+    let child = spec(Some(&parent));
+    let root = spec(None);
+    assert_eq!(
+        store.put_run(StoredRun {
+            events: server::queued_events(&parent),
+            spec: parent.clone(),
+        }),
+        Ok(PutRun::Stored)
+    );
+    let mut admin =
+        postgres::Client::connect(common::queued::POSTGRES_URL, postgres::NoTls).expect("admin");
+    for old in [&child, &root] {
+        admin
+            .execute(
+                "insert into runs (id, spec) values ($1, $2)",
+                &[
+                    &old.run_id.as_uuid(),
+                    &serde_json::to_value(old).expect("spec"),
+                ],
+            )
+            .expect("an older server's insert");
+    }
+    let stops = store.stops().expect("stops");
+    let read = |scope: StopScope| {
+        let mut ids: Vec<RunId> = stops
+            .open_runs_under(&owner, &scope)
+            .expect("read")
+            .iter()
+            .map(|run| run.spec.run_id)
+            .collect();
+        ids.sort_by_key(|id| id.as_uuid());
+        ids
+    };
+    let sorted = |mut ids: Vec<RunId>| {
+        ids.sort_by_key(|id| id.as_uuid());
+        ids
+    };
+    assert_eq!(
+        read(StopScope::Run(parent.run_id)),
+        sorted(vec![parent.run_id, child.run_id])
+    );
+    assert_eq!(
+        read(StopScope::Thread(thread.clone())),
+        sorted(vec![parent.run_id, child.run_id, root.run_id])
+    );
+    assert_eq!(
+        read(StopScope::Owner),
+        sorted(vec![parent.run_id, child.run_id, root.run_id])
+    );
+    // A thread stop covers the older server's root, through its session.
+    assert_eq!(stops.stopped(root.run_id), Ok(false));
+    stops
+        .put_stop(&owner, &StopScope::Thread(thread.clone()))
+        .expect("stop");
+    assert_eq!(stops.stopped(root.run_id), Ok(true));
+}

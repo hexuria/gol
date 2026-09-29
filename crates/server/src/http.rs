@@ -740,7 +740,7 @@ async fn follow_up(
                 Some(task) => (task, text),
                 None => return Err(ApiError::WhichTask(waiting)),
             },
-            None if waiting.len() == 1 => (&waiting[0], body.input.as_str()),
+            None if waiting.len() == 1 => (&waiting[0], body.input.trim()),
             None => return Err(ApiError::WhichTask(waiting)),
         };
         if body.limits.is_some() {

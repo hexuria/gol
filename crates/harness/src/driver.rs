@@ -623,12 +623,9 @@ impl Driver {
         self.push(payload, Actor::System);
     }
 
-    /// Hands a message to the deliverer and records what happened. A tell
-    /// or a new ask starts a task, whose budget is carved as for a
-    /// delegation (decision 33A) and recorded as `ChildStarted`; a reply
-    /// starts none. An accepted ask moves the harness to `WaitingForMessage`.
     /// Puts a question to the run's user, or refuses it when the run cannot
-    /// wait for the answer.
+    /// wait for the answer. A question put moves the harness to
+    /// `WaitingForMessage`.
     fn ask_user(&mut self, prompt: &str) {
         let payload = if self.user_questions {
             EventPayload::UserAsked {
@@ -643,6 +640,10 @@ impl Driver {
         self.push(payload, Actor::System);
     }
 
+    /// Hands a message to the deliverer and records what happened. A tell
+    /// or a new ask starts a task, whose budget is carved as for a
+    /// delegation (decision 33A) and recorded as `ChildStarted`; a reply
+    /// starts none. An accepted ask moves the harness to `WaitingForMessage`.
     fn send_message(
         &mut self,
         to: AgentId,
