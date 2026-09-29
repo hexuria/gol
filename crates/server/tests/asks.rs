@@ -238,11 +238,11 @@ impl Setup {
     }
 
     fn deliverer(&self) -> OwnedDeliverer {
-        OwnedDeliverer::new(
-            self.runs.clone(),
-            self.messages.clone(),
-            Arc::new(RedisRunQueue::with_key(REDIS_URL, &self.key)),
-        )
+        OwnedDeliverer::builder()
+            .store(self.runs.clone())
+            .messages(self.messages.clone())
+            .queue(Arc::new(RedisRunQueue::with_key(REDIS_URL, &self.key)))
+            .build()
     }
 }
 
@@ -650,6 +650,7 @@ fn an_ask_without_its_asker_is_closed() {
             reply_to: None,
             task_run: Some(RunId::new()),
             deadline: Some(Timestamp::unix_millis(now.as_unix_millis() - 1_000)),
+            hop: 0,
         };
         setup.messages.put_message(orphan.clone()).expect("put");
         let open = |setup: &Setup| {
@@ -899,4 +900,62 @@ fn an_ask_never_logged_is_closed_at_its_deadline(which: usize) {
     assert!(swept.contains(&setup.researcher.run_id));
     assert_eq!(setup.answers(), []);
     assert_eq!(setup.messages.ask_of_task(task), Ok(None));
+}
+
+// Decision 26A and the plan's "checks same owner and hop": a tell or a new
+// ask starts a task one hop further, so the deliverer refuses one from a run
+// already 8 hops deep, starting and storing nothing. The eighth hop is sent,
+// and the message keeps its sender's hop.
+#[test]
+fn a_ninth_hop_is_refused() {
+    for which in 0..2 {
+        let setup = setup(which);
+        let deliverer = setup.deliverer();
+        let mut deep = setup.researcher.clone();
+        let send = |from: &RunSpec, decision: u32| {
+            deliverer.send(MessageRequest {
+                from,
+                decision,
+                to: setup.writer,
+                body: "what is the plan?",
+                expects_reply: true,
+                reply_to: None,
+                timeout_secs: Some(3600),
+                limits: Some(Limits {
+                    max_steps: 3,
+                    max_model_calls: 2,
+                }),
+            })
+        };
+
+        deep.lineage.hop = 7;
+        let sent = send(&deep, 1).expect("the eighth hop");
+        let stored = setup
+            .messages
+            .message(sent.message_id)
+            .expect("read")
+            .expect("stored");
+        assert_eq!(stored.hop, 7);
+        let task = sent.task.expect("a task").run_id;
+        let task = setup.runs.run(task).expect("read").expect("task");
+        assert_eq!(task.spec.lineage.hop, 8);
+
+        deep.lineage.hop = 8;
+        let queued = setup.queue.queued().expect("queued");
+        assert_eq!(
+            send(&deep, 2).map(|sent| sent.message_id),
+            Err("messaging is already 8 hops deep".to_string())
+        );
+        assert_eq!(setup.queue.queued().expect("queued"), queued);
+        let due = setup
+            .messages
+            .open_asks_due(Timestamp::unix_millis(i64::MAX))
+            .expect("asks");
+        assert_eq!(
+            due.iter()
+                .filter(|message| message.from_run == deep.run_id)
+                .count(),
+            1
+        );
+    }
 }

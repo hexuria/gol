@@ -2,14 +2,19 @@
 //! worker's `MessageDeliverer`, and the delivery of a reply (or an ask's
 //! timeout) to the run that asked, which the worker and the sweep share.
 //! `formal/runqueue` models the park and wake around it (decision 34A).
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use harness::{ChildRequest, MessageDeliverer, MessageRequest, SentMessage};
-use protocol::{Actor, AgentId, Event, EventPayload, EventSource, MessageId, RunId, Timestamp};
+use protocol::{
+    Actor, AgentId, Event, EventPayload, EventSource, MessageId, RunId, Timestamp,
+    MAX_DELEGATION_HOPS,
+};
 
 use crate::queue::RedisRunQueue;
 use crate::spawner::OwnedSpawner;
 use crate::store::{is_terminal, Append, MessageStore, PutMessage, RunStore, StoredMessage};
+use crate::worker::{Given, Missing};
 
 /// The step a message's task is derived from: the sending decision with the
 /// high bit set, so a task never shares its id with a delegation's child at
@@ -32,18 +37,73 @@ pub struct OwnedDeliverer {
     spawner: OwnedSpawner,
 }
 
-impl OwnedDeliverer {
-    pub fn new(
-        store: Arc<dyn RunStore>,
+/// An `OwnedDeliverer` whose run store, messages store and queue are each
+/// required before `build` exists.
+pub struct OwnedDelivererBuilder<S, M, Q> {
+    store: Option<Arc<dyn RunStore>>,
+    messages: Option<Arc<dyn MessageStore>>,
+    queue: Option<Arc<RedisRunQueue>>,
+    states: PhantomData<(S, M, Q)>,
+}
+
+impl<S, M, Q> OwnedDelivererBuilder<S, M, Q> {
+    fn to<S2, M2, Q2>(self) -> OwnedDelivererBuilder<S2, M2, Q2> {
+        OwnedDelivererBuilder {
+            store: self.store,
+            messages: self.messages,
+            queue: self.queue,
+            states: PhantomData,
+        }
+    }
+}
+
+impl<M, Q> OwnedDelivererBuilder<Missing, M, Q> {
+    pub fn store(mut self, store: Arc<dyn RunStore>) -> OwnedDelivererBuilder<Given, M, Q> {
+        self.store = Some(store);
+        self.to()
+    }
+}
+
+impl<S, Q> OwnedDelivererBuilder<S, Missing, Q> {
+    pub fn messages(
+        mut self,
         messages: Arc<dyn MessageStore>,
-        queue: Arc<RedisRunQueue>,
-    ) -> Self {
+    ) -> OwnedDelivererBuilder<S, Given, Q> {
+        self.messages = Some(messages);
+        self.to()
+    }
+}
+
+impl<S, M> OwnedDelivererBuilder<S, M, Missing> {
+    pub fn queue(mut self, queue: Arc<RedisRunQueue>) -> OwnedDelivererBuilder<S, M, Given> {
+        self.queue = Some(queue);
+        self.to()
+    }
+}
+
+impl OwnedDelivererBuilder<Given, Given, Given> {
+    pub fn build(self) -> OwnedDeliverer {
+        let (Some(store), Some(messages), Some(queue)) = (self.store, self.messages, self.queue)
+        else {
+            unreachable!("every required input is given in this state")
+        };
         let spawner = OwnedSpawner::new(store.clone(), Some(queue.clone()));
-        Self {
+        OwnedDeliverer {
             store,
             messages,
             queue,
             spawner,
+        }
+    }
+}
+
+impl OwnedDeliverer {
+    pub fn builder() -> OwnedDelivererBuilder<Missing, Missing, Missing> {
+        OwnedDelivererBuilder {
+            store: None,
+            messages: None,
+            queue: None,
+            states: PhantomData,
         }
     }
 
@@ -81,6 +141,13 @@ impl MessageDeliverer for OwnedDeliverer {
         let Some(limits) = request.limits else {
             return self.reply(request);
         };
+        // The authorizer denies this too; the deliverer does not start a
+        // task past the cap on another caller's word.
+        if from.lineage.hop >= MAX_DELEGATION_HOPS {
+            return Err(format!(
+                "messaging is already {MAX_DELEGATION_HOPS} hops deep"
+            ));
+        }
         let task = self.spawner.child_spec(ChildRequest {
             parent: from,
             step: task_step(request.decision),
@@ -110,6 +177,7 @@ impl MessageDeliverer for OwnedDeliverer {
             reply_to: request.reply_to,
             task_run: Some(task.run_id),
             deadline,
+            hop: from.lineage.hop,
         })?;
         let task = self.spawner.enqueue_child(from, task)?;
         Ok(SentMessage {
@@ -148,6 +216,7 @@ impl OwnedDeliverer {
             reply_to: Some(ask.id),
             task_run: None,
             deadline: None,
+            hop: from.lineage.hop,
         })?;
         // Stored, so sent: it reaches the asker now, or, while the ask is
         // not in the asker's log yet, never (the task's end answers then).

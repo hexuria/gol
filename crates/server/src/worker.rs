@@ -566,11 +566,13 @@ impl Worker {
         let (spawner, targets) = self.delegation(spec);
         driver = driver.with_spawner(spawner, targets);
         if let Some(messages) = &self.messages {
-            driver = driver.with_deliverer(Arc::new(OwnedDeliverer::new(
-                self.store.clone(),
-                messages.clone(),
-                self.queue.clone(),
-            )));
+            driver = driver.with_deliverer(Arc::new(
+                OwnedDeliverer::builder()
+                    .store(self.store.clone())
+                    .messages(messages.clone())
+                    .queue(self.queue.clone())
+                    .build(),
+            ));
         }
         let mut decider = match jev_client(&self.jev_base_url) {
             Ok(client) => JevDecider::new(client),

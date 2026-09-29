@@ -18,7 +18,7 @@ pub use auth::{
     auth_from_env, AuthError, Authenticator, LocalDevAuthenticator, OidcConfig, OidcConfigBuilder,
     OidcVerifier, Principal, LOCAL_DEV_TOKEN,
 };
-pub use deliverer::OwnedDeliverer;
+pub use deliverer::{OwnedDeliverer, OwnedDelivererBuilder};
 pub use http::{
     router, router_with_gateway, router_with_memory, router_with_queue, router_with_sandbox,
 };
