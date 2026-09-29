@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentId, ApprovalId, Effect, EventId, FailureClass, InvocationId, Limits, MemoryScope,
-    ModelMessage, RunId, RunSpec, StepId,
+    MessageId, ModelMessage, RunId, RunSpec, StepId,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +129,32 @@ pub enum EventPayload {
         agent_id: AgentId,
         reason: String,
     },
+    /// An authorized message was accepted for delivery as `message_id`. An
+    /// ask moves the harness to `WaitingForMessage`.
+    MessageSent {
+        message_id: MessageId,
+        to: AgentId,
+        expects_reply: bool,
+    },
+    /// An authorized message was not accepted, for `reason`.
+    MessageRefused {
+        to: AgentId,
+        reason: String,
+    },
+    /// A message reached this run. The reply to the ask the harness waits
+    /// on (`reply_to`) answers the asking step.
+    MessageReceived {
+        message_id: MessageId,
+        from_agent: AgentId,
+        from_run: RunId,
+        body: String,
+        reply_to: Option<MessageId>,
+    },
+    /// The ask `message_id` had no reply within its timeout; the asking
+    /// step is answered without one.
+    AskTimedOut {
+        message_id: MessageId,
+    },
 }
 
 impl EventPayload {
@@ -161,6 +187,10 @@ impl EventPayload {
             Self::MemoryWritten { .. } => "memory.written",
             Self::ChildStarted { .. } => "child.started",
             Self::DelegateRefused { .. } => "delegate.refused",
+            Self::MessageSent { .. } => "message.sent",
+            Self::MessageRefused { .. } => "message.refused",
+            Self::MessageReceived { .. } => "message.received",
+            Self::AskTimedOut { .. } => "message.ask_timed_out",
         }
     }
 }

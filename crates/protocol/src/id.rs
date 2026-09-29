@@ -54,3 +54,4 @@ id!(ArtifactId);
 id!(ToolId);
 id!(ApprovalId);
 id!(InvocationId);
+id!(MessageId);

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentId, ApprovalId, ArtifactId, InvocationId, RunSpec};
+use crate::{AgentId, ApprovalId, ArtifactId, InvocationId, MessageId, RunSpec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum MemoryScope {
@@ -39,6 +39,16 @@ pub enum Effect {
     Delegate {
         agent_id: AgentId,
         input: String,
+    },
+    /// A message to another agent of the same owner (Phase 2). A tell goes
+    /// on; an ask (`expects_reply`) waits for its reply, or for its
+    /// `timeout_secs`. A reply names the ask it answers in `reply_to`.
+    SendMessage {
+        to: AgentId,
+        body: String,
+        expects_reply: bool,
+        reply_to: Option<MessageId>,
+        timeout_secs: Option<u32>,
     },
     AskUser {
         prompt: String,
