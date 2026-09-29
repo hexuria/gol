@@ -863,9 +863,14 @@ fn every_stop_reads_the_runs_an_older_server_stored() {
                 as Store
         })
         .clone();
+    // This binary's other Postgres store connects now, not while the
+    // older server's rows below must stay unfilled.
+    drop(stores_with_messages());
     let owner = Owner::new(common::ISSUER, fresh_user(), "tenant-1");
     let thread = format!("old-{}", RunId::new());
-    let spec = |parent: Option<&RunSpec>| {
+    let other_thread = format!("old-{}", RunId::new());
+    let bob = Owner::new(common::ISSUER, fresh_user(), "tenant-1");
+    let spec_of = |owner: &Owner, thread: &str, parent: Option<&RunSpec>| {
         let builder = RunSpec::builder()
             .owner(owner.clone())
             .agent(AgentId::new(), "1")
@@ -877,7 +882,7 @@ fn every_stop_reads_the_runs_an_older_server_stored() {
                 credential: protocol::CredentialSource::PlatformGateway,
             })
             .metadata(
-                [(protocol::SESSION_ID.to_string(), thread.clone())]
+                [(protocol::SESSION_ID.to_string(), thread.to_string())]
                     .into_iter()
                     .collect(),
             );
@@ -886,10 +891,16 @@ fn every_stop_reads_the_runs_an_older_server_stored() {
             None => builder.build(),
         }
     };
-    // A parent this server stored, its child and a root an older one did.
+    let spec = |parent: Option<&RunSpec>| spec_of(&owner, &thread, parent);
+    // A parent this server stored, its child and a root an older one did;
+    // in another thread an older server's root and its child; and another
+    // principal's run in the first thread, which no stop of this one reads.
     let parent = spec(None);
     let child = spec(Some(&parent));
     let root = spec(None);
+    let old_root = spec_of(&owner, &other_thread, None);
+    let old_child = spec_of(&owner, &other_thread, Some(&old_root));
+    let bobs = spec_of(&bob, &thread, None);
     assert_eq!(
         store.put_run(StoredRun {
             events: server::queued_events(&parent),
@@ -899,7 +910,7 @@ fn every_stop_reads_the_runs_an_older_server_stored() {
     );
     let mut admin =
         postgres::Client::connect(common::queued::POSTGRES_URL, postgres::NoTls).expect("admin");
-    for old in [&child, &root] {
+    for old in [&child, &root, &old_root, &old_child, &bobs] {
         admin
             .execute(
                 "insert into runs (id, spec) values ($1, $2)",
@@ -935,12 +946,47 @@ fn every_stop_reads_the_runs_an_older_server_stored() {
     );
     assert_eq!(
         read(StopScope::Owner),
-        sorted(vec![parent.run_id, child.run_id, root.run_id])
+        sorted(vec![
+            parent.run_id,
+            child.run_id,
+            root.run_id,
+            old_root.run_id,
+            old_child.run_id
+        ])
     );
+    // A run stop from an older server's root reaches its child.
+    assert_eq!(
+        read(StopScope::Run(old_root.run_id)),
+        sorted(vec![old_root.run_id, old_child.run_id])
+    );
+    // A thread whose root an older server stored is found, so its stop
+    // button is not 404.
+    let found = store
+        .threads()
+        .expect("threads")
+        .thread_root(&owner, &other_thread)
+        .expect("root")
+        .map(|spec| spec.run_id);
+    assert_eq!(found, Some(old_root.run_id));
     // A thread stop covers the older server's root, through its session.
     assert_eq!(stops.stopped(root.run_id), Ok(false));
     stops
         .put_stop(&owner, &StopScope::Thread(thread.clone()))
         .expect("stop");
     assert_eq!(stops.stopped(root.run_id), Ok(true));
+    // The older server's rows stayed unfilled throughout, so the spec
+    // branches, not the columns, answered: a connect elsewhere in this
+    // binary (51A) could have filled them.
+    let olds: Vec<uuid::Uuid> = [&child, &root, &old_root, &old_child, &bobs]
+        .iter()
+        .map(|old| old.run_id.as_uuid())
+        .collect();
+    let unfilled: i64 = admin
+        .query_one(
+            "select count(*) from runs where id = any($1) and owner_issuer is null",
+            &[&olds],
+        )
+        .expect("count")
+        .get(0);
+    assert_eq!(unfilled, 5, "a connect filled the rows mid-test");
 }

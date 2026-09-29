@@ -221,7 +221,7 @@ create table if not exists artifacts (
 
 /// Indexes created once, each as (table, name, statement): an existing one
 /// is found in the catalog, not by `create index if not exists`.
-const INDEXES: [(&str, &str, &str); 8] = [
+const INDEXES: [(&str, &str, &str); 7] = [
     // A stop check reads a principal's stops, and walks runs by parent.
     (
         "stops",
@@ -232,13 +232,6 @@ const INDEXES: [(&str, &str, &str); 8] = [
         "runs",
         "runs_by_parent",
         "create index runs_by_parent on runs (parent_run)",
-    ),
-    // The runs an older server stored without their columns, until the next
-    // connect fills them: a stop reads them through their spec.
-    (
-        "runs",
-        "runs_unfilled",
-        "create index runs_unfilled on runs (id) where owner_issuer is null",
     ),
     // A principal's threads, and a thread's runs in order.
     (
@@ -646,10 +639,19 @@ impl ThreadStore for PostgresStore {
         let row = self.with_client(|client| {
             client
                 .query_opt(
-                    "select spec from runs
+                    "select spec, created_ms, id from runs
                      where owner_issuer = $1 and owner_subject = $2 and thread_id = $3
                        and parent_run is null
-                     order by created_ms, id
+                     union all
+                     -- A root an older server stored, before its columns
+                     -- are filled (51A): by its spec, after any filled one.
+                     select spec, created_ms, id from runs
+                     where owner_issuer is null
+                       and spec->'owner'->>'issuer' = $1
+                       and spec->'owner'->>'subject' = $2
+                       and spec->'metadata'->>'session_id' = $3
+                       and spec->'lineage'->>'parent' is null
+                     order by created_ms nulls last, id
                      limit 1",
                     &[&owner.issuer, &owner.subject, &thread],
                 )
@@ -740,12 +742,14 @@ impl StopStore for PostgresStore {
             let open = "not exists (
                             select 1 from run_events
                             where run_events.run_id = runs.id and run_events.terminal)";
-            // The principal's runs, and those an older server stored without
-            // their columns (`runs_unfilled`), by their spec.
-            let mine = "(owner_issuer = $1 and owner_subject = $2
-                         or owner_issuer is null
+            // The runs an older server stored without their columns, until
+            // the next connect fills them (51A), read by their spec. Each
+            // query reads the filled rows and these apart (`union all`; no
+            // row is both), so the filled half keeps its index.
+            let unfilled = "owner_issuer is null
                             and spec->'owner'->>'issuer' = $1
-                            and spec->'owner'->>'subject' = $2)";
+                            and spec->'owner'->>'subject' = $2";
+            let mine = format!("(owner_issuer = $1 and owner_subject = $2 or {unfilled})");
             let specs = match scope {
                 StopScope::Run(run) => tx.query(
                     &format!(
@@ -755,7 +759,7 @@ impl StopStore for PostgresStore {
                              select runs.id from runs join tree
                                on runs.parent_run = tree.id
                                or runs.owner_issuer is null
-                                  and (runs.spec->'lineage'->>'parent')::uuid = tree.id
+                                  and runs.spec->'lineage'->>'parent' = tree.id::text
                          )
                          select runs.id, runs.spec from runs join tree on runs.id = tree.id
                          where {mine} and {open}"
@@ -765,17 +769,21 @@ impl StopStore for PostgresStore {
                 StopScope::Thread(thread) => tx.query(
                     &format!(
                         "select id, spec from runs
-                         where {mine}
-                           and (thread_id = $3
-                                or owner_issuer is null
-                                   and spec->'metadata'->>'session_id' = $3)
+                         where owner_issuer = $1 and owner_subject = $2 and thread_id = $3
+                           and {open}
+                         union all
+                         select id, spec from runs
+                         where {unfilled} and spec->'metadata'->>'session_id' = $3
                            and {open}"
                     ),
                     &[&owner.issuer, &owner.subject, thread],
                 ),
                 StopScope::Owner => tx.query(
                     &format!(
-                        "select id, spec from runs where {mine} and {open}"
+                        "select id, spec from runs
+                         where owner_issuer = $1 and owner_subject = $2 and {open}
+                         union all
+                         select id, spec from runs where {unfilled} and {open}"
                     ),
                     &[&owner.issuer, &owner.subject],
                 ),

@@ -740,7 +740,7 @@ async fn follow_up(
                 Some(task) => (task, text),
                 None => return Err(ApiError::WhichTask(waiting)),
             },
-            None if waiting.len() == 1 => (&waiting[0], body.input.trim()),
+            None if waiting.len() == 1 => (&waiting[0], body.input.as_str()),
             None => return Err(ApiError::WhichTask(waiting)),
         };
         if body.limits.is_some() {
@@ -834,7 +834,12 @@ async fn answer_question(
     if text.len() > MAX_MESSAGE_BYTES {
         return Err(ApiError::TooLarge("the answer is too long"));
     }
-    let (store, queue, text) = (state.store.clone(), state.queue.clone(), text.to_string());
+    // Stored trimmed, however it came: a reply or a thread message.
+    let (store, queue, text) = (
+        state.store.clone(),
+        state.queue.clone(),
+        text.trim().to_string(),
+    );
     tokio::task::spawn_blocking(move || {
         // The question answered: the one the caller saw, else the one first
         // read. A task that went on to another question is not answered

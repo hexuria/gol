@@ -161,7 +161,8 @@ async fn a_reply_resumes_it() {
         let agent = server.agent(&user, "planner", &["user.ask"]).await;
         let (thread, run) = server.start(&user, agent, "plan a trip").await;
         assert!(server.work().await.is_some());
-        let (status, body) = reply(&server, &user, &run, "SFO").await;
+        // Stored trimmed, as a thread message's answer is.
+        let (status, body) = reply(&server, &user, &run, "  SFO \n").await;
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["answered"], json!(run));
         assert_eq!(answers(&store, &run).await, ["SFO"]);
