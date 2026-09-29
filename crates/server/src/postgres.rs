@@ -1,4 +1,6 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
+
+use postgres::fallible_iterator::FallibleIterator;
 use std::time::Duration;
 
 use postgres::{IsolationLevel, NoTls};
@@ -8,8 +10,9 @@ use serde_json::Value;
 use harness::StoreError;
 
 use crate::store::{
-    check_one_terminal, is_terminal, Append, MessageStore, OutboxEntry, OutboxPage, OutboxStore,
-    PutAgent, PutMessage, PutRun, RunStore, StoredAgent, StoredArtifact, StoredMessage, StoredRun,
+    check_one_terminal, is_terminal, principal_hint_of, Append, Hint, HintStream, Hints,
+    MessageStore, OutboxEntry, OutboxPage, OutboxStore, PutAgent, PutMessage, PutRun, RunStore,
+    StoredAgent, StoredArtifact, StoredMessage, StoredRun, ALL,
 };
 
 /// The run store in Postgres over a pool of connections (C2, owner decision
@@ -19,6 +22,67 @@ use crate::store::{
 /// (C1 decision 2A).
 pub struct PostgresStore {
     pool: r2d2::Pool<Connections>,
+    /// The listener's own connection, outside the pool (decision 40A).
+    listen: postgres::Config,
+    hints: Hints,
+    /// Whether the listener thread was started.
+    listening: std::sync::Mutex<bool>,
+}
+
+/// The channel a principal's hint is notified on, after each append commits
+/// (decision 46A).
+const CHANNEL: &str = "gol_outbox";
+
+/// How long the listener waits for a notification before it checks that its
+/// connection is still alive.
+const LISTEN_CHECK: Duration = Duration::from_secs(30);
+
+/// Listens for `CHANNEL` on its own connection and forwards each hint, for
+/// as long as the process runs. While it is connected, `live` is true. After
+/// a failure (a dead connection, found within `LISTEN_CHECK`, or a panic) it
+/// reconnects after a second and wakes every stream, since hints may have
+/// been lost while it was down.
+fn listen(
+    config: postgres::Config,
+    hints: tokio::sync::broadcast::Sender<Hint>,
+    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    loop {
+        let listened = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+            let mut client = config.connect(NoTls).map_err(|error| error.to_string())?;
+            client
+                .batch_execute(&format!("listen {CHANNEL}"))
+                .map_err(|error| error.to_string())?;
+            live.store(true, Ordering::Relaxed);
+            let _ = hints.send(ALL);
+            loop {
+                {
+                    let mut notifications = client.notifications();
+                    let mut waiting = notifications.timeout_iter(LISTEN_CHECK);
+                    while let Some(notification) =
+                        waiting.next().map_err(|error| error.to_string())?
+                    {
+                        if let Ok(hint) = notification.payload().parse::<Hint>() {
+                            let _ = hints.send(hint);
+                        }
+                    }
+                }
+                // Quiet for LISTEN_CHECK: a half-open connection would stay
+                // quiet forever, so ask the server.
+                if !client.is_valid(Duration::from_secs(5)).is_ok() {
+                    return Err("the connection is gone".to_string());
+                }
+            }
+        }));
+        live.store(false, Ordering::Relaxed);
+        match listened {
+            Ok(Err(error)) => eprintln!("gol: outbox listener: {error}"),
+            Ok(Ok(())) => {}
+            Err(_) => eprintln!("gol: outbox listener: panicked"),
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 /// Opens and checks the pool's connections. A connect that panics (the
@@ -251,10 +315,32 @@ impl PostgresStore {
             .min_idle(Some(options.min_idle.min(size)))
             .test_on_check_out(true)
             .connection_timeout(wait)
-            .build_unchecked(Connections { config });
-        let store = Self { pool };
+            .build_unchecked(Connections {
+                config: config.clone(),
+            });
+        let store = Self {
+            pool,
+            listen: config,
+            hints: Hints::listened(),
+            listening: std::sync::Mutex::new(false),
+        };
         store.with_client(ensure_schema)?;
         Ok(store)
+    }
+
+    /// Tells the streams that `principal` has new entries, after the append
+    /// committed (decision 46A): this process's own at once, and every other
+    /// server by a NOTIFY in a statement of its own, so the append's commit
+    /// never takes Postgres's notify lock. A failure costs only speed, not an
+    /// event: streams also poll.
+    fn notify(&self, client: &mut postgres::Client, principal: &(String, String)) {
+        let hint = principal_hint_of(&principal.0, &principal.1);
+        self.hints.send(hint);
+        if let Err(error) =
+            client.execute("select pg_notify($1, $2)", &[&CHANNEL, &hint.to_string()])
+        {
+            eprintln!("gol: outbox notify: {error}");
+        }
     }
 
     /// Runs `op` on a pooled connection. The pool tests a connection before
@@ -353,6 +439,7 @@ impl PostgresStore {
             }
             rows.insert(&mut tx, id, last, &principal)?;
             tx.commit().map_err(sql)?;
+            self.notify(client, &principal);
             Ok(Append::Appended)
         })
     }
@@ -370,24 +457,24 @@ impl OutboxStore for PostgresStore {
     ) -> Result<OutboxPage, StoreError> {
         let after = i64::try_from(after).unwrap_or(i64::MAX);
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let (pruned, rows) = self.with_client(|client| {
+        let (pruned, last, rows) = self.with_client(|client| {
             let mut tx = client
                 .build_transaction()
                 .read_only(true)
                 .isolation_level(IsolationLevel::RepeatableRead)
                 .start()
                 .map_err(sql)?;
-            let pruned: i64 = tx
+            let (pruned, last): (i64, i64) = tx
                 .query_opt(
-                    "select pruned from outbox_counters
+                    "select pruned, last from outbox_counters
                      where owner_issuer = $1 and owner_subject = $2",
                     &[&owner.issuer, &owner.subject],
                 )
                 .map_err(sql)?
-                .map(|row| row.try_get(0))
+                .map(|row| Ok::<_, postgres::Error>((row.try_get(0)?, row.try_get(1)?)))
                 .transpose()
                 .map_err(sql)?
-                .unwrap_or(0);
+                .unwrap_or((0, 0));
             let rows = tx
                 .query(
                     "select outbox.seq, outbox.run_id, outbox.run_seq, run_events.body
@@ -401,7 +488,7 @@ impl OutboxStore for PostgresStore {
                 )
                 .map_err(sql)?;
             tx.commit().map_err(sql)?;
-            Ok((pruned, rows))
+            Ok((pruned, last, rows))
         })?;
         let entries = rows
             .iter()
@@ -426,7 +513,29 @@ impl OutboxStore for PostgresStore {
         Ok(OutboxPage {
             entries,
             pruned_through: u64::try_from(pruned).unwrap_or(0),
+            last: u64::try_from(last).unwrap_or(0),
         })
+    }
+
+    fn hints(&self) -> HintStream {
+        let stream = self.hints.subscribe();
+        let mut started = self
+            .listening
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !*started {
+            let (config, hints, live) =
+                (self.listen.clone(), self.hints.sender(), self.hints.live());
+            match std::thread::Builder::new()
+                .name("gol-outbox-listener".to_string())
+                .spawn(move || listen(config, hints, live))
+            {
+                Ok(_) => *started = true,
+                // The next stream tries again; this one polls.
+                Err(error) => eprintln!("gol: outbox listener: {error}"),
+            }
+        }
+        stream
     }
 
     /// One statement: for each principal, the last number stored before
@@ -652,6 +761,9 @@ impl RunStore for PostgresStore {
                 rows.insert(&mut tx, id, 0, &principal)?;
             }
             tx.commit().map_err(sql)?;
+            if inserted == 1 && !run.events.is_empty() {
+                self.notify(client, &principal);
+            }
             Ok(if inserted == 1 {
                 PutRun::Stored
             } else {
@@ -763,6 +875,10 @@ impl RunStore for PostgresStore {
             name: row.try_get(1).map_err(sql)?,
             body: row.try_get(2).map_err(sql)?,
         }))
+    }
+
+    fn outbox(&self) -> Option<&dyn OutboxStore> {
+        Some(self)
     }
 }
 

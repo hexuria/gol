@@ -5,6 +5,7 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use harness::{
@@ -25,7 +26,8 @@ use crate::inference::{
 };
 use crate::models::ModelsConfig;
 use crate::queue::RedisRunQueue;
-use crate::store::{AgentManifest, PutAgent, RunStore, StoredAgent, StoredRun};
+use crate::store::{is_terminal, AgentManifest, PutAgent, RunStore, StoredAgent, StoredRun};
+use crate::stream::{outbox_stream, run_stream, SseBody, Streams};
 use crate::surface::{ag_ui_events, json_render_spec};
 
 #[derive(Clone)]
@@ -40,6 +42,8 @@ struct AppState {
     poster: SharedPoster,
     sandbox: Arc<dyn SandboxHost>,
     auth: Arc<dyn Authenticator>,
+    /// The streams each principal has open (Phase 3.2).
+    streams: Arc<Streams>,
 }
 
 /// `POST /v1/runs`. Capabilities come from the stored manifest, so the body
@@ -144,6 +148,7 @@ pub fn router_with_queue(
         poster: Arc::new(HttpGatewayPoster::from_env()),
         sandbox: sandbox_from_env(),
         auth,
+        streams: Arc::default(),
     })
 }
 
@@ -172,6 +177,7 @@ pub fn router_with_sandbox(
         poster,
         sandbox,
         auth,
+        streams: Arc::default(),
     })
 }
 
@@ -197,6 +203,7 @@ pub fn router_with_memory(
         poster,
         sandbox: sandbox_from_env(),
         auth,
+        streams: Arc::default(),
     })
 }
 
@@ -213,6 +220,8 @@ fn router_with_state(state: AppState) -> Router {
         .route("/v1/runs/{id}/events", get(get_events))
         .route("/v1/runs/{id}/ag-ui", get(get_ag_ui))
         .route("/v1/runs/{id}/ui", get(get_ui))
+        .route("/v1/runs/{id}/stream", get(get_run_stream))
+        .route("/v1/stream", get(get_stream))
         .route("/v1/coworker/turns", post(create_coworker_turn))
         .route(
             "/v1/coworker/turns/{id}/completion",
@@ -567,6 +576,75 @@ async fn get_events(
     Ok(Json(stored.events))
 }
 
+/// `?after=` for a stream, beside a `Last-Event-ID` header.
+#[derive(Debug, Deserialize)]
+struct StreamQuery {
+    after: Option<u64>,
+}
+
+/// Where a stream resumes: the `Last-Event-ID` header, else `?after=`.
+fn resume(
+    headers: &HeaderMap,
+    query: Result<Query<StreamQuery>, QueryRejection>,
+) -> Result<Option<u64>, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::BadRequest("after must be a count"))?;
+    match headers.get("last-event-id") {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .map(Some)
+            .ok_or(ApiError::BadRequest("Last-Event-ID must be a count")),
+        None => Ok(query.after),
+    }
+}
+
+/// `GET /v1/stream`: the caller's outbox as server-sent events (Phase 3.2).
+async fn get_stream(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: Result<Query<StreamQuery>, QueryRejection>,
+) -> Result<SseBody, ApiError> {
+    let resume = resume(&headers, query)?;
+    if state.store.outbox().is_none() {
+        return Err(ApiError::NoStreams);
+    }
+    let owner = owner_of(&principal);
+    let slot = state.streams.take(&owner).ok_or(ApiError::TooManyStreams)?;
+    Ok(outbox_stream(state.store.clone(), owner, resume, slot))
+}
+
+/// `GET /v1/runs/{id}/stream`: one owned run's log as server-sent events,
+/// to its end. A run another principal owns is not found. A cursor on the
+/// run's terminal event gets 204, which tells a browser's EventSource to
+/// stop reconnecting; one past the log is refused.
+async fn get_run_stream(
+    Authenticated(principal): Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<RunId>,
+    headers: HeaderMap,
+    query: Result<Query<StreamQuery>, QueryRejection>,
+) -> Result<axum::response::Response, ApiError> {
+    let resume = resume(&headers, query)?.unwrap_or(0);
+    // The event at the cursor (the first, with none), which also checks
+    // that the caller owns the run.
+    let from = usize::try_from(resume.saturating_sub(1)).unwrap_or(usize::MAX);
+    let at = owned_run_page(&state, id, &principal, from, 1).await?;
+    match at.events.first() {
+        Some(event) if resume > 0 && is_terminal(&event.payload) => {
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
+        None if resume > 0 => {
+            return Err(ApiError::BadRequest("the cursor is past the run's log"));
+        }
+        _ => {}
+    }
+    let owner = owner_of(&principal);
+    let slot = state.streams.take(&owner).ok_or(ApiError::TooManyStreams)?;
+    Ok(run_stream(state.store.clone(), owner, id, resume, slot).into_response())
+}
+
 async fn get_ag_ui(
     Authenticated(principal): Authenticated,
     State(state): State<AppState>,
@@ -744,6 +822,9 @@ enum ApiError {
     Rejected(JsonRejection),
     Unauthorized,
     AuthUnavailable(String),
+    TooManyStreams,
+    /// The store keeps no outbox, so there is nothing to stream.
+    NoStreams,
 }
 
 impl From<StoreError> for ApiError {
@@ -784,6 +865,16 @@ impl axum::response::IntoResponse for ApiError {
             Self::NotFound => (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "run not found" })),
+            )
+                .into_response(),
+            Self::NoStreams => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "streams are not available" })),
+            )
+                .into_response(),
+            Self::TooManyStreams => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "too many open streams" })),
             )
                 .into_response(),
             Self::Store(message) => {

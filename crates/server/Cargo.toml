@@ -21,6 +21,7 @@ jsonwebtoken = { version = "9.3.1", default-features = false }
 url = "2.5"
 r2d2 = "0.8"
 memory = { path = "../memory" }
+tokio-stream = "0.1"
 
 [dev-dependencies]
 jsonwebtoken = { version = "9.3.1", features = ["use_pem"] }

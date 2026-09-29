@@ -118,6 +118,11 @@ The desktop chooses Local (start the local image with Docker) or Box (the server
 - `POST /v1/runs` accepts a run spec and executes `Local` placement to a terminal harness state.
 - `GET /v1/runs/{id}` returns the folded state.
 - `GET /v1/runs/{id}/events?after=N&limit=L` returns a page of the event log: the events after the first `N` (default 0), at most `L` (1 to 500, default 500). A log longer than 500 events is read in pages.
+- `GET /v1/stream` sends the caller's outbox as server-sent events: every event of every run the caller's principal owns. Each event has `id` set to its outbox number, `event` set to its kind (for example `model.responded`), and `data` set to `{run_id, run_seq, event}`.
+  - A client resumes with `Last-Event-ID` (or `?after=`). With neither, it starts at the end, with what is stored from now on; `?after=0` asks for the retained history.
+  - A client whose number was pruned gets one `reset` event, with `pruned_through` as its data and its id, and the stream ends. It reloads, then resumes from there, which is what a browser's EventSource does.
+  - An append wakes the streams after it commits: those of its own server at once, and those of every other server by LISTEN/NOTIFY. A stream also re-reads every 30 s, or every 5 s while its server's listener is down. A heartbeat comment goes out every 15 s.
+- `GET /v1/runs/{id}/stream` streams one owned run the same way, with `id` set to the event's place in the run. It ends after the run's terminal event. A reconnect from the terminal event gets 204, which stops a browser's EventSource, and a cursor past the log gets 400. A principal may have at most 16 streams open on one server; beyond that the server answers 429.
 
 `Reverse` and `Box` run the same loop as `Local`. The execution crate runs each placement on a worker thread.
 
