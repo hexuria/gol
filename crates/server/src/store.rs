@@ -154,7 +154,9 @@ pub trait RunStore: Send + Sync {
 /// A message between agents (Phase 2), as its deliverer stored it: from
 /// `from_run`'s `decision`, which names it (decision 30A), to `to_agent`. A
 /// tell or an ask started `task_run` for the target; an ask may have a
-/// `deadline` for its timeout (28A). `hop` is the sender's delegation depth.
+/// `deadline` for its timeout (28A), counted from its first send, and
+/// `timeout_secs` is the timeout it asked for. `hop` is the sender's
+/// delegation depth.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StoredMessage {
     pub id: MessageId,
@@ -168,7 +170,10 @@ pub struct StoredMessage {
     pub reply_to: Option<MessageId>,
     pub task_run: Option<RunId>,
     pub deadline: Option<Timestamp>,
-    /// Stored within the message's JSON body; rows stored without it read 0.
+    /// Stored within the message's JSON body, as `hop` is; rows stored
+    /// without them read `None` and 0.
+    #[serde(default)]
+    pub timeout_secs: Option<u32>,
     #[serde(default)]
     pub hop: u32,
 }

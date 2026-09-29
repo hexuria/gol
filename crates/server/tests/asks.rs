@@ -15,8 +15,8 @@ use protocol::{
 use serde_json::json;
 use server::{
     is_terminal, queued_events, sweep_asks, AgentManifest, InMemoryStore, MessageStore,
-    OwnedDeliverer, OwnedSpawner, PostgresStore, Prepared, QueueTiming, RedisRunQueue, RunStore,
-    StoredAgent, StoredMessage, StoredRun, Worker,
+    OwnedDeliverer, OwnedSpawner, PostgresStore, Prepared, PutMessage, QueueTiming, RedisRunQueue,
+    RunStore, StoreError, StoredAgent, StoredMessage, StoredRun, Worker,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -650,6 +650,7 @@ fn an_ask_without_its_asker_is_closed() {
             reply_to: None,
             task_run: Some(RunId::new()),
             deadline: Some(Timestamp::unix_millis(now.as_unix_millis() - 1_000)),
+            timeout_secs: None,
             hop: 0,
         };
         setup.messages.put_message(orphan.clone()).expect("put");
@@ -751,6 +752,28 @@ fn a_different_message_at_the_same_decision_is_refused() {
         assert_eq!(setup.queue.queued().expect("queued"), queued);
         let task = told.task.expect("a task").run_id;
         assert_eq!(setup.messages.ask_of_task(task), Ok(None));
+        // The same ask with another timeout is another message too.
+        let ask = |timeout_secs: u32| {
+            setup.deliverer().send(MessageRequest {
+                from: &setup.researcher,
+                decision: 4,
+                to: setup.writer,
+                body: "what is the plan?",
+                expects_reply: true,
+                reply_to: None,
+                timeout_secs: Some(timeout_secs),
+                limits: Some(Limits {
+                    max_steps: 3,
+                    max_model_calls: 2,
+                }),
+            })
+        };
+        let asked = ask(3600).expect("asked");
+        assert_eq!(ask(3600).map(|sent| sent.message_id), Ok(asked.message_id));
+        assert_eq!(
+            ask(1800).map(|sent| sent.message_id),
+            Err("another message was sent at this decision".to_string())
+        );
     }
 }
 
@@ -956,6 +979,119 @@ fn a_ninth_hop_is_refused() {
                 .filter(|message| message.from_run == deep.run_id)
                 .count(),
             1
+        );
+    }
+}
+
+/// A messages store whose open-ask lookup by task fails, as a Postgres
+/// query can while the others succeed.
+struct AskLookupFails(Arc<dyn MessageStore>);
+
+impl MessageStore for AskLookupFails {
+    fn put_message(&self, message: StoredMessage) -> Result<PutMessage, StoreError> {
+        self.0.put_message(message)
+    }
+    fn message(&self, id: MessageId) -> Result<Option<StoredMessage>, StoreError> {
+        self.0.message(id)
+    }
+    fn ask_of_task(&self, _task_run: RunId) -> Result<Option<StoredMessage>, StoreError> {
+        Err(StoreError::new("connection reset"))
+    }
+    fn answer(&self, ask: MessageId) -> Result<bool, StoreError> {
+        self.0.answer(ask)
+    }
+    fn open_asks_due(&self, now: Timestamp) -> Result<Vec<StoredMessage>, StoreError> {
+        self.0.open_asks_due(now)
+    }
+}
+
+// A timeout answers an ask for good, so the sweep gives none on a store
+// error: a parked run whose task still runs stays parked, its ask open,
+// for the next sweep (and the task's end).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_error_does_not_time_out_a_parked_ask() {
+    for which in 0..2 {
+        let server = jev(&["ask:writer", "complete"]).await;
+        let uri = server.uri();
+        blocking(move || {
+            let setup = setup(which);
+            let researcher = setup.researcher.run_id;
+            assert_eq!(
+                setup.worker(&uri, true).work_one().expect("work"),
+                Some(researcher)
+            );
+            let (ask, task) = setup.asked();
+            let failing = AskLookupFails(setup.messages.clone());
+            let swept = sweep_asks(
+                &setup.queue,
+                setup.runs.as_ref(),
+                &failing,
+                Timestamp::now(),
+            )
+            .expect("sweep");
+            assert!(!swept.contains(&researcher));
+            assert_eq!(setup.answers(), []);
+            assert_eq!(setup.queue.parked().expect("parked"), [(researcher, ask)]);
+            assert_eq!(
+                setup
+                    .messages
+                    .ask_of_task(task)
+                    .map(|open| open.map(|ask| ask.id)),
+                Ok(Some(ask))
+            );
+        });
+    }
+}
+
+// An explicit reply that cannot reach the asker yet (its ask is not in the
+// asker's log) is refused, not reported as sent; the same reply at the same
+// decision, once the ask is logged, is delivered.
+#[test]
+fn a_reply_before_its_ask_is_logged_is_refused_and_retried() {
+    for which in 0..2 {
+        let setup = setup(which);
+        let sent = setup
+            .deliverer()
+            .send(MessageRequest {
+                from: &setup.researcher,
+                decision: 1,
+                to: setup.writer,
+                body: "what is the plan?",
+                expects_reply: true,
+                reply_to: None,
+                timeout_secs: Some(3600),
+                limits: Some(Limits {
+                    max_steps: 3,
+                    max_model_calls: 2,
+                }),
+            })
+            .expect("sent");
+        let task = sent.task.expect("a task").run_id;
+        let task_spec = setup.runs.run(task).expect("read").expect("task").spec;
+        let reply = || {
+            setup.deliverer().send(MessageRequest {
+                from: &task_spec,
+                decision: 1,
+                to: setup.researcher.agent_id,
+                body: "the plan",
+                expects_reply: false,
+                reply_to: Some(sent.message_id),
+                timeout_secs: None,
+                limits: None,
+            })
+        };
+        assert_eq!(
+            reply().map(|sent| sent.message_id),
+            Err("the asker has not logged the ask yet".to_string())
+        );
+        assert_eq!(setup.answers(), []);
+
+        setup.log_sent(sent.message_id);
+        let replied = reply().expect("replied");
+        assert_eq!(replied.task, None);
+        assert_eq!(
+            setup.answers(),
+            [(sent.message_id, Some("the plan".to_string()))]
         );
     }
 }

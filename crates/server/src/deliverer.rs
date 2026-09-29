@@ -118,7 +118,8 @@ impl OwnedDeliverer {
                     && stored.body == message.body
                     && stored.expects_reply == message.expects_reply
                     && stored.reply_to == message.reply_to
-                    && stored.task_run == message.task_run;
+                    && stored.task_run == message.task_run
+                    && stored.timeout_secs == message.timeout_secs;
                 if same {
                     Ok(stored.id)
                 } else {
@@ -177,6 +178,7 @@ impl MessageDeliverer for OwnedDeliverer {
             reply_to: request.reply_to,
             task_run: Some(task.run_id),
             deadline,
+            timeout_secs: request.timeout_secs,
             hop: from.lineage.hop,
         })?;
         let task = self.spawner.enqueue_child(from, task)?;
@@ -216,11 +218,13 @@ impl OwnedDeliverer {
             reply_to: Some(ask.id),
             task_run: None,
             deadline: None,
+            timeout_secs: None,
             hop: from.lineage.hop,
         })?;
-        // Stored, so sent: it reaches the asker now, or, while the ask is
-        // not in the asker's log yet, never (the task's end answers then).
-        if let Err(error) = deliver(
+        // Stored, but sent only once it reaches the asker. Until its ask is
+        // in the asker's log it cannot, and the sender is told so; the same
+        // reply at the same decision retries it.
+        let delivered = deliver(
             self.store.as_ref(),
             self.messages.as_ref(),
             &self.queue,
@@ -234,8 +238,14 @@ impl OwnedDeliverer {
                 reply_to: Some(ask.id),
             },
             IfUnsent::Leave,
-        ) {
-            eprintln!("gol: reply {message_id} from run {}: {error}", from.run_id);
+        );
+        match delivered {
+            Ok(true) => {}
+            Ok(false) => return Err("the asker has not logged the ask yet".to_string()),
+            Err(error) => {
+                eprintln!("gol: reply {message_id} from run {}: {error}", from.run_id);
+                return Err("store unavailable".to_string());
+            }
         }
         Ok(SentMessage {
             message_id,

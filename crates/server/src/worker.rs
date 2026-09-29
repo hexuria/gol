@@ -842,9 +842,16 @@ pub fn sweep_asks(
                 Ok(Some(row)) => match task_end(store, &row) {
                     Ok(Some(answer)) => Some(answer),
                     // Closed while the log still waits: at its deadline,
-                    // before the asker logged it.
-                    Ok(None) if !open(messages, &row) => Some(timed_out),
-                    Ok(None) => None,
+                    // before the asker logged it. A timeout is final, so
+                    // one the store cannot confirm waits for the next sweep.
+                    Ok(None) => match open(messages, &row) {
+                        Ok(false) => Some(timed_out),
+                        Ok(true) => None,
+                        Err(error) => {
+                            eprintln!("gol: ask sweep: open ask {ask}: {error}");
+                            None
+                        }
+                    },
                     Err(error) => {
                         eprintln!("gol: ask sweep: task of ask {ask}: {error}");
                         None
@@ -900,11 +907,16 @@ pub fn sweep_asks(
     Ok(swept)
 }
 
-/// Whether `ask` is still open in the messages store.
-fn open(messages: &dyn MessageStore, ask: &StoredMessage) -> bool {
-    ask.task_run
-        .and_then(|task| messages.ask_of_task(task).ok().flatten())
-        .is_some_and(|open| open.id == ask.id)
+/// Whether `ask` is still open in the messages store; an error when the
+/// store cannot say now.
+fn open(messages: &dyn MessageStore, ask: &StoredMessage) -> Result<bool, String> {
+    let Some(task) = ask.task_run else {
+        return Ok(false);
+    };
+    Ok(messages
+        .ask_of_task(task)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|open| open.id == ask.id))
 }
 
 /// The answer `ask`'s task gives now that it has ended, if it has; an error

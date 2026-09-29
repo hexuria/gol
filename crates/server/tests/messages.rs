@@ -30,6 +30,7 @@ fn ask(from_run: RunId, decision: u32, deadline: Option<Timestamp>) -> StoredMes
         reply_to: None,
         task_run: Some(RunId::new()),
         deadline,
+        timeout_secs: Some(60),
         hop: 2,
     }
 }
