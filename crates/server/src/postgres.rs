@@ -519,11 +519,11 @@ impl ThreadStore for PostgresStore {
                                  filter (where parent_run is null))[1],
                              (array_agg(spec->>'agent_id' order by created_ms, id))[1]),
                          coalesce(min(created_ms) filter (where parent_run is null),
-                                  min(created_ms))
+                                  min(created_ms)) as started
                      from runs
                      where owner_issuer = $1 and owner_subject = $2 and thread_id is not null
                      group by thread_id
-                     order by 4 desc, thread_id
+                     order by started desc, thread_id
                      offset $3 limit $4",
                     &[&owner.issuer, &owner.subject, &after, &limit],
                 )
@@ -935,7 +935,11 @@ impl RunStore for PostgresStore {
         );
         let thread = thread_of(&run.spec).map(str::to_string);
         let parent = run.spec.lineage.parent.map(RunId::as_uuid);
-        let created = created_ms(&run);
+        // A run stored with no events is dated now, as the backfill dates one.
+        let created = run
+            .events
+            .first()
+            .map_or_else(|| Timestamp::now().as_unix_millis(), |_| created_ms(&run));
         self.with_client(|client| {
             let mut tx = read_committed(client)?;
             let inserted = tx

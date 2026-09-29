@@ -682,9 +682,7 @@ async fn create_thread(
     ))
 }
 
-/// `POST /v1/threads/{id}/messages`: a follow-up, the next coordinator run
-/// of the thread's agent in its session, with the thread's placement, work
-/// model and limits unless the body gives limits.
+/// A follow-up's body: its input, and its limits if not the thread's.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FollowUpBody {
@@ -697,8 +695,11 @@ struct FollowUpBody {
 const BOARD_RUNS: usize = 1000;
 
 /// The most threads, or cards, in a page (decision 50A).
-const THREADS_PAGE_MAX: usize = 50;
+const PAGE_MAX: usize = 50;
 
+/// `POST /v1/threads/{id}/messages`: a follow-up, the next coordinator run
+/// of the thread's agent in its session, with the thread's placement, work
+/// model and limits unless the body gives limits.
 async fn follow_up(
     Authenticated(principal): Authenticated,
     State(state): State<AppState>,
@@ -710,22 +711,20 @@ async fn follow_up(
     // The coordinator's spec, and its agent's manifest as stored now: a
     // follow-up runs the version the owner keeps, not the thread's first.
     let (store, thread_owner, thread) = (state.store.clone(), owner.clone(), id.clone());
-    let (root, agent) = tokio::task::spawn_blocking(move || {
-        let Some(root) = store
-            .threads()
-            .map(|threads| threads.thread_root(&thread_owner, &thread))
-            .transpose()?
-            .flatten()
-        else {
-            return Ok((None, None));
+    let found = tokio::task::spawn_blocking(move || {
+        let Some(threads) = store.threads() else {
+            return Ok(Err(ApiError::NoThreads));
+        };
+        let Some(root) = threads.thread_root(&thread_owner, &thread)? else {
+            return Ok(Err(ApiError::ThreadNotFound));
         };
         let agent = store.agent(root.agent_id)?;
-        Ok::<_, StoreError>((Some(root), agent))
+        Ok::<_, StoreError>(Ok((root, agent)))
     })
     .await
     .map_err(|error| ApiError::Store(error.to_string()))?
     .map_err(ApiError::from)?;
-    let root = root.ok_or(ApiError::ThreadNotFound)?;
+    let (root, agent) = found?;
     let agent = agent
         .filter(|agent| agent.owner.is(&owner))
         .ok_or(ApiError::AgentNotFound)?;
@@ -746,31 +745,40 @@ async fn follow_up(
     Ok(Json(serde_json::json!({ "thread_id": id, "run": run })))
 }
 
-/// A page of threads or cards: `after` of them seen, at most `limit`.
+/// A page of threads: `after` of them seen, at most `limit`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PageQuery {
+struct ThreadsQuery {
     after: Option<usize>,
     limit: Option<usize>,
-    state: Option<String>,
 }
 
-fn page_bounds(query: &PageQuery) -> Result<(usize, usize), ApiError> {
-    let limit = query.limit.unwrap_or(THREADS_PAGE_MAX);
-    if limit == 0 || limit > THREADS_PAGE_MAX {
+/// A page of a board's cards, of one state if `state` is given.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoardQuery {
+    after: Option<usize>,
+    limit: Option<usize>,
+    state: Option<CardState>,
+}
+
+/// `after` and a `limit` from 1 to `PAGE_MAX` (default `PAGE_MAX`).
+fn page_bounds(after: Option<usize>, limit: Option<usize>) -> Result<(usize, usize), ApiError> {
+    let limit = limit.unwrap_or(PAGE_MAX);
+    if limit == 0 || limit > PAGE_MAX {
         return Err(ApiError::BadRequest("limit must be between 1 and 50"));
     }
-    Ok((query.after.unwrap_or(0), limit))
+    Ok((after.unwrap_or(0), limit))
 }
 
 /// `GET /v1/threads`: the caller's threads, newest first.
 async fn list_threads(
     Authenticated(principal): Authenticated,
     State(state): State<AppState>,
-    query: Result<Query<PageQuery>, QueryRejection>,
+    query: Result<Query<ThreadsQuery>, QueryRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let Query(query) = query.map_err(|_| ApiError::BadRequest("after and limit must be counts"))?;
-    let (after, limit) = page_bounds(&query)?;
+    let (after, limit) = page_bounds(query.after, query.limit)?;
     let (store, owner) = (state.store.clone(), owner_of(&principal));
     let threads = tokio::task::spawn_blocking(move || {
         store
@@ -779,7 +787,7 @@ async fn list_threads(
     })
     .await
     .map_err(|error| ApiError::Store(error.to_string()))?
-    .ok_or(ApiError::NotFound)?
+    .ok_or(ApiError::NoThreads)?
     .map_err(ApiError::from)?;
     Ok(Json(serde_json::json!({
         "threads": threads.iter().map(|thread| serde_json::json!({
@@ -792,34 +800,39 @@ async fn list_threads(
 }
 
 /// A card's state, from the fold of its run's log.
-fn card_state(state: &RunState) -> &'static str {
-    match &state.dispatch {
-        DispatchPhase::Created | DispatchPhase::Queued => "queued",
-        DispatchPhase::Completed { .. } => "completed",
-        DispatchPhase::Failed { .. } => "failed",
-        DispatchPhase::Cancelled => "cancelled",
-        DispatchPhase::Expired => "expired",
-        DispatchPhase::Waiting { .. }
-        | DispatchPhase::AwaitingApproval { .. }
-        | DispatchPhase::Paused => "waiting",
-        _ if matches!(state.harness, HarnessState::WaitingForMessage { .. }) => "waiting",
-        _ => "running",
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CardState {
+    Queued,
+    Running,
+    Waiting,
+    Completed,
+    Failed,
+    Cancelled,
+    Expired,
+}
+
+impl CardState {
+    fn of(state: &RunState) -> Self {
+        match &state.dispatch {
+            DispatchPhase::Created | DispatchPhase::Queued => Self::Queued,
+            DispatchPhase::Completed { .. } => Self::Completed,
+            DispatchPhase::Failed { .. } => Self::Failed,
+            DispatchPhase::Cancelled => Self::Cancelled,
+            DispatchPhase::Expired => Self::Expired,
+            DispatchPhase::Waiting { .. }
+            | DispatchPhase::AwaitingApproval { .. }
+            | DispatchPhase::Paused => Self::Waiting,
+            _ if matches!(state.harness, HarnessState::WaitingForMessage { .. }) => Self::Waiting,
+            _ => Self::Running,
+        }
     }
 }
 
-const CARD_STATES: [&str; 7] = [
-    "queued",
-    "running",
-    "waiting",
-    "completed",
-    "failed",
-    "cancelled",
-    "expired",
-];
-
-/// One run's card on a board.
-fn card(run: &StoredRun) -> serde_json::Value {
+/// One run's card on a board, with its state.
+fn card(run: &StoredRun) -> (CardState, serde_json::Value) {
     let state = fold(&run.spec, &run.events);
+    let card_state = CardState::of(&state);
     // Once each, in the order started: a resumed run may log one twice.
     let mut children: Vec<RunId> = Vec::new();
     for event in &run.events {
@@ -833,71 +846,78 @@ fn card(run: &StoredRun) -> serde_json::Value {
         DispatchPhase::Completed { outcome } => Some(outcome.clone()),
         _ => None,
     };
-    serde_json::json!({
+    let at = |wanted: fn(&EventPayload) -> bool| {
+        run.events
+            .iter()
+            .find(|event| wanted(&event.payload))
+            .map(|event| event.envelope.at)
+    };
+    let card = serde_json::json!({
         "run_id": run.spec.run_id,
         "agent_id": run.spec.agent_id,
         "parent": run.spec.lineage.parent,
         "children": children,
-        "state": card_state(&state),
+        "state": card_state,
         "outcome": outcome,
         "steps": state.steps,
         "model_calls": state.model_calls,
         "created_at": run.events.first().map(|event| event.envelope.at),
-        "ended_at": run
-            .events
-            .iter()
-            .find(|event| is_terminal(&event.payload))
-            .map(|event| event.envelope.at),
-    })
+        "started_at": at(|payload| matches!(payload, EventPayload::RunStarted)),
+        "ended_at": at(is_terminal),
+    });
+    (card_state, card)
 }
 
 /// `GET /v1/threads/{id}/board`: a card per run of the thread (every
 /// coordinator run and every task at any depth), oldest first, filtered by
-/// `?state=` and paged. The logs are folded off the async workers.
+/// `?state=` and paged. Without a filter only the page's runs are folded;
+/// with one, each run read is, to know its state. Folded off the async
+/// workers.
 async fn get_board(
     Authenticated(principal): Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
-    query: Result<Query<PageQuery>, QueryRejection>,
+    query: Result<Query<BoardQuery>, QueryRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let Query(query) = query.map_err(|_| ApiError::BadRequest("after and limit must be counts"))?;
-    let (after, limit) = page_bounds(&query)?;
-    if let Some(wanted) = &query.state {
-        if !CARD_STATES.contains(&wanted.as_str()) {
-            return Err(ApiError::BadRequest("state is not a card state"));
-        }
-    }
+    let Query(query) = query.map_err(|_| {
+        ApiError::BadRequest("after and limit must be counts, and state a card state")
+    })?;
+    let (after, limit) = page_bounds(query.after, query.limit)?;
+    let wanted = query.state;
     let (store, owner) = (state.store.clone(), owner_of(&principal));
     let board = tokio::task::spawn_blocking(move || {
         let Some(threads) = store.threads() else {
-            return Ok(None);
+            return Ok(Err(ApiError::NoThreads));
         };
         let mut runs = threads.runs_of_thread(&owner, &id, BOARD_RUNS + 1)?;
         if runs.is_empty() {
-            return Ok(None);
+            return Ok(Err(ApiError::ThreadNotFound));
         }
         let truncated = runs.len() > BOARD_RUNS;
         runs.truncate(BOARD_RUNS);
-        let cards: Vec<serde_json::Value> = runs
-            .iter()
-            .map(card)
-            .filter(|card| {
-                query
-                    .state
-                    .as_deref()
-                    .is_none_or(|wanted| card["state"] == wanted)
-            })
-            .skip(after)
-            .take(limit)
-            .collect();
-        Ok::<_, StoreError>(Some(
+        let cards: Vec<serde_json::Value> = match wanted {
+            None => runs
+                .iter()
+                .skip(after)
+                .take(limit)
+                .map(|run| card(run).1)
+                .collect(),
+            Some(wanted) => runs
+                .iter()
+                .map(card)
+                .filter(|(state, _)| *state == wanted)
+                .skip(after)
+                .take(limit)
+                .map(|(_, card)| card)
+                .collect(),
+        };
+        Ok::<_, StoreError>(Ok(
             serde_json::json!({ "cards": cards, "truncated": truncated }),
         ))
     })
     .await
     .map_err(|error| ApiError::Store(error.to_string()))?
-    .map_err(ApiError::from)?
-    .ok_or(ApiError::ThreadNotFound)?;
+    .map_err(ApiError::from)??;
     Ok(Json(board))
 }
 
@@ -1080,6 +1100,8 @@ enum ApiError {
     AuthUnavailable(String),
     TooManyStreams,
     ThreadNotFound,
+    /// The store keeps no threads.
+    NoThreads,
     /// The store keeps no outbox, so there is nothing to stream.
     NoStreams,
 }
@@ -1127,6 +1149,11 @@ impl axum::response::IntoResponse for ApiError {
             Self::NoStreams => (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "streams are not available" })),
+            )
+                .into_response(),
+            Self::NoThreads => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "threads are not available" })),
             )
                 .into_response(),
             Self::ThreadNotFound => (

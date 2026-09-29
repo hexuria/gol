@@ -340,6 +340,83 @@ async fn two_asks_and_a_question_answer_at_once() {
     }
 }
 
+// The board of a thread in mixed states: ?state= picks its cards, and the
+// board pages them; a card says when it started, or null while queued. The
+// thread list takes no state.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_board_lists_a_threads_tasks_by_state() {
+    for store in stores() {
+        let jev = jev(&[
+            "delegate:writer",
+            "delegate:researcher",
+            "complete",
+            "complete",
+        ])
+        .await;
+        let server = serve(store, &jev, 11).await;
+        let user = fresh_user();
+        let coordinator = server
+            .agent(&user, "coordinator", &["agent.delegate"])
+            .await;
+        server.agent(&user, "writer", &[]).await;
+        server.agent(&user, "researcher", &[]).await;
+        let (thread, first) = server.start(&user, coordinator, "plan a trip").await;
+        // The coordinator, then one of its two tasks; the other stays queued.
+        assert!(server.work().await.is_some());
+        assert!(server.work().await.is_some());
+        let board = |query: &str| {
+            let path = format!("/v1/threads/{thread}/board{query}");
+            let server = &server;
+            let user = user.clone();
+            async move { server.get(&path, &user).await }
+        };
+        let (status, all) = board("").await;
+        assert_eq!(status, 200, "{all}");
+        let states: Vec<String> = cards(&all).into_iter().map(|card| card.1).collect();
+        assert_eq!(states.len(), 3, "{all}");
+        assert_eq!(states[0], "completed");
+        assert_eq!(
+            states.iter().filter(|state| *state == "completed").count(),
+            2,
+            "{all}"
+        );
+        let (_, queued) = board("?state=queued").await;
+        let queued = cards(&queued);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].1, "queued");
+        assert_eq!(queued[0].2.as_deref(), Some(first.as_str()));
+        let (_, completed) = board("?state=completed").await;
+        assert_eq!(cards(&completed).len(), 2);
+        // A started run says when; a queued one has not started.
+        let started = |board: &Value, run: &str| {
+            board["cards"]
+                .as_array()
+                .expect("cards")
+                .iter()
+                .find(|card| card["run_id"] == run)
+                .expect("the card")["started_at"]
+                .clone()
+        };
+        assert!(started(&all, &first).is_number(), "{all}");
+        assert_eq!(started(&all, &queued[0].0), Value::Null);
+        // Pages of the board, oldest first.
+        let (_, page) = board("?limit=1").await;
+        assert_eq!(cards(&page).len(), 1);
+        assert_eq!(cards(&page)[0].0, first);
+        let (_, next) = board("?after=1&limit=1").await;
+        assert_eq!(cards(&next).len(), 1);
+        assert_eq!(cards(&next)[0].0, cards(&all)[1].0);
+        let (_, past) = board("?after=3").await;
+        assert_eq!(cards(&past), Vec::new());
+        let (_, second) = board("?state=completed&after=1&limit=1").await;
+        assert_eq!(cards(&second).len(), 1);
+        assert_eq!(cards(&second)[0].1, "completed");
+        assert_ne!(cards(&second)[0].0, first);
+        assert_eq!(board("?state=sleeping").await.0, 400);
+        assert_eq!(server.get("/v1/threads?state=queued", &user).await.0, 400);
+    }
+}
+
 // A follow-up is a new coordinator run of the same agent in the same thread;
 // the thread lists once, with its runs counted.
 #[tokio::test(flavor = "multi_thread")]
@@ -416,6 +493,22 @@ async fn a_follow_up_is_a_new_run_in_the_same_thread() {
             )
             .await;
         assert_eq!(status, 200, "{body}");
+        let third: RunId = body["run"]["run_id"]
+            .as_str()
+            .expect("run")
+            .parse()
+            .expect("an id");
+        let store = server.store.clone();
+        let version = blocking(move || {
+            store
+                .run(third)
+                .expect("read")
+                .expect("stored")
+                .spec
+                .agent_version
+        })
+        .await;
+        assert_eq!(version, "2");
         assert!(server.work().await.is_some());
     }
 }
