@@ -362,6 +362,8 @@ async fn an_ask_past_its_deadline_times_out() {
             while worker.work_one().expect("work").is_some() {}
             assert!(completed(&setup.events(sent.task.expect("a task").run_id)));
             assert_eq!(setup.answers(), [(ask, None)]);
+
+            a_due_ask_whose_task_ended_gets_the_tasks_answer(which, &uri);
         });
     }
 }
@@ -603,4 +605,51 @@ fn an_ask_without_its_asker_is_closed() {
         .expect("sweep");
         assert!(!open(&setup));
     }
+}
+
+// Decision 31A over 28A: an ask past its deadline whose task has ended (its
+// end never delivered) is answered with that end, not with a timeout. Run
+// from `an_ask_past_its_deadline_times_out`: both sweep past a 60 s deadline,
+// which would reach each other's ask if they ran at once.
+fn a_due_ask_whose_task_ended_gets_the_tasks_answer(which: usize, uri: &str) {
+    let setup = setup(which);
+    let researcher = setup.researcher.run_id;
+    let sent = setup
+        .deliverer()
+        .send(MessageRequest {
+            from: &setup.researcher,
+            decision: 1,
+            to: setup.writer,
+            body: "what is the plan?",
+            expects_reply: true,
+            reply_to: None,
+            timeout_secs: Some(60),
+            limits: Some(Limits {
+                max_steps: 3,
+                max_model_calls: 2,
+            }),
+        })
+        .expect("sent");
+    let task = sent.task.expect("a task").run_id;
+    // A worker that cannot deliver runs the task; the researcher's
+    // claim is held so that it stays open.
+    let worker = setup.worker(uri, false);
+    let held = worker.claim().expect("claim").expect("a run");
+    assert_eq!(held.run_id(), researcher);
+    assert_eq!(worker.work_one().expect("work"), Some(task));
+    assert!(completed(&setup.events(task)));
+    assert_eq!(setup.answers(), []);
+
+    let later = Timestamp::unix_millis(Timestamp::now().as_unix_millis() + 61_000);
+    sweep_asks(
+        &setup.queue,
+        setup.runs.as_ref(),
+        setup.messages.as_ref(),
+        later,
+    )
+    .expect("sweep");
+    assert_eq!(
+        setup.answers(),
+        [(sent.message_id, Some("done".to_string()))]
+    );
 }
