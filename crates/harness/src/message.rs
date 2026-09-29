@@ -1,13 +1,14 @@
 use protocol::{AgentId, MessageId, RunSpec};
 
 /// A message the driver asks a deliverer to accept (Phase 2): from `from`'s
-/// run, sent by its `step`, to agent `to`. The run and the step name the
-/// message, so a resumed run that sends again sends the same message
-/// (decision 30A).
+/// run, sent by its `decision`th decision, to agent `to`. The run and the
+/// decision name the message (decision 30A): two messages in one harness
+/// step are two decisions, and a resumed run that performs the same
+/// decision again sends the same message.
 #[derive(Clone, Copy, Debug)]
 pub struct MessageRequest<'a> {
     pub from: &'a RunSpec,
-    pub step: u32,
+    pub decision: u32,
     pub to: AgentId,
     pub body: &'a str,
     pub expects_reply: bool,

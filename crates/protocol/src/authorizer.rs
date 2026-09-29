@@ -52,7 +52,7 @@ pub fn authorize(spec: &RunSpec, effect: &Effect, tools: &[ToolDescriptor]) -> P
 
 /// A message's bounds, once its capability is held. A tell or a new ask
 /// starts a task one hop further (decision 29A), so it obeys the hop cap; a
-/// reply adds no hop. The body is at most `MAX_MESSAGE_BYTES` (30A), and
+/// reply adds no hop, unless it asks back, which opens a new ask. The body is at most `MAX_MESSAGE_BYTES` (30A), and
 /// only an ask has a timeout, from 1 second to `MAX_ASK_TIMEOUT_SECS` (28A).
 fn check_message(spec: &RunSpec, effect: &Effect) -> PolicyDecision {
     let Effect::SendMessage {
@@ -66,7 +66,8 @@ fn check_message(spec: &RunSpec, effect: &Effect) -> PolicyDecision {
         return PolicyDecision::Allow;
     };
     let deny = |reason: String| PolicyDecision::Deny { reason };
-    if reply_to.is_none() && spec.lineage.hop >= MAX_DELEGATION_HOPS {
+    let starts_task = reply_to.is_none() || *expects_reply;
+    if starts_task && spec.lineage.hop >= MAX_DELEGATION_HOPS {
         return deny(format!(
             "messaging is already {MAX_DELEGATION_HOPS} hops deep"
         ));
@@ -213,6 +214,13 @@ mod tests {
         assert_eq!(
             authorize(&spec, &message(false, true), &[]),
             PolicyDecision::Allow
+        );
+        // A reply that asks back opens a new ask, so the cap applies to it.
+        assert_eq!(
+            authorize(&spec, &message(true, true), &[]),
+            PolicyDecision::Deny {
+                reason: format!("messaging is already {MAX_DELEGATION_HOPS} hops deep")
+            }
         );
         spec.lineage.hop = MAX_DELEGATION_HOPS - 1;
         assert_eq!(

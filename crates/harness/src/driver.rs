@@ -610,20 +610,20 @@ impl Driver {
         reply_to: Option<MessageId>,
         timeout_secs: Option<u32>,
     ) {
-        let step = match self.state().harness {
-            HarnessState::Running { step, .. } => Some(step),
-            _ => None,
-        };
-        let sent = step
+        let state = self.state();
+        // The decision that sent it: fold's count of decisions, the same
+        // when a resumed run performs it again.
+        let decision = matches!(state.harness, HarnessState::Running { .. }).then_some(state.steps);
+        let sent = decision
             .ok_or_else(|| "the run is not running".to_string())
-            .and_then(|step| {
+            .and_then(|decision| {
                 let deliverer = self
                     .deliverer
                     .clone()
                     .ok_or_else(|| "no message deliverer is configured".to_string())?;
                 deliverer.send(MessageRequest {
                     from: &self.spec,
-                    step,
+                    decision,
                     to,
                     body,
                     expects_reply,

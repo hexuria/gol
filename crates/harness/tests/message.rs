@@ -64,7 +64,7 @@ fn complete() -> Effect {
 #[derive(Debug, PartialEq, Eq)]
 struct Asked {
     from: RunId,
-    step: u32,
+    decision: u32,
     to: AgentId,
     body: String,
     expects_reply: bool,
@@ -98,7 +98,7 @@ impl MessageDeliverer for Fake {
     fn send(&self, request: MessageRequest<'_>) -> Result<MessageId, String> {
         self.asked.lock().unwrap().push(Asked {
             from: request.from.run_id,
-            step: request.step,
+            decision: request.decision,
             to: request.to,
             body: request.body.to_string(),
             expects_reply: request.expects_reply,
@@ -162,7 +162,7 @@ fn a_tell_is_sent_and_the_run_goes_on() {
         *deliverer.asked.lock().unwrap(),
         [Asked {
             from: spec.run_id,
-            step: 1,
+            decision: 1,
             to: writer(),
             body: "draft the plan".to_string(),
             expects_reply: false,
@@ -314,4 +314,28 @@ fn a_message_without_the_capability_is_denied() {
         EventPayload::EffectDenied { reason, .. } if reason == "missing capability: agent.message"
     )));
     assert!(deliverer.asked.lock().unwrap().is_empty());
+}
+
+// Review of #73: two tells in one harness step are two messages. The request
+// names each by the run's decision count, which a resumed run repeats for
+// the same decision, so a deliverer can tell them apart and dedupe a resend.
+#[test]
+fn two_tells_in_one_step_are_two_requests() {
+    let spec = spec();
+    let deliverer = Fake::accepting();
+    let mut driver = Driver::boot(spec)
+        .unwrap()
+        .with_deliverer(deliverer.clone());
+    run(
+        &mut driver,
+        vec![message(false, None), message(false, None), complete()],
+    );
+    let decisions: Vec<u32> = deliverer
+        .asked
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|asked| asked.decision)
+        .collect();
+    assert_eq!(decisions, [1, 2]);
 }
