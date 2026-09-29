@@ -55,6 +55,33 @@ fn models_config_reads_keys_base_urls_and_the_timeout() {
         ModelsConfig::from_env(&env(&[])).expect("config").timeout(),
         Duration::from_secs(60)
     );
+    // A key read from a secret file keeps its trailing newline; it is trimmed.
+    assert_eq!(
+        ModelsConfig::from_env(&env(&[("GOL_GEMINI_API_KEY", "sk-gem\n")]))
+            .expect("config")
+            .api_key(ModelProvider::Gemini),
+        Some("sk-gem")
+    );
+    // A plain-HTTP base URL would send the key in the clear; only a local
+    // host (a mock or a proxy on this machine) may use one.
+    for local in ["http://127.0.0.1:9", "http://localhost:9", "http://[::1]:9"] {
+        assert!(
+            ModelsConfig::from_env(&env(&[("GOL_OPENAI_BASE_URL", local)])).is_ok(),
+            "{local}"
+        );
+    }
+    for remote in ["http://api.example.com", "ftp://x", "api.example.com"] {
+        assert!(
+            ModelsConfig::from_env(&env(&[("GOL_OPENAI_BASE_URL", remote)])).is_err(),
+            "{remote}"
+        );
+    }
+    // Debug output never shows a key.
+    let debug = format!(
+        "{:?}",
+        ModelsConfig::default().with_key(ModelProvider::OpenAI, "sk-secret")
+    );
+    assert!(!debug.contains("sk-secret"), "{debug}");
     for bad in ["0", "601", "soon"] {
         assert!(
             ModelsConfig::from_env(&env(&[("GOL_MODEL_TIMEOUT_SECS", bad)])).is_err(),
@@ -354,4 +381,67 @@ async fn an_inline_runs_model_call_reaches_its_provider() {
             })
         )]
     );
+}
+
+/// Anthropic failing every call with an error body that repeats the key it
+/// was sent, as some gateways' debug pages do.
+async fn anthropic_echoing_the_key() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("invalid x-api-key: sk-ant-test"))
+        .mount(&server)
+        .await;
+    server
+}
+
+// Review of #71: the run log, which clients read, gets a fixed message for
+// a failed model call. The provider's error body (which may repeat the
+// platform's key) and the URL go to stderr only.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_model_call_does_not_put_the_providers_error_in_the_log() {
+    let (_jevs, jev_uris) = jevs().await;
+    let anthropic = anthropic_echoing_the_key().await;
+    let config = ModelsConfig::default()
+        .with_key(ModelProvider::Anthropic, "sk-ant-test")
+        .with_base_url(ModelProvider::Anthropic, anthropic.uri());
+    for payloads in run_queued(jev_uris, spec(ModelProvider::Anthropic), config) {
+        let text = format!("{payloads:?}");
+        assert!(!text.contains("sk-ant-test"), "{text}");
+        assert!(!text.contains("127.0.0.1"), "{text}");
+        assert!(
+            matches!(
+                payloads.last(),
+                Some(EventPayload::RunFailed { class: FailureClass::Dependency, message })
+                    if message == "model call to Anthropic failed"
+            ),
+            "{:?}",
+            payloads.last()
+        );
+    }
+}
+
+// Decision 22A through a real run: a bring-your-own credential fails the
+// run on the server.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bring_your_own_run_fails_on_the_server() {
+    let (_jevs, jev_uris) = jevs().await;
+    let mut byo = spec(ModelProvider::Anthropic);
+    byo.work_model.credential = CredentialSource::BringYourOwn {
+        secret_ref: "vault:alice/anthropic".to_string(),
+    };
+    let config = ModelsConfig::default().with_key(ModelProvider::Anthropic, "sk-ant-test");
+    for payloads in run_queued(jev_uris, byo, config) {
+        let text = format!("{payloads:?}");
+        assert!(!text.contains("sk-ant-test"), "{text}");
+        assert!(
+            matches!(
+                payloads.last(),
+                Some(EventPayload::RunFailed { class: FailureClass::Dependency, message })
+                    if message.contains("bring-your-own")
+            ),
+            "{:?}",
+            payloads.last()
+        );
+    }
 }

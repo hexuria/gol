@@ -33,10 +33,11 @@ Runs and memory are kept in the process unless `GOL_DATABASE_URL` names a Postgr
 A run's model calls go to its work model's provider with the platform's key for that provider:
 
 - `GOL_OPENAI_API_KEY`, `GOL_ANTHROPIC_API_KEY`, `GOL_GEMINI_API_KEY`, `GOL_SYSTEMONE_API_KEY`: a provider without one fails the call, and the run, with `RunFailed { Dependency }`.
-- `GOL_<PROVIDER>_BASE_URL` overrides the provider's host. System One has no public host, so it needs one.
+- `GOL_<PROVIDER>_BASE_URL` overrides the provider's host: `https://`, or `http://` to a local host. System One has no public host, so it needs one. Values are trimmed.
 - `GOL_MODEL_TIMEOUT_SECS` bounds each call's connect and whole call (default 60, 1 to 600). A call is not retried.
 - A bring-your-own credential is refused on the server; it is used from the desktop through the local proxy.
 - Each `ModelResponded` records the tokens the call used, when the provider reports them.
+- A failed call leaves a fixed reason in the run log (`model call to Anthropic failed`); the provider's error, which may repeat the request's key, goes to the server's stderr.
 
 ## Authentication
 
