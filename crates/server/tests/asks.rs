@@ -375,22 +375,30 @@ async fn an_ask_past_its_deadline_times_out() {
                 .expect("sent");
             let ask = sent.message_id;
             setup.log_sent(ask);
+            // Swept at the stored deadline's own clock: a millisecond before
+            // it the ask is not due, however slow the machine; at it, it is.
+            let deadline = setup
+                .messages
+                .message(ask)
+                .expect("read")
+                .expect("stored")
+                .deadline
+                .expect("an ask with a timeout")
+                .as_unix_millis();
             let sweep = |at: i64| {
                 sweep_asks(
                     &setup.queue,
                     setup.runs.as_ref(),
                     setup.messages.as_ref(),
-                    Timestamp::unix_millis(Timestamp::now().as_unix_millis() + at),
+                    Timestamp::unix_millis(at),
                 )
                 .expect("sweep")
             };
-            // Well inside the deadline, however slow the machine: the ask
-            // was sent with 60 s from its own clock reading, before this one.
-            assert!(!sweep(30_000).contains(&researcher));
+            assert!(!sweep(deadline - 1).contains(&researcher));
             assert_eq!(setup.answers(), []);
-            assert!(sweep(61_000).contains(&researcher));
+            assert!(sweep(deadline).contains(&researcher));
             assert_eq!(setup.answers(), [(ask, None)]);
-            assert!(!sweep(61_000).contains(&researcher));
+            assert!(!sweep(deadline + 1_000).contains(&researcher));
 
             // The task still runs, and its end answers nothing.
             let worker = setup.worker(&uri, true);

@@ -384,9 +384,13 @@ pub struct ThreadSummary {
     pub runs: u64,
 }
 
-/// The thread a run belongs to: its session id, if it has one.
+/// The thread a run belongs to: its session id, if it has one that is not
+/// empty.
 pub fn thread_of(spec: &RunSpec) -> Option<&str> {
-    spec.metadata.get(protocol::SESSION_ID).map(String::as_str)
+    spec.metadata
+        .get(protocol::SESSION_ID)
+        .map(String::as_str)
+        .filter(|session| !session.is_empty())
 }
 
 /// When a run was stored, for ordering: its first event's time.
@@ -415,6 +419,9 @@ pub trait ThreadStore: Send + Sync {
         thread: &str,
         limit: usize,
     ) -> Result<Vec<StoredRun>, StoreError>;
+    /// The spec of the thread's coordinator: its first run with no parent.
+    /// None for a thread that is not the principal's.
+    fn thread_root(&self, owner: &Owner, thread: &str) -> Result<Option<RunSpec>, StoreError>;
 }
 
 /// The in-memory store. A poisoned lock (a writer panicked holding it) still
@@ -637,44 +644,53 @@ impl ThreadStore for InMemoryStore {
         limit: usize,
     ) -> Result<Vec<ThreadSummary>, StoreError> {
         let runs = read(&self.runs);
-        let mut threads: HashMap<String, ThreadSummary> = HashMap::new();
         let mut owned: Vec<&StoredRun> = runs
             .values()
             .filter(|run| run.spec.owner.is(owner) && thread_of(&run.spec).is_some())
             .collect();
         owned.sort_by_key(|run| (created_ms(run), run.spec.run_id.as_uuid()));
+        // One pass, oldest first: a thread's first run sets it, and its first
+        // run with no parent (its coordinator) names its agent and start.
+        let mut threads: HashMap<&str, (ThreadSummary, bool)> = HashMap::new();
         for run in owned {
-            let id = thread_of(&run.spec).expect("filtered").to_string();
-            let thread = threads.entry(id.clone()).or_insert(ThreadSummary {
-                thread_id: id,
-                agent_id: run.spec.agent_id,
-                started_ms: created_ms(run),
-                runs: 0,
-            });
+            let id = thread_of(&run.spec).expect("filtered");
+            let root = run.spec.lineage.parent.is_none();
+            let (thread, rooted) = threads.entry(id).or_insert((
+                ThreadSummary {
+                    thread_id: id.to_string(),
+                    agent_id: run.spec.agent_id,
+                    started_ms: created_ms(run),
+                    runs: 0,
+                },
+                false,
+            ));
             thread.runs += 1;
-        }
-        // The coordinator: the first run with no parent.
-        for thread in threads.values_mut() {
-            if let Some(root) = runs
-                .values()
-                .filter(|run| {
-                    run.spec.owner.is(owner)
-                        && thread_of(&run.spec) == Some(thread.thread_id.as_str())
-                        && run.spec.lineage.parent.is_none()
-                })
-                .min_by_key(|run| (created_ms(run), run.spec.run_id.as_uuid()))
-            {
-                thread.agent_id = root.spec.agent_id;
-                thread.started_ms = created_ms(root);
+            if root && !*rooted {
+                thread.agent_id = run.spec.agent_id;
+                thread.started_ms = created_ms(run);
+                *rooted = true;
             }
         }
-        let mut threads: Vec<ThreadSummary> = threads.into_values().collect();
+        let mut threads: Vec<ThreadSummary> =
+            threads.into_values().map(|(thread, _)| thread).collect();
         threads.sort_by(|a, b| {
             b.started_ms
                 .cmp(&a.started_ms)
                 .then_with(|| a.thread_id.cmp(&b.thread_id))
         });
         Ok(threads.into_iter().skip(after).take(limit).collect())
+    }
+
+    fn thread_root(&self, owner: &Owner, thread: &str) -> Result<Option<RunSpec>, StoreError> {
+        Ok(read(&self.runs)
+            .values()
+            .filter(|run| {
+                run.spec.owner.is(owner)
+                    && thread_of(&run.spec) == Some(thread)
+                    && run.spec.lineage.parent.is_none()
+            })
+            .min_by_key(|run| (created_ms(run), run.spec.run_id.as_uuid()))
+            .map(|run| run.spec.clone()))
     }
 
     fn runs_of_thread(

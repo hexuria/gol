@@ -692,34 +692,12 @@ struct FollowUpBody {
     limits: Option<Limits>,
 }
 
-/// The most runs a board reads for one thread.
+/// The most runs a board reads for one thread; a board of a longer thread
+/// says it is `truncated`.
 const BOARD_RUNS: usize = 1000;
 
 /// The most threads, or cards, in a page (decision 50A).
 const THREADS_PAGE_MAX: usize = 50;
-
-/// `owner`'s thread `id`'s runs, oldest first; none for a thread that is not
-/// the principal's, which is reported exactly like a missing one.
-async fn thread_runs(
-    state: &AppState,
-    owner: &Owner,
-    id: &str,
-) -> Result<Vec<StoredRun>, ApiError> {
-    let (store, owner, id) = (state.store.clone(), owner.clone(), id.to_string());
-    let runs = tokio::task::spawn_blocking(move || {
-        store
-            .threads()
-            .map(|threads| threads.runs_of_thread(&owner, &id, BOARD_RUNS))
-    })
-    .await
-    .map_err(|error| ApiError::Store(error.to_string()))?
-    .ok_or(ApiError::NotFound)?
-    .map_err(ApiError::from)?;
-    if runs.is_empty() {
-        return Err(ApiError::NotFound);
-    }
-    Ok(runs)
-}
 
 async fn follow_up(
     Authenticated(principal): Authenticated,
@@ -729,23 +707,39 @@ async fn follow_up(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let Json(body) = body.map_err(body_rejection)?;
     let owner = owner_of(&principal);
-    let runs = thread_runs(&state, &owner, &id).await?;
-    // The coordinator: the thread's first run with no parent.
-    let root = runs
-        .iter()
-        .find(|run| run.spec.lineage.parent.is_none())
-        .unwrap_or(&runs[0]);
+    // The coordinator's spec, and its agent's manifest as stored now: a
+    // follow-up runs the version the owner keeps, not the thread's first.
+    let (store, thread_owner, thread) = (state.store.clone(), owner.clone(), id.clone());
+    let (root, agent) = tokio::task::spawn_blocking(move || {
+        let Some(root) = store
+            .threads()
+            .map(|threads| threads.thread_root(&thread_owner, &thread))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok((None, None));
+        };
+        let agent = store.agent(root.agent_id)?;
+        Ok::<_, StoreError>((Some(root), agent))
+    })
+    .await
+    .map_err(|error| ApiError::Store(error.to_string()))?
+    .map_err(ApiError::from)?;
+    let root = root.ok_or(ApiError::ThreadNotFound)?;
+    let agent = agent
+        .filter(|agent| agent.owner.is(&owner))
+        .ok_or(ApiError::AgentNotFound)?;
     let run = start_run(
         &state,
         owner,
         RunBody {
-            agent_id: root.spec.agent_id,
-            agent_version: root.spec.agent_version.clone(),
+            agent_id: root.agent_id,
+            agent_version: agent.manifest.version,
             input: body.input,
-            placement: root.spec.placement,
-            work_model: root.spec.work_model.clone(),
-            limits: Some(body.limits.unwrap_or(root.spec.limits)),
-            metadata: root.spec.metadata.clone(),
+            placement: root.placement,
+            work_model: root.work_model,
+            limits: Some(body.limits.unwrap_or(root.limits)),
+            metadata: root.metadata,
         },
     )
     .await?;
@@ -754,6 +748,7 @@ async fn follow_up(
 
 /// A page of threads or cards: `after` of them seen, at most `limit`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PageQuery {
     after: Option<usize>,
     limit: Option<usize>,
@@ -825,14 +820,15 @@ const CARD_STATES: [&str; 7] = [
 /// One run's card on a board.
 fn card(run: &StoredRun) -> serde_json::Value {
     let state = fold(&run.spec, &run.events);
-    let children: Vec<RunId> = run
-        .events
-        .iter()
-        .filter_map(|event| match event.payload {
-            EventPayload::ChildStarted { run_id, .. } => Some(run_id),
-            _ => None,
-        })
-        .collect();
+    // Once each, in the order started: a resumed run may log one twice.
+    let mut children: Vec<RunId> = Vec::new();
+    for event in &run.events {
+        if let EventPayload::ChildStarted { run_id, .. } = event.payload {
+            if !children.contains(&run_id) {
+                children.push(run_id);
+            }
+        }
+    }
     let outcome = match &state.dispatch {
         DispatchPhase::Completed { outcome } => Some(outcome.clone()),
         _ => None,
@@ -846,7 +842,7 @@ fn card(run: &StoredRun) -> serde_json::Value {
         "outcome": outcome,
         "steps": state.steps,
         "model_calls": state.model_calls,
-        "started_at": run.events.first().map(|event| event.envelope.at),
+        "created_at": run.events.first().map(|event| event.envelope.at),
         "ended_at": run
             .events
             .iter()
@@ -857,7 +853,7 @@ fn card(run: &StoredRun) -> serde_json::Value {
 
 /// `GET /v1/threads/{id}/board`: a card per run of the thread (every
 /// coordinator run and every task at any depth), oldest first, filtered by
-/// `?state=` and paged.
+/// `?state=` and paged. The logs are folded off the async workers.
 async fn get_board(
     Authenticated(principal): Authenticated,
     State(state): State<AppState>,
@@ -871,20 +867,38 @@ async fn get_board(
             return Err(ApiError::BadRequest("state is not a card state"));
         }
     }
-    let runs = thread_runs(&state, &owner_of(&principal), &id).await?;
-    let cards: Vec<serde_json::Value> = runs
-        .iter()
-        .map(card)
-        .filter(|card| {
-            query
-                .state
-                .as_deref()
-                .is_none_or(|wanted| card["state"] == wanted)
-        })
-        .skip(after)
-        .take(limit)
-        .collect();
-    Ok(Json(serde_json::json!({ "cards": cards })))
+    let (store, owner) = (state.store.clone(), owner_of(&principal));
+    let board = tokio::task::spawn_blocking(move || {
+        let Some(threads) = store.threads() else {
+            return Ok(None);
+        };
+        let mut runs = threads.runs_of_thread(&owner, &id, BOARD_RUNS + 1)?;
+        if runs.is_empty() {
+            return Ok(None);
+        }
+        let truncated = runs.len() > BOARD_RUNS;
+        runs.truncate(BOARD_RUNS);
+        let cards: Vec<serde_json::Value> = runs
+            .iter()
+            .map(card)
+            .filter(|card| {
+                query
+                    .state
+                    .as_deref()
+                    .is_none_or(|wanted| card["state"] == wanted)
+            })
+            .skip(after)
+            .take(limit)
+            .collect();
+        Ok::<_, StoreError>(Some(
+            serde_json::json!({ "cards": cards, "truncated": truncated }),
+        ))
+    })
+    .await
+    .map_err(|error| ApiError::Store(error.to_string()))?
+    .map_err(ApiError::from)?
+    .ok_or(ApiError::ThreadNotFound)?;
+    Ok(Json(board))
 }
 
 async fn get_ag_ui(
@@ -1065,6 +1079,7 @@ enum ApiError {
     Unauthorized,
     AuthUnavailable(String),
     TooManyStreams,
+    ThreadNotFound,
     /// The store keeps no outbox, so there is nothing to stream.
     NoStreams,
 }
@@ -1112,6 +1127,11 @@ impl axum::response::IntoResponse for ApiError {
             Self::NoStreams => (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "streams are not available" })),
+            )
+                .into_response(),
+            Self::ThreadNotFound => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "thread not found" })),
             )
                 .into_response(),
             Self::TooManyStreams => (
