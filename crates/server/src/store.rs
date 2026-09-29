@@ -155,6 +155,11 @@ pub trait RunStore: Send + Sync {
     fn outbox(&self) -> Option<&dyn OutboxStore> {
         None
     }
+
+    /// The threads this store can list, if it keeps them (Phase 3.3).
+    fn threads(&self) -> Option<&dyn ThreadStore> {
+        None
+    }
 }
 
 /// A message between agents (Phase 2), as its deliverer stored it: from
@@ -368,6 +373,57 @@ fn principal(owner: &Owner) -> (String, String) {
     (owner.issuer.clone(), owner.subject.clone())
 }
 
+/// A thread (Phase 3.3, decision 47A): the runs of one session of one
+/// principal. `agent_id` is its coordinator's, the agent of its first run
+/// with no parent; `started_ms` is when that run was stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadSummary {
+    pub thread_id: String,
+    pub agent_id: AgentId,
+    pub started_ms: i64,
+    pub runs: u64,
+}
+
+/// The thread a run belongs to: its session id, if it has one that is not
+/// empty.
+pub fn thread_of(spec: &RunSpec) -> Option<&str> {
+    spec.metadata
+        .get(protocol::SESSION_ID)
+        .map(String::as_str)
+        .filter(|session| !session.is_empty())
+}
+
+/// When a run was stored, for ordering: its first event's time.
+pub(crate) fn created_ms(run: &StoredRun) -> i64 {
+    run.events
+        .first()
+        .map(|event| event.envelope.at.as_unix_millis())
+        .unwrap_or(0)
+}
+
+/// Threads by principal (decision 48A).
+pub trait ThreadStore: Send + Sync {
+    /// `owner`'s principal's threads, newest first: after the first `after`,
+    /// at most `limit`.
+    fn threads_of(
+        &self,
+        owner: &Owner,
+        after: usize,
+        limit: usize,
+    ) -> Result<Vec<ThreadSummary>, StoreError>;
+    /// The runs of `owner`'s principal's thread `thread`, oldest first, at
+    /// most `limit`. Empty for a thread that is not the principal's.
+    fn runs_of_thread(
+        &self,
+        owner: &Owner,
+        thread: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredRun>, StoreError>;
+    /// The spec of the thread's coordinator: its first run with no parent.
+    /// None for a thread that is not the principal's.
+    fn thread_root(&self, owner: &Owner, thread: &str) -> Result<Option<RunSpec>, StoreError>;
+}
+
 /// The in-memory store. A poisoned lock (a writer panicked holding it) still
 /// serves reads, since every write completes before its guard drops; a write
 /// under a poisoned lock is refused as a StoreError (owner decision 3A).
@@ -574,6 +630,84 @@ impl RunStore for InMemoryStore {
 
     fn outbox(&self) -> Option<&dyn OutboxStore> {
         Some(self)
+    }
+    fn threads(&self) -> Option<&dyn ThreadStore> {
+        Some(self)
+    }
+}
+
+impl ThreadStore for InMemoryStore {
+    fn threads_of(
+        &self,
+        owner: &Owner,
+        after: usize,
+        limit: usize,
+    ) -> Result<Vec<ThreadSummary>, StoreError> {
+        let runs = read(&self.runs);
+        let mut owned: Vec<&StoredRun> = runs
+            .values()
+            .filter(|run| run.spec.owner.is(owner) && thread_of(&run.spec).is_some())
+            .collect();
+        owned.sort_by_key(|run| (created_ms(run), run.spec.run_id.as_uuid()));
+        // One pass, oldest first: a thread's first run sets it, and its first
+        // run with no parent (its coordinator) names its agent and start.
+        let mut threads: HashMap<&str, (ThreadSummary, bool)> = HashMap::new();
+        for run in owned {
+            let id = thread_of(&run.spec).expect("filtered");
+            let root = run.spec.lineage.parent.is_none();
+            let (thread, rooted) = threads.entry(id).or_insert((
+                ThreadSummary {
+                    thread_id: id.to_string(),
+                    agent_id: run.spec.agent_id,
+                    started_ms: created_ms(run),
+                    runs: 0,
+                },
+                false,
+            ));
+            thread.runs += 1;
+            if root && !*rooted {
+                thread.agent_id = run.spec.agent_id;
+                thread.started_ms = created_ms(run);
+                *rooted = true;
+            }
+        }
+        let mut threads: Vec<ThreadSummary> =
+            threads.into_values().map(|(thread, _)| thread).collect();
+        threads.sort_by(|a, b| {
+            b.started_ms
+                .cmp(&a.started_ms)
+                .then_with(|| a.thread_id.cmp(&b.thread_id))
+        });
+        Ok(threads.into_iter().skip(after).take(limit).collect())
+    }
+
+    fn thread_root(&self, owner: &Owner, thread: &str) -> Result<Option<RunSpec>, StoreError> {
+        Ok(read(&self.runs)
+            .values()
+            .filter(|run| {
+                run.spec.owner.is(owner)
+                    && thread_of(&run.spec) == Some(thread)
+                    && run.spec.lineage.parent.is_none()
+            })
+            .min_by_key(|run| (created_ms(run), run.spec.run_id.as_uuid()))
+            .map(|run| run.spec.clone()))
+    }
+
+    fn runs_of_thread(
+        &self,
+        owner: &Owner,
+        thread: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredRun>, StoreError> {
+        let runs = read(&self.runs);
+        let mut found: Vec<StoredRun> = runs
+            .values()
+            .filter(|run| run.spec.owner.is(owner) && thread_of(&run.spec) == Some(thread))
+            .cloned()
+            .collect();
+        found.sort_by_key(|run| (created_ms(run), run.spec.run_id.as_uuid()));
+        found.truncate(limit);
+        Ok(found)
     }
 }
 

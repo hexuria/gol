@@ -4,15 +4,16 @@ use postgres::fallible_iterator::FallibleIterator;
 use std::time::Duration;
 
 use postgres::{IsolationLevel, NoTls};
-use protocol::{AgentId, ArtifactId, Event, MessageId, Owner, RunId, Timestamp};
+use protocol::{AgentId, ArtifactId, Event, MessageId, Owner, RunId, RunSpec, Timestamp};
 use serde_json::Value;
 
 use harness::StoreError;
 
 use crate::store::{
-    check_one_terminal, is_terminal, principal_hint_of, Append, Hint, HintStream, Hints,
-    MessageStore, OutboxEntry, OutboxPage, OutboxStore, PutAgent, PutMessage, PutRun, RunStore,
-    StoredAgent, StoredArtifact, StoredMessage, StoredRun, ALL,
+    check_one_terminal, created_ms, is_terminal, principal_hint_of, thread_of, Append, Hint,
+    HintStream, Hints, MessageStore, OutboxEntry, OutboxPage, OutboxStore, PutAgent, PutMessage,
+    PutRun, RunStore, StoredAgent, StoredArtifact, StoredMessage, StoredRun, ThreadStore,
+    ThreadSummary, ALL,
 };
 
 /// The run store in Postgres over a pool of connections (C2, owner decision
@@ -143,7 +144,13 @@ create table if not exists agents (
 );
 create table if not exists runs (
     id uuid primary key,
-    spec jsonb not null
+    spec jsonb not null,
+    -- From the spec, written once by put_run (Phase 3.3, decision 48A).
+    owner_issuer text,
+    owner_subject text,
+    thread_id text,
+    parent_run uuid,
+    created_ms bigint
 );
 create table if not exists run_events (
     run_id uuid not null references runs (id),
@@ -196,7 +203,13 @@ create table if not exists artifacts (
 
 /// Indexes created once, each as (table, name, statement): an existing one
 /// is found in the catalog, not by `create index if not exists`.
-const INDEXES: [(&str, &str, &str); 4] = [
+const INDEXES: [(&str, &str, &str); 5] = [
+    // A principal's threads, and a thread's runs in order.
+    (
+        "runs",
+        "runs_by_thread",
+        "create index runs_by_thread on runs (owner_issuer, owner_subject, thread_id, created_ms)",
+    ),
     (
         "run_events",
         "run_events_one_terminal",
@@ -229,6 +242,47 @@ fn ensure_schema(client: &mut postgres::Client) -> Result<(), StoreError> {
     tx.query_one("select pg_advisory_xact_lock(872346)", &[])
         .map_err(sql)?;
     tx.batch_execute(SCHEMA).map_err(sql)?;
+    // A runs table from before Phase 3.3 has no thread columns (decision
+    // 49A): they are added and filled from each run's spec, once. Looked up
+    // in the catalog first, since `alter table` locks the table even when
+    // there is nothing to do.
+    let threaded = tx
+        .query_opt(
+            "select 1 from pg_attribute
+             where attrelid = 'runs'::regclass and attname = 'thread_id' and not attisdropped",
+            &[],
+        )
+        .map_err(sql)?;
+    if threaded.is_none() {
+        // The table is locked for the alter: give up rather than wait long
+        // behind a writer, and let the next connect try again.
+        tx.batch_execute(
+            "set local lock_timeout = '10s';
+             alter table runs
+                 add column owner_issuer text,
+                 add column owner_subject text,
+                 add column thread_id text,
+                 add column parent_run uuid,
+                 add column created_ms bigint;",
+        )
+        .map_err(sql)?;
+    }
+    // Every run without its columns: all of them just after the alter, and
+    // any an older server stored since (a rolling deploy). A run with no
+    // first event is dated now.
+    tx.batch_execute(
+        "update runs set
+             owner_issuer = spec->'owner'->>'issuer',
+             owner_subject = spec->'owner'->>'subject',
+             thread_id = nullif(spec->'metadata'->>'session_id', ''),
+             parent_run = (spec->'lineage'->>'parent')::uuid,
+             created_ms = coalesce(
+                 (select (body->'envelope'->>'at')::bigint from run_events
+                  where run_events.run_id = runs.id and run_events.seq = 1),
+                 (extract(epoch from clock_timestamp()) * 1000)::bigint)
+         where owner_issuer is null;",
+    )
+    .map_err(sql)?;
     // `create index if not exists` locks the table even when the index is
     // there, and would wait behind any writer stalled mid-append.
     for (table, name, create) in INDEXES {
@@ -400,7 +454,9 @@ impl PostgresStore {
             let mut tx = read_committed(client)?;
             let locked = tx
                 .query_opt(
-                    "select spec->'owner'->>'issuer', spec->'owner'->>'subject'
+                    // An older server's row has no owner columns yet.
+                    "select coalesce(owner_issuer, spec->'owner'->>'issuer'),
+                            coalesce(owner_subject, spec->'owner'->>'subject')
                      from runs where id = $1 for update",
                     &[&id],
                 )
@@ -442,6 +498,134 @@ impl PostgresStore {
             self.notify(client, &principal);
             Ok(Append::Appended)
         })
+    }
+}
+
+impl ThreadStore for PostgresStore {
+    fn threads_of(
+        &self,
+        owner: &Owner,
+        after: usize,
+        limit: usize,
+    ) -> Result<Vec<ThreadSummary>, StoreError> {
+        let after = i64::try_from(after).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self.with_client(|client| {
+            client
+                .query(
+                    "select thread_id, count(*),
+                         coalesce(
+                             (array_agg(spec->>'agent_id' order by created_ms, id)
+                                 filter (where parent_run is null))[1],
+                             (array_agg(spec->>'agent_id' order by created_ms, id))[1]),
+                         coalesce(min(created_ms) filter (where parent_run is null),
+                                  min(created_ms)) as started
+                     from runs
+                     where owner_issuer = $1 and owner_subject = $2 and thread_id is not null
+                     group by thread_id
+                     order by started desc, thread_id
+                     offset $3 limit $4",
+                    &[&owner.issuer, &owner.subject, &after, &limit],
+                )
+                .map_err(sql)
+        })?;
+        rows.iter()
+            .map(|row| {
+                let agent: String = row.try_get(2).map_err(sql)?;
+                let runs: i64 = row.try_get(1).map_err(sql)?;
+                Ok(ThreadSummary {
+                    thread_id: row.try_get(0).map_err(sql)?,
+                    agent_id: agent
+                        .parse()
+                        .map_err(|_| StoreError::new("a run's agent_id is not an id"))?,
+                    started_ms: row.try_get(3).map_err(sql)?,
+                    runs: u64::try_from(runs).unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+
+    /// One snapshot: the thread's runs, oldest first, then their events.
+    fn runs_of_thread(
+        &self,
+        owner: &Owner,
+        thread: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredRun>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let (specs, events) = self.with_client(|client| {
+            let mut tx = client
+                .build_transaction()
+                .read_only(true)
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()
+                .map_err(sql)?;
+            let specs = tx
+                .query(
+                    "select id, spec from runs
+                     where owner_issuer = $1 and owner_subject = $2 and thread_id = $3
+                     order by created_ms, id
+                     limit $4",
+                    &[&owner.issuer, &owner.subject, &thread, &limit],
+                )
+                .map_err(sql)?;
+            let ids: Vec<uuid::Uuid> = specs
+                .iter()
+                .map(|row| row.try_get(0))
+                .collect::<Result<_, _>>()
+                .map_err(sql)?;
+            let events = tx
+                .query(
+                    "select run_id, body from run_events
+                     where run_id = any($1)
+                     order by run_id, seq",
+                    &[&ids],
+                )
+                .map_err(sql)?;
+            tx.commit().map_err(sql)?;
+            Ok((specs, events))
+        })?;
+        let mut by_run: std::collections::HashMap<uuid::Uuid, Vec<Event>> =
+            std::collections::HashMap::new();
+        for row in &events {
+            let id: uuid::Uuid = row.try_get(0).map_err(sql)?;
+            let body: serde_json::Value = row.try_get(1).map_err(sql)?;
+            by_run
+                .entry(id)
+                .or_default()
+                .push(serde_json::from_value(body).map_err(json)?);
+        }
+        specs
+            .iter()
+            .map(|row| {
+                let id: uuid::Uuid = row.try_get(0).map_err(sql)?;
+                let spec: serde_json::Value = row.try_get(1).map_err(sql)?;
+                Ok(StoredRun {
+                    spec: serde_json::from_value(spec).map_err(json)?,
+                    events: by_run.remove(&id).unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
+    fn thread_root(&self, owner: &Owner, thread: &str) -> Result<Option<RunSpec>, StoreError> {
+        let row = self.with_client(|client| {
+            client
+                .query_opt(
+                    "select spec from runs
+                     where owner_issuer = $1 and owner_subject = $2 and thread_id = $3
+                       and parent_run is null
+                     order by created_ms, id
+                     limit 1",
+                    &[&owner.issuer, &owner.subject, &thread],
+                )
+                .map_err(sql)
+        })?;
+        row.map(|row| {
+            let spec: serde_json::Value = row.try_get(0).map_err(sql)?;
+            serde_json::from_value(spec).map_err(json)
+        })
+        .transpose()
     }
 }
 
@@ -749,12 +933,30 @@ impl RunStore for PostgresStore {
             run.spec.owner.issuer.clone(),
             run.spec.owner.subject.clone(),
         );
+        let thread = thread_of(&run.spec).map(str::to_string);
+        let parent = run.spec.lineage.parent.map(RunId::as_uuid);
+        // A run stored with no events is dated now, as the backfill dates one.
+        let created = run
+            .events
+            .first()
+            .map_or_else(|| Timestamp::now().as_unix_millis(), |_| created_ms(&run));
         self.with_client(|client| {
             let mut tx = read_committed(client)?;
             let inserted = tx
                 .execute(
-                    "insert into runs (id, spec) values ($1, $2) on conflict (id) do nothing",
-                    &[&id, &spec],
+                    "insert into runs
+                         (id, spec, owner_issuer, owner_subject, thread_id, parent_run, created_ms)
+                     values ($1, $2, $3, $4, $5, $6, $7)
+                     on conflict (id) do nothing",
+                    &[
+                        &id,
+                        &spec,
+                        &principal.0,
+                        &principal.1,
+                        &thread,
+                        &parent,
+                        &created,
+                    ],
                 )
                 .map_err(sql)?;
             if inserted == 1 {
@@ -878,6 +1080,10 @@ impl RunStore for PostgresStore {
     }
 
     fn outbox(&self) -> Option<&dyn OutboxStore> {
+        Some(self)
+    }
+
+    fn threads(&self) -> Option<&dyn ThreadStore> {
         Some(self)
     }
 }
