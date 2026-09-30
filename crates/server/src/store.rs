@@ -627,6 +627,9 @@ pub trait TriggerStore: Send + Sync {
     /// Running schedule triggers with no tick yet (made before Phase 4.2),
     /// at most `limit`.
     fn unscheduled_triggers(&self, limit: usize) -> Result<Vec<StoredTrigger>, StoreError>;
+    /// Webhook trigger `id`, whoever owns it (Phase 4.3): a hook names no
+    /// principal until its signature is checked.
+    fn webhook_trigger(&self, id: TriggerId) -> Result<Option<StoredTrigger>, StoreError>;
 }
 
 /// The in-memory store. A poisoned lock (a writer panicked holding it) still
@@ -982,6 +985,13 @@ impl TriggerStore for InMemoryStore {
             .find(|trigger| trigger.id == id && trigger.next_fire_ms == due_ms)
             .map(|trigger| trigger.next_fire_ms = next_ms)
             .is_some())
+    }
+
+    fn webhook_trigger(&self, id: TriggerId) -> Result<Option<StoredTrigger>, StoreError> {
+        Ok(read(&self.triggers)
+            .iter()
+            .find(|trigger| trigger.id == id && matches!(trigger.kind, TriggerKind::Webhook { .. }))
+            .cloned())
     }
 
     fn unscheduled_triggers(&self, limit: usize) -> Result<Vec<StoredTrigger>, StoreError> {

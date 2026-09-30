@@ -74,11 +74,142 @@ pub fn fire_trigger(
     owner: &Owner,
     id: TriggerId,
 ) -> Result<Fired, FireError> {
-    fire(store, queue, owner, id, None)
+    fire(store, queue, owner, id, None).map(|(fired, _)| fired)
 }
 
-/// A scheduled fire: its run id, and its tick.
-type Tick = (RunId, i64);
+/// What keys a fire's run id, when something does.
+enum Key {
+    /// A scheduled fire: its run id, and its tick.
+    Tick(RunId, i64),
+    /// A webhook's fire (Phase 4.3): its run id, the sender's event id, and
+    /// the body, which follows the trigger's input.
+    Event(RunId, String, String),
+}
+
+/// The namespace of a webhook fire's run id (UUID v5 over the trigger and
+/// the sender's event id).
+const EVENT_RUN_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x7d3a_19c4_e2b8_4a56_9f01_3c6e_8b24_d5a7);
+
+/// The event id a webhook fire answered, on its run.
+const EVENT_KEY: &str = "gol.event";
+
+/// What a webhook request did (Phase 4.3, decisions 76A and 80A).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hooked {
+    /// Queued this run for the event: its first delivery, or a retry that
+    /// pushed a run an earlier delivery stored but never pushed.
+    Started(RunId),
+    /// A replay of an event whose run is queued, running or done.
+    Duplicate(RunId),
+    /// Nothing: the trigger is paused, or was paused or resumed while the
+    /// event's run waited, so the run was held, now or on an earlier
+    /// delivery.
+    Refused,
+    /// Nothing: its agent is no longer the owner's.
+    AgentNotFound,
+    /// Nothing: the trigger is gone.
+    NotFound,
+}
+
+/// How a webhook event's stored run answers another delivery of the event
+/// (80A), from its log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Replay {
+    /// Only its queued events: settled, or queued already.
+    Waiting,
+    /// Held (cancelled) before any worker scheduled it: refused again.
+    Refused,
+    /// Scheduled, or ended any other way: a duplicate.
+    Duplicate,
+}
+
+fn replay_of(events: &[protocol::Event]) -> Replay {
+    use protocol::EventPayload::{RunCancelled, RunScheduled};
+    if crate::spawner::still_waiting(events) {
+        Replay::Waiting
+    } else if events
+        .iter()
+        .any(|event| matches!(event.payload, RunCancelled))
+        && !events
+            .iter()
+            .any(|event| matches!(event.payload, RunScheduled))
+    {
+        Replay::Refused
+    } else {
+        Replay::Duplicate
+    }
+}
+
+/// `replay_of` run `run`'s log as it is now.
+fn replay_now(store: &dyn RunStore, run: RunId) -> Result<Replay, FireError> {
+    let events = store
+        .run(run)
+        .map_err(|error| FireError::MaybeStored {
+            run,
+            message: error.to_string(),
+        })?
+        .map(|stored| stored.events)
+        .unwrap_or_default();
+    Ok(replay_of(&events))
+}
+
+/// Fires webhook `trigger` for the sender's event `event` with `body`
+/// (Phase 4.3, decisions 74A, 77A and 80A). The run's id comes from the
+/// trigger and the event id, so a replay of the event fires nothing new;
+/// its input is the trigger's input, a blank line, and the body. A replay
+/// is answered from the event's stored run: queued, running or done is a
+/// duplicate; held before it ran is refused again; still waiting (an
+/// earlier delivery stored it and failed before its push) is settled as
+/// the queue sweep settles it, by the generation it recorded.
+pub fn fire_webhook(
+    store: &dyn RunStore,
+    queue: &RedisRunQueue,
+    trigger: &StoredTrigger,
+    event: &str,
+    body: &str,
+) -> Result<Hooked, FireError> {
+    let mut name = trigger.id.as_uuid().as_bytes().to_vec();
+    name.extend_from_slice(event.as_bytes());
+    let run = RunId::from_uuid(uuid::Uuid::new_v5(&EVENT_RUN_NAMESPACE, &name));
+    let stored = store
+        .run(run)
+        .map_err(|error| FireError::NotStored(error.to_string()))?;
+    if let Some(stored) = stored {
+        match replay_of(&stored.events) {
+            Replay::Refused => return Ok(Hooked::Refused),
+            Replay::Duplicate => return Ok(Hooked::Duplicate(run)),
+            Replay::Waiting => {}
+        }
+        return match settle_fired_run(queue, store, &stored.spec) {
+            Ok(Fire::Pushed) => Ok(Hooked::Started(run)),
+            // Queued already, or ended since this delivery read it: held
+            // by another delivery or the sweep is refused.
+            Ok(Fire::Found) => Ok(match replay_now(store, run)? {
+                Replay::Refused => Hooked::Refused,
+                Replay::Waiting | Replay::Duplicate => Hooked::Duplicate(run),
+            }),
+            Ok(Fire::Held) => Ok(Hooked::Refused),
+            Err(message) => Err(FireError::MaybeStored { run, message }),
+        };
+    }
+    let key = Key::Event(run, event.to_string(), body.to_string());
+    Ok(
+        match fire(store, queue, &trigger.owner, trigger.id, Some(key))? {
+            (Fired::Run(run), true) => Hooked::Started(run),
+            // Another delivery of the event stored the run first: answered
+            // from its log, as a replay is.
+            (Fired::Run(run), false) => match replay_now(store, run)? {
+                Replay::Waiting => Hooked::Started(run),
+                Replay::Refused => Hooked::Refused,
+                Replay::Duplicate => Hooked::Duplicate(run),
+            },
+            (Fired::Paused | Fired::Moved, _) => Hooked::Refused,
+            (Fired::AgentNotFound, _) => Hooked::AgentNotFound,
+            (Fired::NotFound, _) => Hooked::NotFound,
+        },
+    )
+}
 
 /// The namespace of a scheduled fire's run id (UUID v5 over the trigger and
 /// its tick).
@@ -99,7 +230,7 @@ pub fn fire_trigger_at(
     let mut name = id.as_uuid().as_bytes().to_vec();
     name.extend_from_slice(&tick_ms.to_le_bytes());
     let run = RunId::from_uuid(uuid::Uuid::new_v5(&TICK_RUN_NAMESPACE, &name));
-    fire(store, queue, owner, id, Some((run, tick_ms)))
+    fire(store, queue, owner, id, Some(Key::Tick(run, tick_ms))).map(|(fired, _)| fired)
 }
 
 fn fire(
@@ -107,37 +238,47 @@ fn fire(
     queue: &RedisRunQueue,
     owner: &Owner,
     id: TriggerId,
-    tick: Option<Tick>,
-) -> Result<Fired, FireError> {
+    key: Option<Key>,
+) -> Result<(Fired, bool), FireError> {
     let unread = |error: StoreError| FireError::NotStored(error.to_string());
     let triggers = store
         .triggers()
         .ok_or_else(|| FireError::NotStored("the store keeps no triggers".to_string()))?;
     let Some(trigger) = triggers.trigger(owner, id).map_err(unread)? else {
-        return Ok(Fired::NotFound);
+        return Ok((Fired::NotFound, false));
     };
     if !trigger.enabled {
-        return Ok(Fired::Paused);
+        return Ok((Fired::Paused, false));
     }
-    if tick.is_some_and(|(_, at)| trigger.next_fire_ms != Some(at)) {
-        return Ok(Fired::Moved);
+    if let Some(Key::Tick(_, at)) = key {
+        if trigger.next_fire_ms != Some(at) {
+            return Ok((Fired::Moved, false));
+        }
     }
     let Some(agent) = store
         .agent(trigger.agent_id)
         .map_err(unread)?
         .filter(|agent| agent.owner.is(&trigger.owner))
     else {
-        return Ok(Fired::AgentNotFound);
+        return Ok((Fired::AgentNotFound, false));
     };
     let mut spec = run_of(
         &trigger,
         agent.manifest.version,
         agent.manifest.required_capabilities,
     );
-    if let Some((run_id, at)) = tick {
-        // A top-level run: its lineage names no root, so the id is its own.
-        spec.run_id = run_id;
-        spec.metadata.insert(TICK_KEY.to_string(), at.to_string());
+    // A top-level run: its lineage names no root, so the id is its own.
+    match key {
+        Some(Key::Tick(run_id, at)) => {
+            spec.run_id = run_id;
+            spec.metadata.insert(TICK_KEY.to_string(), at.to_string());
+        }
+        Some(Key::Event(run_id, event, body)) => {
+            spec.run_id = run_id;
+            spec.input = format!("{}\n\n{body}", spec.input);
+            spec.metadata.insert(EVENT_KEY.to_string(), event);
+        }
+        None => {}
     }
     let run = spec.run_id;
     // Why the run was held, if it was.
@@ -154,8 +295,8 @@ fn fire(
         },
     })?;
     Ok(match (fired, held.take()) {
-        (Fire::Held, Some(why)) => why,
-        _ => Fired::Run(run),
+        (Fire::Held, Some(why)) => (why, false),
+        (fired, _) => (Fired::Run(run), fired == Fire::Pushed),
     })
 }
 
@@ -274,4 +415,58 @@ pub fn webhook_secret(key: &[u8], trigger: &StoredTrigger) -> Option<String> {
             .map(|byte| format!("{byte:02x}"))
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inference::{queued_events, run_cancelled_event, run_failed_event, system_event};
+    use protocol::{
+        AgentId, CredentialSource, EventPayload, ExecutionPlacement, FailureClass, ModelProvider,
+        WorkModel,
+    };
+
+    fn spec() -> RunSpec {
+        RunSpec::builder()
+            .owner(Owner::new("https://issuer.test", "user-1", "tenant-1"))
+            .agent(AgentId::new(), "1")
+            .input("hello")
+            .placement(ExecutionPlacement::Local)
+            .work_model(WorkModel {
+                provider: ModelProvider::OpenAI,
+                model_name: "gpt-test".to_string(),
+                credential: CredentialSource::PlatformGateway,
+            })
+            .limits(Limits {
+                max_steps: 4,
+                max_model_calls: 1,
+            })
+            .build()
+    }
+
+    // A webhook event's run answers another delivery from its log (80A):
+    // only queued, it waits; cancelled before any worker scheduled it, it
+    // was held and is refused; scheduled, or ended any other way (a worker
+    // fails a run it cannot start before scheduling it), it is a duplicate.
+    #[test]
+    fn a_replay_is_classified_from_the_runs_log() {
+        let spec = spec();
+        let queued = queued_events(&spec);
+        assert_eq!(replay_of(&queued), Replay::Waiting);
+        let mut held = queued.clone();
+        held.push(run_cancelled_event(&spec));
+        assert_eq!(replay_of(&held), Replay::Refused);
+        let mut failed = queued.clone();
+        failed.push(run_failed_event(
+            &spec,
+            FailureClass::Infrastructure,
+            "started too often".to_string(),
+        ));
+        assert_eq!(replay_of(&failed), Replay::Duplicate);
+        let mut scheduled = queued.clone();
+        scheduled.push(system_event(&spec, EventPayload::RunScheduled));
+        assert_eq!(replay_of(&scheduled), Replay::Duplicate);
+        scheduled.push(run_cancelled_event(&spec));
+        assert_eq!(replay_of(&scheduled), Replay::Duplicate, "stopped mid-run");
+    }
 }

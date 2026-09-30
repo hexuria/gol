@@ -1,0 +1,21 @@
+[package]
+name = "server-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+server = { path = ".." }
+libfuzzer-sys = "0.4"
+ring = "0.17"
+
+# Its own workspace: cargo-fuzz builds it with a nightly toolchain, apart
+# from the main workspace.
+[workspace]
+
+[[bin]]
+name = "webhook"
+path = "fuzz_targets/webhook.rs"

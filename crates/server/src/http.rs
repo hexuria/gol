@@ -36,7 +36,8 @@ use crate::store::{
 use crate::stream::{outbox_stream, run_stream, SseBody, Streams};
 use crate::surface::{ag_ui_events, json_render_spec};
 use crate::triggers::{
-    trigger_thread, webhook_secret, MAX_TRIGGERS, MIN_WEBHOOK_KEY_BYTES, TRIGGER_KEY,
+    trigger_thread, webhook_secret, FireError, Hooked, MAX_TRIGGERS, MIN_WEBHOOK_KEY_BYTES,
+    TRIGGER_KEY,
 };
 
 #[derive(Clone)]
@@ -297,6 +298,11 @@ fn router_with_state(state: AppState) -> Router {
         .route("/v1/triggers/{id}/pause", post(pause_trigger))
         .route("/v1/triggers/{id}/resume", post(resume_trigger))
         .route("/v1/triggers/{id}/rotate", post(rotate_trigger))
+        .route(
+            "/hooks/{id}",
+            // Twice the limit is read, so a body just over it gets our 413.
+            post(webhook_hook).layer(axum::extract::DefaultBodyLimit::max(2 * MAX_MESSAGE_BYTES)),
+        )
         .route("/v1/coworker/turns", post(create_coworker_turn))
         .route(
             "/v1/coworker/turns/{id}/completion",
@@ -1672,6 +1678,110 @@ async fn rotate_trigger(
     .await?;
     let view = with_secret(&state, &trigger, trigger_view(&trigger));
     Ok((no_store(), Json(view)).into_response())
+}
+
+/// `POST /hooks/{id}`: a signed request fires webhook trigger `id`, with
+/// no bearer token (decisions 74A-81A). 202 with the run it queued; a
+/// replay is answered from the event's run: 200 with it and `duplicate`
+/// once it is queued, running or done, 409 if it was refused. 401 for a bad
+/// or stale signature, a bad event id, and an unknown trigger or one that
+/// is not a webhook, alike, so ids cannot be probed; 409 while paused; 413
+/// when the run's input would be over `MAX_MESSAGE_BYTES`; 400 for a body
+/// that is not UTF-8 or has a NUL.
+async fn webhook_hook(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response, ApiError> {
+    let (Some(key), Some(queue)) = (state.webhook_key.clone(), state.queue.clone()) else {
+        return Err(ApiError::Unavailable("webhooks are not available"));
+    };
+    // Refused before any lookup or MAC, so it tells a prober nothing.
+    if body.len() > MAX_MESSAGE_BYTES {
+        return Err(ApiError::TooLarge("the body is over 32 KiB"));
+    }
+    let id: TriggerId = id.parse().map_err(|_| ApiError::Unauthorized)?;
+    let (Some(event), Some(timestamp), Some(signature)) = (
+        header_value(&headers, "x-gol-event"),
+        header_value(&headers, "x-gol-timestamp"),
+        header_value(&headers, "x-gol-signature"),
+    ) else {
+        return Err(ApiError::Unauthorized);
+    };
+    // What can be checked before the lookup is, so a flood of junk costs
+    // no store read.
+    let now_s = Timestamp::now().as_unix_millis() / 1000;
+    if !crate::webhook::is_event_id(&event)
+        || !crate::webhook::plausible(&timestamp, &signature, now_s)
+    {
+        return Err(ApiError::Unauthorized);
+    }
+    let store = state.store.clone();
+    let fired = tokio::task::spawn_blocking(move || {
+        let Some(triggers) = store.triggers() else {
+            return Err(ApiError::NoTriggers);
+        };
+        let Some(trigger) = triggers.webhook_trigger(id).map_err(ApiError::from)? else {
+            return Err(ApiError::Unauthorized);
+        };
+        let signed = webhook_secret(&key, &trigger).is_some_and(|secret| {
+            let request = crate::webhook::Request {
+                event: &event,
+                timestamp: &timestamp,
+                signature: &signature,
+                body: &body,
+            };
+            crate::webhook::verify(&secret, &request, now_s)
+        });
+        if !signed {
+            return Err(ApiError::Unauthorized);
+        }
+        // The run's input, the trigger's and the body, is bounded as any
+        // message is (81A).
+        if trigger.input.len() + 2 + body.len() > MAX_MESSAGE_BYTES {
+            return Err(ApiError::TooLarge(
+                "the body, after the trigger's input, is over 32 KiB",
+            ));
+        }
+        // A NUL is refused too: the Postgres store cannot keep one.
+        let Some(body) = std::str::from_utf8(&body)
+            .ok()
+            .filter(|body| !body.contains('\0'))
+        else {
+            return Err(ApiError::BadRequest("the body is not UTF-8, or has a NUL"));
+        };
+        Ok(crate::triggers::fire_webhook(
+            store.as_ref(),
+            &queue,
+            &trigger,
+            &event,
+            body,
+        ))
+    })
+    .await
+    .map_err(|error| ApiError::Store(error.to_string()))??;
+    match fired {
+        Ok(Hooked::Started(run)) => Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "run_id": run })),
+        )
+            .into_response()),
+        Ok(Hooked::Duplicate(run)) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({ "run_id": run, "duplicate": true })),
+        )
+            .into_response()),
+        Ok(Hooked::Refused) => Err(ApiError::Conflict(
+            "the trigger is paused, or was when this event came",
+        )),
+        Ok(Hooked::AgentNotFound) => Err(ApiError::AgentNotFound),
+        // Deleted since the lookup.
+        Ok(Hooked::NotFound) => Err(ApiError::Unauthorized),
+        Err(FireError::NotStored(message) | FireError::MaybeStored { message, .. }) => {
+            Err(ApiError::Store(message))
+        }
+    }
 }
 
 /// An answer that carries a webhook secret is not kept by any cache.
