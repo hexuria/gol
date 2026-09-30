@@ -1300,6 +1300,14 @@ impl SandboxHost for NoProvision {
         Ok(Vec::new())
     }
 
+    fn list_volumes(&self) -> Result<Vec<String>, server::SandboxError> {
+        Ok(Vec::new())
+    }
+
+    fn remove_volume(&self, _name: &str) -> Result<(), server::SandboxError> {
+        Ok(())
+    }
+
     fn launches_docker(&self) -> bool {
         false
     }
@@ -1577,6 +1585,14 @@ impl SandboxHost for ProvisionLeavesSandbox {
 
     fn list(&self) -> Result<Vec<String>, server::SandboxError> {
         Ok(Vec::new())
+    }
+
+    fn list_volumes(&self) -> Result<Vec<String>, server::SandboxError> {
+        Ok(Vec::new())
+    }
+
+    fn remove_volume(&self, _name: &str) -> Result<(), server::SandboxError> {
+        Ok(())
     }
 
     fn launches_docker(&self) -> bool {

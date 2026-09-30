@@ -851,6 +851,14 @@ impl SandboxHost for NoProvision {
         Ok(Vec::new())
     }
 
+    fn list_volumes(&self) -> Result<Vec<String>, SandboxError> {
+        Ok(Vec::new())
+    }
+
+    fn remove_volume(&self, _name: &str) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     fn launches_docker(&self) -> bool {
         false
     }

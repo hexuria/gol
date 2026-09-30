@@ -31,8 +31,8 @@ pub use http::{
 pub use inference::{
     accept_subscription_completion, box_attempt_name, box_container_name, box_run_of,
     box_workspace_volume, computer_plan, ensure_fixture_proxy, fail_turn, open_turn, queued_events,
-    run_failed_event, sandbox_from_env, DockerSandbox, GatewayCall, GatewayPoster,
-    HttpGatewayPoster, MemorySandbox, SandboxError, SandboxHost, TurnError,
+    run_failed_event, sandbox_from_env, workspace_run_of, DockerSandbox, GatewayCall,
+    GatewayPoster, HttpGatewayPoster, MemorySandbox, SandboxError, SandboxHost, TurnError,
 };
 pub use local::LocalEchoFactory;
 pub use models::{GatewayModel, ModelsConfig};
@@ -53,9 +53,9 @@ pub use triggers::{
     Hooked, MAX_TRIGGERS, MIN_WEBHOOK_KEY_BYTES, TRIGGER_KEY,
 };
 pub use worker::{
-    queue_from_env, reap_forever, start_queue, sweep, sweep_asks, sweep_sandboxes,
-    sweep_sandboxes_forever, Claim, Done, Executed, Open, Prepared, QueueSettings, Worker,
-    WorkerBuilder,
+    queue_from_env, reap_forever, start_queue, start_sandbox_sweep, sweep, sweep_asks,
+    sweep_sandboxes, sweep_sandboxes_forever, Claim, Done, Executed, Open, Prepared, QueueSettings,
+    Worker, WorkerBuilder,
 };
 
 /// Returned by every `RunStore` method.

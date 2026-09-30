@@ -11,7 +11,9 @@
 \* - stop() (crates/server/src/http.rs): it records the stop, and cancels only a
 \*   turn no worker has started;
 \* - the reaper: a lease that ran out puts the run back on the queue, and it
-\*   removes every gol-box sandbox the host lists whose turn has ended.
+\*   removes every gol-box sandbox the host lists whose turn has ended, then
+\*   the run's workspace volume once no sandbox of the run is listed (88A),
+\*   with `docker volume rm`, which refuses a volume a container mounts (89A).
 \* Sandbox calls are one step each; destroying a name not up succeeds. The log
 \* is "open" or "ended"; the store refuses a second end (RunLog).
 \*
@@ -24,6 +26,9 @@
 \*   "stopall"   the stop cancels a started turn itself;
 \*   "nocleanup" past max_deliveries the turn is failed without cleaning up;
 \*   "nosweep"   the reaper does not clean up after an ended turn;
+\*   "anyrun"    the volume sweep does not check that the turn has ended;
+\*   "once"      the volume sweep removes a run's volume once, never again;
+\*   "volforce"  the volume removal is not refused while a sandbox mounts it;
 \*   "set"       the reaper removes only what a Redis set names: a worker adds
 \*               its name before it provisions, and a removal confirmed gone
 \*               takes the name off (the first 86A).
@@ -47,6 +52,12 @@ VARIABLES log, started, stopReq, starts, queued, holder, up, named,
 vars == <<log, started, stopReq, starts, queued, holder, up, named,
           pc, att, why, todo, fails, crashes, lapses, cleared, late>>
 
+\* The run's workspace volume: a provision makes it (docker create -v), and
+\* the volume sweep removes it. volSeen: the sweep listed no sandbox of the
+\* run; swept: it removed the volume (history, for "once").
+VARIABLES vol, volSeen, swept
+allVars == <<vars, vol, volSeen, swept>>
+
 TypeOK ==
   /\ log \in {"open", "ended"}
   /\ started \in BOOLEAN /\ stopReq \in BOOLEAN
@@ -58,6 +69,7 @@ TypeOK ==
   /\ todo \in [Workers -> SUBSET Attempts]
   /\ fails \in 0..MaxFails /\ crashes \in 0..MaxCrashes /\ lapses \in 0..MaxLapses
   /\ cleared \subseteq Attempts /\ late \subseteq Attempts
+  /\ vol \in BOOLEAN /\ volSeen \in BOOLEAN /\ swept \in BOOLEAN
 
 \* The turn is stored queued and pushed (the 202).
 Init ==
@@ -68,6 +80,7 @@ Init ==
   /\ why = [w \in Workers |-> "none"] /\ todo = [w \in Workers |-> {}]
   /\ fails = 0 /\ crashes = 0 /\ lapses = 0
   /\ cleared = {} /\ late = {}
+  /\ vol = FALSE /\ volSeen = FALSE /\ swept = FALSE
 
 \* The lease is the claim's: one worker runs one claim at a time.
 Holds(w) == holder = w
@@ -211,20 +224,37 @@ Sweep ==
   /\ UNCHANGED <<log, started, stopReq, starts, queued, holder, pc, att, why, todo,
                  crashes, lapses, cleared, late>>
 
+\* The volume sweep: the host lists no sandbox of the run whose turn ended...
+VolCheck ==
+  /\ Design # "novsweep" /\ vol /\ ~volSeen /\ up = {}
+  /\ log = "ended" \/ Design = "anyrun"
+  /\ ~(swept /\ Design = "once")
+  /\ volSeen' = TRUE /\ UNCHANGED <<vars, vol, swept>>
+\* ...then docker volume rm, which refuses while a container mounts it.
+VolRemove ==
+  /\ volSeen /\ volSeen' = FALSE
+  /\ IF up = {} \/ Design = "volforce" THEN vol' = FALSE /\ swept' = TRUE
+                                           ELSE UNCHANGED <<vol, swept>>
+  /\ UNCHANGED vars
+
 Done ==
-  /\ log = "ended" /\ ~queued /\ ~ENABLED Sweep
+  /\ log = "ended" /\ ~queued /\ ~ENABLED Sweep /\ ~ENABLED VolCheck /\ ~volSeen
   /\ \A w \in Workers : pc[w] \in {"idle", "dead"}
   /\ UNCHANGED vars
 
 Step(w) == Claim(w) \/ Begin(w) \/ Record(w) \/ Provision(w) \/ Fence(w)
            \/ Call(w) \/ Drop(w) \/ Clean(w) \/ Append(w)
 
-Next == \E w \in Workers : Step(w) \/ Crash(w)
-        \/ Lapse \/ LapseDead \/ Stop \/ Sweep \/ Done
+\* A core step leaves the volume as it was, or makes it with a new sandbox.
+Made(A) == A /\ vol' = (vol \/ up' \ up # {}) /\ UNCHANGED <<volSeen, swept>>
+Next == \/ Made(\E w \in Workers : Step(w) \/ Crash(w))
+        \/ Made(Lapse \/ LapseDead \/ Stop \/ Sweep \/ Done)
+        \/ VolCheck \/ VolRemove
 
 \* Workers and the reaper keep running; a crash, a stall and a stop may not come.
-Spec == Init /\ [][Next]_vars /\ \A w \in Workers : WF_vars(Step(w))
-          /\ WF_vars(LapseDead) /\ WF_vars(Sweep)
+Spec == Init /\ [][Next]_allVars /\ \A w \in Workers : WF_allVars(Made(Step(w)))
+          /\ WF_allVars(Made(LapseDead)) /\ WF_allVars(Made(Sweep))
+          /\ WF_allVars(VolCheck) /\ WF_allVars(VolRemove)
 
 \* While the turn is open, the worker holding its lease has its sandbox up
 \* through the gateway call: no other worker removed it.
@@ -244,7 +274,15 @@ EndClean ==
        /\ stopReq' # stopReq => up' \subseteq Excused(Cap)
        /\ \A w \in Workers : pc[w] = "appending" /\ pc'[w] = "idle" => up' \subseteq Excused(att[w])]_vars
 
-\* The turn ends, and then no sandbox is left.
+\* The turn ends, and then no sandbox is left, and no volume.
 TurnEnds == <>(log = "ended")
 EventuallyClean == <>[](log = "ended" /\ up = {})
+EventuallyNoVolume == <>[](log = "ended" /\ ~vol)
+
+\* Every sandbox that exists has its volume: none is taken from under one.
+MountedHasVolume == up # {} => vol
+
+\* While the turn is open, a volume once made stays: no sweep takes the
+\* workspace from between two deliveries.
+VolumeKeptWhileOpen == [][log = "open" /\ vol => vol']_allVars
 ====
