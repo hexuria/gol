@@ -108,7 +108,7 @@ Checked on 2026-09-30 with TLC 2.19 (tla2tools v1.7.4):
 java -XX:+UseParallelGC -jar tla2tools.jar -workers auto -lncheck final -config BoxTurn.cfg BoxTurn.tla
 ```
 
-`BoxTurn.tla` is a model of its own in this directory, 250 lines. It covers the writers of one Box background coworker turn:
+`BoxTurn.tla` is a model of its own in this directory, 250 lines when it was added (283 with the workspace volumes below). It covers the writers of one Box background coworker turn:
 - queue workers, each running one delivery (an attempt), with a lease that can run out while the worker still acts;
 - the owner's stop;
 - the reaper.
@@ -130,17 +130,17 @@ It abstracts `Claim::prepare`, `Worker::run_box_turn`, `end_box` and `clean_box`
 - Fairness: weak fairness on each worker, on the lapse of a dead worker's lease, and on the reaper. A crash, a stall (a live worker's lease running out) and a stop may never come.
 
 **Runs:**
-- `BoxTurn.cfg`: `Design = "new"`, two workers, `MaxDeliveries = 2`, one crash, one stall, one failed removal. 60,367 states generated, 18,531 distinct, depth 28, 4 s. No error, deadlock checked.
-- The same with three workers: 294,243 distinct, depth 33, 54 s with `-workers 1`, no error. With `-workers auto`, TLC finished its checks and then threw an `ArithmeticException` (division by zero) while printing its statistics, as on #85's three-scheduler run; the single-worker run is the result.
+- `BoxTurn.cfg`: `Design = "new"`, two workers, `MaxDeliveries = 2`, one crash, one stall, one failed removal. With the workspace volume: 22,781 distinct states, depth 30, a few seconds. No error, deadlock checked. (Before the volume, 18,531 distinct, depth 28.)
+- The same with three workers: 371,907 distinct, depth 35, 2 min 21 s with `-workers 1`, no error. TLC sometimes finishes its checks and then throws an `ArithmeticException` (division by zero) while printing its statistics, as on #85's three-scheduler run; a run that reports "No error has been found" is the result.
 
 **Negative controls** (`Design` changed on `BoxTurn.cfg`, run with `-workers 1`), each failing as recorded:
 - `"shared"`: one sandbox name for every attempt, the #83 design. Breaks `LiveSandbox` in 11 states: a worker whose lease ran out removes the name the live worker is calling with.
-- `"nofence"`: no lease check after the provision or after the call; the check before the append stays. It holds every property (19,293 distinct states, depth 33). A worker cleans up only attempts 1 to its own, so a stale one never removes a later attempt's sandbox. Those two checks save a gateway call and a cleanup; no property here depends on them.
+- `"nofence"`: no lease check after the provision or after the call; the check before the append stays. It holds every property (24,003 distinct states, depth 35). A worker cleans up only attempts 1 to its own, so a stale one never removes a later attempt's sandbox. Those two checks save a gateway call and a cleanup; no property here depends on them.
 - `"cleanlatest"`: no lease checks, and a cleanup of attempts up to the latest start instead of the worker's own. Breaks `LiveSandbox` in 13 states: a stale worker's cleanup removes the sandbox the live worker is calling with. The bound to its own attempt is what keeps `LiveSandbox`.
 - `"stopall"`: the stop cancels a started turn itself. Breaks `EndClean` in 6 states.
 - `"nocleanup"`: past `max_deliveries` the turn is failed without cleaning up. Breaks `EndClean` in 13 states.
-- `"nosweep"`: breaks `EventuallyClean` in a 15-state lasso.
-- `"set"`: the first 86A. The reaper removes only what a Redis set names; a worker adds its name before it provisions, and a removal confirmed gone takes the name off. Breaks `EventuallyClean` in a 17-state trace:
+- `"nosweep"`: breaks `EventuallyClean` in a 23-state lasso.
+- `"set"`: the first 86A. The reaper removes only what a Redis set names; a worker adds its name before it provisions, and a removal confirmed gone takes the name off. Breaks `EventuallyClean` in a 16-state trace:
   1. `w1`'s lease runs out after its stop check.
   2. `w1` adds its name to the set.
   3. `w2` claims attempt 2, sees the stop, and cleans up. Nothing is up yet, so it takes `w1`'s name off the set.
@@ -166,3 +166,37 @@ It abstracts `Claim::prepare`, `Worker::run_box_turn`, `end_box` and `clean_box`
 | `EndClean` | `a_box_turn_runs_in_its_attempts_sandbox`, `a_stop_on_a_redelivered_turn_removes_its_sandbox_then_cancels`, `a_stop_during_the_provision_cancels_before_the_call`, `past_max_deliveries_a_box_turn_is_cleaned_up_then_failed`, `a_failed_removal_keeps_the_turn_open` |
 | `EndClean`'s exceptions | `a_later_attempts_sandbox_is_left_to_the_sweep` (a later attempt provisions while this worker ends the turn), `a_provision_after_the_turn_ended_is_removed_by_its_worker` (a late provision: its worker's check finds the lease gone and removes it) |
 | `EventuallyClean` | `the_sweep_removes_the_sandboxes_of_ended_turns_only`, `a_later_attempts_sandbox_is_left_to_the_sweep` |
+
+### Workspace volumes (88A, 89A)
+
+Checked on 2026-09-30. `BoxTurn.tla` gains the run's workspace volume, `vol`:
+- a provision makes it (`docker create -v`);
+- the sweep removes it in two steps, a check then a removal:
+  - `VolCheck`: the turn has ended, and the host lists no sandbox of the run;
+  - `VolRemove`: `docker volume rm`, which Docker refuses while a container mounts the volume.
+
+Every core action leaves the volume as it was, except that a new sandbox makes it (`Made`). So the late provision after an end, the case in `EndClean`'s exceptions, makes the volume again, and the sweep has to remove it again.
+
+**Properties:**
+- `VolumeKeptWhileOpen` (action): while the turn is open, a volume once made stays, so no sweep takes the workspace from between two deliveries.
+- `EventuallyNoVolume` (liveness): after the end, eventually no volume.
+- Fairness: weak fairness on both sweep steps.
+
+**Runs:** as above (`BoxTurn.cfg` and three workers), no error.
+
+**Negative controls,** with `-workers 1`:
+- `"anyrun"`: the check does not ask whether the turn has ended. Breaks `VolumeKeptWhileOpen` in 9 states: between two deliveries no sandbox is up, and the volume is removed from an open turn.
+- `"once"`: a run's volume is removed once and never again. Breaks `EventuallyNoVolume` in a 25-state lasso: a late provision after the end makes the volume again, and it stays.
+- `"novsweep"`: no volume sweep. Breaks `EventuallyNoVolume` in a 17-state lasso.
+
+**Docker's refusal (89A)** keeps a volume while a leftover container of an ended turn mounts it. No property here depends on it: the check already requires an ended turn, and an ended turn stays ended. It is kept because the listing and the removal are separate calls, and a late provision can fall between them. The refusal is what makes the removal wait for that container, not a guess made from the listing.
+
+**Scope:** only the server host's volumes, the ones Box turns make. A Local or Reverse run's `gol-workspace-<run>` is on the user's desktop.
+
+**Mapping** (`crates/server/tests/box_turns.rs`, on both stores; the host is the test double `Sandboxes`, which refuses a volume a sandbox of its run mounts):
+
+| Property | Tests |
+| --- | --- |
+| `VolumeKeptWhileOpen` | `an_open_turns_volume_is_kept_between_deliveries`, `the_sweep_removes_the_sandboxes_of_ended_turns_only` (an open turn's volume is kept) |
+| `EventuallyNoVolume` | `the_sweep_removes_the_sandboxes_of_ended_turns_only`, `a_later_attempts_sandbox_is_left_to_the_sweep` (sandbox, then volume), `a_volume_waits_for_its_runs_sandboxes`, `a_refused_volume_removal_is_tried_again` |
+| The refusal (89A) | `a_memory_volume_in_use_is_not_removed`, `docker_lists_volumes_and_removes_one_without_force` (unit tests in `crates/server/src/inference.rs`) |

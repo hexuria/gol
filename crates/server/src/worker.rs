@@ -33,8 +33,8 @@ use crate::deliverer::{
 use crate::http::{jev_client, Delegation};
 use crate::inference::{
     box_attempt_name, box_run_of, completion_events, dispatch_events, finish_turn, gateway_call,
-    is_turn, run_cancelled_event, run_failed_event, sandbox_from_env, system_event, GatewayPoster,
-    HttpGatewayPoster, SandboxError, SandboxHost, TurnError,
+    is_turn, run_cancelled_event, run_failed_event, sandbox_from_env, system_event,
+    workspace_run_of, GatewayPoster, HttpGatewayPoster, SandboxError, SandboxHost, TurnError,
 };
 use crate::models::ModelsConfig;
 use crate::queue::{QueueTiming, RedisRunQueue};
@@ -944,8 +944,11 @@ fn is_box_turn(spec: &RunSpec) -> bool {
 }
 
 /// Removes every Box sandbox `sandbox` lists whose turn has ended (86C):
-/// what a worker that lost its lease, or died, left behind. A sandbox of an
-/// open turn, or of no stored run, is left. The names removed.
+/// what a worker that lost its lease, or died, left behind. Then the
+/// workspace volume of each ended run the host lists no sandbox of (88A),
+/// which the host refuses while a container mounts it (89A); a refusal is
+/// tried again by the next sweep. A sandbox or volume of an open turn, or of
+/// no stored run, is left. The names removed, sandboxes first.
 pub fn sweep_sandboxes(
     store: &dyn RunStore,
     sandbox: &dyn SandboxHost,
@@ -954,32 +957,61 @@ pub fn sweep_sandboxes(
         .list()
         .map_err(|SandboxError::Host(message)| message)?;
     let mut removed = Vec::new();
+    let mut left = Vec::new();
     for name in listed {
         let Some(run) = box_run_of(&name) else {
             continue;
         };
-        let ended = match store.run(run) {
-            Ok(Some(stored)) => stored
-                .events
-                .iter()
-                .any(|event| is_terminal(&event.payload)),
-            Ok(None) => false,
-            Err(error) => {
-                eprintln!("gol: sandbox sweep: run {run}: {error}");
-                false
-            }
-        };
-        if !ended {
+        if !has_ended(store, run) {
+            left.push(run);
             continue;
         }
         match sandbox.destroy(&name) {
             Ok(()) => removed.push(name),
             Err(SandboxError::Host(message)) => {
+                left.push(run);
                 eprintln!("gol: sandbox sweep: {name} was not removed: {message}")
             }
         }
     }
+    let volumes = match sandbox.list_volumes() {
+        Ok(volumes) => volumes,
+        Err(SandboxError::Host(message)) => {
+            eprintln!("gol: sandbox sweep: volumes: {message}");
+            return Ok(removed);
+        }
+    };
+    for name in volumes {
+        let Some(run) = workspace_run_of(&name) else {
+            continue;
+        };
+        if left.contains(&run) || !has_ended(store, run) {
+            continue;
+        }
+        match sandbox.remove_volume(&name) {
+            Ok(()) => removed.push(name),
+            Err(SandboxError::Host(message)) => {
+                eprintln!("gol: sandbox sweep: volume {name} was not removed: {message}")
+            }
+        }
+    }
     Ok(removed)
+}
+
+/// Whether run `run` is stored and its log has ended. A store that cannot
+/// say is taken as no: the sweep leaves it for next time.
+fn has_ended(store: &dyn RunStore, run: RunId) -> bool {
+    match store.run(run) {
+        Ok(Some(stored)) => stored
+            .events
+            .iter()
+            .any(|event| is_terminal(&event.payload)),
+        Ok(None) => false,
+        Err(error) => {
+            eprintln!("gol: sandbox sweep: run {run}: {error}");
+            false
+        }
+    }
 }
 
 impl<'a> Executed<'a> {

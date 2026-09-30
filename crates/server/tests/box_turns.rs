@@ -5,8 +5,10 @@
 //! that lost it removes its own sandbox and stops (85A). Before a Box turn
 //! ends, for any reason, the sandboxes of attempts 1 to n are removed, each
 //! confirmed gone; one that cannot be leaves the turn open (84A). The
-//! reaper removes what the host still lists for ended turns (86C). On both
-//! stores; needs Redis, as `pg_redis.rs` does.
+//! reaper removes what the host still lists for ended turns (86C), then
+//! their workspace volumes once no sandbox of the run is listed (88A), with
+//! a removal the host refuses while a container mounts the volume (89A). On
+//! both stores; needs Redis, as `pg_redis.rs` does.
 mod common;
 
 use std::collections::HashSet;
@@ -19,8 +21,9 @@ use protocol::{
     ModelProvider, Owner, RunId, RunSpec, Timestamp, WorkModel,
 };
 use server::{
-    is_terminal, queued_events, sweep_sandboxes, GatewayCall, GatewayPoster, QueueTiming,
-    RedisRunQueue, SandboxError, SandboxHost, StopScope, StoredRun, Worker,
+    box_run_of, box_workspace_volume, is_terminal, queued_events, sweep_sandboxes,
+    workspace_run_of, GatewayCall, GatewayPoster, QueueTiming, RedisRunQueue, SandboxError,
+    SandboxHost, StopScope, StoredRun, Worker,
 };
 
 const REDIS_URL: &str = "redis://127.0.0.1/";
@@ -72,6 +75,8 @@ type Hook = Box<dyn Fn(&str) + Send + Sync>;
 #[derive(Default)]
 struct Sandboxes {
     live: Mutex<HashSet<String>>,
+    volumes: Mutex<HashSet<String>>,
+    failing_volume_removals: Mutex<u32>,
     ops: Mutex<Vec<Op>>,
     failing_destroys: Mutex<u32>,
     on_provision: Mutex<Option<Hook>>,
@@ -79,8 +84,25 @@ struct Sandboxes {
 }
 
 impl Sandboxes {
+    /// A sandbox made, and its run's workspace volume with it, as
+    /// `docker create -v` makes both.
     fn up(&self, name: &str) {
         self.live.lock().expect("live").insert(name.to_string());
+        if let Some(run) = box_run_of(name) {
+            self.volume(&box_workspace_volume(run));
+        }
+    }
+    fn volume(&self, name: &str) {
+        self.volumes
+            .lock()
+            .expect("volumes")
+            .insert(name.to_string());
+    }
+    fn volumes(&self) -> HashSet<String> {
+        self.volumes.lock().expect("volumes").clone()
+    }
+    fn fail_volume_removals(&self, n: u32) {
+        *self.failing_volume_removals.lock().expect("fails") = n;
     }
     fn live(&self) -> HashSet<String> {
         self.live.lock().expect("live").clone()
@@ -137,6 +159,30 @@ impl SandboxHost for Sandboxes {
         let mut names: Vec<String> = self.live().into_iter().collect();
         names.sort();
         Ok(names)
+    }
+    fn list_volumes(&self) -> Result<Vec<String>, SandboxError> {
+        let mut names: Vec<String> = self.volumes().into_iter().collect();
+        names.sort();
+        Ok(names)
+    }
+    /// Refused while a sandbox of the volume's run mounts it, as Docker
+    /// refuses `docker volume rm` of a volume in use.
+    fn remove_volume(&self, name: &str) -> Result<(), SandboxError> {
+        let mut fails = self.failing_volume_removals.lock().expect("fails");
+        if *fails > 0 {
+            *fails -= 1;
+            return Err(SandboxError::Host("the host is unreachable".to_string()));
+        }
+        let run = workspace_run_of(name);
+        if self
+            .live()
+            .iter()
+            .any(|live| run.is_some() && box_run_of(live) == run)
+        {
+            return Err(SandboxError::Host(format!("volume {name} is in use")));
+        }
+        self.volumes.lock().expect("volumes").remove(name);
+        Ok(())
     }
     fn launches_docker(&self) -> bool {
         false
@@ -491,8 +537,10 @@ fn a_later_attempts_sandbox_is_left_to_the_sweep() {
         assert_eq!(s.payloads().last(), Some(&"run.completed"));
         assert_eq!(s.sandboxes.live(), HashSet::from([later.clone()]));
         let removed = sweep_sandboxes(s.store.as_ref(), s.sandboxes.as_ref()).expect("sweep");
-        assert_eq!(removed, [later]);
+        let volume = box_workspace_volume(s.spec.run_id);
+        assert_eq!(removed, [later, volume]);
         assert!(s.sandboxes.live().is_empty());
+        assert!(s.sandboxes.volumes().is_empty());
     }
 }
 
@@ -525,8 +573,9 @@ fn a_provision_after_the_turn_ended_is_removed_by_its_worker() {
     }
 }
 
-// The reaper removes the sandboxes the host lists for ended turns, and
-// leaves those of open turns (86C).
+// The reaper removes the sandboxes the host lists for ended turns, then
+// their workspace volumes, and leaves those of open turns and names gol
+// did not make (86C, 88A).
 #[test]
 fn the_sweep_removes_the_sandboxes_of_ended_turns_only() {
     for store in stores() {
@@ -544,9 +593,92 @@ fn the_sweep_removes_the_sandboxes_of_ended_turns_only() {
         sandboxes.up(&left);
         sandboxes.up(&running);
         sandboxes.up("gol-box-not-a-run");
+        let upper = format!(
+            "gol-workspace-{}",
+            ended.spec.run_id.to_string().to_uppercase()
+        );
+        for name in ["gol-workspace-not-a-run", "other", upper.as_str()] {
+            sandboxes.volume(name);
+        }
         let removed = sweep_sandboxes(open.store.as_ref(), &sandboxes).expect("sweep");
-        assert_eq!(removed, [left]);
+        let (gone, kept) = (
+            box_workspace_volume(ended.spec.run_id),
+            box_workspace_volume(open.spec.run_id),
+        );
+        assert_eq!(removed, [left, gone]);
         assert!(sandboxes.live().contains(&running));
         assert!(sandboxes.live().contains("gol-box-not-a-run"));
+        assert_eq!(
+            sandboxes.volumes(),
+            HashSet::from([
+                kept,
+                "gol-workspace-not-a-run".to_string(),
+                "other".to_string(),
+                upper
+            ])
+        );
+    }
+}
+
+/// An ended turn, with attempt 1's sandbox left up, on a host of its own.
+fn ended_with_a_sandbox_left(store: Store) -> (Setup, Sandboxes) {
+    let s = setup(store, 5);
+    s.store
+        .append_events(
+            s.spec.run_id,
+            vec![event(&s.spec, EventPayload::RunCancelled)],
+        )
+        .expect("cancel");
+    let sandboxes = Sandboxes::default();
+    sandboxes.up(&attempt(&s.spec, 1));
+    (s, sandboxes)
+}
+
+// A volume waits for its run's sandboxes: while one is still listed (its
+// removal failed), the volume is kept; the next sweep removes both (88A).
+#[test]
+fn a_volume_waits_for_its_runs_sandboxes() {
+    for store in stores() {
+        let (s, sandboxes) = ended_with_a_sandbox_left(store);
+        let volume = box_workspace_volume(s.spec.run_id);
+        sandboxes.fail_destroys(1);
+        let removed = sweep_sandboxes(s.store.as_ref(), &sandboxes).expect("sweep");
+        assert!(removed.is_empty(), "{removed:?}");
+        assert!(sandboxes.volumes().contains(&volume));
+        let removed = sweep_sandboxes(s.store.as_ref(), &sandboxes).expect("sweep");
+        assert_eq!(removed, [attempt(&s.spec, 1), volume]);
+    }
+}
+
+// A removal the host refuses (the volume in use, or the host unreachable)
+// is tried again by the next sweep (89A).
+#[test]
+fn a_refused_volume_removal_is_tried_again() {
+    for store in stores() {
+        let (s, sandboxes) = ended_with_a_sandbox_left(store);
+        let volume = box_workspace_volume(s.spec.run_id);
+        sandboxes.fail_volume_removals(1);
+        let removed = sweep_sandboxes(s.store.as_ref(), &sandboxes).expect("sweep");
+        assert_eq!(removed, [attempt(&s.spec, 1)]);
+        assert!(sandboxes.volumes().contains(&volume));
+        let removed = sweep_sandboxes(s.store.as_ref(), &sandboxes).expect("sweep");
+        assert_eq!(removed, [volume]);
+        assert!(sandboxes.volumes().is_empty());
+    }
+}
+
+// Between two deliveries an open turn has no sandbox up, only its volume:
+// the sweep keeps it, since the turn has not ended (the model's
+// VolumeKeptWhileOpen).
+#[test]
+fn an_open_turns_volume_is_kept_between_deliveries() {
+    for store in stores() {
+        let s = setup(store, 5);
+        let sandboxes = Sandboxes::default();
+        let volume = box_workspace_volume(s.spec.run_id);
+        sandboxes.volume(&volume);
+        let removed = sweep_sandboxes(s.store.as_ref(), &sandboxes).expect("sweep");
+        assert!(removed.is_empty(), "{removed:?}");
+        assert_eq!(sandboxes.volumes(), HashSet::from([volume]));
     }
 }

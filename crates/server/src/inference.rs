@@ -133,6 +133,17 @@ pub fn box_workspace_volume(run_id: impl std::fmt::Display) -> String {
     format!("gol-workspace-{run_id}")
 }
 
+/// The run a workspace volume belongs to: `gol-workspace-<run>`, the run id
+/// as gol writes it (lowercase). None for any other name, so the sweep
+/// leaves what gol did not make.
+pub fn workspace_run_of(name: &str) -> Option<RunId> {
+    let run = name.strip_prefix("gol-workspace-")?;
+    if run.len() != 36 || run.bytes().any(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    run.parse().ok()
+}
+
 fn workspace_mount(run_id: impl std::fmt::Display) -> String {
     format!("{}:/workspace", box_workspace_volume(run_id))
 }
@@ -197,6 +208,11 @@ pub trait SandboxHost: Send + Sync {
     /// The names of the Box sandboxes (`gol-box-`) this host has, running or
     /// not: what the reaper looks through (decision 86C).
     fn list(&self) -> Result<Vec<String>, SandboxError>;
+    /// The names of the workspace volumes (`gol-workspace-`) this host has.
+    fn list_volumes(&self) -> Result<Vec<String>, SandboxError>;
+    /// Removes volume `name`. The host refuses while a container mounts it
+    /// (`docker volume rm` without `-f`, decision 89A).
+    fn remove_volume(&self, name: &str) -> Result<(), SandboxError>;
     fn launches_docker(&self) -> bool;
 }
 
@@ -204,6 +220,7 @@ pub trait SandboxHost: Send + Sync {
 pub struct MemorySandbox {
     live: Mutex<HashSet<String>>,
     provisioned: Mutex<Vec<String>>,
+    volumes: Mutex<HashSet<String>>,
 }
 
 impl SandboxHost for MemorySandbox {
@@ -223,6 +240,12 @@ impl SandboxHost for MemorySandbox {
             .lock()
             .expect("sandbox")
             .push(name.to_string());
+        if let Some(run) = box_run_of(name) {
+            self.volumes
+                .lock()
+                .expect("sandbox")
+                .insert(box_workspace_volume(run));
+        }
         Ok(())
     }
 
@@ -254,6 +277,33 @@ impl SandboxHost for MemorySandbox {
             .collect();
         names.sort();
         Ok(names)
+    }
+
+    fn list_volumes(&self) -> Result<Vec<String>, SandboxError> {
+        let mut names: Vec<String> = self
+            .volumes
+            .lock()
+            .expect("sandbox")
+            .iter()
+            .cloned()
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
+    fn remove_volume(&self, name: &str) -> Result<(), SandboxError> {
+        let run = workspace_run_of(name);
+        let in_use = self
+            .live
+            .lock()
+            .expect("sandbox")
+            .iter()
+            .any(|live| run.is_some() && box_run_of(live) == run);
+        if in_use {
+            return Err(SandboxError::Host(format!("volume {name} is in use")));
+        }
+        self.volumes.lock().expect("sandbox").remove(name);
+        Ok(())
     }
 
     fn launches_docker(&self) -> bool {
@@ -401,6 +451,33 @@ impl SandboxHost for DockerSandbox {
             .filter(|name| name.starts_with("gol-box-"))
             .map(str::to_string)
             .collect())
+    }
+
+    fn list_volumes(&self) -> Result<Vec<String>, SandboxError> {
+        let args: Vec<String> = [
+            "volume",
+            "ls",
+            "--filter",
+            "name=gol-workspace-",
+            "--format",
+            "{{.Name}}",
+        ]
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect();
+        let listed =
+            (self.output)(&args).map_err(|message| SandboxError::Host(last_line(&message)))?;
+        Ok(listed
+            .lines()
+            .map(str::trim)
+            .filter(|name| name.starts_with("gol-workspace-"))
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Without `-f`: Docker refuses a volume a container still mounts.
+    fn remove_volume(&self, name: &str) -> Result<(), SandboxError> {
+        self.command(&["volume", "rm", name])
     }
 
     fn launches_docker(&self) -> bool {
@@ -1018,6 +1095,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_workspace_volume_names_its_run() {
+        let run = RunId::new();
+        assert_eq!(workspace_run_of(&box_workspace_volume(run)), Some(run));
+        let upper = run.to_string().to_uppercase();
+        assert_eq!(workspace_run_of(&format!("gol-workspace-{upper}")), None);
+        assert_eq!(workspace_run_of(&format!("gol-workspace-{run}-1")), None);
+        assert_eq!(workspace_run_of("gol-workspace"), None);
+        assert_eq!(workspace_run_of("gol-workspace-"), None);
+    }
+
+    // Volumes are listed by prefix, and removed without -f, so Docker
+    // refuses one a container still mounts (89A).
+    #[test]
+    fn docker_lists_volumes_and_removes_one_without_force() {
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = asked.clone();
+        let commands: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let run = commands.clone();
+        let sandbox = DockerSandbox::from_command(move |args: &[String]| {
+            run.lock().expect("commands").push(args.to_vec());
+            Ok(())
+        })
+        .with_output(move |args: &[String]| {
+            *seen.lock().expect("args") = args.to_vec();
+            Ok("gol-workspace-a\nother\n".to_string())
+        });
+        assert_eq!(
+            sandbox.list_volumes().expect("list"),
+            ["gol-workspace-a".to_string()]
+        );
+        assert_eq!(
+            *asked.lock().expect("args"),
+            [
+                "volume",
+                "ls",
+                "--filter",
+                "name=gol-workspace-",
+                "--format",
+                "{{.Name}}"
+            ]
+        );
+        sandbox.remove_volume("gol-workspace-a").expect("remove");
+        assert_eq!(
+            commands.lock().expect("commands")[0],
+            ["volume", "rm", "gol-workspace-a"]
+        );
+    }
+
+    // The in-process host makes a run's volume with its sandbox, and refuses
+    // to remove it while a sandbox of the run is up.
+    #[test]
+    fn a_memory_volume_in_use_is_not_removed() {
+        let run = RunId::new();
+        let sandbox = MemorySandbox::default();
+        sandbox
+            .provision(&box_attempt_name(run, 1))
+            .expect("provision");
+        let volume = box_workspace_volume(run);
+        assert_eq!(
+            sandbox.list_volumes().expect("list"),
+            std::slice::from_ref(&volume)
+        );
+        assert!(sandbox.remove_volume(&volume).is_err());
+        sandbox.destroy(&box_attempt_name(run, 1)).expect("destroy");
+        sandbox.remove_volume(&volume).expect("remove");
+        assert!(sandbox.list_volumes().expect("list").is_empty());
+    }
+
     // A command that hangs is killed at its timeout, not waited for.
     #[test]
     fn a_hung_command_is_killed_at_its_timeout() {
@@ -1050,6 +1196,26 @@ mod tests {
             ],
         ) {
             prop_assert_eq!(box_run_of(&name), run_oracle(&name));
+        }
+
+        // Any volume name: no panic, and a run exactly for gol-workspace- and
+        // a lowercase run id.
+        #[test]
+        fn any_volume_name_is_read_only_in_its_form(
+            name in prop_oneof![
+                any::<String>(),
+                (any::<u128>(), any::<bool>(), "(-[0-9a-z]{0,2})?").prop_map(|(n, upper, suffix)| {
+                    let run = uuid::Uuid::from_u128(n).to_string();
+                    let run = if upper { run.to_uppercase() } else { run };
+                    format!("gol-workspace-{run}{suffix}")
+                }),
+            ],
+        ) {
+            let oracle = name
+                .strip_prefix("gol-workspace-")
+                .filter(|run| run.len() == 36 && !run.chars().any(|c| c.is_ascii_uppercase()))
+                .and_then(|run| run.parse::<RunId>().ok());
+            prop_assert_eq!(workspace_run_of(&name), oracle);
         }
 
         #[test]
