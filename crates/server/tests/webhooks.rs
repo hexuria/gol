@@ -255,13 +255,148 @@ async fn a_replay_is_answered_from_the_events_run() {
     }
 }
 
+/// An in-memory store whose next read of a run, once armed, misses it: as
+/// when another delivery of the same event stores its run between this
+/// delivery's read and its own store.
+struct MissNextRead {
+    inner: server::InMemoryStore,
+    /// Armed by the test thread before a request, taken by the request's
+    /// one read; the swap needs no order with other memory.
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl MissNextRead {
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl server::RunStore for MissNextRead {
+    fn put_agent(
+        &self,
+        agent: server::StoredAgent,
+    ) -> Result<server::PutAgent, server::StoreError> {
+        self.inner.put_agent(agent)
+    }
+    fn agent(
+        &self,
+        id: protocol::AgentId,
+    ) -> Result<Option<server::StoredAgent>, server::StoreError> {
+        self.inner.agent(id)
+    }
+    fn agents_of(
+        &self,
+        owner: &protocol::Owner,
+    ) -> Result<Vec<server::StoredAgent>, server::StoreError> {
+        self.inner.agents_of(owner)
+    }
+    fn put_run(&self, run: server::StoredRun) -> Result<server::PutRun, server::StoreError> {
+        self.inner.put_run(run)
+    }
+    fn append_events(
+        &self,
+        id: RunId,
+        events: Vec<protocol::Event>,
+    ) -> Result<server::Append, server::StoreError> {
+        self.inner.append_events(id, events)
+    }
+    fn append_events_after(
+        &self,
+        id: RunId,
+        seen: usize,
+        events: Vec<protocol::Event>,
+    ) -> Result<server::Append, server::StoreError> {
+        self.inner.append_events_after(id, seen, events)
+    }
+    fn run(&self, id: RunId) -> Result<Option<server::StoredRun>, server::StoreError> {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(None);
+        }
+        self.inner.run(id)
+    }
+    fn put_artifact(&self, artifact: server::StoredArtifact) -> Result<(), server::StoreError> {
+        self.inner.put_artifact(artifact)
+    }
+    fn artifact(
+        &self,
+        id: protocol::ArtifactId,
+    ) -> Result<Option<server::StoredArtifact>, server::StoreError> {
+        self.inner.artifact(id)
+    }
+    fn threads(&self) -> Option<&dyn server::ThreadStore> {
+        self.inner.threads()
+    }
+    fn stops(&self) -> Option<&dyn server::StopStore> {
+        self.inner.stops()
+    }
+    fn triggers(&self) -> Option<&dyn server::TriggerStore> {
+        self.inner.triggers()
+    }
+}
+
+// Overlapping deliveries of one event (80A): one that reads no run, then
+// finds another delivery's run stored before its own, is answered from
+// that run's log, as a replay is: held is 409, done is 200 duplicate, and
+// still queued is 202, queued once.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overlapping_delivery_is_answered_from_the_runs_log() {
+    let miss = std::sync::Arc::new(MissNextRead {
+        inner: server::InMemoryStore::default(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let store: Store = miss.clone();
+    let (server, user, id, secret) = setup(&store, 6).await;
+    let (pause, resume) = (
+        format!("/v1/triggers/{id}/pause"),
+        format!("/v1/triggers/{id}/resume"),
+    );
+    // Held by the other delivery.
+    let (status, held) = signed(&server, &id, &secret, "held", b"{}").await;
+    assert_eq!(status, 202, "{held}");
+    let url = server.redis.clone();
+    blocking(move || RedisRunQueue::open(url).pop().expect("pop")).await;
+    post(&server, &user, &pause).await;
+    let (status, answer) = signed(&server, &id, &secret, "held", b"{}").await;
+    assert_eq!(status, 409, "{answer}");
+    post(&server, &user, &resume).await;
+    miss.arm();
+    let (status, answer) = signed(&server, &id, &secret, "held", b"{}").await;
+    assert_eq!(status, 409, "{answer}");
+    // Done by the other delivery.
+    let (status, done) = signed(&server, &id, &secret, "done", b"{}").await;
+    assert_eq!(status, 202, "{done}");
+    assert!(server.work().await.is_some());
+    miss.arm();
+    let (status, answer) = signed(&server, &id, &secret, "done", b"{}").await;
+    assert_eq!(
+        (status, &answer["duplicate"]),
+        (200, &json!(true)),
+        "{answer}"
+    );
+    assert_eq!(answer["run_id"], done["run_id"]);
+    // Still queued by the other delivery.
+    let (status, waiting) = signed(&server, &id, &secret, "waiting", b"{}").await;
+    assert_eq!(status, 202, "{waiting}");
+    miss.arm();
+    let (status, answer) = signed(&server, &id, &secret, "waiting", b"{}").await;
+    assert_eq!(status, 202, "{answer}");
+    assert_eq!(answer["run_id"], waiting["run_id"]);
+    let run: RunId = waiting["run_id"]
+        .as_str()
+        .expect("run")
+        .parse()
+        .expect("id");
+    assert_eq!(queued(&server).await, [run]);
+}
+
 // What is refused, and fires nothing: 401 for a tampered body, a wrong or
 // missing signature, one for another event (79A), a timestamp over 5
 // minutes off, a missing event id or one that is not 1 to 128 visible
-// ASCII characters, an unknown trigger or one that is not a webhook (so ids
-// cannot be probed); 409 for a paused trigger; 413 for a body that makes
-// the run's input over 32 KiB (81A); 400 for one that is not UTF-8 or has a
-// NUL. A rotated secret stops the old one.
+// ASCII characters other than a dot, an unknown trigger or one that is not
+// a webhook (so ids cannot be probed); 409 for a paused trigger; 413 for a
+// body that makes the run's input over 32 KiB (81A); 400 for one that is
+// not UTF-8 or has a NUL. A rotated secret stops the old one, and a
+// captured request cannot be split again as another event.
 #[tokio::test(flavor = "multi_thread")]
 async fn bad_requests_are_refused() {
     for store in stores() {
@@ -492,6 +627,33 @@ async fn bad_requests_are_refused() {
         let (status, answer) = signed(&server, &id, &fresh, "evt-r", body).await;
         assert_eq!(status, 202, "{answer}");
         assert!(server.work().await.is_some());
+        // 79A: a captured request whose body begins with a fresh timestamp
+        // and a dot has the same signed bytes as another split, with the
+        // first timestamp in the event id; that split is refused, since an
+        // event id has no dot.
+        let (at, later) = (now_s(), now_s() + 100);
+        let captured = format!("{later}.payload").into_bytes();
+        let signature = sign(&fresh, "evt", at, &captured);
+        let (status, answer) = hook(
+            &server,
+            &id,
+            &captured,
+            Some("evt"),
+            Some(at),
+            Some(signature.clone()),
+        )
+        .await;
+        assert_eq!(status, 202, "{answer}");
+        let (status, answer) = hook(
+            &server,
+            &id,
+            b"payload",
+            Some(&format!("evt.{at}")),
+            Some(later),
+            Some(signature),
+        )
+        .await;
+        assert_eq!(status, 401, "{answer}");
     }
 }
 

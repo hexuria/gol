@@ -42,11 +42,14 @@ pub fn parse_timestamp(header: &str) -> Option<i64> {
 }
 
 /// Whether an `X-Gol-Event` header is an event id: 1 to `MAX_EVENT_ID`
-/// visible ASCII characters.
+/// visible ASCII characters, none a `.`. The signed message joins the event
+/// id, the timestamp (digits only) and the body with dots, so with no dot in
+/// the event id each part ends at a known dot, and a captured request
+/// cannot be split again as another event.
 pub fn is_event_id(header: &str) -> bool {
     !header.is_empty()
         && header.len() <= MAX_EVENT_ID
-        && header.bytes().all(|b| b.is_ascii_graphic())
+        && header.bytes().all(|b| b.is_ascii_graphic() && b != b'.')
 }
 
 /// Whether a request's timestamp and signature are of their forms and the
@@ -174,6 +177,21 @@ mod tests {
             !check("secret", "evt-1", "01000", &good, b"{}", 1000),
             "as sent"
         );
+        // A captured request whose body begins with a fresh timestamp and a
+        // dot, split again with the first timestamp in the event id: the
+        // same signed bytes, refused, since an event id has no dot.
+        let captured = sign("secret", "evt", "1000", b"1100.payload");
+        assert!(check(
+            "secret",
+            "evt",
+            "1000",
+            &captured,
+            b"1100.payload",
+            1000
+        ));
+        assert!(!check(
+            "secret", "evt.1000", "1100", &captured, b"payload", 1000
+        ));
         // A signed request with an event id that is not one does not verify.
         let spaced = sign("secret", "evt 1", "1000", b"{}");
         assert!(!check("secret", "evt 1", "1000", &spaced, b"{}", 1000));
@@ -216,15 +234,15 @@ mod tests {
             header in prop_oneof![any::<String>(), "[ -~]{0,130}", "[!-~]{120,130}"],
         ) {
             let oracle = (1..=MAX_EVENT_ID).contains(&header.len())
-                && header.chars().all(|c| c.is_ascii_graphic());
+                && header.chars().all(|c| c.is_ascii_graphic() && c != '.');
             prop_assert_eq!(is_event_id(&header), oracle);
         }
 
         // A signature over any event id verifies it, and no other.
         #[test]
         fn a_signature_verifies_its_event_only(
-            event in "[!-~]{1,128}",
-            other in "[!-~]{1,128}",
+            event in "[!-\\-/-~]{1,128}",
+            other in "[!-\\-/-~]{1,128}",
         ) {
             let signature = sign("secret", &event, "1000", b"{}");
             prop_assert!(check("secret", &event, "1000", &signature, b"{}", 1000), "signed");
