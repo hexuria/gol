@@ -75,6 +75,7 @@ struct Sandboxes {
     ops: Mutex<Vec<Op>>,
     failing_destroys: Mutex<u32>,
     on_provision: Mutex<Option<Hook>>,
+    on_destroy: Mutex<Option<Hook>>,
 }
 
 impl Sandboxes {
@@ -92,6 +93,9 @@ impl Sandboxes {
     }
     fn on_provision(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
         *self.on_provision.lock().expect("hook") = Some(Box::new(hook));
+    }
+    fn on_destroy(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
+        *self.on_destroy.lock().expect("hook") = Some(Box::new(hook));
     }
 }
 
@@ -118,6 +122,9 @@ impl SandboxHost for Sandboxes {
             return Err(SandboxError::Host("the host is unreachable".to_string()));
         }
         self.live.lock().expect("live").remove(name);
+        if let Some(hook) = self.on_destroy.lock().expect("hook").as_ref() {
+            hook(name);
+        }
         Ok(())
     }
     fn exists(&self, name: &str) -> bool {
@@ -238,6 +245,20 @@ impl Setup {
         self.sandboxes.up(&attempt(&self.spec, 1));
     }
 
+    /// This claim's lease runs out, and the reaper puts the run back.
+    fn expire_lease(&self) {
+        let mut redis = redis::Client::open(REDIS_URL)
+            .expect("client")
+            .get_connection()
+            .expect("connect");
+        redis::cmd("DEL")
+            .arg(format!("{{{}}}:lease:{}", self.key, self.spec.run_id))
+            .query::<()>(&mut redis)
+            .expect("expire the lease");
+        self.queue.reap().expect("reap");
+        assert_eq!(self.queue.queued().expect("queued"), [self.spec.run_id]);
+    }
+
     fn payloads(&self) -> Vec<&'static str> {
         self.store
             .run(self.spec.run_id)
@@ -327,17 +348,20 @@ fn a_stop_on_a_redelivered_turn_removes_its_sandbox_then_cancels() {
 
 // Past max_deliveries a Box turn is not run again: its sandboxes are
 // removed, then it is failed. One that cannot be removed leaves the turn
-// open and back on the queue, and the next delivery cleans up again (84A).
+// open, its claim unacknowledged, so it comes back once its lease expires
+// (not at once, which would spin), and the next delivery cleans up (84A).
 #[test]
 fn past_max_deliveries_a_box_turn_is_cleaned_up_then_failed() {
     for store in stores() {
         let s = setup(store, 1);
         s.died_in_attempt_one();
         s.sandboxes.fail_destroys(1);
-        assert_eq!(s.worker.work_one().expect("work"), Some(s.spec.run_id));
+        assert!(s.worker.work_one().is_err());
         assert!(!s.ended(), "{:?}", s.payloads());
         assert!(s.sandboxes.live().contains(&attempt(&s.spec, 1)));
-        assert_eq!(s.queue.queued().expect("queued"), [s.spec.run_id]);
+        assert_eq!(s.queue.queued().expect("queued"), []);
+        assert_eq!(s.queue.processing().expect("processing"), [s.spec.run_id]);
+        s.expire_lease();
         assert_eq!(s.worker.work_one().expect("work"), Some(s.spec.run_id));
         assert!(s.gateway.calls().is_empty());
         assert!(s.sandboxes.live().is_empty());
@@ -345,16 +369,34 @@ fn past_max_deliveries_a_box_turn_is_cleaned_up_then_failed() {
     }
 }
 
+// Past max_deliveries, a lease lost while the sandboxes are removed: the
+// check just before the end finds it gone, so this delivery ends nothing
+// (85A); the new holder fails the turn.
+#[test]
+fn a_lease_lost_during_the_last_cleanup_stores_no_end() {
+    for store in stores() {
+        let s = setup(store, 1);
+        s.died_in_attempt_one();
+        let (key, run) = (s.key.clone(), s.spec.run_id);
+        s.sandboxes.on_destroy(move |_| steal(&key, run));
+        assert_eq!(s.worker.work_one().expect("work"), Some(s.spec.run_id));
+        assert!(s.sandboxes.live().is_empty());
+        assert!(!s.ended(), "{:?}", s.payloads());
+    }
+}
+
 // A removal that fails before the completion is stored leaves the turn
-// open and back on the queue; the next delivery ends it clean.
+// open, its claim unacknowledged; once its lease expires, the next
+// delivery ends it clean.
 #[test]
 fn a_failed_removal_keeps_the_turn_open() {
     for store in stores() {
         let s = setup(store, 5);
         s.sandboxes.fail_destroys(1);
-        assert_eq!(s.worker.work_one().expect("work"), Some(s.spec.run_id));
+        assert!(s.worker.work_one().is_err());
         assert!(!s.ended(), "{:?}", s.payloads());
-        assert_eq!(s.queue.queued().expect("queued"), [s.spec.run_id]);
+        assert_eq!(s.queue.queued().expect("queued"), []);
+        s.expire_lease();
         assert_eq!(s.worker.work_one().expect("work"), Some(s.spec.run_id));
         assert!(s.sandboxes.live().is_empty());
         assert_eq!(s.payloads().last(), Some(&"run.completed"));
@@ -362,33 +404,124 @@ fn a_failed_removal_keeps_the_turn_open() {
 }
 
 // A worker that finds its lease gone right after it provisioned removes its
-// own sandbox, calls no gateway, and stores no end (85A).
+// own sandbox, and nothing else (an earlier attempt's is the new holder's
+// to clean up), calls no gateway, and stores no end (85A).
 #[test]
 fn a_worker_that_lost_its_lease_after_the_provision_removes_its_sandbox() {
     for store in stores() {
         let s = setup(store, 5);
+        s.died_in_attempt_one();
         let (key, run) = (s.key.clone(), s.spec.run_id);
         s.sandboxes.on_provision(move |_| steal(&key, run));
         assert_eq!(s.worker.work_one().expect("work"), Some(s.spec.run_id));
         assert!(s.gateway.calls().is_empty());
-        assert!(s.sandboxes.live().is_empty());
+        assert_eq!(s.sandboxes.live(), HashSet::from([attempt(&s.spec, 1)]));
         assert!(!s.ended(), "{:?}", s.payloads());
         assert_eq!(s.queue.processing().expect("processing"), [s.spec.run_id]);
     }
 }
 
 // A worker whose lease ran out during the gateway call removes its own
-// sandbox and stores no end: the new holder runs the turn (85A).
+// sandbox, and nothing else, and stores no end: the new holder runs the
+// turn (85A).
 #[test]
 fn a_worker_that_lost_its_lease_during_the_call_removes_its_sandbox() {
     for store in stores() {
         let s = setup(store, 5);
+        s.died_in_attempt_one();
         let (key, run) = (s.key.clone(), s.spec.run_id);
         *s.gateway.during.lock().expect("during") = Some(Box::new(move || steal(&key, run)));
         assert_eq!(s.worker.work_one().expect("work"), Some(s.spec.run_id));
         assert_eq!(s.gateway.calls().len(), 1);
+        assert_eq!(s.sandboxes.live(), HashSet::from([attempt(&s.spec, 1)]));
+        assert!(!s.ended(), "{:?}", s.payloads());
+    }
+}
+
+// A stop that comes while the sandbox is provisioned: the sandbox is
+// removed and the turn cancelled before any gateway call.
+#[test]
+fn a_stop_during_the_provision_cancels_before_the_call() {
+    for store in stores() {
+        let s = setup(store, 5);
+        let (stopped, owner, run) = (s.store.clone(), s.spec.owner.clone(), s.spec.run_id);
+        s.sandboxes.on_provision(move |_| {
+            stopped
+                .stops()
+                .expect("stops")
+                .put_stop(&owner, &StopScope::Run(run))
+                .expect("stop");
+        });
+        assert_eq!(s.worker.work_one().expect("work"), Some(s.spec.run_id));
+        assert!(s.gateway.calls().is_empty());
+        assert!(s.sandboxes.live().is_empty());
+        assert_eq!(s.payloads().last(), Some(&"run.cancelled"));
+    }
+}
+
+// The lease runs out while the worker cleans up, after the call: the
+// check just before the append finds it gone, so this worker stores no
+// end; the new holder ends the turn (85A).
+#[test]
+fn a_lease_lost_during_the_cleanup_stores_no_end() {
+    for store in stores() {
+        let s = setup(store, 5);
+        let (key, run) = (s.key.clone(), s.spec.run_id);
+        s.sandboxes.on_destroy(move |_| steal(&key, run));
+        assert_eq!(s.worker.work_one().expect("work"), Some(s.spec.run_id));
+        assert_eq!(s.gateway.calls().len(), 1);
         assert!(s.sandboxes.live().is_empty());
         assert!(!s.ended(), "{:?}", s.payloads());
+    }
+}
+
+// A later attempt provisioned while this worker, still holding what it
+// last saw as its lease, ends the turn: this worker removes attempts up to
+// its own, so the later sandbox is left (EndClean's exception), and the
+// sweep removes it once the turn has ended (86C).
+#[test]
+fn a_later_attempts_sandbox_is_left_to_the_sweep() {
+    for store in stores() {
+        let s = setup(store, 5);
+        let (later, sandboxes) = (attempt(&s.spec, 2), s.sandboxes.clone());
+        let provisioned = later.clone();
+        *s.gateway.during.lock().expect("during") =
+            Some(Box::new(move || sandboxes.up(&provisioned)));
+        assert_eq!(s.worker.work_one().expect("work"), Some(s.spec.run_id));
+        assert_eq!(s.payloads().last(), Some(&"run.completed"));
+        assert_eq!(s.sandboxes.live(), HashSet::from([later.clone()]));
+        let removed = sweep_sandboxes(s.store.as_ref(), s.sandboxes.as_ref()).expect("sweep");
+        assert_eq!(removed, [later]);
+        assert!(s.sandboxes.live().is_empty());
+    }
+}
+
+// A worker that provisions after another ended the turn and took the
+// lease (it read the turn open before) finds its lease gone, removes its
+// own sandbox, and ends nothing: the turn keeps one end.
+#[test]
+fn a_provision_after_the_turn_ended_is_removed_by_its_worker() {
+    for store in stores() {
+        let s = setup(store, 5);
+        let (key, run) = (s.key.clone(), s.spec.run_id);
+        let ender = s.store.clone();
+        let spec = s.spec.clone();
+        s.sandboxes.on_provision(move |_| {
+            ender
+                .append_events(run, vec![event(&spec, EventPayload::RunCancelled)])
+                .expect("end");
+            steal(&key, run);
+        });
+        assert_eq!(s.worker.work_one().expect("work"), Some(s.spec.run_id));
+        assert!(s.gateway.calls().is_empty());
+        assert!(s.sandboxes.live().is_empty());
+        let events = s.store.run(run).expect("read").expect("stored").events;
+        let ends: Vec<_> = events
+            .iter()
+            .filter(|event| is_terminal(&event.payload))
+            .collect();
+        assert_eq!(ends.len(), 1, "{:?}", s.payloads());
+        assert_eq!(s.payloads().last(), Some(&"run.cancelled"));
     }
 }
 

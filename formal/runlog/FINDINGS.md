@@ -133,14 +133,14 @@ It abstracts `Claim::prepare`, `Worker::run_box_turn`, `end_box` and `clean_box`
 - `BoxTurn.cfg`: `Design = "new"`, two workers, `MaxDeliveries = 2`, one crash, one stall, one failed removal. 60,367 states generated, 18,531 distinct, depth 28, 4 s. No error, deadlock checked.
 - The same with three workers: 294,243 distinct, depth 33, 54 s with `-workers 1`, no error. With `-workers auto`, TLC finished its checks and then threw an `ArithmeticException` (division by zero) while printing its statistics, as on #85's three-scheduler run; the single-worker run is the result.
 
-**Negative controls** (`Design` changed on `BoxTurn.cfg`), each failing as recorded:
+**Negative controls** (`Design` changed on `BoxTurn.cfg`, run with `-workers 1`), each failing as recorded:
 - `"shared"`: one sandbox name for every attempt, the #83 design. Breaks `LiveSandbox` in 11 states: a worker whose lease ran out removes the name the live worker is calling with.
-- `"nofence"`: no lease check after the provision or the call. It holds every property (17,037 distinct states). A worker cleans up only attempts 1 to its own, so a stale one never removes a later attempt's sandbox, and the lease check before the append keeps it from ending the turn. Those two checks save a gateway call and a cleanup, not a sandbox.
+- `"nofence"`: no lease check after the provision or after the call; the check before the append stays. It holds every property (19,293 distinct states, depth 33). A worker cleans up only attempts 1 to its own, so a stale one never removes a later attempt's sandbox. Those two checks save a gateway call and a cleanup; no property here depends on them.
 - `"cleanlatest"`: no lease checks, and a cleanup of attempts up to the latest start instead of the worker's own. Breaks `LiveSandbox` in 13 states: a stale worker's cleanup removes the sandbox the live worker is calling with. The bound to its own attempt is what keeps `LiveSandbox`.
 - `"stopall"`: the stop cancels a started turn itself. Breaks `EndClean` in 6 states.
 - `"nocleanup"`: past `max_deliveries` the turn is failed without cleaning up. Breaks `EndClean` in 13 states.
-- `"nosweep"`: breaks `EventuallyClean` in an 18-state lasso.
-- `"set"`: the first 86A. The reaper removes only what a Redis set names; a worker adds its name before it provisions, and a removal confirmed gone takes the name off. Breaks `EventuallyClean` in a 19-state trace:
+- `"nosweep"`: breaks `EventuallyClean` in a 15-state lasso.
+- `"set"`: the first 86A. The reaper removes only what a Redis set names; a worker adds its name before it provisions, and a removal confirmed gone takes the name off. Breaks `EventuallyClean` in a 17-state trace:
   1. `w1`'s lease runs out after its stop check.
   2. `w1` adds its name to the set.
   3. `w2` claims attempt 2, sees the stop, and cleans up. Nothing is up yet, so it takes `w1`'s name off the set.
@@ -153,15 +153,16 @@ It abstracts `Claim::prepare`, `Worker::run_box_turn`, `end_box` and `clean_box`
 - A lease check that meets a Redis error counts as holding (`holds` in `run_from`, as the heartbeat does). The model's checks are exact.
 - The lease is in Redis and the log in Postgres, so no check-then-append is atomic. `EndClean` excuses the sandboxes of attempts after the ender's own for that reason.
 - Each server's reaper lists its own host (`SandboxHost::list`): a leaked Docker sandbox is swept by the server on the machine that ran it.
-- Past `max_deliveries`, attempts share the capped number, and none provisions.
+- Past `max_deliveries`, attempts share the capped number, and none provisions. Every server runs with the same `max_deliveries`, and the start count in Redis never goes back (a counter lost in a failover would give a name again, the #83 hazard).
+- Every server's workers use one Docker daemon for Box sandboxes (`GOL_START_BOX=1`, the same `DOCKER_HOST`): `absent` asks the local daemon, so a delivery on another daemon could not see, or remove, an earlier attempt's sandbox. The model has one host.
+- Docker commands are killed after 5 minutes (`DOCKER_TIMEOUT`), and the sandbox sweep has a thread of its own, so a hung daemon holds neither a worker nor the reaper for good.
 
 **Mapping** (`crates/server/tests/box_turns.rs`, on both stores):
 
 | Property | Tests |
 | --- | --- |
 | `LiveSandbox`, per-attempt names | `a_redelivered_turn_removes_the_earlier_attempts_sandbox` (attempt 2 runs in its own sandbox while attempt 1's is up) |
-| The lease checks (not needed for `LiveSandbox`; see `"nofence"`) | `a_worker_that_lost_its_lease_after_the_provision_removes_its_sandbox`, `a_worker_that_lost_its_lease_during_the_call_removes_its_sandbox` (forced: the lease is taken by another claim at that point). Neither calls on, removes anything but its own sandbox, or ends the turn. |
-| `EndClean` | `a_box_turn_runs_in_its_attempts_sandbox`, `a_stop_on_a_redelivered_turn_removes_its_sandbox_then_cancels`, `past_max_deliveries_a_box_turn_is_cleaned_up_then_failed`, `a_failed_removal_keeps_the_turn_open` |
-| `EventuallyClean` | `the_sweep_removes_the_sandboxes_of_ended_turns_only` |
-
-The stale ender's window (a lease that runs out between the last check and the append) is unlinked: no Rust test forces it.
+| The lease checks (no property depends on those after the provision and the call; see `"nofence"`) | `a_worker_that_lost_its_lease_after_the_provision_removes_its_sandbox`, `a_worker_that_lost_its_lease_during_the_call_removes_its_sandbox` (forced: the lease is taken by another claim at that point, with attempt 1's sandbox up; it is left), `a_lease_lost_during_the_cleanup_stores_no_end` (the check before the append) |
+| `EndClean` | `a_box_turn_runs_in_its_attempts_sandbox`, `a_stop_on_a_redelivered_turn_removes_its_sandbox_then_cancels`, `a_stop_during_the_provision_cancels_before_the_call`, `past_max_deliveries_a_box_turn_is_cleaned_up_then_failed`, `a_failed_removal_keeps_the_turn_open` |
+| `EndClean`'s exceptions | `a_later_attempts_sandbox_is_left_to_the_sweep` (a later attempt provisions while this worker ends the turn), `a_provision_after_the_turn_ended_is_removed_by_its_worker` (a late provision: its worker's check finds the lease gone and removes it) |
+| `EventuallyClean` | `the_sweep_removes_the_sandboxes_of_ended_turns_only`, `a_later_attempts_sandbox_is_left_to_the_sweep` |

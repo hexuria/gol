@@ -110,10 +110,14 @@ pub fn box_attempt_name(run_id: RunId, attempt: u32) -> String {
 }
 
 /// The run a Box sandbox name belongs to: `gol-box-<run>` or
-/// `gol-box-<run>-<attempt>`. None for any other name.
+/// `gol-box-<run>-<attempt>`, the run id as gol writes it (lowercase). None
+/// for any other name, so the sweep leaves what gol did not make.
 pub fn box_run_of(name: &str) -> Option<RunId> {
     let rest = name.strip_prefix("gol-box-")?;
     let (run, attempt) = rest.split_at_checked(36)?;
+    if run.bytes().any(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
     let attempt_ok = attempt.is_empty()
         || attempt
             .strip_prefix('-')
@@ -382,7 +386,7 @@ impl SandboxHost for DockerSandbox {
             "ps",
             "--all",
             "--filter",
-            "name=^gol-box-",
+            "name=gol-box-",
             "--format",
             "{{.Names}}",
         ]
@@ -423,36 +427,83 @@ fn last_line(message: &str) -> String {
     format!("{kept}…")
 }
 
+/// The longest a Docker command may take before it is killed: a daemon
+/// that hangs must not hold a worker, or the sandbox sweep, for good.
+const DOCKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 fn docker(args: &[String]) -> Result<(), String> {
-    let output = Command::new("docker")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "docker {args:?} exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
+    docker_output(args).map(|_| ())
 }
 
+/// Runs `docker args`, killed after `DOCKER_TIMEOUT`: its standard output,
+/// or why it failed.
 fn docker_output(args: &[String]) -> Result<String, String> {
-    let output = Command::new("docker")
+    run_within("docker", args, DOCKER_TIMEOUT)
+}
+
+/// Runs `program args`, killed after `timeout`: its standard output, or why
+/// it failed.
+fn run_within(
+    program: &str,
+    args: &[String],
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    use std::io::Read;
+    let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    // The pipes are drained as the command runs, so a full pipe cannot
+    // stall it.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(|error| error.to_string())? {
+            Some(status) => break status,
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{program} {args:?} did not finish in {}ms",
+                    timeout.as_millis()
+                ));
+            }
+        }
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    if status.success() {
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
     } else {
         Err(format!(
-            "docker {args:?} exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            "{program} {args:?} exited {status}: {}",
+            String::from_utf8_lossy(&stderr).trim()
         ))
     }
 }
@@ -893,6 +944,9 @@ mod tests {
             return None;
         }
         let (run, attempt) = rest.split_at(36);
+        if run.chars().any(|c| c.is_ascii_uppercase()) {
+            return None;
+        }
         let digits = attempt.strip_prefix('-');
         let attempt_ok = attempt.is_empty()
             || digits.is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()));
@@ -907,6 +961,8 @@ mod tests {
         assert_eq!(box_run_of(&format!("gol-box-{run}-")), None);
         assert_eq!(box_run_of(&format!("gol-box-{run}-1x")), None);
         assert_eq!(box_run_of(&format!("gol-box-{run}x")), None);
+        let upper = run.to_string().to_uppercase();
+        assert_eq!(box_run_of(&format!("gol-box-{upper}")), None);
         assert_eq!(box_run_of("gol-box-"), None);
         assert_eq!(box_run_of("gol-agent-local"), None);
     }
@@ -914,11 +970,29 @@ mod tests {
     // The host's listing: one name a line, only Box sandboxes, trimmed.
     #[test]
     fn a_docker_listing_reads_its_box_sandboxes() {
-        let sandbox = DockerSandbox::from_command(|_: &[String]| Ok(()))
-            .with_output(|_: &[String]| Ok("gol-box-a\nother\n  gol-box-b  \n\n".to_string()));
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = asked.clone();
+        let sandbox = DockerSandbox::from_command(|_: &[String]| Ok(())).with_output(
+            move |args: &[String]| {
+                *seen.lock().expect("args") = args.to_vec();
+                Ok("gol-box-a\nother\n  gol-box-b  \n\n".to_string())
+            },
+        );
         assert_eq!(
             sandbox.list().expect("list"),
             ["gol-box-a".to_string(), "gol-box-b".to_string()]
+        );
+        // Stopped ones too: every Box sandbox exits once its command ends.
+        assert_eq!(
+            *asked.lock().expect("args"),
+            [
+                "ps",
+                "--all",
+                "--filter",
+                "name=gol-box-",
+                "--format",
+                "{{.Names}}"
+            ]
         );
         let failing = DockerSandbox::from_command(|_: &[String]| Ok(()));
         assert!(failing.list().is_err());
@@ -942,6 +1016,25 @@ mod tests {
             create.contains(&format!("gol-workspace-{run}:/workspace")),
             "{create:?}"
         );
+    }
+
+    // A command that hangs is killed at its timeout, not waited for.
+    #[test]
+    fn a_hung_command_is_killed_at_its_timeout() {
+        let started = std::time::Instant::now();
+        let hung = run_within(
+            "sleep",
+            &["5".to_string()],
+            std::time::Duration::from_millis(200),
+        );
+        assert!(hung.expect_err("killed").contains("did not finish"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        let quick = run_within(
+            "echo",
+            &["gol-box-a".to_string()],
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(quick.expect("ran"), "gol-box-a\n");
     }
 
     proptest! {

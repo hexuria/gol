@@ -406,12 +406,19 @@ impl<'a> Claim<'a> {
         };
         if starts > worker.timing.max_deliveries {
             // A Box turn is failed only once every attempt's sandbox is gone
-            // (84A); until then it goes back on the queue, and each later
-            // delivery only cleans up.
+            // (84A). Until then its claim is left to expire, so it comes
+            // back after its lease, and each later delivery only cleans up.
+            // The lease is checked again before the end: cleaning took time
+            // this claim renewed nothing in (85A).
             if is_box_turn(&stored.spec) {
                 let attempts = starts.min(worker.timing.max_deliveries);
-                if let Err(error) = worker.clean_box(run_id, attempts) {
-                    eprintln!("gol: queue worker: run {run_id}: {error}");
+                worker.clean_box(run_id, attempts).map_err(|error| {
+                    format!("run {run_id}: {error}; it is retried once its lease expires")
+                })?;
+                if matches!(
+                    worker.queue.renew(run_id, &self.token, worker.timing.lease),
+                    Ok(false)
+                ) {
                     return Ok(Prepared::Done(Done {
                         claim: self,
                         recorded: Some(Append::Moved),
@@ -490,9 +497,6 @@ enum Stopped {
     LostLease,
     /// Its harness waits on the reply to this ask.
     Waiting(MessageId),
-    /// It could not finish now (a Box turn's sandbox could not be removed):
-    /// the run goes back on the queue for another delivery.
-    Release,
 }
 
 impl Worker {
@@ -514,7 +518,7 @@ impl Worker {
             match self.run_from(&spec, events, token, attempt)? {
                 Stopped::Store(Append::Moved) if reloads < RELOADS => reloads += 1,
                 Stopped::Store(other) => return Ok(Outcome::Stored(other)),
-                Stopped::LostLease | Stopped::Release => return Ok(Outcome::Stored(Append::Moved)),
+                Stopped::LostLease => return Ok(Outcome::Stored(Append::Moved)),
                 Stopped::Waiting(ask) => return Ok(Outcome::Waiting(ask)),
             }
             events = match self.store.run(spec.run_id).map_err(|e| e.to_string())? {
@@ -861,6 +865,10 @@ impl Worker {
             self.drop_own(&name);
             return Ok(Stopped::LostLease);
         }
+        // A stop that came during the provision: no gateway call.
+        if self.stopped(spec.run_id) {
+            return self.end_box(spec, attempt, vec![run_cancelled_event(spec)], holds);
+        }
         let answer = self.poster.complete(&gateway_call(spec));
         if !holds() {
             self.drop_own(&name);
@@ -879,8 +887,8 @@ impl Worker {
 
     /// Ends Box turn `spec` with `end` once the sandboxes of attempts 1 to
     /// `attempt` are gone (84A), checking the lease just before the append.
-    /// A sandbox that cannot be removed leaves the turn open, and the run
-    /// goes back on the queue.
+    /// A sandbox that cannot be removed leaves the turn open: the claim is
+    /// not acknowledged, so the run comes back once its lease expires.
     fn end_box(
         &self,
         spec: &RunSpec,
@@ -888,10 +896,12 @@ impl Worker {
         end: Vec<Event>,
         holds: &dyn Fn() -> bool,
     ) -> Result<Stopped, String> {
-        if let Err(error) = self.clean_box(spec.run_id, attempt) {
-            eprintln!("gol: queue worker: run {}: {error}", spec.run_id);
-            return Ok(Stopped::Release);
-        }
+        self.clean_box(spec.run_id, attempt).map_err(|error| {
+            format!(
+                "run {}: {error}; it is retried once its lease expires",
+                spec.run_id
+            )
+        })?;
         if !holds() {
             return Ok(Stopped::LostLease);
         }
@@ -1076,17 +1086,13 @@ pub const OUTBOX_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Hands back runs whose lease ran out, sweeps runs left pending and the
 /// asks of parked runs, and prunes outbox entries older than
 /// `OUTBOX_RETENTION`, every `reap_every`, for as long as the process runs.
-/// With `sandbox`, it also removes the Box sandboxes of ended turns, every
-/// `SANDBOX_SWEEP_EVERY` (86C).
 pub fn reap_forever(
     queue: &RedisRunQueue,
     store: &dyn RunStore,
     messages: Option<&dyn MessageStore>,
     outbox: Option<&dyn OutboxStore>,
-    sandbox: Option<&dyn SandboxHost>,
     timing: QueueTiming,
 ) {
-    let mut swept_sandboxes: Option<std::time::Instant> = None;
     loop {
         match catch_unwind(AssertUnwindSafe(|| queue.reap())) {
             Ok(Ok(_)) => {}
@@ -1121,23 +1127,26 @@ pub fn reap_forever(
                 Err(_) => eprintln!("gol: outbox prune: pruning panicked"),
             }
         }
-        // The host's sandboxes are listed less often: a Docker call.
-        if let Some(sandbox) = sandbox {
-            if swept_sandboxes.is_none_or(|at| at.elapsed() >= SANDBOX_SWEEP_EVERY) {
-                swept_sandboxes = Some(std::time::Instant::now());
-                match catch_unwind(AssertUnwindSafe(|| sweep_sandboxes(store, sandbox))) {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => eprintln!("gol: sandbox sweep: {error}"),
-                    Err(_) => eprintln!("gol: sandbox sweep: sweeping panicked"),
-                }
-            }
-        }
         std::thread::sleep(timing.reap_every);
     }
 }
 
-/// How often the reaper looks through the host's Box sandboxes (86C).
+/// How often a server looks through its host's Box sandboxes (86C).
 const SANDBOX_SWEEP_EVERY: Duration = Duration::from_secs(30);
+
+/// Removes the Box sandboxes of ended turns (`sweep_sandboxes`) every
+/// `SANDBOX_SWEEP_EVERY`, for as long as the process runs. A thread of its
+/// own: a slow host does not hold up the reaper.
+pub fn sweep_sandboxes_forever(store: &dyn RunStore, sandbox: &dyn SandboxHost) {
+    loop {
+        match catch_unwind(AssertUnwindSafe(|| sweep_sandboxes(store, sandbox))) {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => eprintln!("gol: sandbox sweep: {error}"),
+            Err(_) => eprintln!("gol: sandbox sweep: sweeping panicked"),
+        }
+        std::thread::sleep(SANDBOX_SWEEP_EVERY);
+    }
+}
 
 /// Pushes each run pending for at least `after` that its producer stored but
 /// never pushed: the producer died in between (C6). A pending run whose log
@@ -1415,6 +1424,7 @@ pub fn start_queue(
         .name("gol-scheduler".to_string())
         .spawn(move || crate::scheduler::schedule_forever(scheduled, scheduler, SCHEDULE_EVERY))
         .map_err(|error| error.to_string())?;
+    let (swept, sandboxes) = (store.clone(), sandbox.clone());
     let reaper = RedisRunQueue::open(&settings.redis_url);
     std::thread::Builder::new()
         .name("gol-reaper".to_string())
@@ -1424,10 +1434,13 @@ pub fn start_queue(
                 store.as_ref(),
                 Some(messages.as_ref()),
                 Some(outbox.as_ref()),
-                Some(sandbox.as_ref()),
                 timing,
             )
         })
+        .map_err(|error| error.to_string())?;
+    std::thread::Builder::new()
+        .name("gol-sandbox-sweep".to_string())
+        .spawn(move || sweep_sandboxes_forever(swept.as_ref(), sandboxes.as_ref()))
         .map_err(|error| error.to_string())?;
     Ok(())
 }

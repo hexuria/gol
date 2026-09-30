@@ -122,7 +122,7 @@ Provision(w) ==
 \* sandbox and stops, or, its cleanup done, stops without ending the turn.
 Fence(w) ==
   /\ pc[w] \in {"provisioned", "called", "ending"}
-  /\ IF Holds(w) \/ Design \in {"nofence", "cleanlatest"}
+  /\ IF Holds(w) \/ Design = "cleanlatest" \/ (Design = "nofence" /\ pc[w] # "ending")
        THEN CASE pc[w] = "provisioned" -> pc' = Set(pc, w, "calling") /\ UNCHANGED <<why, todo>>
               [] pc[w] = "called" ->
                    ToClean(w, "done", IF Design = "cleanlatest" THEN starts ELSE att[w])
