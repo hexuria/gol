@@ -99,3 +99,69 @@ Scope of the Phase 1.5b model:
 - Each worker in `Workers` runs the run once. `WritersFinish` says each of them finishes, but not that a run that keeps being handed back ends under unbounded redelivery. The queue side of that is `formal/runqueue`'s `EveryRunEnds`, with releases bounded by `MaxReleases`, and `max_deliveries` in the code, which is not modelled.
 - A worker whose lease ran out stores nothing more. `run_from` renews the lease before every write: the ladder, each boundary, both failure writes, and the tail that ends the run. It also renews before `run_until`, which can perform an effect the log left pending before any boundary. When a renewal answers that another claim holds the lease, the worker stops, and its release does nothing. A renewal that fails with a Redis error does not stop it, as with the heartbeat. Tests: `a_worker_that_lost_its_lease_stops_at_the_next_boundary`, `a_worker_that_lost_its_lease_during_the_last_step_does_not_end_the_run` (lease lost during the Jev call whose completion or error would end the run), and `a_worker_without_its_lease_does_not_redo_a_pending_effect` (a delegation cut after its authorization is not started). The model does not have leases (`formal/runqueue` does), so it lets a stale worker keep appending. That is the weaker case, and the conditional append still keeps `StepsContiguous` in it.
 - The forced tests inject another writer's append at a chosen point of one worker. Two live workers running one run are covered at the store level by `racing_conditional_appends_one_lands`, not end to end.
+
+## Box background turns (the 67A follow-up)
+
+Checked on 2026-09-30 with TLC 2.19 (tla2tools v1.7.4):
+
+```
+java -XX:+UseParallelGC -jar tla2tools.jar -workers auto -lncheck final -config BoxTurn.cfg BoxTurn.tla
+```
+
+`BoxTurn.tla` is a model of its own in this directory, 250 lines. It covers the writers of one Box background coworker turn:
+- queue workers, each running one delivery (an attempt), with a lease that can run out while the worker still acts;
+- the owner's stop;
+- the reaper.
+
+It owns what `CompletedHasNoSandbox` owns for a quick turn: whether a turn ends with a sandbox up. For background turns there is a worker that provisions, and several workers can act on one run.
+
+It abstracts `Claim::prepare`, `Worker::run_box_turn`, `end_box` and `clean_box` (`crates/server/src/worker.rs`), `stop()` (`crates/server/src/http.rs`) and `sweep_sandboxes`.
+
+- **The log:** "open" or "ended". Which terminal event does not matter here, and the store refuses a second one (`RunLog`).
+- **Sandbox calls:** one step each. Destroying a name that is not up succeeds, because `clean_box` asks `absent` first.
+
+**Properties:**
+- `LiveSandbox` (invariant): while the turn is open, the worker that holds its lease has its sandbox up through the gateway call.
+- `EndClean` (action): a turn ends only with no sandbox up except:
+  - those of workers still under way, each of which removes its own;
+  - those provisioned after a cleanup confirmed their name gone;
+  - when a worker ends it, those of attempts after its own.
+- `TurnEnds` and `EventuallyClean` (liveness): the turn ends, and then no sandbox is left.
+- Fairness: weak fairness on each worker, on the lapse of a dead worker's lease, and on the reaper. A crash, a stall (a live worker's lease running out) and a stop may never come.
+
+**Runs:**
+- `BoxTurn.cfg`: `Design = "new"`, two workers, `MaxDeliveries = 2`, one crash, one stall, one failed removal. 60,367 states generated, 18,531 distinct, depth 28, 4 s. No error, deadlock checked.
+- The same with three workers: 294,243 distinct, depth 33, 54 s with `-workers 1`, no error. With `-workers auto`, TLC finished its checks and then threw an `ArithmeticException` (division by zero) while printing its statistics, as on #85's three-scheduler run; the single-worker run is the result.
+
+**Negative controls** (`Design` changed on `BoxTurn.cfg`), each failing as recorded:
+- `"shared"`: one sandbox name for every attempt, the #83 design. Breaks `LiveSandbox` in 11 states: a worker whose lease ran out removes the name the live worker is calling with.
+- `"nofence"`: no lease check after the provision or the call. It holds every property (17,037 distinct states). A worker cleans up only attempts 1 to its own, so a stale one never removes a later attempt's sandbox, and the lease check before the append keeps it from ending the turn. Those two checks save a gateway call and a cleanup, not a sandbox.
+- `"cleanlatest"`: no lease checks, and a cleanup of attempts up to the latest start instead of the worker's own. Breaks `LiveSandbox` in 13 states: a stale worker's cleanup removes the sandbox the live worker is calling with. The bound to its own attempt is what keeps `LiveSandbox`.
+- `"stopall"`: the stop cancels a started turn itself. Breaks `EndClean` in 6 states.
+- `"nocleanup"`: past `max_deliveries` the turn is failed without cleaning up. Breaks `EndClean` in 13 states.
+- `"nosweep"`: breaks `EventuallyClean` in an 18-state lasso.
+- `"set"`: the first 86A. The reaper removes only what a Redis set names; a worker adds its name before it provisions, and a removal confirmed gone takes the name off. Breaks `EventuallyClean` in a 19-state trace:
+  1. `w1`'s lease runs out after its stop check.
+  2. `w1` adds its name to the set.
+  3. `w2` claims attempt 2, sees the stop, and cleans up. Nothing is up yet, so it takes `w1`'s name off the set.
+  4. `w1` provisions and dies.
+  5. `w2` ends the turn. The sandbox is up, and nothing names it.
+
+  This trace is why 86C replaced 86A: the reaper lists the host's sandboxes instead.
+
+**Assumptions:**
+- A lease check that meets a Redis error counts as holding (`holds` in `run_from`, as the heartbeat does). The model's checks are exact.
+- The lease is in Redis and the log in Postgres, so no check-then-append is atomic. `EndClean` excuses the sandboxes of attempts after the ender's own for that reason.
+- Each server's reaper lists its own host (`SandboxHost::list`): a leaked Docker sandbox is swept by the server on the machine that ran it.
+- Past `max_deliveries`, attempts share the capped number, and none provisions.
+
+**Mapping** (`crates/server/tests/box_turns.rs`, on both stores):
+
+| Property | Tests |
+| --- | --- |
+| `LiveSandbox`, per-attempt names | `a_redelivered_turn_removes_the_earlier_attempts_sandbox` (attempt 2 runs in its own sandbox while attempt 1's is up) |
+| The lease checks (not needed for `LiveSandbox`; see `"nofence"`) | `a_worker_that_lost_its_lease_after_the_provision_removes_its_sandbox`, `a_worker_that_lost_its_lease_during_the_call_removes_its_sandbox` (forced: the lease is taken by another claim at that point). Neither calls on, removes anything but its own sandbox, or ends the turn. |
+| `EndClean` | `a_box_turn_runs_in_its_attempts_sandbox`, `a_stop_on_a_redelivered_turn_removes_its_sandbox_then_cancels`, `past_max_deliveries_a_box_turn_is_cleaned_up_then_failed`, `a_failed_removal_keeps_the_turn_open` |
+| `EventuallyClean` | `the_sweep_removes_the_sandboxes_of_ended_turns_only` |
+
+The stale ender's window (a lease that runs out between the last check and the append) is unlinked: no Rust test forces it.

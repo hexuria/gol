@@ -32,8 +32,9 @@ use crate::deliverer::{
 };
 use crate::http::{jev_client, Delegation};
 use crate::inference::{
-    dispatch_events, finish_turn, is_turn, run_cancelled_event, run_failed_event, sandbox_from_env,
-    system_event, GatewayPoster, HttpGatewayPoster, SandboxHost, TurnError,
+    box_attempt_name, box_run_of, completion_events, dispatch_events, finish_turn, gateway_call,
+    is_turn, run_cancelled_event, run_failed_event, sandbox_from_env, system_event, GatewayPoster,
+    HttpGatewayPoster, SandboxError, SandboxHost, TurnError,
 };
 use crate::models::ModelsConfig;
 use crate::queue::{QueueTiming, RedisRunQueue};
@@ -223,6 +224,8 @@ pub enum Prepared<'a> {
 pub struct Open<'a> {
     claim: Claim<'a>,
     stored: Box<StoredRun>,
+    /// Which delivery of the run this is: its start count.
+    attempt: u32,
 }
 
 /// A claimed run executed, with the events to record.
@@ -402,6 +405,20 @@ impl<'a> Claim<'a> {
             }
         };
         if starts > worker.timing.max_deliveries {
+            // A Box turn is failed only once every attempt's sandbox is gone
+            // (84A); until then it goes back on the queue, and each later
+            // delivery only cleans up.
+            if is_box_turn(&stored.spec) {
+                let attempts = starts.min(worker.timing.max_deliveries);
+                if let Err(error) = worker.clean_box(run_id, attempts) {
+                    eprintln!("gol: queue worker: run {run_id}: {error}");
+                    return Ok(Prepared::Done(Done {
+                        claim: self,
+                        recorded: Some(Append::Moved),
+                        waiting: None,
+                    }));
+                }
+            }
             let before = starts - 1;
             let failed = run_failed_event(
                 &stored.spec,
@@ -422,6 +439,7 @@ impl<'a> Claim<'a> {
         Ok(Prepared::Open(Open {
             claim: self,
             stored: Box::new(stored),
+            attempt: starts,
         }))
     }
 }
@@ -435,6 +453,7 @@ impl<'a> Open<'a> {
         let worker = self.claim.worker;
         let claim = &self.claim;
         let stored = *self.stored;
+        let attempt = self.attempt;
         let spec = stored.spec.clone();
         let outcome = std::thread::scope(|scope| {
             let (stop, stopped) = mpsc::channel::<()>();
@@ -442,7 +461,7 @@ impl<'a> Open<'a> {
                 .name("gol-heartbeat".to_string())
                 .spawn_scoped(scope, move || claim.heartbeat(&stopped))
                 .expect("spawn the heartbeat thread");
-            let outcome = worker.store_as_it_goes(stored, &claim.token);
+            let outcome = worker.store_as_it_goes(stored, &claim.token, attempt);
             drop(stop);
             outcome
         });
@@ -471,6 +490,9 @@ enum Stopped {
     LostLease,
     /// Its harness waits on the reply to this ask.
     Waiting(MessageId),
+    /// It could not finish now (a Box turn's sandbox could not be removed):
+    /// the run goes back on the queue for another delivery.
+    Release,
 }
 
 impl Worker {
@@ -479,15 +501,20 @@ impl Worker {
     /// worker ended the run, `Terminal` when another writer did, `Moved` when
     /// it gave up or lost its lease (`Done::ack` then releases the run, which
     /// does nothing once another worker holds the lease).
-    fn store_as_it_goes(&self, stored: StoredRun, token: &str) -> Result<Outcome, String> {
+    fn store_as_it_goes(
+        &self,
+        stored: StoredRun,
+        token: &str,
+        attempt: u32,
+    ) -> Result<Outcome, String> {
         let spec = stored.spec;
         let mut events = stored.events;
         let mut reloads = 0;
         loop {
-            match self.run_from(&spec, events, token)? {
+            match self.run_from(&spec, events, token, attempt)? {
                 Stopped::Store(Append::Moved) if reloads < RELOADS => reloads += 1,
                 Stopped::Store(other) => return Ok(Outcome::Stored(other)),
-                Stopped::LostLease => return Ok(Outcome::Stored(Append::Moved)),
+                Stopped::LostLease | Stopped::Release => return Ok(Outcome::Stored(Append::Moved)),
                 Stopped::Waiting(ask) => return Ok(Outcome::Waiting(ask)),
             }
             events = match self.store.run(spec.run_id).map_err(|e| e.to_string())? {
@@ -560,6 +587,7 @@ impl Worker {
         spec: &RunSpec,
         mut events: Vec<Event>,
         token: &str,
+        attempt: u32,
     ) -> Result<Stopped, String> {
         // Another writer ended it: a reload finds the log as it was left.
         if events.iter().any(|event| is_terminal(&event.payload)) {
@@ -586,8 +614,12 @@ impl Worker {
                 .map(Stopped::Store)
                 .map_err(|error| error.to_string())
         };
-        // A stop covers the run (Phase 3.4): it ends cancelled, unrun.
+        // A stop covers the run (Phase 3.4): it ends cancelled, unrun. A Box
+        // turn first loses every attempt's sandbox (84A).
         if self.stopped(run_id) {
+            if is_box_turn(spec) {
+                return self.end_box(spec, attempt, vec![run_cancelled_event(spec)], &holds);
+            }
             return append(seen, vec![run_cancelled_event(spec)]);
         }
         // A queued run is scheduled first, as one append.
@@ -603,7 +635,7 @@ impl Worker {
         // A background coworker turn (Phase 3.6) runs as a quick turn does,
         // not through the harness.
         if is_turn(spec) {
-            return self.run_turn(spec, events, seen, &append, &holds);
+            return self.run_turn(spec, events, seen, attempt, &append, &holds);
         }
         let mut driver = match Driver::resume(spec.clone(), events) {
             Ok(driver) => driver,
@@ -707,32 +739,35 @@ impl Worker {
 
 impl Worker {
     /// Runs background coworker turn `spec` from its log (`events`, the
-    /// first `seen` stored; its user message was stored with it queued):
-    /// starts it, then `finish_turn`, which calls the gateway and stores the
-    /// completion, or the failure. Only a gateway turn outside a Box runs in
-    /// the background (decisions 63A, 67A); one stored otherwise is failed,
-    /// not run. A turn a dead worker started is picked up where its log
-    /// stops, and the gateway is called again (65A). A turn left open (the
-    /// store could not answer) is not acknowledged, so it is tried again.
+    /// first `seen` stored; its user message was stored with it queued), as
+    /// delivery `attempt`: starts it, then calls the gateway and stores the
+    /// completion, or the failure (`finish_turn`, or `run_box_turn` in a Box).
+    /// Only a gateway turn runs in the background (decision 63A); one stored
+    /// otherwise is failed, not run. A turn a dead worker started is picked
+    /// up where its log stops, and the gateway is called again (65A). A turn
+    /// left open (the store could not answer) is not acknowledged, so it is
+    /// tried again.
     fn run_turn(
         &self,
         spec: &RunSpec,
         mut events: Vec<Event>,
         mut seen: usize,
+        attempt: u32,
         append: &dyn Fn(usize, Vec<Event>) -> Result<Stopped, String>,
         holds: &dyn Fn() -> bool,
     ) -> Result<Stopped, String> {
-        if spec.placement == protocol::ExecutionPlacement::Box
-            || !matches!(
-                spec.work_model.credential,
-                protocol::CredentialSource::PlatformGateway
-            )
-        {
+        if !matches!(
+            spec.work_model.credential,
+            protocol::CredentialSource::PlatformGateway
+        ) {
             let failed = run_failed_event(
                 spec,
                 FailureClass::Infrastructure,
-                "only a gateway turn outside a Box runs in the background".to_string(),
+                "only a gateway turn runs in the background".to_string(),
             );
+            if is_box_turn(spec) {
+                return self.end_box(spec, attempt, vec![failed], holds);
+            }
             return append(seen, vec![failed]);
         }
         let started = events
@@ -751,6 +786,9 @@ impl Worker {
         // worker's start (its cancel found the log moved) is seen here,
         // before the gateway is called (66A).
         if self.stopped(spec.run_id) {
+            if is_box_turn(spec) {
+                return self.end_box(spec, attempt, vec![run_cancelled_event(spec)], holds);
+            }
             return append(seen, vec![run_cancelled_event(spec)]);
         }
         if !holds() {
@@ -768,6 +806,9 @@ impl Worker {
                 return Ok(Stopped::Store(Append::Terminal));
             }
             Some(_) => {}
+        }
+        if is_box_turn(spec) {
+            return self.run_box_turn(spec, attempt, holds);
         }
         match finish_turn(
             self.store.as_ref(),
@@ -789,6 +830,146 @@ impl Worker {
             },
         }
     }
+}
+
+impl Worker {
+    /// Runs Box turn `spec` as delivery `attempt`, in a sandbox of its own,
+    /// `gol-box-<run>-<attempt>` (82A): the lease checked, the provision,
+    /// the lease checked, the gateway call, the lease checked, then
+    /// `end_box` with the completion or the failure (84A, 85A). A worker
+    /// that lost its lease removes its own sandbox and stops: the turn is
+    /// its new holder's (`formal/runlog/BoxTurn.tla`).
+    fn run_box_turn(
+        &self,
+        spec: &RunSpec,
+        attempt: u32,
+        holds: &dyn Fn() -> bool,
+    ) -> Result<Stopped, String> {
+        let name = box_attempt_name(spec.run_id, attempt);
+        if !holds() {
+            return Ok(Stopped::LostLease);
+        }
+        if let Err(SandboxError::Host(message)) = self.sandbox.provision(&name) {
+            let failed = run_failed_event(
+                spec,
+                FailureClass::Environment,
+                format!("provision: {message}"),
+            );
+            return self.end_box(spec, attempt, vec![failed], holds);
+        }
+        if !holds() {
+            self.drop_own(&name);
+            return Ok(Stopped::LostLease);
+        }
+        let answer = self.poster.complete(&gateway_call(spec));
+        if !holds() {
+            self.drop_own(&name);
+            return Ok(Stopped::LostLease);
+        }
+        let end = match answer {
+            Ok(text) => completion_events(spec, &text),
+            Err(message) => vec![run_failed_event(
+                spec,
+                FailureClass::Dependency,
+                format!("proxy: {message}"),
+            )],
+        };
+        self.end_box(spec, attempt, end, holds)
+    }
+
+    /// Ends Box turn `spec` with `end` once the sandboxes of attempts 1 to
+    /// `attempt` are gone (84A), checking the lease just before the append.
+    /// A sandbox that cannot be removed leaves the turn open, and the run
+    /// goes back on the queue.
+    fn end_box(
+        &self,
+        spec: &RunSpec,
+        attempt: u32,
+        end: Vec<Event>,
+        holds: &dyn Fn() -> bool,
+    ) -> Result<Stopped, String> {
+        if let Err(error) = self.clean_box(spec.run_id, attempt) {
+            eprintln!("gol: queue worker: run {}: {error}", spec.run_id);
+            return Ok(Stopped::Release);
+        }
+        if !holds() {
+            return Ok(Stopped::LostLease);
+        }
+        self.store
+            .append_events(spec.run_id, end)
+            .map(Stopped::Store)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Removes the sandboxes of attempts 1 to `attempts` of Box turn `run`,
+    /// each confirmed gone (84A).
+    fn clean_box(&self, run: RunId, attempts: u32) -> Result<(), String> {
+        for attempt in 1..=attempts {
+            let name = box_attempt_name(run, attempt);
+            if matches!(self.sandbox.absent(&name), Ok(true)) {
+                continue;
+            }
+            if let Err(SandboxError::Host(message)) = self.sandbox.destroy(&name) {
+                return Err(format!("sandbox {name} was not removed: {message}"));
+            }
+            if !matches!(self.sandbox.absent(&name), Ok(true)) {
+                return Err(format!("sandbox {name} is not confirmed gone"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes this worker's own sandbox once it lost its lease. One that
+    /// cannot be removed is left to the turn's next cleanup, or the reaper.
+    fn drop_own(&self, name: &str) {
+        if let Err(SandboxError::Host(message)) = self.sandbox.destroy(name) {
+            eprintln!("gol: queue worker: sandbox {name} was not removed: {message}");
+        }
+    }
+}
+
+/// Whether `spec` is a background coworker turn in a Box.
+fn is_box_turn(spec: &RunSpec) -> bool {
+    is_turn(spec) && spec.placement == protocol::ExecutionPlacement::Box
+}
+
+/// Removes every Box sandbox `sandbox` lists whose turn has ended (86C):
+/// what a worker that lost its lease, or died, left behind. A sandbox of an
+/// open turn, or of no stored run, is left. The names removed.
+pub fn sweep_sandboxes(
+    store: &dyn RunStore,
+    sandbox: &dyn SandboxHost,
+) -> Result<Vec<String>, String> {
+    let listed = sandbox
+        .list()
+        .map_err(|SandboxError::Host(message)| message)?;
+    let mut removed = Vec::new();
+    for name in listed {
+        let Some(run) = box_run_of(&name) else {
+            continue;
+        };
+        let ended = match store.run(run) {
+            Ok(Some(stored)) => stored
+                .events
+                .iter()
+                .any(|event| is_terminal(&event.payload)),
+            Ok(None) => false,
+            Err(error) => {
+                eprintln!("gol: sandbox sweep: run {run}: {error}");
+                false
+            }
+        };
+        if !ended {
+            continue;
+        }
+        match sandbox.destroy(&name) {
+            Ok(()) => removed.push(name),
+            Err(SandboxError::Host(message)) => {
+                eprintln!("gol: sandbox sweep: {name} was not removed: {message}")
+            }
+        }
+    }
+    Ok(removed)
 }
 
 impl<'a> Executed<'a> {
@@ -895,13 +1076,17 @@ pub const OUTBOX_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Hands back runs whose lease ran out, sweeps runs left pending and the
 /// asks of parked runs, and prunes outbox entries older than
 /// `OUTBOX_RETENTION`, every `reap_every`, for as long as the process runs.
+/// With `sandbox`, it also removes the Box sandboxes of ended turns, every
+/// `SANDBOX_SWEEP_EVERY` (86C).
 pub fn reap_forever(
     queue: &RedisRunQueue,
     store: &dyn RunStore,
     messages: Option<&dyn MessageStore>,
     outbox: Option<&dyn OutboxStore>,
+    sandbox: Option<&dyn SandboxHost>,
     timing: QueueTiming,
 ) {
+    let mut swept_sandboxes: Option<std::time::Instant> = None;
     loop {
         match catch_unwind(AssertUnwindSafe(|| queue.reap())) {
             Ok(Ok(_)) => {}
@@ -936,9 +1121,23 @@ pub fn reap_forever(
                 Err(_) => eprintln!("gol: outbox prune: pruning panicked"),
             }
         }
+        // The host's sandboxes are listed less often: a Docker call.
+        if let Some(sandbox) = sandbox {
+            if swept_sandboxes.is_none_or(|at| at.elapsed() >= SANDBOX_SWEEP_EVERY) {
+                swept_sandboxes = Some(std::time::Instant::now());
+                match catch_unwind(AssertUnwindSafe(|| sweep_sandboxes(store, sandbox))) {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => eprintln!("gol: sandbox sweep: {error}"),
+                    Err(_) => eprintln!("gol: sandbox sweep: sweeping panicked"),
+                }
+            }
+        }
         std::thread::sleep(timing.reap_every);
     }
 }
+
+/// How often the reaper looks through the host's Box sandboxes (86C).
+const SANDBOX_SWEEP_EVERY: Duration = Duration::from_secs(30);
 
 /// Pushes each run pending for at least `after` that its producer stored but
 /// never pushed: the producer died in between (C6). A pending run whose log
@@ -1188,9 +1387,13 @@ pub fn start_queue(
     models: Arc<ModelsConfig>,
 ) -> Result<(), String> {
     let timing = QueueTiming::default();
+    // One sandbox host for the workers and the reaper, so the reaper sees
+    // what the workers provisioned.
+    let sandbox = sandbox_from_env();
     for index in 0..settings.workers {
         let worker = Worker::builder()
             .queue(RedisRunQueue::open(&settings.redis_url))
+            .sandbox(sandbox.clone())
             .store(store.clone())
             .memory(memory.clone())
             .jev(jev_base_url)
@@ -1221,6 +1424,7 @@ pub fn start_queue(
                 store.as_ref(),
                 Some(messages.as_ref()),
                 Some(outbox.as_ref()),
+                Some(sandbox.as_ref()),
                 timing,
             )
         })

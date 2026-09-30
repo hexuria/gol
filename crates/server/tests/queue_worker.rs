@@ -1048,7 +1048,7 @@ fn the_reaper_sweeps_stranded_runs() {
     let queue = RedisRunQueue::with_key(REDIS_URL, &setup.key);
     let store = setup.store.clone();
     // The loop runs for as long as the test process does.
-    std::thread::spawn(move || reap_forever(&queue, store.as_ref(), None, None, quick()));
+    std::thread::spawn(move || reap_forever(&queue, store.as_ref(), None, None, None, quick()));
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while setup.queue.queued().expect("queued").is_empty() {
         assert!(

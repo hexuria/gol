@@ -1,9 +1,9 @@
 //! Background coworker turns (Phase 3.6, decisions 62A-67A). A gateway turn
-//! outside a Box posted with `background: true` is stored queued and
-//! answered 202 at once; a queue worker then runs it as a quick turn runs:
-//! one gateway completion, then the completion stored. A Box turn does not
-//! run in the background yet (67A). A quick turn is unchanged. On both
-//! stores; needs Postgres and Redis, as `pg_redis.rs` does.
+//! posted with `background: true` is stored queued and answered 202 at once;
+//! a queue worker then runs it as a quick turn runs: one gateway completion,
+//! then the completion stored. A Box turn's sandboxes are `box_turns.rs`'s.
+//! A quick turn is unchanged. On both stores; needs Postgres and Redis, as
+//! `pg_redis.rs` does.
 mod common;
 
 use std::sync::{Arc, Mutex};
@@ -375,9 +375,10 @@ async fn a_background_turn_is_refused_where_it_cannot_run() {
         body["error"],
         "a subscription turn cannot run in the background"
     );
+    // A Box turn runs in the background too, in a sandbox per delivery (82A).
     let (status, body) = post_turn(&server, &user, turn("Box", platform(), Some(true), "s")).await;
-    assert_eq!(status, 400, "{body}");
-    assert_eq!(body["error"], "a Box turn cannot run in the background yet");
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["placement"], "Box");
     let mut marked = turn("Local", platform(), Some(true), "s");
     marked["metadata"]["gol.turn"] = json!("1");
     let (status, body) = post_turn(&server, &user, marked).await;
@@ -414,7 +415,12 @@ async fn a_background_turn_is_refused_where_it_cannot_run() {
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/v1/coworker/turns"))
         .header("authorization", common::bearer_for(&user))
-        .json(&turn("Box", platform(), Some(true), "s"))
+        .json(&turn(
+            "Local",
+            json!({"BringYourOwn": {"secret_ref": "desktop"}}),
+            Some(true),
+            "s",
+        ))
         .send()
         .await
         .expect("send");
