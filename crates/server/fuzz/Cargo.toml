@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 server = { path = ".." }
 libfuzzer-sys = "0.4"
+ring = "0.17"
 
 # Its own workspace: cargo-fuzz builds it with a nightly toolchain, apart
 # from the main workspace.

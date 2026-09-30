@@ -1,11 +1,12 @@
-//! Webhooks (Phase 4.3, decisions 73A-78A): a webhook trigger fires on a
+//! Webhooks (Phase 4.3, decisions 73A-81A): a webhook trigger fires on a
 //! signed request to `POST /hooks/{id}`. The signature is HMAC-SHA256 of
-//! "timestamp.body" under the trigger's secret (derived from the server's
-//! key, 73A), sent as `X-Gol-Signature: v1=<hex>` with `X-Gol-Timestamp`
-//! (Unix seconds, within 5 minutes) and `X-Gol-Event` (the sender's event
-//! id). A fire's run id comes from the trigger and the event id, so a replay
-//! fires nothing new. On both stores; needs Postgres and Redis, as
-//! `pg_redis.rs` does.
+//! "event.timestamp.body" under the trigger's secret (derived from the
+//! server's key, 73A; the event id signed, 79A), sent as
+//! `X-Gol-Signature: v1=<hex>` with `X-Gol-Timestamp` (Unix seconds, within
+//! 5 minutes) and `X-Gol-Event` (the sender's event id). A fire's run id
+//! comes from the trigger and the event id, so a replay fires nothing new,
+//! and is answered from the event's run (80A). On both stores; needs
+//! Postgres and Redis, as `pg_redis.rs` does.
 mod common;
 
 use common::queued::{blocking, fresh_user, jev, serve_with_webhooks, stores, Server, Store};
@@ -47,10 +48,11 @@ fn now_s() -> i64 {
     protocol::Timestamp::now().as_unix_millis() / 1000
 }
 
-/// The `X-Gol-Signature` of `body` at `timestamp` under `secret`.
-fn sign(secret: &str, timestamp: i64, body: &[u8]) -> String {
+/// The `X-Gol-Signature` of event `event`'s `body` at `timestamp` under
+/// `secret`.
+fn sign(secret: &str, event: &str, timestamp: i64, body: &[u8]) -> String {
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
-    let mut message = format!("{timestamp}.").into_bytes();
+    let mut message = format!("{event}.{timestamp}.").into_bytes();
     message.extend_from_slice(body);
     let tag = ring::hmac::sign(&key, &message);
     let hex: String = tag
@@ -97,7 +99,7 @@ async fn signed(server: &Server, id: &str, secret: &str, event: &str, body: &[u8
         body,
         Some(event),
         Some(at),
-        Some(sign(secret, at, body)),
+        Some(sign(secret, event, at, body)),
     )
     .await
 }
@@ -124,6 +126,10 @@ async fn a_signed_webhook_starts_a_task() {
             "triage the incoming issue\n\n{\"issue\": 42}"
         );
         assert_eq!(stored.spec.metadata.get("gol.trigger"), Some(&id));
+        assert_eq!(
+            stored.spec.metadata.get("gol.event").map(String::as_str),
+            Some("evt-1")
+        );
         assert_eq!(
             server.work().await.map(|run| run.to_string()),
             Some(run.clone())
@@ -159,19 +165,110 @@ async fn a_replayed_event_is_dropped() {
     }
 }
 
+/// The runs on this server's queue.
+async fn queued(server: &Server) -> Vec<RunId> {
+    let url = server.redis.clone();
+    blocking(move || RedisRunQueue::open(url).queued().expect("queued")).await
+}
+
+async fn post(server: &Server, user: &str, path: &str) {
+    let (status, answer) = server.post(path, user, json!({})).await;
+    assert_eq!(status, 200, "{path}: {answer}");
+}
+
+// A replay is answered from the event's run (80A), never fired anew: one
+// that ran is a duplicate even while paused; one stored but never pushed
+// (its delivery failed between the store and the push) is pushed by the
+// replay, or held if the trigger was paused since, and a held run is
+// refused again after a resume. A delivery refused while paused stores no
+// run, so its retry after a resume fires.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replay_is_answered_from_the_events_run() {
+    for store in stores() {
+        let (server, user, id, secret) = setup(&store, 5).await;
+        let (pause, resume) = (
+            format!("/v1/triggers/{id}/pause"),
+            format!("/v1/triggers/{id}/resume"),
+        );
+        // Refused while paused, nothing stored: retried after a resume, it
+        // fires.
+        post(&server, &user, &pause).await;
+        let (status, answer) = signed(&server, &id, &secret, "retried", b"{}").await;
+        assert_eq!(status, 409, "{answer}");
+        assert_eq!(queued(&server).await, []);
+        post(&server, &user, &resume).await;
+        let (status, answer) = signed(&server, &id, &secret, "retried", b"{}").await;
+        assert_eq!(status, 202, "{answer}");
+        assert!(server.work().await.is_some());
+        // Ran, then replayed while paused: a duplicate.
+        let (status, ran) = signed(&server, &id, &secret, "ran", b"{}").await;
+        assert_eq!(status, 202, "{ran}");
+        assert!(server.work().await.is_some());
+        post(&server, &user, &pause).await;
+        let (status, again) = signed(&server, &id, &secret, "ran", b"{}").await;
+        assert_eq!(
+            (status, &again["duplicate"]),
+            (200, &json!(true)),
+            "{again}"
+        );
+        assert_eq!(again["run_id"], ran["run_id"]);
+        post(&server, &user, &resume).await;
+        // Stored, its push lost: the replay pushes it, once.
+        let (status, lost) = signed(&server, &id, &secret, "lost", b"{}").await;
+        assert_eq!(status, 202, "{lost}");
+        let run: RunId = lost["run_id"].as_str().expect("run").parse().expect("id");
+        let url = server.redis.clone();
+        let popped = blocking(move || RedisRunQueue::open(url).pop().expect("pop")).await;
+        assert_eq!(popped, Some(run));
+        let (status, again) = signed(&server, &id, &secret, "lost", b"{}").await;
+        assert_eq!(status, 202, "{again}");
+        assert_eq!(again["run_id"], lost["run_id"]);
+        assert_eq!(queued(&server).await, [run]);
+        let (status, again) = signed(&server, &id, &secret, "lost", b"{}").await;
+        assert_eq!(
+            (status, &again["duplicate"]),
+            (200, &json!(true)),
+            "{again}"
+        );
+        assert_eq!(queued(&server).await, [run]);
+        assert_eq!(server.work().await, Some(run));
+        // Stored, its push lost, then paused: the replay holds it.
+        let (status, held) = signed(&server, &id, &secret, "held", b"{}").await;
+        assert_eq!(status, 202, "{held}");
+        let url = server.redis.clone();
+        blocking(move || RedisRunQueue::open(url).pop().expect("pop")).await;
+        post(&server, &user, &pause).await;
+        let (status, answer) = signed(&server, &id, &secret, "held", b"{}").await;
+        assert_eq!(status, 409, "{answer}");
+        let run = held["run_id"].as_str().expect("run");
+        assert!(run_of(&store, run)
+            .await
+            .events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::RunCancelled)));
+        assert_eq!(queued(&server).await, []);
+        // Held, then replayed after a resume: refused again, never run.
+        post(&server, &user, &resume).await;
+        let (status, answer) = signed(&server, &id, &secret, "held", b"{}").await;
+        assert_eq!(status, 409, "{answer}");
+        assert_eq!(queued(&server).await, []);
+    }
+}
+
 // What is refused, and fires nothing: 401 for a tampered body, a wrong or
-// missing signature, a timestamp over 5 minutes off, a missing event id or
-// one that is not 1 to 128 printable ASCII characters, an unknown trigger
-// or one that is not a webhook (so ids cannot be probed); 409 for a paused
-// trigger; 413 for a body over 32 KiB; 400 for one that is not UTF-8. A
-// rotated secret stops the old one.
+// missing signature, one for another event (79A), a timestamp over 5
+// minutes off, a missing event id or one that is not 1 to 128 visible
+// ASCII characters, an unknown trigger or one that is not a webhook (so ids
+// cannot be probed); 409 for a paused trigger; 413 for a body that makes
+// the run's input over 32 KiB (81A); 400 for one that is not UTF-8 or has a
+// NUL. A rotated secret stops the old one.
 #[tokio::test(flavor = "multi_thread")]
 async fn bad_requests_are_refused() {
     for store in stores() {
         let (server, user, id, secret) = setup(&store, 3).await;
         let at = now_s();
         let body = b"{}";
-        let good = sign(&secret, at, body);
+        let good = sign(&secret, "e", at, body);
         let cases: Vec<(&str, u16, (u16, Value))> = vec![
             (
                 "tampered",
@@ -195,7 +292,7 @@ async fn bad_requests_are_refused() {
                     body,
                     Some("e"),
                     Some(at),
-                    Some(sign("wrong", at, body)),
+                    Some(sign("wrong", "e", at, body)),
                 )
                 .await,
             ),
@@ -225,8 +322,8 @@ async fn bad_requests_are_refused() {
                     &id,
                     body,
                     Some("e"),
-                    Some(at - 301),
-                    Some(sign(&secret, at - 301, body)),
+                    Some(at - 400),
+                    Some(sign(&secret, "e", at - 400, body)),
                 )
                 .await,
             ),
@@ -238,8 +335,8 @@ async fn bad_requests_are_refused() {
                     &id,
                     body,
                     Some("e"),
-                    Some(at + 301),
-                    Some(sign(&secret, at + 301, body)),
+                    Some(at + 400),
+                    Some(sign(&secret, "e", at + 400, body)),
                 )
                 .await,
             ),
@@ -262,7 +359,7 @@ async fn bad_requests_are_refused() {
                     body,
                     Some("evt 1"),
                     Some(at),
-                    Some(good.clone()),
+                    Some(sign(&secret, "evt 1", at, body)),
                 )
                 .await,
             ),
@@ -275,7 +372,7 @@ async fn bad_requests_are_refused() {
                     body,
                     Some(&"e".repeat(129)),
                     Some(at),
-                    Some(good.clone()),
+                    Some(sign(&secret, &"e".repeat(129), at, body)),
                 )
                 .await,
             ),
@@ -300,10 +397,42 @@ async fn bad_requests_are_refused() {
                     &long,
                     Some("e"),
                     Some(at),
-                    Some(sign(&secret, at, &long)),
+                    Some(sign(&secret, "e", at, &long)),
                 )
                 .await
             }),
+            // 81A: the body after the trigger's input and a blank line.
+            ("too long with the input", 413, {
+                let input = "triage the incoming issue".len();
+                let long = vec![b'x'; protocol::MAX_MESSAGE_BYTES - input - 1];
+                hook(
+                    &server,
+                    &id,
+                    &long,
+                    Some("e"),
+                    Some(at),
+                    Some(sign(&secret, "e", at, &long)),
+                )
+                .await
+            }),
+            ("a NUL", 400, {
+                let bytes = b"{\"a\": \"\0\"}";
+                hook(
+                    &server,
+                    &id,
+                    bytes,
+                    Some("e"),
+                    Some(at),
+                    Some(sign(&secret, "e", at, bytes)),
+                )
+                .await
+            }),
+            // 79A: a captured request cannot be sent as another event.
+            (
+                "signed for another event",
+                401,
+                hook(&server, &id, body, Some("f"), Some(at), Some(good.clone())).await,
+            ),
             ("not utf-8", 400, {
                 let bytes = [0xff, 0xfe];
                 hook(
@@ -312,7 +441,7 @@ async fn bad_requests_are_refused() {
                     &bytes,
                     Some("e"),
                     Some(at),
-                    Some(sign(&secret, at, &bytes)),
+                    Some(sign(&secret, "e", at, &bytes)),
                 )
                 .await
             }),
@@ -320,6 +449,8 @@ async fn bad_requests_are_refused() {
         for (name, expected, (status, answer)) in cases {
             assert_eq!(status, expected, "{name}: {answer}");
         }
+        // None of them fired: this server's queue has nothing.
+        assert_eq!(queued(&server).await, []);
         // A schedule trigger has no hook.
         let agent = server.agent(&user, "digest", &[]).await;
         let (_, scheduled) = server
@@ -364,22 +495,29 @@ async fn bad_requests_are_refused() {
     }
 }
 
-/// A scheduler's step over schedule `id` of `user` at `now`, as a pass takes
-/// it: the trigger as read, fired for its tick and moved on. The run it
-/// fired, if any. (A whole pass fires every principal's due triggers, a
-/// batch at a time, on the shared Postgres store; its batching is
-/// `scheduler.rs`'s to test.)
-async fn step(server: &Server, user: &str, id: &str, now: i64) -> Option<RunId> {
-    let (store, url) = (server.store.clone(), server.redis.clone());
+/// Schedule `id` of `user` as a scheduler pass reads it.
+async fn read(server: &Server, user: &str, id: &str) -> server::StoredTrigger {
+    let store = server.store.clone();
     let owner = protocol::Owner::new(common::ISSUER, user.to_string(), "tenant-1");
     let id: server::TriggerId = id.parse().expect("id");
     blocking(move || {
-        let trigger = store
+        store
             .triggers()
             .expect("triggers")
             .trigger(&owner, id)
             .expect("read")
-            .expect("stored");
+            .expect("stored")
+    })
+    .await
+}
+
+/// A scheduler's step over `trigger`, as its pass read it, at `now`: fired
+/// for its tick and moved on. The run it fired, if any. (A whole pass fires
+/// every principal's due triggers, a batch at a time, on the shared
+/// Postgres store; its batching is `scheduler.rs`'s to test.)
+async fn step(server: &Server, trigger: &server::StoredTrigger, now: i64) -> Option<RunId> {
+    let (store, url, trigger) = (server.store.clone(), server.redis.clone(), trigger.clone());
+    blocking(move || {
         server::fire_due_trigger(store.as_ref(), &RedisRunQueue::open(url), &trigger, now)
             .expect("fire")
     })
@@ -407,10 +545,13 @@ async fn case_8_schedules_and_webhooks_end_to_end() {
         assert_eq!(status, 201, "{scheduled}");
         let schedule_id = scheduled["id"].as_str().expect("id").to_string();
         let tick = scheduled["next_fire_at"].as_i64().expect("next tick");
-        // Two schedulers take it at once, just after the tick: one task.
+        // Two schedulers read it due, just after the tick, and take it at
+        // once: one task.
+        let due = read(&server, &user, &schedule_id).await;
+        assert_eq!(due.next_fire_ms, Some(tick));
         let (one, two) = tokio::join!(
-            step(&server, &user, &schedule_id, tick + 1_000),
-            step(&server, &user, &schedule_id, tick + 1_000)
+            step(&server, &due, tick + 1_000),
+            step(&server, &due, tick + 1_000)
         );
         let mut runs: Vec<RunId> = one.into_iter().chain(two).collect();
         runs.dedup();
@@ -441,6 +582,7 @@ async fn case_8_schedules_and_webhooks_end_to_end() {
         let (status, answer) = signed(&server, &hook_id, &secret, "case-8b", b"{}").await;
         assert_eq!(status, 409, "{answer}");
         let later = tick + 10 * 60_000;
-        assert_eq!(step(&server, &user, &schedule_id, later).await, None);
+        let paused = read(&server, &user, &schedule_id).await;
+        assert_eq!(step(&server, &paused, later).await, None);
     }
 }

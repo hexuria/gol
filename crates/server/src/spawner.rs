@@ -169,7 +169,7 @@ pub(crate) fn settle_fire(
 
 /// Whether a run's log is still only its queued events: no worker ever
 /// scheduled it, and nothing ended it.
-fn still_waiting(events: &[protocol::Event]) -> bool {
+pub(crate) fn still_waiting(events: &[protocol::Event]) -> bool {
     events.iter().all(|event| {
         matches!(
             event.payload,
@@ -197,7 +197,7 @@ fn settle_existing(
 }
 
 /// Whether a stored log ended before a worker ever scheduled it.
-fn never_ran(events: &[protocol::Event]) -> bool {
+pub(crate) fn never_ran(events: &[protocol::Event]) -> bool {
     events.iter().any(|event| is_terminal(&event.payload))
         && !events
             .iter()

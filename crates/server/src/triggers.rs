@@ -94,27 +94,68 @@ const EVENT_RUN_NAMESPACE: uuid::Uuid =
 /// The event id a webhook fire answered, on its run.
 const EVENT_KEY: &str = "gol.event";
 
+/// What a webhook request did (Phase 4.3, decisions 76A and 80A).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hooked {
+    /// Queued this run for the event: its first delivery, or a retry that
+    /// pushed a run an earlier delivery stored but never pushed.
+    Started(RunId),
+    /// A replay of an event whose run is queued, running or done.
+    Duplicate(RunId),
+    /// Nothing: the trigger is paused, or was paused or resumed while the
+    /// event's run waited, so the run was held, now or on an earlier
+    /// delivery.
+    Refused,
+    /// Nothing: its agent is no longer the owner's.
+    AgentNotFound,
+    /// Nothing: the trigger is gone.
+    NotFound,
+}
+
 /// Fires webhook `trigger` for the sender's event `event` with `body`
-/// (Phase 4.3, decisions 74A and 77A): the run's id comes from the trigger
-/// and the event id, so a replay of the event fires nothing new; its input
-/// is the trigger's input, a blank line, and the body. Whether the event's
-/// run was already stored (a replay).
+/// (Phase 4.3, decisions 74A, 77A and 80A). The run's id comes from the
+/// trigger and the event id, so a replay of the event fires nothing new;
+/// its input is the trigger's input, a blank line, and the body. A replay
+/// is answered from the event's stored run: queued, running or done is a
+/// duplicate; held before it ran is refused again; still waiting (an
+/// earlier delivery stored it and failed before its push) is settled as
+/// the queue sweep settles it, by the generation it recorded.
 pub fn fire_webhook(
     store: &dyn RunStore,
     queue: &RedisRunQueue,
     trigger: &StoredTrigger,
     event: &str,
     body: &str,
-) -> Result<(Fired, bool), FireError> {
+) -> Result<Hooked, FireError> {
     let mut name = trigger.id.as_uuid().as_bytes().to_vec();
     name.extend_from_slice(event.as_bytes());
     let run = RunId::from_uuid(uuid::Uuid::new_v5(&EVENT_RUN_NAMESPACE, &name));
-    let replay = store
+    let stored = store
         .run(run)
-        .map_err(|error| FireError::NotStored(error.to_string()))?
-        .is_some();
+        .map_err(|error| FireError::NotStored(error.to_string()))?;
+    if let Some(stored) = stored {
+        if crate::spawner::never_ran(&stored.events) {
+            return Ok(Hooked::Refused);
+        }
+        if !crate::spawner::still_waiting(&stored.events) {
+            return Ok(Hooked::Duplicate(run));
+        }
+        return match settle_fired_run(queue, store, &stored.spec) {
+            Ok(Fire::Pushed) => Ok(Hooked::Started(run)),
+            Ok(Fire::Found) => Ok(Hooked::Duplicate(run)),
+            Ok(Fire::Held) => Ok(Hooked::Refused),
+            Err(message) => Err(FireError::MaybeStored { run, message }),
+        };
+    }
     let key = Key::Event(run, event.to_string(), body.to_string());
-    fire(store, queue, &trigger.owner, trigger.id, Some(key)).map(|fired| (fired, replay))
+    Ok(
+        match fire(store, queue, &trigger.owner, trigger.id, Some(key))? {
+            Fired::Run(run) => Hooked::Started(run),
+            Fired::Paused | Fired::Moved => Hooked::Refused,
+            Fired::AgentNotFound => Hooked::AgentNotFound,
+            Fired::NotFound => Hooked::NotFound,
+        },
+    )
 }
 
 /// The namespace of a scheduled fire's run id (UUID v5 over the trigger and
