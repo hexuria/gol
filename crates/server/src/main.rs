@@ -87,8 +87,11 @@ async fn main() {
         .await
         .expect("bind");
     // Every server sweeps its host's Box sandboxes and volumes, queue or
-    // not: quick Box turns leave volumes too. The workers share the sweep's
-    // host, so it sees what they made.
+    // not: quick Box turns leave volumes too. The workers share this host
+    // with the sweep. The router made its own above, so with Docker
+    // (GOL_START_BOX=1) the sweep sees quick turns' sandboxes and volumes on
+    // the one daemon; the default in-process host's records are the
+    // router's alone, and this sweep does not see them.
     let sandbox = sandbox_from_env();
     if let Err(message) = start_sandbox_sweep(stores.runs.clone(), sandbox.clone()) {
         eprintln!("gol: refusing to start: sandbox sweep: {message}");

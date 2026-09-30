@@ -713,27 +713,29 @@ fn an_open_turns_volume_is_kept_between_deliveries() {
 #[test]
 fn a_local_runs_volume_is_left_to_the_desktop() {
     for store in stores() {
-        let mut local = spec();
-        local.placement = ExecutionPlacement::Local;
-        store
-            .put_run(StoredRun {
-                spec: local.clone(),
-                events: queued_events(&local),
-            })
-            .expect("put run");
-        store
-            .append_events(
-                local.run_id,
-                vec![event(&local, EventPayload::RunCancelled)],
-            )
-            .expect("cancel");
-        let sandboxes = Sandboxes::default();
-        let volume = box_workspace_volume(local.run_id);
-        sandboxes.volume(&volume);
-        let removed = sweep_sandboxes(store.as_ref(), &sandboxes).expect("sweep");
-        assert!(removed.is_empty(), "{removed:?}");
-        assert!(sandboxes.volume_removals().is_empty());
-        assert_eq!(sandboxes.volumes(), HashSet::from([volume]));
+        for placement in [ExecutionPlacement::Local, ExecutionPlacement::Reverse] {
+            let mut desktop = spec();
+            desktop.placement = placement;
+            store
+                .put_run(StoredRun {
+                    spec: desktop.clone(),
+                    events: queued_events(&desktop),
+                })
+                .expect("put run");
+            store
+                .append_events(
+                    desktop.run_id,
+                    vec![event(&desktop, EventPayload::RunCancelled)],
+                )
+                .expect("cancel");
+            let sandboxes = Sandboxes::default();
+            let volume = box_workspace_volume(desktop.run_id);
+            sandboxes.volume(&volume);
+            let removed = sweep_sandboxes(store.as_ref(), &sandboxes).expect("sweep");
+            assert!(removed.is_empty(), "{placement:?}: {removed:?}");
+            assert!(sandboxes.volume_removals().is_empty());
+            assert_eq!(sandboxes.volumes(), HashSet::from([volume]));
+        }
     }
 }
 
