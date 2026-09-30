@@ -693,21 +693,26 @@ impl Worker {
                 return append(seen, tail);
             }
         };
-        // Its tools: echo, and the catalog tools its owner's manifest names
-        // (8a). A store or a catalog that cannot answer now leaves the run
-        // to its next delivery, once its lease expires: a tool it had must
-        // not go missing mid-run.
-        let named = self
-            .store
-            .agent(spec.agent_id)
-            .map_err(|error| format!("run {run_id}: its agent: {error}"))?
-            .filter(|agent| agent.owner.is(&spec.owner))
-            .map(|agent| agent.manifest.tools)
-            .ok_or_else(|| {
-                format!(
-                    "run {run_id}: its agent is unavailable; it is retried once its lease expires"
-                )
-            })?;
+        // Its tools: echo, and, with a catalog, the catalog tools its
+        // owner's manifest names (8a). A store that cannot answer, or an
+        // agent that is missing or another principal's, leaves the run to
+        // its next delivery, once its lease expires, as a catalog that does
+        // not load does: a tool it had must not go missing mid-run. Without
+        // a catalog there is nothing to look up.
+        let named = match &self.catalog_dir {
+            None => Vec::new(),
+            Some(_) => self
+                .store
+                .agent(spec.agent_id)
+                .map_err(|error| format!("run {run_id}: its agent: {error}"))?
+                .filter(|agent| agent.owner.is(&spec.owner))
+                .map(|agent| agent.manifest.tools)
+                .ok_or_else(|| {
+                    format!(
+                        "run {run_id}: its agent is unavailable; it is retried once its lease expires"
+                    )
+                })?,
+        };
         let tools = crate::tools::RunTools::load(self.catalog_dir.as_deref(), named)
             .map_err(|error| format!("run {run_id}: {error}"))?;
         let models = self.models.model_for(spec);
