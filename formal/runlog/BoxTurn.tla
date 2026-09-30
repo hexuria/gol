@@ -28,6 +28,7 @@
 \*   "nosweep"   the reaper does not clean up after an ended turn;
 \*   "anyrun"    the volume sweep does not check that the turn has ended;
 \*   "once"      the volume sweep removes a run's volume once, never again;
+\*   "novsweep"  no volume sweep;
 \*   "volforce"  the volume removal is not refused while a sandbox mounts it;
 \*   "set"       the reaper removes only what a Redis set names: a worker adds
 \*               its name before it provisions, and a removal confirmed gone
