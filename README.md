@@ -41,7 +41,14 @@ A run's model calls go to its work model's provider with the platform's key for 
 
 ## Tools
 
-Every run can call `echo`. With `GOL_CATALOG_DIR` set to a catalog directory (a `harness.toml` naming tools, skills and MCP servers), a run can also call the catalog tools its agent's manifest names in `tools`. It still needs each tool's capability (an MCP tool's is `mcp.<server>.<tool>`). A catalog tool the manifest does not name is not offered. Each run loads the catalog itself, so its MCP servers are its own and start on their first call. A catalog that does not load stops the server from starting, and one that stops loading later fails the run that needs it.
+Every run can call `echo`. With `GOL_CATALOG_DIR` set to a catalog directory (a `harness.toml` naming tools, skills and MCP servers), a run can also call the catalog tools its agent's manifest names in `tools`. It still needs each tool's capability; an MCP tool's is `mcp.<server>.<tool>`.
+
+- A catalog tool the manifest does not name is not offered. A catalog tool named `echo` is left out, since the built-in one is always there.
+- A run that names catalog tools loads the catalog itself, so its MCP servers are its own and start on their first call.
+- An MCP server is given `PATH`, `HOME`, `LANG` and `TMPDIR`, and the host variables its catalog entry lists in `env`. Nothing else of the server's environment reaches it: not its keys, and not its database address.
+- A catalog that does not load stops the server from starting. If it stops loading later, a queued run that needs it is left open and tried again once its lease expires. An inline run that needs it ends failed ("the tool catalog did not load"), with the detail on stderr.
+- Catalog skills are not given to runs yet.
+- Capabilities are not an allowlist. Anyone who can store an agent can grant it an `mcp.*` capability and call that tool, and MCP servers run on the gol host. Put only tools that every principal of this server may call in a catalog.
 
 ## Authentication
 

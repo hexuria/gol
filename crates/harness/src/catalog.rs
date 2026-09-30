@@ -75,9 +75,17 @@ struct McpServer {
     /// does not bound a write: a server that stops reading its stdin can still
     /// block a call whose input overflows the pipe.
     timeout_ms: Option<u64>,
+    /// The environment variables the server is given, beside `BASE_ENV`:
+    /// nothing else of the host's environment reaches it (its keys and
+    /// database address included).
+    #[serde(default)]
+    env: Vec<String>,
     #[serde(default)]
     tools: Vec<McpToolDecl>,
 }
+
+/// The host's environment variables every MCP server is given.
+const BASE_ENV: [&str; 4] = ["PATH", "HOME", "LANG", "TMPDIR"];
 
 #[derive(Debug, Deserialize)]
 struct McpToolDecl {
@@ -223,6 +231,7 @@ pub fn load_catalog(dir: impl AsRef<Path>) -> Result<LoadedCatalog, LoadError> {
             server_name: server.name.clone(),
             command: server.command,
             args: server.args,
+            env: server.env,
             timeout: Duration::from_millis(server.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
             live: None,
         }));
@@ -322,6 +331,7 @@ struct PendingMcp {
     server_name: String,
     command: String,
     args: Vec<String>,
+    env: Vec<String>,
     timeout: Duration,
     live: Option<McpSession>,
 }
@@ -334,6 +344,7 @@ impl PendingMcp {
                 &self.server_name,
                 &self.command,
                 &self.args,
+                &self.env,
                 self.timeout,
             )
             .map_err(McpFailure::message)?;
@@ -372,10 +383,18 @@ impl McpSession {
         name: &str,
         command: &str,
         args: &[String],
+        env: &[String],
         timeout: Duration,
     ) -> Result<Self, McpFailure> {
+        let given = BASE_ENV
+            .iter()
+            .copied()
+            .chain(env.iter().map(String::as_str))
+            .filter_map(|key| std::env::var_os(key).map(|value| (key.to_string(), value)));
         let mut child = Command::new(command)
             .args(args)
+            .env_clear()
+            .envs(given)
             .current_dir(dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -744,6 +763,7 @@ mod tests {
             server_name: "local".to_string(),
             command: "gol-no-such-command".to_string(),
             args: Vec::new(),
+            env: Vec::new(),
             timeout: Duration::from_millis(100),
             live: None,
         }));

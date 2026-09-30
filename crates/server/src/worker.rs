@@ -693,22 +693,19 @@ impl Worker {
                 return append(seen, tail);
             }
         };
-        // Its tools: echo, and the catalog tools its manifest names (8a).
-        let named = match self.store.agent(spec.agent_id) {
-            Ok(agent) => agent.map(|agent| agent.manifest.tools).unwrap_or_default(),
-            Err(error) => {
-                eprintln!("gol: queue worker: run {run_id}: its agent: {error}");
-                Vec::new()
-            }
-        };
-        let tools = match crate::tools::RunTools::load(self.catalog_dir.as_deref(), named) {
-            Ok(tools) => tools,
-            Err(message) => {
-                let mut tail = driver.events()[seen..].to_vec();
-                tail.push(run_failed_event(spec, FailureClass::Environment, message));
-                return append(seen, tail);
-            }
-        };
+        // Its tools: echo, and the catalog tools its owner's manifest names
+        // (8a). A store or a catalog that cannot answer now leaves the run
+        // to its next delivery, once its lease expires: a tool it had must
+        // not go missing mid-run.
+        let named = self
+            .store
+            .agent(spec.agent_id)
+            .map_err(|error| format!("run {run_id}: its agent: {error}"))?
+            .filter(|agent| agent.owner.is(&spec.owner))
+            .map(|agent| agent.manifest.tools)
+            .unwrap_or_default();
+        let tools = crate::tools::RunTools::load(self.catalog_dir.as_deref(), named)
+            .map_err(|error| format!("run {run_id}: {error}"))?;
         let models = self.models.model_for(spec);
         let memory = RunMemory::new(self.memory.as_ref());
         let mut refused = None;

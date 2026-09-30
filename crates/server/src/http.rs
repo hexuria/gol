@@ -490,14 +490,20 @@ async fn start_run(state: &AppState, owner: Owner, body: RunBody) -> Result<RunS
                 None,
                 &tools,
             ),
-            Err(message) => (
-                vec![run_failed_event(
-                    &spec_for_run,
-                    FailureClass::Environment,
-                    message.clone(),
-                )],
-                Err(RunStartError::Decider(message)),
-            ),
+            // A fixed reason in the log and the answer; the detail, which
+            // may quote the catalog file, goes to stderr only.
+            Err(message) => {
+                eprintln!("gol: run {}: {message}", spec_for_run.run_id);
+                let reason = "the tool catalog did not load".to_string();
+                (
+                    vec![run_failed_event(
+                        &spec_for_run,
+                        FailureClass::Environment,
+                        reason.clone(),
+                    )],
+                    Err(RunStartError::Decider(reason)),
+                )
+            }
         };
         // Append, never overwrite: anything stored while Jev ran stays. When the
         // run is already terminal the store keeps its log and refuses these.
