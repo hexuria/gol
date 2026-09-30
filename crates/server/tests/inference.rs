@@ -1296,6 +1296,10 @@ impl SandboxHost for NoProvision {
         Ok(true)
     }
 
+    fn list(&self) -> Result<Vec<String>, server::SandboxError> {
+        Ok(Vec::new())
+    }
+
     fn launches_docker(&self) -> bool {
         false
     }
@@ -1569,6 +1573,10 @@ impl SandboxHost for ProvisionLeavesSandbox {
 
     fn absent(&self, _name: &str) -> Result<bool, server::SandboxError> {
         Ok(false)
+    }
+
+    fn list(&self) -> Result<Vec<String>, server::SandboxError> {
+        Ok(Vec::new())
     }
 
     fn launches_docker(&self) -> bool {

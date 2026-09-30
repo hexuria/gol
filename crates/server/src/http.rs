@@ -539,9 +539,8 @@ async fn create_coworker_turn(
 /// A coworker turn posted with `background: true` (Phase 3.6): stored queued
 /// and marked as a turn (decision 62A), pushed for a worker, and answered 202
 /// at once. A subscription turn's model call is the desktop's, so it has
-/// nothing to run in the background (63A); a Box turn does not run in the
-/// background yet (67A: its sandbox needs a lease fence and a model first);
-/// without a queue there is no worker to run it (64A).
+/// nothing to run in the background (63A); without a queue there is no
+/// worker to run it (64A). A Box turn runs in a sandbox per delivery (82A).
 async fn background_turn(
     state: &AppState,
     principal: Principal,
@@ -553,11 +552,6 @@ async fn background_turn(
     ) {
         return Err(ApiError::BadRequest(
             "a subscription turn cannot run in the background",
-        ));
-    }
-    if body.placement == ExecutionPlacement::Box {
-        return Err(ApiError::BadRequest(
-            "a Box turn cannot run in the background yet",
         ));
     }
     let mut spec = build_spec(

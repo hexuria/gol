@@ -847,6 +847,10 @@ impl SandboxHost for NoProvision {
         Ok(true)
     }
 
+    fn list(&self) -> Result<Vec<String>, SandboxError> {
+        Ok(Vec::new())
+    }
+
     fn launches_docker(&self) -> bool {
         false
     }

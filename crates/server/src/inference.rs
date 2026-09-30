@@ -102,6 +102,32 @@ pub fn box_container_name(run_id: RunId) -> String {
     format!("gol-box-{run_id}")
 }
 
+/// The sandbox of attempt `attempt` (its delivery count) of a background
+/// Box turn: one per attempt, so a worker whose lease ran out touches only
+/// its own (decision 82A).
+pub fn box_attempt_name(run_id: RunId, attempt: u32) -> String {
+    format!("gol-box-{run_id}-{attempt}")
+}
+
+/// The run a Box sandbox name belongs to: `gol-box-<run>` or
+/// `gol-box-<run>-<attempt>`, the run id as gol writes it (lowercase). None
+/// for any other name, so the sweep leaves what gol did not make.
+pub fn box_run_of(name: &str) -> Option<RunId> {
+    let rest = name.strip_prefix("gol-box-")?;
+    let (run, attempt) = rest.split_at_checked(36)?;
+    if run.bytes().any(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    let attempt_ok = attempt.is_empty()
+        || attempt
+            .strip_prefix('-')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    if !attempt_ok {
+        return None;
+    }
+    run.parse().ok()
+}
+
 /// Ephemeral workspace for one run. The shared volume `gol-workspace` is not mounted.
 pub fn box_workspace_volume(run_id: impl std::fmt::Display) -> String {
     format!("gol-workspace-{run_id}")
@@ -168,6 +194,9 @@ pub trait SandboxHost: Send + Sync {
     /// absence lets a turn end without removing its sandbox. Every host answers
     /// it itself: `exists` cannot tell "gone" from "cannot ask".
     fn absent(&self, name: &str) -> Result<bool, SandboxError>;
+    /// The names of the Box sandboxes (`gol-box-`) this host has, running or
+    /// not: what the reaper looks through (decision 86C).
+    fn list(&self) -> Result<Vec<String>, SandboxError>;
     fn launches_docker(&self) -> bool;
 }
 
@@ -214,6 +243,19 @@ impl SandboxHost for MemorySandbox {
         Ok(!self.exists(name))
     }
 
+    fn list(&self) -> Result<Vec<String>, SandboxError> {
+        let mut names: Vec<String> = self
+            .live
+            .lock()
+            .expect("sandbox")
+            .iter()
+            .filter(|name| name.starts_with("gol-box-"))
+            .cloned()
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
     fn launches_docker(&self) -> bool {
         false
     }
@@ -238,22 +280,40 @@ where
     }
 }
 
+/// A Docker call that answers its standard output.
+type DockerOutput = dyn Fn(&[String]) -> Result<String, String> + Send + Sync;
+
 pub struct DockerSandbox {
     command: Arc<dyn RunDocker>,
+    output: Arc<DockerOutput>,
 }
 
 impl DockerSandbox {
     pub fn new() -> Self {
-        Self::from_command(docker)
+        Self {
+            command: Arc::new(docker),
+            output: Arc::new(docker_output),
+        }
     }
 
+    /// A host whose commands `command` runs; it cannot list its sandboxes.
     pub fn from_command<F>(command: F) -> Self
     where
         F: Fn(&[String]) -> Result<(), String> + Send + Sync + 'static,
     {
         Self {
             command: Arc::new(command),
+            output: Arc::new(|_: &[String]| Err("this host cannot list".to_string())),
         }
+    }
+
+    /// A host whose listings `output` answers.
+    pub fn with_output<F>(mut self, output: F) -> Self
+    where
+        F: Fn(&[String]) -> Result<String, String> + Send + Sync + 'static,
+    {
+        self.output = Arc::new(output);
+        self
     }
 
     fn command(&self, args: &[&str]) -> Result<(), SandboxError> {
@@ -278,8 +338,11 @@ impl SandboxHost for DockerSandbox {
         if name.is_empty() || name == "gol-agent-box" {
             return Err(SandboxError::Host(format!("refusing sandbox name {name}")));
         }
-        let run_id = name.strip_prefix("gol-box-").unwrap_or(name);
-        let mount = workspace_mount(run_id);
+        // One workspace per run, whichever attempt's sandbox mounts it.
+        let mount = match box_run_of(name) {
+            Some(run_id) => workspace_mount(run_id),
+            None => workspace_mount(name.strip_prefix("gol-box-").unwrap_or(name)),
+        };
         self.command(&[
             "create",
             "--name",
@@ -318,6 +381,28 @@ impl SandboxHost for DockerSandbox {
         }
     }
 
+    fn list(&self) -> Result<Vec<String>, SandboxError> {
+        let args: Vec<String> = [
+            "ps",
+            "--all",
+            "--filter",
+            "name=gol-box-",
+            "--format",
+            "{{.Names}}",
+        ]
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect();
+        let listed =
+            (self.output)(&args).map_err(|message| SandboxError::Host(last_line(&message)))?;
+        Ok(listed
+            .lines()
+            .map(str::trim)
+            .filter(|name| name.starts_with("gol-box-"))
+            .map(str::to_string)
+            .collect())
+    }
+
     fn launches_docker(&self) -> bool {
         true
     }
@@ -342,19 +427,83 @@ fn last_line(message: &str) -> String {
     format!("{kept}…")
 }
 
+/// The longest a Docker command may take before it is killed: a daemon
+/// that hangs must not hold a worker, or the sandbox sweep, for good.
+const DOCKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 fn docker(args: &[String]) -> Result<(), String> {
-    let output = Command::new("docker")
+    docker_output(args).map(|_| ())
+}
+
+/// Runs `docker args`, killed after `DOCKER_TIMEOUT`: its standard output,
+/// or why it failed.
+fn docker_output(args: &[String]) -> Result<String, String> {
+    run_within("docker", args, DOCKER_TIMEOUT)
+}
+
+/// Runs `program args`, killed after `timeout`: its standard output, or why
+/// it failed.
+fn run_within(
+    program: &str,
+    args: &[String],
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    use std::io::Read;
+    let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(())
+    // The pipes are drained as the command runs, so a full pipe cannot
+    // stall it.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(|error| error.to_string())? {
+            Some(status) => break status,
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{program} {args:?} did not finish in {}ms",
+                    timeout.as_millis()
+                ));
+            }
+        }
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    if status.success() {
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
     } else {
         Err(format!(
-            "docker {args:?} exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            "{program} {args:?} exited {status}: {}",
+            String::from_utf8_lossy(&stderr).trim()
         ))
     }
 }
@@ -459,12 +608,7 @@ pub(crate) fn finish_turn(
     }
     let completion = match &spec.work_model.credential {
         CredentialSource::PlatformGateway => {
-            match poster.complete(&GatewayCall {
-                run_id: spec.run_id,
-                input: spec.input.clone(),
-                model_name: spec.work_model.model_name.clone(),
-                placement: spec.placement,
-            }) {
+            match poster.complete(&gateway_call(&spec)) {
                 Ok(text) => Some(text),
                 Err(message) => {
                     // The sandbox goes first. A turn whose sandbox could not be
@@ -635,6 +779,24 @@ pub fn fail_turn(
     })
 }
 
+/// The gateway call of turn `spec`.
+pub(crate) fn gateway_call(spec: &RunSpec) -> GatewayCall {
+    GatewayCall {
+        run_id: spec.run_id,
+        input: spec.input.clone(),
+        model_name: spec.work_model.model_name.clone(),
+        placement: spec.placement,
+    }
+}
+
+/// The events that store turn `spec`'s completion `text`, the last one
+/// terminal.
+pub(crate) fn completion_events(spec: &RunSpec, text: &str) -> Vec<Event> {
+    let mut events = Vec::new();
+    append_completion(spec, &mut events, text);
+    events
+}
+
 /// Ends a turn that failed before anything else could end it. The store
 /// refuses the append if another writer ended the run first.
 fn end_failed(store: &dyn RunStore, spec: &RunSpec, class: FailureClass, message: String) {
@@ -768,3 +930,148 @@ fn placement_name(placement: ExecutionPlacement) -> &'static str {
 }
 
 pub type SharedPoster = Arc<dyn GatewayPoster>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// What `box_run_of` accepts, said another way: the prefix, a run id,
+    /// then nothing or a dash and digits.
+    fn run_oracle(name: &str) -> Option<RunId> {
+        let rest = name.strip_prefix("gol-box-")?;
+        if rest.len() < 36 || !rest.is_char_boundary(36) {
+            return None;
+        }
+        let (run, attempt) = rest.split_at(36);
+        if run.chars().any(|c| c.is_ascii_uppercase()) {
+            return None;
+        }
+        let digits = attempt.strip_prefix('-');
+        let attempt_ok = attempt.is_empty()
+            || digits.is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()));
+        attempt_ok.then(|| run.parse().ok()).flatten()
+    }
+
+    #[test]
+    fn a_box_sandbox_name_names_its_run() {
+        let run = RunId::new();
+        assert_eq!(box_run_of(&box_container_name(run)), Some(run));
+        assert_eq!(box_run_of(&box_attempt_name(run, 12)), Some(run));
+        assert_eq!(box_run_of(&format!("gol-box-{run}-")), None);
+        assert_eq!(box_run_of(&format!("gol-box-{run}-1x")), None);
+        assert_eq!(box_run_of(&format!("gol-box-{run}x")), None);
+        let upper = run.to_string().to_uppercase();
+        assert_eq!(box_run_of(&format!("gol-box-{upper}")), None);
+        assert_eq!(box_run_of("gol-box-"), None);
+        assert_eq!(box_run_of("gol-agent-local"), None);
+    }
+
+    // The host's listing: one name a line, only Box sandboxes, trimmed.
+    #[test]
+    fn a_docker_listing_reads_its_box_sandboxes() {
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = asked.clone();
+        let sandbox = DockerSandbox::from_command(|_: &[String]| Ok(())).with_output(
+            move |args: &[String]| {
+                *seen.lock().expect("args") = args.to_vec();
+                Ok("gol-box-a\nother\n  gol-box-b  \n\n".to_string())
+            },
+        );
+        assert_eq!(
+            sandbox.list().expect("list"),
+            ["gol-box-a".to_string(), "gol-box-b".to_string()]
+        );
+        // Stopped ones too: every Box sandbox exits once its command ends.
+        assert_eq!(
+            *asked.lock().expect("args"),
+            [
+                "ps",
+                "--all",
+                "--filter",
+                "name=gol-box-",
+                "--format",
+                "{{.Names}}"
+            ]
+        );
+        let failing = DockerSandbox::from_command(|_: &[String]| Ok(()));
+        assert!(failing.list().is_err());
+    }
+
+    // Every attempt's sandbox mounts its run's one workspace.
+    #[test]
+    fn an_attempts_sandbox_mounts_its_runs_workspace() {
+        let run = RunId::new();
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let calls = seen.clone();
+        let sandbox = DockerSandbox::from_command(move |args: &[String]| {
+            calls.lock().expect("calls").push(args.to_vec());
+            Ok(())
+        });
+        sandbox
+            .provision(&box_attempt_name(run, 3))
+            .expect("provision");
+        let create = seen.lock().expect("calls")[0].clone();
+        assert!(
+            create.contains(&format!("gol-workspace-{run}:/workspace")),
+            "{create:?}"
+        );
+    }
+
+    // A command that hangs is killed at its timeout, not waited for.
+    #[test]
+    fn a_hung_command_is_killed_at_its_timeout() {
+        let started = std::time::Instant::now();
+        let hung = run_within(
+            "sleep",
+            &["5".to_string()],
+            std::time::Duration::from_millis(200),
+        );
+        assert!(hung.expect_err("killed").contains("did not finish"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        let quick = run_within(
+            "echo",
+            &["gol-box-a".to_string()],
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(quick.expect("ran"), "gol-box-a\n");
+    }
+
+    proptest! {
+        // Any name: no panic, and a run exactly where the oracle finds one.
+        #[test]
+        fn any_name_is_read_only_in_its_form(
+            name in prop_oneof![
+                any::<String>(),
+                "gol-box-[0-9a-f-]{30,40}(-[0-9x]{0,3})?",
+                (any::<u128>(), "(-[0-9]{0,3}|[a-z-]{0,2})").prop_map(|(n, suffix)| {
+                    format!("gol-box-{}{suffix}", uuid::Uuid::from_u128(n))
+                }),
+            ],
+        ) {
+            prop_assert_eq!(box_run_of(&name), run_oracle(&name));
+        }
+
+        #[test]
+        fn an_attempt_name_reads_back(attempt in any::<u32>()) {
+            let run = RunId::new();
+            prop_assert_eq!(box_run_of(&box_attempt_name(run, attempt)), Some(run));
+        }
+
+        // Any listing: no panic, and each name kept is a trimmed line that
+        // starts with the prefix.
+        #[test]
+        fn any_listing_keeps_only_box_lines(listing in any::<String>()) {
+            let text = listing.clone();
+            let sandbox = DockerSandbox::from_command(|_: &[String]| Ok(()))
+                .with_output(move |_: &[String]| Ok(text.clone()));
+            let expected: Vec<String> = listing
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("gol-box-"))
+                .map(str::to_string)
+                .collect();
+            prop_assert_eq!(sandbox.list().expect("list"), expected);
+        }
+    }
+}
