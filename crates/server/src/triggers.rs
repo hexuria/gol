@@ -77,8 +77,45 @@ pub fn fire_trigger(
     fire(store, queue, owner, id, None)
 }
 
-/// A scheduled fire: its run id, and its tick.
-type Tick = (RunId, i64);
+/// What keys a fire's run id, when something does.
+enum Key {
+    /// A scheduled fire: its run id, and its tick.
+    Tick(RunId, i64),
+    /// A webhook's fire (Phase 4.3): its run id, the sender's event id, and
+    /// the body, which follows the trigger's input.
+    Event(RunId, String, String),
+}
+
+/// The namespace of a webhook fire's run id (UUID v5 over the trigger and
+/// the sender's event id).
+const EVENT_RUN_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x7d3a_19c4_e2b8_4a56_9f01_3c6e_8b24_d5a7);
+
+/// The event id a webhook fire answered, on its run.
+const EVENT_KEY: &str = "gol.event";
+
+/// Fires webhook `trigger` for the sender's event `event` with `body`
+/// (Phase 4.3, decisions 74A and 77A): the run's id comes from the trigger
+/// and the event id, so a replay of the event fires nothing new; its input
+/// is the trigger's input, a blank line, and the body. Whether the event's
+/// run was already stored (a replay).
+pub fn fire_webhook(
+    store: &dyn RunStore,
+    queue: &RedisRunQueue,
+    trigger: &StoredTrigger,
+    event: &str,
+    body: &str,
+) -> Result<(Fired, bool), FireError> {
+    let mut name = trigger.id.as_uuid().as_bytes().to_vec();
+    name.extend_from_slice(event.as_bytes());
+    let run = RunId::from_uuid(uuid::Uuid::new_v5(&EVENT_RUN_NAMESPACE, &name));
+    let replay = store
+        .run(run)
+        .map_err(|error| FireError::NotStored(error.to_string()))?
+        .is_some();
+    let key = Key::Event(run, event.to_string(), body.to_string());
+    fire(store, queue, &trigger.owner, trigger.id, Some(key)).map(|fired| (fired, replay))
+}
 
 /// The namespace of a scheduled fire's run id (UUID v5 over the trigger and
 /// its tick).
@@ -99,7 +136,7 @@ pub fn fire_trigger_at(
     let mut name = id.as_uuid().as_bytes().to_vec();
     name.extend_from_slice(&tick_ms.to_le_bytes());
     let run = RunId::from_uuid(uuid::Uuid::new_v5(&TICK_RUN_NAMESPACE, &name));
-    fire(store, queue, owner, id, Some((run, tick_ms)))
+    fire(store, queue, owner, id, Some(Key::Tick(run, tick_ms)))
 }
 
 fn fire(
@@ -107,7 +144,7 @@ fn fire(
     queue: &RedisRunQueue,
     owner: &Owner,
     id: TriggerId,
-    tick: Option<Tick>,
+    key: Option<Key>,
 ) -> Result<Fired, FireError> {
     let unread = |error: StoreError| FireError::NotStored(error.to_string());
     let triggers = store
@@ -119,8 +156,10 @@ fn fire(
     if !trigger.enabled {
         return Ok(Fired::Paused);
     }
-    if tick.is_some_and(|(_, at)| trigger.next_fire_ms != Some(at)) {
-        return Ok(Fired::Moved);
+    if let Some(Key::Tick(_, at)) = key {
+        if trigger.next_fire_ms != Some(at) {
+            return Ok(Fired::Moved);
+        }
     }
     let Some(agent) = store
         .agent(trigger.agent_id)
@@ -134,10 +173,18 @@ fn fire(
         agent.manifest.version,
         agent.manifest.required_capabilities,
     );
-    if let Some((run_id, at)) = tick {
-        // A top-level run: its lineage names no root, so the id is its own.
-        spec.run_id = run_id;
-        spec.metadata.insert(TICK_KEY.to_string(), at.to_string());
+    // A top-level run: its lineage names no root, so the id is its own.
+    match key {
+        Some(Key::Tick(run_id, at)) => {
+            spec.run_id = run_id;
+            spec.metadata.insert(TICK_KEY.to_string(), at.to_string());
+        }
+        Some(Key::Event(run_id, event, body)) => {
+            spec.run_id = run_id;
+            spec.input = format!("{}\n\n{body}", spec.input);
+            spec.metadata.insert(EVENT_KEY.to_string(), event);
+        }
+        None => {}
     }
     let run = spec.run_id;
     // Why the run was held, if it was.

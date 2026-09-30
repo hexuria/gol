@@ -36,7 +36,8 @@ use crate::store::{
 use crate::stream::{outbox_stream, run_stream, SseBody, Streams};
 use crate::surface::{ag_ui_events, json_render_spec};
 use crate::triggers::{
-    trigger_thread, webhook_secret, MAX_TRIGGERS, MIN_WEBHOOK_KEY_BYTES, TRIGGER_KEY,
+    trigger_thread, webhook_secret, FireError, Fired, MAX_TRIGGERS, MIN_WEBHOOK_KEY_BYTES,
+    TRIGGER_KEY,
 };
 
 #[derive(Clone)]
@@ -297,6 +298,7 @@ fn router_with_state(state: AppState) -> Router {
         .route("/v1/triggers/{id}/pause", post(pause_trigger))
         .route("/v1/triggers/{id}/resume", post(resume_trigger))
         .route("/v1/triggers/{id}/rotate", post(rotate_trigger))
+        .route("/hooks/{id}", post(webhook_hook))
         .route("/v1/coworker/turns", post(create_coworker_turn))
         .route(
             "/v1/coworker/turns/{id}/completion",
@@ -1672,6 +1674,85 @@ async fn rotate_trigger(
     .await?;
     let view = with_secret(&state, &trigger, trigger_view(&trigger));
     Ok((no_store(), Json(view)).into_response())
+}
+
+/// `POST /hooks/{id}`: a signed request fires webhook trigger `id`, with
+/// no bearer token (decisions 74A-77A). 202 with the run it queued; a
+/// replay of an event 200 with that event's run and `duplicate`; 401 for a
+/// bad or stale signature, a missing event id, and an unknown trigger or
+/// one that is not a webhook, alike, so ids cannot be probed; 409 while
+/// paused; 413 over `MAX_MESSAGE_BYTES`; 400 for a body that is not UTF-8.
+async fn webhook_hook(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response, ApiError> {
+    let (Some(key), Some(queue)) = (state.webhook_key.clone(), state.queue.clone()) else {
+        return Err(ApiError::Unavailable("webhooks are not available"));
+    };
+    // Refused before any lookup or MAC, so it tells a prober nothing.
+    if body.len() > MAX_MESSAGE_BYTES {
+        return Err(ApiError::TooLarge("the body is over 32 KiB"));
+    }
+    let id: TriggerId = id.parse().map_err(|_| ApiError::Unauthorized)?;
+    let (Some(event), Some(timestamp), Some(signature)) = (
+        header_value(&headers, "x-gol-event"),
+        header_value(&headers, "x-gol-timestamp"),
+        header_value(&headers, "x-gol-signature"),
+    ) else {
+        return Err(ApiError::Unauthorized);
+    };
+    if !crate::webhook::is_event_id(&event) {
+        return Err(ApiError::Unauthorized);
+    }
+    let store = state.store.clone();
+    let fired = tokio::task::spawn_blocking(move || {
+        let Some(triggers) = store.triggers() else {
+            return Err(ApiError::NoTriggers);
+        };
+        let Some(trigger) = triggers.webhook_trigger(id).map_err(ApiError::from)? else {
+            return Err(ApiError::Unauthorized);
+        };
+        let signed = webhook_secret(&key, &trigger).is_some_and(|secret| {
+            let now_s = Timestamp::now().as_unix_millis() / 1000;
+            crate::webhook::verify(&secret, &timestamp, &signature, &body, now_s)
+        });
+        if !signed {
+            return Err(ApiError::Unauthorized);
+        }
+        let Ok(body) = std::str::from_utf8(&body) else {
+            return Err(ApiError::BadRequest("the body is not UTF-8"));
+        };
+        Ok(crate::triggers::fire_webhook(
+            store.as_ref(),
+            &queue,
+            &trigger,
+            &event,
+            body,
+        ))
+    })
+    .await
+    .map_err(|error| ApiError::Store(error.to_string()))??;
+    match fired {
+        Ok((Fired::Run(run), false)) => Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "run_id": run })),
+        )
+            .into_response()),
+        Ok((Fired::Run(run), true)) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({ "run_id": run, "duplicate": true })),
+        )
+            .into_response()),
+        Ok((Fired::Paused, _)) => Err(ApiError::Conflict("the trigger is paused")),
+        Ok((Fired::AgentNotFound, _)) => Err(ApiError::AgentNotFound),
+        // Deleted since the lookup; a moved tick is a schedule's alone.
+        Ok((Fired::NotFound | Fired::Moved, _)) => Err(ApiError::Unauthorized),
+        Err(FireError::NotStored(message) | FireError::MaybeStored { message, .. }) => {
+            Err(ApiError::Store(message))
+        }
+    }
 }
 
 /// An answer that carries a webhook secret is not kept by any cache.

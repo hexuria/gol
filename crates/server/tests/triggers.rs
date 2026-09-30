@@ -592,6 +592,12 @@ impl server::TriggerStore for ForcedStore {
     fn triggers_of(&self, owner: &Owner) -> Result<Vec<server::StoredTrigger>, server::StoreError> {
         self.inner.triggers_of(owner)
     }
+    fn webhook_trigger(
+        &self,
+        id: TriggerId,
+    ) -> Result<Option<server::StoredTrigger>, server::StoreError> {
+        self.inner.webhook_trigger(id)
+    }
     fn trigger(
         &self,
         owner: &Owner,

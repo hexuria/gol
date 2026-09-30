@@ -1513,6 +1513,19 @@ impl TriggerStore for PostgresStore {
         Ok(readable_triggers(&rows))
     }
 
+    fn webhook_trigger(&self, id: TriggerId) -> Result<Option<StoredTrigger>, StoreError> {
+        let row = self.with_client(|client| {
+            client
+                .query_opt(
+                    "select body, enabled, next_fire_ms from triggers
+                     where id = $1 and body->'kind' ? 'webhook'",
+                    &[&id.as_uuid()],
+                )
+                .map_err(sql)
+        })?;
+        row.as_ref().map(trigger_row).transpose()
+    }
+
     fn unscheduled_triggers(&self, limit: usize) -> Result<Vec<StoredTrigger>, StoreError> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = self.with_client(|client| {
