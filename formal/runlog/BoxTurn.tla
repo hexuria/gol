@@ -28,6 +28,7 @@
 \*   "nosweep"   the reaper does not clean up after an ended turn;
 \*   "anyrun"    the volume sweep does not check that the turn has ended;
 \*   "once"      the volume sweep removes a run's volume once, never again;
+\*   "volforce"  the volume removal is not refused while a sandbox mounts it;
 \*   "set"       the reaper removes only what a Redis set names: a worker adds
 \*               its name before it provisions, and a removal confirmed gone
 \*               takes the name off (the first 86A).
@@ -232,7 +233,8 @@ VolCheck ==
 \* ...then docker volume rm, which refuses while a container mounts it.
 VolRemove ==
   /\ volSeen /\ volSeen' = FALSE
-  /\ IF up = {} THEN vol' = FALSE /\ swept' = TRUE ELSE UNCHANGED <<vol, swept>>
+  /\ IF up = {} \/ Design = "volforce" THEN vol' = FALSE /\ swept' = TRUE
+                                           ELSE UNCHANGED <<vol, swept>>
   /\ UNCHANGED vars
 
 Done ==
@@ -276,6 +278,9 @@ EndClean ==
 TurnEnds == <>(log = "ended")
 EventuallyClean == <>[](log = "ended" /\ up = {})
 EventuallyNoVolume == <>[](log = "ended" /\ ~vol)
+
+\* Every sandbox that exists has its volume: none is taken from under one.
+MountedHasVolume == up # {} => vol
 
 \* While the turn is open, a volume once made stays: no sweep takes the
 \* workspace from between two deliveries.

@@ -985,7 +985,9 @@ pub fn sweep_sandboxes(
         let Some(run) = workspace_run_of(&name) else {
             continue;
         };
-        if left.contains(&run) || !has_ended(store, run) {
+        // Only a Box run's volume is this host's: a Local or Reverse run's
+        // is the desktop's, even when the desktop shares this daemon.
+        if left.contains(&run) || !ended_box(store, run) {
             continue;
         }
         match sandbox.remove_volume(&name) {
@@ -1001,15 +1003,30 @@ pub fn sweep_sandboxes(
 /// Whether run `run` is stored and its log has ended. A store that cannot
 /// say is taken as no: the sweep leaves it for next time.
 fn has_ended(store: &dyn RunStore, run: RunId) -> bool {
+    stored_ended(store, run).is_some()
+}
+
+/// Whether run `run` is a Box run whose log has ended.
+fn ended_box(store: &dyn RunStore, run: RunId) -> bool {
+    stored_ended(store, run)
+        .is_some_and(|stored| stored.spec.placement == protocol::ExecutionPlacement::Box)
+}
+
+/// Run `run`, if it is stored and its log has ended.
+fn stored_ended(store: &dyn RunStore, run: RunId) -> Option<StoredRun> {
     match store.run(run) {
-        Ok(Some(stored)) => stored
-            .events
-            .iter()
-            .any(|event| is_terminal(&event.payload)),
-        Ok(None) => false,
+        Ok(Some(stored))
+            if stored
+                .events
+                .iter()
+                .any(|event| is_terminal(&event.payload)) =>
+        {
+            Some(stored)
+        }
+        Ok(_) => None,
         Err(error) => {
             eprintln!("gol: sandbox sweep: run {run}: {error}");
-            false
+            None
         }
     }
 }
@@ -1165,6 +1182,20 @@ pub fn reap_forever(
 
 /// How often a server looks through its host's Box sandboxes (86C).
 const SANDBOX_SWEEP_EVERY: Duration = Duration::from_secs(30);
+
+/// Starts the thread that removes the Box sandboxes and volumes of ended
+/// runs (`sweep_sandboxes_forever`). Every server runs one, queue or not:
+/// quick Box turns leave volumes too.
+pub fn start_sandbox_sweep(
+    store: Arc<dyn RunStore>,
+    sandbox: Arc<dyn SandboxHost>,
+) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("gol-sandbox-sweep".to_string())
+        .spawn(move || sweep_sandboxes_forever(store.as_ref(), sandbox.as_ref()))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
 
 /// Removes the Box sandboxes of ended turns (`sweep_sandboxes`) every
 /// `SANDBOX_SWEEP_EVERY`, for as long as the process runs. A thread of its
@@ -1417,20 +1448,23 @@ const SCHEDULE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Starts `settings.workers` worker threads, one scheduler and one reaper,
 /// which also sweeps, all running for as long as the process does. Queued
-/// runs may message each other through `messages` (Phase 2.3).
+/// runs may message each other through `messages` (Phase 2.3). The workers
+/// use `sandbox`, the server's one sandbox host, which its sandbox sweep
+/// (`start_sandbox_sweep`) looks through too.
 pub fn start_queue(
     settings: &QueueSettings,
-    store: Arc<dyn RunStore>,
-    memory: Arc<dyn Memory>,
-    messages: Arc<dyn MessageStore>,
-    outbox: Arc<dyn OutboxStore>,
+    stores: crate::stores::Stores,
     jev_base_url: &str,
     models: Arc<ModelsConfig>,
+    sandbox: Arc<dyn SandboxHost>,
 ) -> Result<(), String> {
+    let crate::stores::Stores {
+        runs: store,
+        memory,
+        messages,
+        outbox,
+    } = stores;
     let timing = QueueTiming::default();
-    // One sandbox host for the workers and the reaper, so the reaper sees
-    // what the workers provisioned.
-    let sandbox = sandbox_from_env();
     for index in 0..settings.workers {
         let worker = Worker::builder()
             .queue(RedisRunQueue::open(&settings.redis_url))
@@ -1456,7 +1490,6 @@ pub fn start_queue(
         .name("gol-scheduler".to_string())
         .spawn(move || crate::scheduler::schedule_forever(scheduled, scheduler, SCHEDULE_EVERY))
         .map_err(|error| error.to_string())?;
-    let (swept, sandboxes) = (store.clone(), sandbox.clone());
     let reaper = RedisRunQueue::open(&settings.redis_url);
     std::thread::Builder::new()
         .name("gol-reaper".to_string())
@@ -1469,10 +1502,6 @@ pub fn start_queue(
                 timing,
             )
         })
-        .map_err(|error| error.to_string())?;
-    std::thread::Builder::new()
-        .name("gol-sandbox-sweep".to_string())
-        .spawn(move || sweep_sandboxes_forever(swept.as_ref(), sandboxes.as_ref()))
         .map_err(|error| error.to_string())?;
     Ok(())
 }

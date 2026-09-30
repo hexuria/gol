@@ -108,7 +108,7 @@ Checked on 2026-09-30 with TLC 2.19 (tla2tools v1.7.4):
 java -XX:+UseParallelGC -jar tla2tools.jar -workers auto -lncheck final -config BoxTurn.cfg BoxTurn.tla
 ```
 
-`BoxTurn.tla` is a model of its own in this directory, 250 lines when it was added (283 with the workspace volumes below). It covers the writers of one Box background coworker turn:
+`BoxTurn.tla` is a model of its own in this directory, 250 lines when it was added (288 with the workspace volumes below). It covers the writers of one Box background coworker turn:
 - queue workers, each running one delivery (an attempt), with a lease that can run out while the worker still acts;
 - the owner's stop;
 - the reaper.
@@ -139,8 +139,8 @@ It abstracts `Claim::prepare`, `Worker::run_box_turn`, `end_box` and `clean_box`
 - `"cleanlatest"`: no lease checks, and a cleanup of attempts up to the latest start instead of the worker's own. Breaks `LiveSandbox` in 13 states: a stale worker's cleanup removes the sandbox the live worker is calling with. The bound to its own attempt is what keeps `LiveSandbox`.
 - `"stopall"`: the stop cancels a started turn itself. Breaks `EndClean` in 6 states.
 - `"nocleanup"`: past `max_deliveries` the turn is failed without cleaning up. Breaks `EndClean` in 13 states.
-- `"nosweep"`: breaks `EventuallyClean` in a 23-state lasso.
-- `"set"`: the first 86A. The reaper removes only what a Redis set names; a worker adds its name before it provisions, and a removal confirmed gone takes the name off. Breaks `EventuallyClean` in a 16-state trace:
+- `"nosweep"`: breaks `EventuallyClean` in a 22-state lasso. (Lasso lengths vary a little from one TLC run to the next; these are the latest run's.)
+- `"set"`: the first 86A. The reaper removes only what a Redis set names; a worker adds its name before it provisions, and a removal confirmed gone takes the name off. Breaks `EventuallyClean` in a 19-state trace:
   1. `w1`'s lease runs out after its stop check.
   2. `w1` adds its name to the set.
   3. `w2` claims attempt 2, sees the stop, and cleans up. Nothing is up yet, so it takes `w1`'s name off the set.
@@ -178,6 +178,7 @@ Checked on 2026-09-30. `BoxTurn.tla` gains the run's workspace volume, `vol`:
 Every core action leaves the volume as it was, except that a new sandbox makes it (`Made`). So the late provision after an end, the case in `EndClean`'s exceptions, makes the volume again, and the sweep has to remove it again.
 
 **Properties:**
+- `MountedHasVolume` (invariant): every sandbox that exists has its volume, so none is taken from under one.
 - `VolumeKeptWhileOpen` (action): while the turn is open, a volume once made stays, so no sweep takes the workspace from between two deliveries.
 - `EventuallyNoVolume` (liveness): after the end, eventually no volume.
 - Fairness: weak fairness on both sweep steps.
@@ -185,11 +186,12 @@ Every core action leaves the volume as it was, except that a new sandbox makes i
 **Runs:** as above (`BoxTurn.cfg` and three workers), no error.
 
 **Negative controls,** with `-workers 1`:
+- `"volforce"`: the removal is not refused while a sandbox mounts the volume. Breaks `MountedHasVolume` in 17 states: a late provision falls between the sweep's listing and its removal, and the volume goes from under that sandbox.
 - `"anyrun"`: the check does not ask whether the turn has ended. Breaks `VolumeKeptWhileOpen` in 9 states: between two deliveries no sandbox is up, and the volume is removed from an open turn.
-- `"once"`: a run's volume is removed once and never again. Breaks `EventuallyNoVolume` in a 25-state lasso: a late provision after the end makes the volume again, and it stays.
-- `"novsweep"`: no volume sweep. Breaks `EventuallyNoVolume` in a 17-state lasso.
+- `"once"`: a run's volume is removed once and never again. Breaks `EventuallyNoVolume` in a 27-state lasso: a late provision after the end makes the volume again, and it stays.
+- `"novsweep"`: no volume sweep. Breaks `EventuallyNoVolume` in an 18-state lasso.
 
-**Docker's refusal (89A)** keeps a volume while a leftover container of an ended turn mounts it. No property here depends on it: the check already requires an ended turn, and an ended turn stays ended. It is kept because the listing and the removal are separate calls, and a late provision can fall between them. The refusal is what makes the removal wait for that container, not a guess made from the listing.
+**Docker's refusal (89A)** is what keeps `MountedHasVolume`. The listing and the removal are separate calls, and a late provision can fall between them, so the sweep's own check of the listing is not enough. The model also shows that this protects only sandboxes of turns that have already ended: `VolumeKeptWhileOpen` holds by the check on the log alone.
 
 **Scope:** only the server host's volumes, the ones Box turns make. A Local or Reverse run's `gol-workspace-<run>` is on the user's desktop.
 
@@ -199,4 +201,7 @@ Every core action leaves the volume as it was, except that a new sandbox makes i
 | --- | --- |
 | `VolumeKeptWhileOpen` | `an_open_turns_volume_is_kept_between_deliveries`, `the_sweep_removes_the_sandboxes_of_ended_turns_only` (an open turn's volume is kept) |
 | `EventuallyNoVolume` | `the_sweep_removes_the_sandboxes_of_ended_turns_only`, `a_later_attempts_sandbox_is_left_to_the_sweep` (sandbox, then volume), `a_volume_waits_for_its_runs_sandboxes`, `a_refused_volume_removal_is_tried_again` |
-| The refusal (89A) | `a_memory_volume_in_use_is_not_removed`, `docker_lists_volumes_and_removes_one_without_force` (unit tests in `crates/server/src/inference.rs`) |
+| `MountedHasVolume`, the refusal (89A) | `a_provision_between_the_listing_and_the_removal_keeps_its_volume` (forced: the provision comes in the sweep's listing), `a_volume_waits_for_its_runs_sandboxes` (no removal is asked while a sandbox is listed); unit tests `a_memory_volume_in_use_is_not_removed` and `docker_lists_volumes_and_removes_one_without_force` in `crates/server/src/inference.rs` |
+| Scope: Box runs only | `a_local_runs_volume_is_left_to_the_desktop` |
+
+Assumption, unlinked: Docker refuses `docker volume rm` of a volume any container refers to, running or stopped. No test runs a real Docker daemon; the tests use in-process hosts that refuse the same way.

@@ -2,8 +2,8 @@
 use std::sync::Arc;
 
 use server::{
-    auth_from_env, queue_from_env, router_with_memory, start_queue, stores_from_env,
-    HttpGatewayPoster, ModelsConfig, RedisRunQueue,
+    auth_from_env, queue_from_env, router_with_memory, sandbox_from_env, start_queue,
+    start_sandbox_sweep, stores_from_env, HttpGatewayPoster, ModelsConfig, RedisRunQueue,
 };
 
 #[tokio::main]
@@ -86,18 +86,18 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .expect("bind");
+    // Every server sweeps its host's Box sandboxes and volumes, queue or
+    // not: quick Box turns leave volumes too. The workers share the sweep's
+    // host, so it sees what they made.
+    let sandbox = sandbox_from_env();
+    if let Err(message) = start_sandbox_sweep(stores.runs.clone(), sandbox.clone()) {
+        eprintln!("gol: refusing to start: sandbox sweep: {message}");
+        std::process::exit(2);
+    }
     // Workers start once the port is ours, so a server that cannot bind
     // claims no runs.
     if let Some(queue) = &queue {
-        if let Err(message) = start_queue(
-            queue,
-            stores.runs,
-            stores.memory,
-            stores.messages,
-            stores.outbox,
-            &jev_base_url,
-            models.clone(),
-        ) {
+        if let Err(message) = start_queue(queue, stores, &jev_base_url, models.clone(), sandbox) {
             eprintln!("gol: refusing to start: queue workers: {message}");
             std::process::exit(2);
         }

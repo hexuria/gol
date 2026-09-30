@@ -77,6 +77,9 @@ struct Sandboxes {
     live: Mutex<HashSet<String>>,
     volumes: Mutex<HashSet<String>>,
     failing_volume_removals: Mutex<u32>,
+    /// The volumes removal was asked for, in order.
+    volume_removals: Mutex<Vec<String>>,
+    on_list_volumes: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     ops: Mutex<Vec<Op>>,
     failing_destroys: Mutex<u32>,
     on_provision: Mutex<Option<Hook>>,
@@ -103,6 +106,12 @@ impl Sandboxes {
     }
     fn fail_volume_removals(&self, n: u32) {
         *self.failing_volume_removals.lock().expect("fails") = n;
+    }
+    fn volume_removals(&self) -> Vec<String> {
+        self.volume_removals.lock().expect("removals").clone()
+    }
+    fn on_list_volumes(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.on_list_volumes.lock().expect("hook") = Some(Box::new(hook));
     }
     fn live(&self) -> HashSet<String> {
         self.live.lock().expect("live").clone()
@@ -163,25 +172,35 @@ impl SandboxHost for Sandboxes {
     fn list_volumes(&self) -> Result<Vec<String>, SandboxError> {
         let mut names: Vec<String> = self.volumes().into_iter().collect();
         names.sort();
+        if let Some(hook) = self.on_list_volumes.lock().expect("hook").as_ref() {
+            hook();
+        }
         Ok(names)
     }
     /// Refused while a sandbox of the volume's run mounts it, as Docker
-    /// refuses `docker volume rm` of a volume in use.
+    /// refuses `docker volume rm` of a volume in use (checked and removed
+    /// under the sandbox lock), and for a volume it does not have.
     fn remove_volume(&self, name: &str) -> Result<(), SandboxError> {
+        self.volume_removals
+            .lock()
+            .expect("removals")
+            .push(name.to_string());
         let mut fails = self.failing_volume_removals.lock().expect("fails");
         if *fails > 0 {
             *fails -= 1;
             return Err(SandboxError::Host("the host is unreachable".to_string()));
         }
         let run = workspace_run_of(name);
-        if self
-            .live()
+        let live = self.live.lock().expect("live");
+        if live
             .iter()
-            .any(|live| run.is_some() && box_run_of(live) == run)
+            .any(|sandbox| run.is_some() && box_run_of(sandbox) == run)
         {
             return Err(SandboxError::Host(format!("volume {name} is in use")));
         }
-        self.volumes.lock().expect("volumes").remove(name);
+        if !self.volumes.lock().expect("volumes").remove(name) {
+            return Err(SandboxError::Host(format!("no such volume: {name}")));
+        }
         Ok(())
     }
     fn launches_docker(&self) -> bool {
@@ -645,6 +664,10 @@ fn a_volume_waits_for_its_runs_sandboxes() {
         let removed = sweep_sandboxes(s.store.as_ref(), &sandboxes).expect("sweep");
         assert!(removed.is_empty(), "{removed:?}");
         assert!(sandboxes.volumes().contains(&volume));
+        assert!(
+            sandboxes.volume_removals().is_empty(),
+            "not even asked while a sandbox of the run is listed"
+        );
         let removed = sweep_sandboxes(s.store.as_ref(), &sandboxes).expect("sweep");
         assert_eq!(removed, [attempt(&s.spec, 1), volume]);
     }
@@ -680,5 +703,66 @@ fn an_open_turns_volume_is_kept_between_deliveries() {
         let removed = sweep_sandboxes(s.store.as_ref(), &sandboxes).expect("sweep");
         assert!(removed.is_empty(), "{removed:?}");
         assert_eq!(sandboxes.volumes(), HashSet::from([volume]));
+        assert!(sandboxes.volume_removals().is_empty(), "not even asked");
+    }
+}
+
+// A Local or Reverse run's volume is the desktop's, even on a desktop that
+// shares this server's Docker daemon: the sweep leaves it once the run has
+// ended.
+#[test]
+fn a_local_runs_volume_is_left_to_the_desktop() {
+    for store in stores() {
+        let mut local = spec();
+        local.placement = ExecutionPlacement::Local;
+        store
+            .put_run(StoredRun {
+                spec: local.clone(),
+                events: queued_events(&local),
+            })
+            .expect("put run");
+        store
+            .append_events(
+                local.run_id,
+                vec![event(&local, EventPayload::RunCancelled)],
+            )
+            .expect("cancel");
+        let sandboxes = Sandboxes::default();
+        let volume = box_workspace_volume(local.run_id);
+        sandboxes.volume(&volume);
+        let removed = sweep_sandboxes(store.as_ref(), &sandboxes).expect("sweep");
+        assert!(removed.is_empty(), "{removed:?}");
+        assert!(sandboxes.volume_removals().is_empty());
+        assert_eq!(sandboxes.volumes(), HashSet::from([volume]));
+    }
+}
+
+// A late provision between the sweep's listing and its removal (a worker
+// that lost its lease provisions after the end): the host refuses the
+// volume it mounts, and a later sweep removes the sandbox, then the volume
+// (89A).
+#[test]
+fn a_provision_between_the_listing_and_the_removal_keeps_its_volume() {
+    for store in stores() {
+        let s = setup(store, 5);
+        s.store
+            .append_events(
+                s.spec.run_id,
+                vec![event(&s.spec, EventPayload::RunCancelled)],
+            )
+            .expect("cancel");
+        let sandboxes = Arc::new(Sandboxes::default());
+        let (volume, late) = (box_workspace_volume(s.spec.run_id), attempt(&s.spec, 2));
+        sandboxes.volume(&volume);
+        let (host, provisioned) = (sandboxes.clone(), late.clone());
+        sandboxes.on_list_volumes(move || host.up(&provisioned));
+        let removed = sweep_sandboxes(s.store.as_ref(), sandboxes.as_ref()).expect("sweep");
+        assert!(removed.is_empty(), "{removed:?}");
+        assert_eq!(sandboxes.volume_removals(), std::slice::from_ref(&volume));
+        assert!(sandboxes.volumes().contains(&volume), "refused: in use");
+        *sandboxes.on_list_volumes.lock().expect("hook") = None;
+        let removed = sweep_sandboxes(s.store.as_ref(), sandboxes.as_ref()).expect("sweep");
+        assert_eq!(removed, [late, volume]);
+        assert!(sandboxes.volumes().is_empty());
     }
 }

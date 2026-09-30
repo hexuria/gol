@@ -291,18 +291,21 @@ impl SandboxHost for MemorySandbox {
         Ok(names)
     }
 
+    /// Refused, as Docker refuses, while a sandbox of the volume's run is up
+    /// (checked and removed under the sandbox lock, so a provision cannot
+    /// come between), and for a volume it does not have.
     fn remove_volume(&self, name: &str) -> Result<(), SandboxError> {
         let run = workspace_run_of(name);
-        let in_use = self
-            .live
-            .lock()
-            .expect("sandbox")
+        let live = self.live.lock().expect("sandbox");
+        if live
             .iter()
-            .any(|live| run.is_some() && box_run_of(live) == run);
-        if in_use {
+            .any(|sandbox| run.is_some() && box_run_of(sandbox) == run)
+        {
             return Err(SandboxError::Host(format!("volume {name} is in use")));
         }
-        self.volumes.lock().expect("sandbox").remove(name);
+        if !self.volumes.lock().expect("sandbox").remove(name) {
+            return Err(SandboxError::Host(format!("no such volume: {name}")));
+        }
         Ok(())
     }
 
@@ -475,7 +478,8 @@ impl SandboxHost for DockerSandbox {
             .collect())
     }
 
-    /// Without `-f`: Docker refuses a volume a container still mounts.
+    /// Docker refuses a volume any container still mounts, running or not
+    /// (89A). The removal leaves `-f` off: it would hide a missing volume.
     fn remove_volume(&self, name: &str) -> Result<(), SandboxError> {
         self.command(&["volume", "rm", name])
     }
@@ -1216,6 +1220,28 @@ mod tests {
                 .filter(|run| run.len() == 36 && !run.chars().any(|c| c.is_ascii_uppercase()))
                 .and_then(|run| run.parse::<RunId>().ok());
             prop_assert_eq!(workspace_run_of(&name), oracle);
+        }
+
+        #[test]
+        fn a_volume_name_reads_back(n in any::<u128>()) {
+            let run: RunId = uuid::Uuid::from_u128(n).to_string().parse().expect("run id");
+            prop_assert_eq!(workspace_run_of(&box_workspace_volume(run)), Some(run));
+        }
+
+        // Any volume listing: no panic, and each name kept is a trimmed line
+        // that starts with the prefix.
+        #[test]
+        fn any_volume_listing_keeps_only_workspace_lines(listing in any::<String>()) {
+            let text = listing.clone();
+            let sandbox = DockerSandbox::from_command(|_: &[String]| Ok(()))
+                .with_output(move |_: &[String]| Ok(text.clone()));
+            let expected: Vec<String> = listing
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("gol-workspace-"))
+                .map(str::to_string)
+                .collect();
+            prop_assert_eq!(sandbox.list_volumes().expect("list"), expected);
         }
 
         #[test]

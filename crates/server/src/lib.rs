@@ -53,9 +53,9 @@ pub use triggers::{
     Hooked, MAX_TRIGGERS, MIN_WEBHOOK_KEY_BYTES, TRIGGER_KEY,
 };
 pub use worker::{
-    queue_from_env, reap_forever, start_queue, sweep, sweep_asks, sweep_sandboxes,
-    sweep_sandboxes_forever, Claim, Done, Executed, Open, Prepared, QueueSettings, Worker,
-    WorkerBuilder,
+    queue_from_env, reap_forever, start_queue, start_sandbox_sweep, sweep, sweep_asks,
+    sweep_sandboxes, sweep_sandboxes_forever, Claim, Done, Executed, Open, Prepared, QueueSettings,
+    Worker, WorkerBuilder,
 };
 
 /// Returned by every `RunStore` method.
