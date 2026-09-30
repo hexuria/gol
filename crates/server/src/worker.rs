@@ -19,9 +19,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::Duration;
 
-use harness::{
-    run_until, Boundary, DelegateTarget, Driver, EchoTool, JevDecider, Memory, RunMemory,
-};
+use harness::{run_until, Boundary, DelegateTarget, Driver, JevDecider, Memory, RunMemory};
 use protocol::{
     fold, Capability, DispatchPhase, Event, EventPayload, FailureClass, HarnessState, MessageId,
     RunId, RunSpec, Timestamp,
@@ -61,6 +59,9 @@ pub struct Worker {
     /// (Phase 3.6).
     poster: Arc<dyn GatewayPoster>,
     sandbox: Arc<dyn SandboxHost>,
+    /// The catalog each run's tools come from (item 8a): without it, a run
+    /// has `echo` alone.
+    catalog_dir: Option<std::path::PathBuf>,
 }
 
 /// Builder state: a required input not given yet.
@@ -81,6 +82,7 @@ pub struct WorkerBuilder<Q, S, M, J> {
     messages: Option<Arc<dyn MessageStore>>,
     poster: Option<Arc<dyn GatewayPoster>>,
     sandbox: Option<Arc<dyn SandboxHost>>,
+    catalog_dir: Option<std::path::PathBuf>,
     states: PhantomData<(Q, S, M, J)>,
 }
 
@@ -96,6 +98,7 @@ impl Worker {
             messages: None,
             poster: None,
             sandbox: None,
+            catalog_dir: crate::tools::catalog_dir_from_env(),
             states: PhantomData,
         }
     }
@@ -113,8 +116,16 @@ impl<Q, S, M, J> WorkerBuilder<Q, S, M, J> {
             messages: self.messages,
             poster: self.poster,
             sandbox: self.sandbox,
+            catalog_dir: self.catalog_dir,
             states: PhantomData,
         }
+    }
+
+    /// The catalog directory runs take their catalog tools from, in place
+    /// of `GOL_CATALOG_DIR`.
+    pub fn catalog_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.catalog_dir = Some(dir);
+        self
     }
 
     pub fn timing(mut self, timing: QueueTiming) -> Self {
@@ -197,6 +208,7 @@ impl WorkerBuilder<Given, Given, Given, Given> {
                 .poster
                 .unwrap_or_else(|| Arc::new(HttpGatewayPoster::from_env())),
             sandbox: self.sandbox.unwrap_or_else(sandbox_from_env),
+            catalog_dir: self.catalog_dir,
         }
     }
 }
@@ -681,14 +693,29 @@ impl Worker {
                 return append(seen, tail);
             }
         };
-        let echo = EchoTool;
+        // Its tools: echo, and the catalog tools its manifest names (8a).
+        let named = match self.store.agent(spec.agent_id) {
+            Ok(agent) => agent.map(|agent| agent.manifest.tools).unwrap_or_default(),
+            Err(error) => {
+                eprintln!("gol: queue worker: run {run_id}: its agent: {error}");
+                Vec::new()
+            }
+        };
+        let tools = match crate::tools::RunTools::load(self.catalog_dir.as_deref(), named) {
+            Ok(tools) => tools,
+            Err(message) => {
+                let mut tail = driver.events()[seen..].to_vec();
+                tail.push(run_failed_event(spec, FailureClass::Environment, message));
+                return append(seen, tail);
+            }
+        };
         let models = self.models.model_for(spec);
         let memory = RunMemory::new(self.memory.as_ref());
         let mut refused = None;
         let outcome = run_until(
             &mut driver,
             &mut decider,
-            &[&echo],
+            &tools.tools(),
             &models,
             &memory,
             &mut |driver| {

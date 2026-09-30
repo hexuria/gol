@@ -39,6 +39,10 @@ A run's model calls go to its work model's provider with the platform's key for 
 - Each `ModelResponded` records the tokens the call used, when the provider reports them.
 - A failed call leaves a fixed reason in the run log (`model call to Anthropic failed`); the provider's error, which may repeat the request's key, goes to the server's stderr.
 
+## Tools
+
+Every run can call `echo`. With `GOL_CATALOG_DIR` set to a catalog directory (a `harness.toml` naming tools, skills and MCP servers), a run can also call the catalog tools its agent's manifest names in `tools`. It still needs each tool's capability (an MCP tool's is `mcp.<server>.<tool>`). A catalog tool the manifest does not name is not offered. Each run loads the catalog itself, so its MCP servers are its own and start on their first call. A catalog that does not load stops the server from starting, and one that stops loading later fails the run that needs it.
+
 ## Authentication
 
 Every route needs `Authorization: Bearer <token>`. The server refuses to start unless one of these is configured:
