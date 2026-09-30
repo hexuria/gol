@@ -39,6 +39,18 @@ A run's model calls go to its work model's provider with the platform's key for 
 - Each `ModelResponded` records the tokens the call used, when the provider reports them.
 - A failed call leaves a fixed reason in the run log (`model call to Anthropic failed`); the provider's error, which may repeat the request's key, goes to the server's stderr.
 
+## Tools
+
+Every run can call `echo`. With `GOL_CATALOG_DIR` set to a catalog directory (a `harness.toml` naming tools, skills and MCP servers), a run can also call the catalog tools its agent's manifest names in `tools`. It still needs each tool's capability; an MCP tool's is `mcp.<server>.<tool>`.
+
+- A catalog tool the manifest does not name is not offered. A catalog tool named `echo` is left out, since the built-in one is always there.
+- A run that names catalog tools loads the catalog itself, so its MCP servers are its own and start on their first call.
+- An MCP server is given `PATH`, `HOME`, `LANG` and `TMPDIR`, and the host variables its catalog entry lists in `env` (each a variable name; anything else stops the catalog from loading). Nothing else of the server's environment is passed to it: not its keys, and not its database address.
+- That is the environment of a trusted command, not a sandbox. An MCP server runs as the server's user, so it can read the server process's environment through `/proc` and whatever that user's `HOME` holds. Its working directory is the catalog's, so keep the catalog directory unwritable by that user.
+- A catalog that does not load stops the server from starting. If it stops loading later, or the run's agent cannot be read, a queued run that needs it is left open and tried again once its lease expires. Each try counts as a delivery, so a run started more than five times without ending is failed, with the cause on stderr. An inline run that needs a catalog that no longer loads ends failed ("the tool catalog did not load"), with the detail on stderr.
+- Catalog skills are not given to runs yet.
+- Capabilities are not an allowlist. Anyone who can store an agent can grant it an `mcp.*` capability and call that tool, and MCP servers run on the gol host. Put only tools that every principal of this server may call in a catalog.
+
 ## Authentication
 
 Every route needs `Authorization: Bearer <token>`. The server refuses to start unless one of these is configured:

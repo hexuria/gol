@@ -161,6 +161,21 @@ impl Server {
         self
     }
 
+    /// The same server, with a worker whose runs get the catalog in `dir`
+    /// (the tools each agent's manifest names).
+    pub fn with_catalog(mut self, dir: &std::path::Path) -> Self {
+        self.worker = Arc::new(
+            Worker::builder()
+                .queue(RedisRunQueue::open(self.redis.clone()))
+                .store(self.store.clone())
+                .memory(Arc::new(InMemory::default()))
+                .jev(self.jev.clone())
+                .catalog_dir(dir.to_path_buf())
+                .build(),
+        );
+        self
+    }
+
     /// The same server, with a worker whose background coworker turns
     /// (Phase 3.6) call `poster` and run in `sandbox`.
     pub fn with_turns(

@@ -14,6 +14,8 @@ mod store;
 mod stores;
 mod stream;
 mod surface;
+/// The tools a run gets (item 8a).
+pub mod tools;
 mod triggers;
 /// Webhook requests (Phase 4.3).
 pub mod webhook;

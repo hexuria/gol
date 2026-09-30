@@ -9,8 +9,8 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use harness::{
-    run_to_completion, AgentSpawner, BootError, DelegateTarget, Driver, EchoTool, InMemory,
-    JevDecider, Memory, RunMemory, StoreError,
+    run_to_completion, AgentSpawner, BootError, DelegateTarget, Driver, InMemory, JevDecider,
+    Memory, RunMemory, StoreError,
 };
 use protocol::{
     fold, Actor, AgentId, Capability, DispatchPhase, Event, EventPayload, EventSource,
@@ -416,6 +416,9 @@ async fn start_run(state: &AppState, owner: Owner, body: RunBody) -> Result<RunS
             "agent_version does not match the stored manifest",
         ));
     }
+    // Its tools, when it runs here: echo, and the catalog tools its
+    // manifest names (8a). A queued run's worker loads its own.
+    let named = agent.manifest.tools.clone();
     let spec = build_spec(
         owner,
         SpecCore {
@@ -477,8 +480,31 @@ async fn start_run(state: &AppState, owner: Owner, body: RunBody) -> Result<RunS
             })
             .map_err(RunStartError::Store)?;
         // Inline: a child needs the run queue, so this run offers no delegation.
-        let (events, outcome) =
-            harness_events(&jev_base_url, &spec_for_run, memory.as_ref(), &models, None);
+        let catalog = crate::tools::catalog_dir_from_env();
+        let (events, outcome) = match crate::tools::RunTools::load(catalog.as_deref(), named) {
+            Ok(tools) => harness_events(
+                &jev_base_url,
+                &spec_for_run,
+                memory.as_ref(),
+                &models,
+                None,
+                &tools,
+            ),
+            // A fixed reason in the log and the answer; the detail, which
+            // may quote the catalog file, goes to stderr only.
+            Err(message) => {
+                eprintln!("gol: run {}: {message}", spec_for_run.run_id);
+                let reason = "the tool catalog did not load".to_string();
+                (
+                    vec![run_failed_event(
+                        &spec_for_run,
+                        FailureClass::Environment,
+                        reason.clone(),
+                    )],
+                    Err(RunStartError::Decider(reason)),
+                )
+            }
+        };
         // Append, never overwrite: anything stored while Jev ran stays. When the
         // run is already terminal the store keeps its log and refuses these.
         store_for_run
@@ -1849,9 +1875,16 @@ pub(crate) fn harness_events(
     memory: &dyn Memory,
     models: &ModelsConfig,
     delegation: Option<Delegation>,
+    tools: &crate::tools::RunTools,
 ) -> (Vec<Event>, Result<(), RunStartError>) {
-    let (mut events, outcome) =
-        run_with_jev(jev_base_url, spec.clone(), memory, models, delegation);
+    let (mut events, outcome) = run_with_jev(
+        jev_base_url,
+        spec.clone(),
+        memory,
+        models,
+        delegation,
+        tools,
+    );
     if let Err(error) = &outcome {
         let (class, message) = match error {
             RunStartError::Unsupported(placement) => (
@@ -1880,6 +1913,7 @@ fn run_with_jev(
     memory: &dyn Memory,
     models: &ModelsConfig,
     delegation: Option<Delegation>,
+    tools: &crate::tools::RunTools,
 ) -> (Vec<Event>, Result<(), RunStartError>) {
     let model = models.model_for(&spec);
     let mut driver = match Driver::boot(spec) {
@@ -1896,11 +1930,10 @@ fn run_with_jev(
         Err(message) => return (Vec::new(), Err(RunStartError::Decider(message))),
     };
     let mut decider = JevDecider::new(client);
-    let echo = EchoTool;
     let outcome = run_to_completion(
         &mut driver,
         &mut decider,
-        &[&echo],
+        &tools.tools(),
         &model,
         &RunMemory::new(memory),
     )

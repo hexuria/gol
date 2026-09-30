@@ -962,3 +962,73 @@ fn a_listed_tool_without_a_name_is_malformed() {
         Err("mcp local.ping: tools/list: malformed result".to_string())
     );
 }
+
+// An MCP server gets PATH, HOME, LANG and TMPDIR, and the variables its
+// catalog entry lists in `env`, and none of the host's other variables:
+// not the server's keys or its database address.
+#[test]
+fn an_mcp_server_gets_only_the_environment_it_names() {
+    let dir = scratch();
+    let (secret, given) = (
+        format!("GOL_TEST_SECRET_{}", std::process::id()),
+        format!("GOL_TEST_GIVEN_{}", std::process::id()),
+    );
+    std::env::set_var(&secret, "hidden");
+    std::env::set_var(&given, "shared");
+    let script = dir.join("env.py");
+    fs::write(
+        &script,
+        r#"import json, os, sys
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    msg = json.loads(line)
+    if "id" not in msg:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"env","version":"0"}}})
+    elif method == "tools/list":
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"env","description":"e","inputSchema":{"type":"object"}}]}})
+    elif method == "tools/call":
+        names = msg["params"]["arguments"].get("input", "").split(",")
+        seen = ",".join(n + "=" + os.environ.get(n, "-") for n in names)
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"content":[{"type":"text","text":seen}]}})
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.join("harness.toml"),
+        format!(
+            "[[mcp]]\nname = \"local\"\ncommand = \"python3\"\nargs = [\"{}\"]\nenv = [\"{given}\"]\n\n[[mcp.tools]]\nname = \"env\"\ndescription = \"e\"\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+    let catalog = load_catalog(&dir).unwrap();
+    let tool = catalog.tools()[0];
+    let seen = tool
+        .call(&format!("{secret},{given}"))
+        .expect("the server answers");
+    assert_eq!(seen, format!("{secret}=-,{given}=shared"));
+    let path = tool.call("PATH").expect("the server answers");
+    assert_ne!(path, "PATH=-", "PATH is given");
+}
+
+// An `env` entry that is not a variable name (empty, or holding `=` or a
+// NUL) is refused when the catalog loads, not dropped when the server starts.
+#[test]
+fn an_env_entry_that_is_not_a_name_is_refused() {
+    for bad in ["", "KEY=value", "A\\u0000B"] {
+        let dir = scratch();
+        fs::write(
+            dir.join("harness.toml"),
+            format!(
+                "[[mcp]]\nname = \"local\"\ncommand = \"true\"\nenv = [\"{bad}\"]\n\n[[mcp.tools]]\nname = \"ping\"\n"
+            ),
+        )
+        .unwrap();
+        assert!(load_catalog(&dir).is_err(), "{bad:?}");
+    }
+}

@@ -19,9 +19,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::Duration;
 
-use harness::{
-    run_until, Boundary, DelegateTarget, Driver, EchoTool, JevDecider, Memory, RunMemory,
-};
+use harness::{run_until, Boundary, DelegateTarget, Driver, JevDecider, Memory, RunMemory};
 use protocol::{
     fold, Capability, DispatchPhase, Event, EventPayload, FailureClass, HarnessState, MessageId,
     RunId, RunSpec, Timestamp,
@@ -61,6 +59,9 @@ pub struct Worker {
     /// (Phase 3.6).
     poster: Arc<dyn GatewayPoster>,
     sandbox: Arc<dyn SandboxHost>,
+    /// The catalog each run's tools come from (item 8a): without it, a run
+    /// has `echo` alone.
+    catalog_dir: Option<std::path::PathBuf>,
 }
 
 /// Builder state: a required input not given yet.
@@ -81,6 +82,7 @@ pub struct WorkerBuilder<Q, S, M, J> {
     messages: Option<Arc<dyn MessageStore>>,
     poster: Option<Arc<dyn GatewayPoster>>,
     sandbox: Option<Arc<dyn SandboxHost>>,
+    catalog_dir: Option<std::path::PathBuf>,
     states: PhantomData<(Q, S, M, J)>,
 }
 
@@ -96,6 +98,7 @@ impl Worker {
             messages: None,
             poster: None,
             sandbox: None,
+            catalog_dir: crate::tools::catalog_dir_from_env(),
             states: PhantomData,
         }
     }
@@ -113,8 +116,16 @@ impl<Q, S, M, J> WorkerBuilder<Q, S, M, J> {
             messages: self.messages,
             poster: self.poster,
             sandbox: self.sandbox,
+            catalog_dir: self.catalog_dir,
             states: PhantomData,
         }
+    }
+
+    /// The catalog directory runs take their catalog tools from, in place
+    /// of `GOL_CATALOG_DIR`.
+    pub fn catalog_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.catalog_dir = Some(dir);
+        self
     }
 
     pub fn timing(mut self, timing: QueueTiming) -> Self {
@@ -197,6 +208,7 @@ impl WorkerBuilder<Given, Given, Given, Given> {
                 .poster
                 .unwrap_or_else(|| Arc::new(HttpGatewayPoster::from_env())),
             sandbox: self.sandbox.unwrap_or_else(sandbox_from_env),
+            catalog_dir: self.catalog_dir,
         }
     }
 }
@@ -681,14 +693,35 @@ impl Worker {
                 return append(seen, tail);
             }
         };
-        let echo = EchoTool;
+        // Its tools: echo, and, with a catalog, the catalog tools its
+        // owner's manifest names (8a). A store that cannot answer, or an
+        // agent that is missing or another principal's, leaves the run to
+        // its next delivery, once its lease expires, as a catalog that does
+        // not load does: a tool it had must not go missing mid-run. Without
+        // a catalog there is nothing to look up.
+        let named = match &self.catalog_dir {
+            None => Vec::new(),
+            Some(_) => self
+                .store
+                .agent(spec.agent_id)
+                .map_err(|error| format!("run {run_id}: its agent: {error}"))?
+                .filter(|agent| agent.owner.is(&spec.owner))
+                .map(|agent| agent.manifest.tools)
+                .ok_or_else(|| {
+                    format!(
+                        "run {run_id}: its agent is unavailable; it is retried once its lease expires"
+                    )
+                })?,
+        };
+        let tools = crate::tools::RunTools::load(self.catalog_dir.as_deref(), named)
+            .map_err(|error| format!("run {run_id}: {error}"))?;
         let models = self.models.model_for(spec);
         let memory = RunMemory::new(self.memory.as_ref());
         let mut refused = None;
         let outcome = run_until(
             &mut driver,
             &mut decider,
-            &[&echo],
+            &tools.tools(),
             &models,
             &memory,
             &mut |driver| {

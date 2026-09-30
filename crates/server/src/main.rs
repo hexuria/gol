@@ -74,6 +74,13 @@ async fn main() {
             std::process::exit(2);
         }
     }
+    // A catalog that does not load is refused at start, not found by a run.
+    if let Some(dir) = server::tools::catalog_dir_from_env() {
+        if let Err(message) = server::tools::check_catalog(&dir) {
+            eprintln!("gol: refusing to start: GOL_CATALOG_DIR: {message}");
+            std::process::exit(2);
+        }
+    }
     let app = router_with_memory(
         stores.runs.clone(),
         stores.memory.clone(),
