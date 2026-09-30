@@ -141,6 +141,19 @@ fn replay_of(events: &[protocol::Event]) -> Replay {
     }
 }
 
+/// `replay_of` run `run`'s log as it is now.
+fn replay_now(store: &dyn RunStore, run: RunId) -> Result<Replay, FireError> {
+    let events = store
+        .run(run)
+        .map_err(|error| FireError::MaybeStored {
+            run,
+            message: error.to_string(),
+        })?
+        .map(|stored| stored.events)
+        .unwrap_or_default();
+    Ok(replay_of(&events))
+}
+
 /// Fires webhook `trigger` for the sender's event `event` with `body`
 /// (Phase 4.3, decisions 74A, 77A and 80A). The run's id comes from the
 /// trigger and the event id, so a replay of the event fires nothing new;
@@ -170,7 +183,12 @@ pub fn fire_webhook(
         }
         return match settle_fired_run(queue, store, &stored.spec) {
             Ok(Fire::Pushed) => Ok(Hooked::Started(run)),
-            Ok(Fire::Found) => Ok(Hooked::Duplicate(run)),
+            // Queued already, or ended since this delivery read it: held
+            // by another delivery or the sweep is refused.
+            Ok(Fire::Found) => Ok(match replay_now(store, run)? {
+                Replay::Refused => Hooked::Refused,
+                Replay::Waiting | Replay::Duplicate => Hooked::Duplicate(run),
+            }),
             Ok(Fire::Held) => Ok(Hooked::Refused),
             Err(message) => Err(FireError::MaybeStored { run, message }),
         };
@@ -181,21 +199,11 @@ pub fn fire_webhook(
             (Fired::Run(run), true) => Hooked::Started(run),
             // Another delivery of the event stored the run first: answered
             // from its log, as a replay is.
-            (Fired::Run(run), false) => {
-                let events = store
-                    .run(run)
-                    .map_err(|error| FireError::MaybeStored {
-                        run,
-                        message: error.to_string(),
-                    })?
-                    .map(|stored| stored.events)
-                    .unwrap_or_default();
-                match replay_of(&events) {
-                    Replay::Waiting => Hooked::Started(run),
-                    Replay::Refused => Hooked::Refused,
-                    Replay::Duplicate => Hooked::Duplicate(run),
-                }
-            }
+            (Fired::Run(run), false) => match replay_now(store, run)? {
+                Replay::Waiting => Hooked::Started(run),
+                Replay::Refused => Hooked::Refused,
+                Replay::Duplicate => Hooked::Duplicate(run),
+            },
             (Fired::Paused | Fired::Moved, _) => Hooked::Refused,
             (Fired::AgentNotFound, _) => Hooked::AgentNotFound,
             (Fired::NotFound, _) => Hooked::NotFound,

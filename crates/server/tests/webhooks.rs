@@ -255,23 +255,30 @@ async fn a_replay_is_answered_from_the_events_run() {
     }
 }
 
-/// An in-memory store whose next read of a run, once armed, misses it: as
-/// when another delivery of the same event stores its run between this
-/// delivery's read and its own store.
-struct MissNextRead {
-    inner: server::InMemoryStore,
-    /// Armed by the test thread before a request, taken by the request's
-    /// one read; the swap needs no order with other memory.
-    armed: std::sync::atomic::AtomicBool,
+/// What a `ForcedRead` store's next read of a run does.
+#[derive(Clone, Copy)]
+enum Read {
+    /// It misses the run: as when another delivery of the same event
+    /// stores its run between this delivery's read and its own store.
+    Miss,
+    /// It reads the run, then the run is held: as when another delivery,
+    /// or the queue sweep, cancels it right after this delivery's read.
+    ThenHeld,
 }
 
-impl MissNextRead {
-    fn arm(&self) {
-        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+/// An in-memory store whose next read of a run, once armed, is forced.
+struct ForcedRead {
+    inner: server::InMemoryStore,
+    next: std::sync::Mutex<Option<Read>>,
+}
+
+impl ForcedRead {
+    fn arm(&self, read: Read) {
+        *self.next.lock().expect("lock") = Some(read);
     }
 }
 
-impl server::RunStore for MissNextRead {
+impl server::RunStore for ForcedRead {
     fn put_agent(
         &self,
         agent: server::StoredAgent,
@@ -309,10 +316,26 @@ impl server::RunStore for MissNextRead {
         self.inner.append_events_after(id, seen, events)
     }
     fn run(&self, id: RunId) -> Result<Option<server::StoredRun>, server::StoreError> {
-        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            return Ok(None);
+        let next = self.next.lock().expect("lock").take();
+        match next {
+            Some(Read::Miss) => Ok(None),
+            Some(Read::ThenHeld) => {
+                let read = self.inner.run(id)?;
+                if let Some(run) = &read {
+                    let cancelled = protocol::Event::record(
+                        protocol::EventSource::for_spec(
+                            &run.spec,
+                            protocol::Actor::System,
+                            protocol::Timestamp::now(),
+                        ),
+                        EventPayload::RunCancelled,
+                    );
+                    self.inner.append_events(id, vec![cancelled])?;
+                }
+                Ok(read)
+            }
+            None => self.inner.run(id),
         }
-        self.inner.run(id)
     }
     fn put_artifact(&self, artifact: server::StoredArtifact) -> Result<(), server::StoreError> {
         self.inner.put_artifact(artifact)
@@ -334,15 +357,17 @@ impl server::RunStore for MissNextRead {
     }
 }
 
-// Overlapping deliveries of one event (80A): one that reads no run, then
-// finds another delivery's run stored before its own, is answered from
-// that run's log, as a replay is: held is 409, done is 200 duplicate, and
-// still queued is 202, queued once.
+// Overlapping deliveries of one event (80A), answered from the run's log
+// as it is when this delivery settles: one that reads no run, then finds
+// another delivery's run stored before its own, is refused if that run is
+// held, a duplicate if it is done, and 202 (queued once) if it is still
+// queued; one that reads the run waiting, then finds it held by another
+// writer before it settles, is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_overlapping_delivery_is_answered_from_the_runs_log() {
-    let miss = std::sync::Arc::new(MissNextRead {
+    let miss = std::sync::Arc::new(ForcedRead {
         inner: server::InMemoryStore::default(),
-        armed: std::sync::atomic::AtomicBool::new(false),
+        next: std::sync::Mutex::new(None),
     });
     let store: Store = miss.clone();
     let (server, user, id, secret) = setup(&store, 6).await;
@@ -359,14 +384,14 @@ async fn an_overlapping_delivery_is_answered_from_the_runs_log() {
     let (status, answer) = signed(&server, &id, &secret, "held", b"{}").await;
     assert_eq!(status, 409, "{answer}");
     post(&server, &user, &resume).await;
-    miss.arm();
+    miss.arm(Read::Miss);
     let (status, answer) = signed(&server, &id, &secret, "held", b"{}").await;
     assert_eq!(status, 409, "{answer}");
     // Done by the other delivery.
     let (status, done) = signed(&server, &id, &secret, "done", b"{}").await;
     assert_eq!(status, 202, "{done}");
     assert!(server.work().await.is_some());
-    miss.arm();
+    miss.arm(Read::Miss);
     let (status, answer) = signed(&server, &id, &secret, "done", b"{}").await;
     assert_eq!(
         (status, &answer["duplicate"]),
@@ -377,7 +402,7 @@ async fn an_overlapping_delivery_is_answered_from_the_runs_log() {
     // Still queued by the other delivery.
     let (status, waiting) = signed(&server, &id, &secret, "waiting", b"{}").await;
     assert_eq!(status, 202, "{waiting}");
-    miss.arm();
+    miss.arm(Read::Miss);
     let (status, answer) = signed(&server, &id, &secret, "waiting", b"{}").await;
     assert_eq!(status, 202, "{answer}");
     assert_eq!(answer["run_id"], waiting["run_id"]);
@@ -387,6 +412,17 @@ async fn an_overlapping_delivery_is_answered_from_the_runs_log() {
         .parse()
         .expect("id");
     assert_eq!(queued(&server).await, [run]);
+    assert_eq!(server.work().await, Some(run));
+    // Read waiting, then held by another writer before this delivery
+    // settles it.
+    let (status, raced) = signed(&server, &id, &secret, "raced", b"{}").await;
+    assert_eq!(status, 202, "{raced}");
+    let url = server.redis.clone();
+    blocking(move || RedisRunQueue::open(url).pop().expect("pop")).await;
+    miss.arm(Read::ThenHeld);
+    let (status, answer) = signed(&server, &id, &secret, "raced", b"{}").await;
+    assert_eq!(status, 409, "{answer}");
+    assert_eq!(queued(&server).await, []);
 }
 
 // What is refused, and fires nothing: 401 for a tampered body, a wrong or
