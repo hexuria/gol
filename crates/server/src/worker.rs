@@ -703,7 +703,11 @@ impl Worker {
             .map_err(|error| format!("run {run_id}: its agent: {error}"))?
             .filter(|agent| agent.owner.is(&spec.owner))
             .map(|agent| agent.manifest.tools)
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                format!(
+                    "run {run_id}: its agent is unavailable; it is retried once its lease expires"
+                )
+            })?;
         let tools = crate::tools::RunTools::load(self.catalog_dir.as_deref(), named)
             .map_err(|error| format!("run {run_id}: {error}"))?;
         let models = self.models.model_for(spec);

@@ -220,6 +220,18 @@ pub fn load_catalog(dir: impl AsRef<Path>) -> Result<LoadedCatalog, LoadError> {
                 server.name
             )));
         }
+        // A name `Command` would drop without a word is refused here, so a
+        // bad entry stops the server at start rather than going missing.
+        if let Some(bad) = server
+            .env
+            .iter()
+            .find(|key| key.is_empty() || key.contains('=') || key.contains('\0'))
+        {
+            return Err(LoadError::Parse(format!(
+                "{}: env names variables, and {bad:?} is not a variable name",
+                server.name
+            )));
+        }
         if server.tools.is_empty() {
             return Err(LoadError::Mcp(format!(
                 "{}: declare tools in the catalog; loading does not start {}",

@@ -56,7 +56,17 @@ for line in sys.stdin:
 /// Stores an agent of `user`'s whose manifest names `tools`, with the
 /// capability of the catalog's `ping`.
 async fn agent(store: &Store, user: &str, tools: &[&str]) -> AgentId {
+    agent_with(store, user, tools, &["mcp.local.ping"]).await
+}
+
+/// Stores an agent of `user`'s whose manifest names `tools`, with
+/// `capabilities`.
+async fn agent_with(store: &Store, user: &str, tools: &[&str], capabilities: &[&str]) -> AgentId {
     let (store, user) = (store.clone(), user.to_string());
+    let capabilities: Vec<Capability> = capabilities
+        .iter()
+        .map(|name| Capability::new(*name))
+        .collect();
     let tools: Vec<String> = tools.iter().map(|tool| (*tool).to_string()).collect();
     let id = AgentId::new();
     blocking(move || {
@@ -69,7 +79,7 @@ async fn agent(store: &Store, user: &str, tools: &[&str]) -> AgentId {
                     description: "Pings.".to_string(),
                     instructions: "Ping.".to_string(),
                     tools,
-                    required_capabilities: vec![Capability::new("mcp.local.ping")],
+                    required_capabilities: capabilities,
                 },
                 owner: protocol::Owner::new(common::ISSUER, user, "tenant-1"),
             })
@@ -171,22 +181,41 @@ async fn a_catalog_that_stops_loading_leaves_the_run_open() {
     }
 }
 
-/// An in-memory store whose reads of an agent fail once armed: the run
-/// store blipped while a worker looked up the run's tools.
-struct AgentReadFails {
-    inner: server::InMemoryStore,
-    failing: std::sync::Mutex<bool>,
+/// What an `AgentRead` store's reads of an agent answer, once armed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Read {
+    /// As stored.
+    Stored,
+    /// An error: the run store blipped.
+    Fails,
+    /// No agent.
+    Missing,
+    /// The agent, owned by another principal.
+    Foreign,
 }
 
-impl server::RunStore for AgentReadFails {
+/// An in-memory store whose reads of an agent are forced once armed, while
+/// a worker looks up the run's tools.
+struct AgentRead {
+    inner: server::InMemoryStore,
+    read: std::sync::Mutex<Read>,
+}
+
+impl server::RunStore for AgentRead {
     fn put_agent(&self, agent: StoredAgent) -> Result<server::PutAgent, server::StoreError> {
         self.inner.put_agent(agent)
     }
     fn agent(&self, id: AgentId) -> Result<Option<StoredAgent>, server::StoreError> {
-        if *self.failing.lock().expect("lock") {
-            return Err(server::StoreError::new("the store is unreachable"));
+        let read = *self.read.lock().expect("lock");
+        match read {
+            Read::Stored => self.inner.agent(id),
+            Read::Fails => Err(server::StoreError::new("the store is unreachable")),
+            Read::Missing => Ok(None),
+            Read::Foreign => Ok(self.inner.agent(id)?.map(|mut agent| {
+                agent.owner = protocol::Owner::new(common::ISSUER, "someone-else", "tenant-1");
+                agent
+            })),
         }
-        self.inner.agent(id)
     }
     fn agents_of(&self, owner: &protocol::Owner) -> Result<Vec<StoredAgent>, server::StoreError> {
         self.inner.agents_of(owner)
@@ -233,30 +262,60 @@ impl server::RunStore for AgentReadFails {
 }
 
 // A store that cannot answer for the run's agent when its worker looks up
-// its tools leaves the run open, to be tried again, rather than running it
-// without the tools its manifest names.
+// its tools, that has no such agent, or whose agent is another principal's,
+// leaves the run open, to be tried again, rather than running it without
+// the tools its manifest names.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_store_blip_on_the_agent_leaves_the_run_open() {
-    let blip = std::sync::Arc::new(AgentReadFails {
-        inner: server::InMemoryStore::default(),
-        failing: std::sync::Mutex::new(false),
-    });
-    let store: Store = blip.clone();
-    let jev = jev(&["ping", "complete"]).await;
-    let server = serve(store.clone(), &jev, 4).await.with_catalog(&catalog());
-    let user = fresh_user();
-    let agent = agent(&store, &user, &["ping"]).await;
-    let (_, run) = server.start(&user, agent, "hi").await;
-    *blip.failing.lock().expect("lock") = true;
-    let worker = server.worker.clone();
-    let worked = blocking(move || worker.work_one()).await;
-    assert!(worked.is_err(), "{worked:?}");
-    let log = payloads(&store, &run).await;
-    assert!(
-        !log.iter().any(|payload| matches!(
-            payload,
-            EventPayload::RunFailed { .. } | EventPayload::RunCompleted { .. }
-        )),
-        "{log:?}"
-    );
+async fn an_agent_the_worker_cannot_use_leaves_the_run_open() {
+    for read in [Read::Fails, Read::Missing, Read::Foreign] {
+        let forced = std::sync::Arc::new(AgentRead {
+            inner: server::InMemoryStore::default(),
+            read: std::sync::Mutex::new(Read::Stored),
+        });
+        let store: Store = forced.clone();
+        let jev = jev(&["ping", "complete"]).await;
+        let server = serve(store.clone(), &jev, 4).await.with_catalog(&catalog());
+        let user = fresh_user();
+        let agent = agent(&store, &user, &["ping"]).await;
+        let (_, run) = server.start(&user, agent, "hi").await;
+        *forced.read.lock().expect("lock") = read;
+        let worker = server.worker.clone();
+        let worked = blocking(move || worker.work_one()).await;
+        assert!(worked.is_err(), "{worked:?}");
+        let log = payloads(&store, &run).await;
+        assert!(
+            !log.iter().any(|payload| matches!(
+                payload,
+                EventPayload::RunFailed { .. } | EventPayload::RunCompleted { .. }
+            )),
+            "{log:?}"
+        );
+    }
+}
+
+// A catalog tool the manifest names still needs its capability: an agent
+// without `mcp.local.ping` is denied the call, and nothing is called.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catalog_tool_needs_its_capability() {
+    for store in stores() {
+        let jev = jev(&["ping", "complete"]).await;
+        let server = serve(store.clone(), &jev, 5).await.with_catalog(&catalog());
+        let user = fresh_user();
+        let agent = agent_with(&store, &user, &["ping"], &[]).await;
+        let (_, run) = server.start(&user, agent, "hi").await;
+        assert!(server.work().await.is_some());
+        let log = payloads(&store, &run).await;
+        assert!(
+            !log.iter()
+                .any(|payload| matches!(payload, EventPayload::ToolResult { .. })),
+            "{log:?}"
+        );
+        assert!(
+            log.iter().any(|payload| matches!(
+                payload,
+                EventPayload::EffectDenied { reason, .. } if reason.contains("mcp.local.ping")
+            )),
+            "{log:?}"
+        );
+    }
 }

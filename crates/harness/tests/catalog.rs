@@ -1015,3 +1015,20 @@ for line in sys.stdin:
     let path = tool.call("PATH").expect("the server answers");
     assert_ne!(path, "PATH=-", "PATH is given");
 }
+
+// An `env` entry that is not a variable name (empty, or holding `=` or a
+// NUL) is refused when the catalog loads, not dropped when the server starts.
+#[test]
+fn an_env_entry_that_is_not_a_name_is_refused() {
+    for bad in ["", "KEY=value", "A\\u0000B"] {
+        let dir = scratch();
+        fs::write(
+            dir.join("harness.toml"),
+            format!(
+                "[[mcp]]\nname = \"local\"\ncommand = \"true\"\nenv = [\"{bad}\"]\n\n[[mcp.tools]]\nname = \"ping\"\n"
+            ),
+        )
+        .unwrap();
+        assert!(load_catalog(&dir).is_err(), "{bad:?}");
+    }
+}
